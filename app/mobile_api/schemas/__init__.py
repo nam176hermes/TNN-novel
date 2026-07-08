@@ -1,0 +1,692 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+class UserResponse(BaseModel):
+    username: str
+
+
+# ── Health ────────────────────────────────────────────────────────────────
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    checks: dict[str, bool]
+    details: dict[str, str] = {}
+
+
+class VersionResponse(BaseModel):
+    version: str
+    build: str = ""
+
+
+class SystemStatusResponse(BaseModel):
+    db_size_bytes: int = 0
+    cache_count: int = 0
+    cache_size_bytes: int = 0
+    ollama_host: str = ""
+    ollama_model: str = ""
+    data_dir: str = ""
+    public_deploy: bool = False
+    api_ready: bool = False
+    active_provider: str = ""
+    upload_max_bytes: int = 0
+    asset_protection_enabled: bool = False
+    active_jobs: int = 0
+    running_jobs: int = 0
+    queued_jobs: int = 0
+    retrying_jobs: int = 0
+    interrupted_jobs: int = 0
+    failed_jobs: int = 0
+    last_failed_job: dict[str, Any] | None = None
+    recent_operational_errors: list[dict[str, Any]] = Field(default_factory=list)
+    recent_operational_events: list[dict[str, Any]] = Field(default_factory=list)
+    recent_backup_events: list[dict[str, Any]] = Field(default_factory=list)
+    app_version: str = ""
+    build: str = ""
+    database_path: str = ""
+    backup_recommendation: str = ""
+
+
+# ── Books ────────────────────────────────────────────────────────────────
+
+class BookCreate(BaseModel):
+    title: str
+    author: str = ""
+    source: str = "manual"
+    source_url: str = ""
+
+
+class BookUpdate(BaseModel):
+    title: str | None = None
+    author: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+
+
+class BookResponse(BaseModel):
+    id: int
+    title: str
+    author: str = ""
+    source: str = "manual"
+    source_url: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+# ── Chapters ─────────────────────────────────────────────────────────────
+
+class ChapterResponse(BaseModel):
+    id: int
+    book_id: int
+    chapter_number: int
+    title: str
+    status: str = ""
+    source_url: str = ""
+    raw_text_path: str | None = None
+    cleaned_text_path: str | None = None
+    translated_text_path: str | None = None
+    audio_path: str | None = None
+    translated_at: str | None = None
+    audio_created_at: str | None = None
+    created_at: str = ""
+    word_count: int = 0
+
+
+class TranslationEdit(BaseModel):
+    text: str
+
+
+class TextResponse(BaseModel):
+    text: str
+
+
+# ── Reader State ─────────────────────────────────────────────────────────
+
+class ReaderProgressAnchor(BaseModel):
+    version: Literal[1] = 1
+    text: str = Field(default="", max_length=256)
+    offset: int = Field(default=0, ge=0)
+    prefix: str = Field(default="", max_length=128)
+    suffix: str = Field(default="", max_length=128)
+
+
+class ReaderProgressUpdate(BaseModel):
+    chapter_id: int
+    mode: Literal["scroll", "paginated"] = "scroll"
+    percent: int = Field(default=0, ge=0, le=100)
+    paragraph_index: int = Field(default=0, ge=0)
+    char_offset: int = Field(default=0, ge=0)
+    absolute_char_offset: int = Field(default=0, ge=0)
+    page_index: int = Field(default=0, ge=0)
+    anchor: ReaderProgressAnchor | None = None
+
+
+class ReaderAnnotationCreate(BaseModel):
+    kind: Literal["bookmark", "highlight", "note"]
+    paragraph_index: int = Field(default=0, ge=0)
+    char_start: int = Field(default=0, ge=0)
+    char_end: int = Field(default=0, ge=0)
+    selected_text: str = ""
+    note: str = ""
+    color: str = "yellow"
+
+
+class ReaderAnnotationUpdate(BaseModel):
+    kind: Literal["bookmark", "highlight", "note"] | None = None
+    paragraph_index: int | None = Field(default=None, ge=0)
+    char_start: int | None = Field(default=None, ge=0)
+    char_end: int | None = Field(default=None, ge=0)
+    selected_text: str | None = None
+    note: str | None = None
+    color: str | None = None
+
+
+class ReaderAnnotationImportItem(BaseModel):
+    client_id: str | None = None
+    chapter_id: int | None = Field(default=None, ge=0)
+    chapter_number: int | None = Field(default=None, ge=0)
+    kind: Literal["bookmark", "highlight", "note"]
+    paragraph_index: int = Field(default=0, ge=0)
+    char_start: int = Field(default=0, ge=0)
+    char_end: int = Field(default=0, ge=0)
+    selected_text: str = ""
+    note: str = ""
+    color: str = "yellow"
+
+
+class ReaderAnnotationImportRequest(BaseModel):
+    annotations: list[ReaderAnnotationImportItem] = Field(default_factory=list)
+
+
+class ReaderSyncProgress(ReaderProgressUpdate):
+    updated_at: str = ""
+
+
+class ReaderSyncAnnotation(BaseModel):
+    id: int | None = None
+    client_id: str | None = None
+    chapter_id: int
+    kind: Literal["bookmark", "highlight", "note"]
+    paragraph_index: int = Field(default=0, ge=0)
+    char_start: int = Field(default=0, ge=0)
+    char_end: int = Field(default=0, ge=0)
+    selected_text: str = ""
+    note: str = ""
+    color: str = "yellow"
+    created_at: str = ""
+    updated_at: str = ""
+    deleted_at: str | None = None
+
+
+class ReaderSyncRequest(BaseModel):
+    device_id: str = ""
+    last_sync_at: str | None = None
+    progress: ReaderSyncProgress | None = None
+    annotations: list[ReaderSyncAnnotation] = Field(default_factory=list)
+
+
+class ReaderExplainRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    context_before: str = Field(default="", max_length=3000)
+    context_after: str = Field(default="", max_length=3000)
+    spoiler_mode: Literal["no_spoiler", "allow_spoiler"] = "no_spoiler"
+
+
+class ReaderExplainTerm(BaseModel):
+    source: str = ""
+    target: str = ""
+    note: str = ""
+
+
+class ReaderExplainResponse(BaseModel):
+    explanation: str
+    terms: list[ReaderExplainTerm] = Field(default_factory=list)
+
+
+class ReaderXrayEnrichRequest(BaseModel):
+    chapter_id: int | None = None
+    spoiler_mode: Literal["no_spoiler", "allow_spoiler"] = "no_spoiler"
+
+
+# ── Import ───────────────────────────────────────────────────────────────
+
+class PasteImport(BaseModel):
+    title: str
+    chapter_number: int = 1
+    chapter_title: str = ""
+    text: str
+
+
+class URLNoteImport(BaseModel):
+    url: str
+    title: str = ""
+    notes: str = ""
+    chapter_number: int = 1
+    chapter_title: str = ""
+
+
+class URLPreviewRequest(BaseModel):
+    url: str
+
+
+class SourceChapterPreview(BaseModel):
+    chapter_number: int
+    title: str
+    url: str
+
+
+class SourcePolicyPreview(BaseModel):
+    source_id: str = ""
+    label: str = ""
+    delay_seconds: int = 0
+    max_concurrency: int = 1
+    retry_limit: int = 0
+
+
+class SourceCapability(BaseModel):
+    source_id: str
+    label: str
+    domains: list[str] = Field(default_factory=list)
+    adapter_id: str = ""
+    adapter_label: str = ""
+    extraction: str = "generic"
+    direct_import: bool = True
+    delay_seconds: int = 0
+    max_concurrency: int = 1
+    retry_limit: int = 0
+    notes: str = ""
+
+
+class SourceCapabilityList(BaseModel):
+    sources: list[SourceCapability] = Field(default_factory=list)
+
+
+class SourceCatalogEntry(BaseModel):
+    id: str
+    external_id: str = ""
+    catalog_source: str = "yckceo"
+    name: str = ""
+    url: str = ""
+    domain: str = ""
+    author: str = ""
+    downloads: int = 0
+    version: str = ""
+    raw_tags: str = ""
+    tags: list[str] = Field(default_factory=list)
+    unknown_tags: list[str] = Field(default_factory=list)
+    supported: bool = False
+    supported_status: str = "unsupported"
+    supported_source_id: str = ""
+    invalid_reason: str = ""
+    updated_label: str = ""
+    last_check_status: str = ""
+    last_check_at: str = ""
+    last_check_error: str = ""
+    last_check_http_status: int | None = None
+    last_check_final_url: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class SourceCatalogList(BaseModel):
+    items: list[SourceCatalogEntry] = Field(default_factory=list)
+    entries: list[SourceCatalogEntry] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    per_page: int = 50
+    page_size: int = 50
+
+
+class SourceCatalogHealthResponse(BaseModel):
+    catalog_entry_id: str
+    domain: str = ""
+    status: Literal["reachable", "timeout", "blocked", "captcha", "unsupported", "preview_ok", "error"] | str
+    reason: str = ""
+    checked_at: str
+    final_url: str = ""
+    http_status: int | None = None
+
+
+class ParserCandidateCreateRequest(BaseModel):
+    sample_url: str = ""
+
+
+class SourceAdapterCandidate(BaseModel):
+    id: str = ""
+    catalog_entry_id: str
+    domain: str = ""
+    sample_url: str = ""
+    detected_title: str = ""
+    detected_chapter_list: list[dict[str, Any]] = Field(default_factory=list)
+    parser_confidence: Literal["high", "medium", "low", "failed"] | str = "low"
+    failure_reason: str = ""
+    status: Literal["draft", "needs_review", "rejected", "promoted"] | str = "draft"
+    created_at: str = ""
+    updated_at: str = ""
+    reviewed_at: str = ""
+    reviewed_by: str = ""
+
+
+class SourceAdapterCandidateList(BaseModel):
+    items: list[SourceAdapterCandidate] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    per_page: int = 50
+    page_size: int = 50
+
+
+class SourcePreviewResponse(BaseModel):
+    adapter_id: str
+    adapter_label: str
+    source: str
+    source_url: str
+    title: str
+    author: str = ""
+    description: str = ""
+    cover_url: str = ""
+    chapters: list[SourceChapterPreview] = Field(default_factory=list)
+    chapter_count: int = 0
+    policy: SourcePolicyPreview | None = None
+
+
+class URLImportChapter(BaseModel):
+    url: str
+    chapter_number: int = 1
+    title: str = ""
+
+
+class URLImportStart(BaseModel):
+    url: str
+    title: str = ""
+    author: str = ""
+    source: str = ""
+    chapters: list[URLImportChapter] = Field(default_factory=list)
+    retry_limit: int = Field(default=2, ge=0, le=5)
+
+
+class ImportResponse(BaseModel):
+    book_id: int
+    chapter_id: int
+    path: str = ""
+    message: str = "ok"
+
+
+# ── Jobs ─────────────────────────────────────────────────────────────────
+
+class JobStart(BaseModel):
+    book_id: int | None = None
+    chapter_ids: list[int] | None = None
+    limit: int = 15
+    params: dict[str, Any] = {}
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str = "pending"
+    message: str = ""
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    job_type: str = ""
+    status: str
+    state: str = ""
+    progress: int = 0
+    total: int = 0
+    current_book_id: int = 0
+    current_chapter_id: int = 0
+    current_chunk_index: int = 0
+    total_chunks: int = 0
+    current_step: str = ""
+    provider: str = ""
+    model: str = ""
+    target_ids: list[int] = Field(default_factory=list)
+    message: str = ""
+    error: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    started_at: str = ""
+    completed_at: str = ""
+    failed_at: str = ""
+    finished_at: str | None = None
+    cancel_requested: bool = False
+    last_safe_error: str = ""
+    internal_error_ref: str = ""
+    preset_id: str = ""
+    chunk_size: int | None = None
+    active_stage: str = ""
+    stage_timings: list[dict[str, Any]] = Field(default_factory=list)
+    retry_of_job_id: str = ""
+    retry_count: int = 0
+    previous_error: str = ""
+    last_retry_job_id: str = ""
+    skipped_completed_chapter_ids: list[int] = Field(default_factory=list)
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobStatus]
+
+
+class JobLogEntry(BaseModel):
+    id: int
+    job_id: str
+    event_type: str
+    state: str = ""
+    step: str = ""
+    message: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+# ── Export ────────────────────────────────────────────────────────────────
+
+class ExportRequest(BaseModel):
+    format: str = Field(..., pattern="^(txt|docx|epub)$")
+
+
+class ExportResponse(BaseModel):
+    book_id: int
+    book_title: str
+    format: str
+    filename: str
+    path: str
+    media_type: str
+    size_bytes: int
+    chapter_count: int
+
+
+# ── Audio ────────────────────────────────────────────────────────────────
+
+class PlaylistItem(BaseModel):
+    chapter_id: int
+    chapter_number: int
+    title: str
+    duration_seconds: float = 0
+    download_url: str
+    filename: str
+    order: int = 0
+    size_bytes: int = 0
+    stream_url: str
+
+
+class PlaylistResponse(BaseModel):
+    book_id: int
+    book_title: str = ""
+    chapters: list[PlaylistItem]
+
+
+# ── Glossary ─────────────────────────────────────────────────────────────
+
+class GlossaryTermCreate(BaseModel):
+    source_term: str
+    target_term: str
+    book_id: int = 0
+    category: str = "term"
+    mode: str = "translate"
+    pinyin: str = ""
+    notes_vi: str = ""
+    variants: str = ""
+    approved: int = 1
+    priority: int = 0
+    locked: int = 0
+    genre: str = ""
+    term_type: str = "term"
+
+
+class GlossaryTermUpdate(BaseModel):
+    target_term: str | None = None
+    category: str | None = None
+    mode: str | None = None
+    pinyin: str | None = None
+    notes_vi: str | None = None
+    variants: str | None = None
+    approved: int | None = None
+    priority: int | None = None
+    locked: int | None = None
+    genre: str | None = None
+    term_type: str | None = None
+
+
+class TranslationMemoryEntryCreate(BaseModel):
+    source_text: str = Field(..., min_length=1)
+    translation_text: str = Field(..., min_length=1)
+    score: int = Field(default=85, ge=0, le=100)
+    book_id: int = 0
+    chapter_number: int | None = None
+    source_lang: str = "zh"
+    target_lang: str = "vi"
+
+
+class GlossaryTermResponse(BaseModel):
+    id: int
+    book_id: int
+    source_term: str
+    target_term: str
+    category: str = "term"
+    mode: str = "translate"
+    approved: int = 1
+    pinyin: str = ""
+    notes_vi: str = ""
+    variants: str = ""
+    occurrence_count: int = 0
+    last_seen: str = ""
+    priority: int = 0
+    locked: int = 0
+    genre: str = ""
+    term_type: str = "term"
+    created_at: str = ""
+
+
+class GlossarySearchResponse(BaseModel):
+    results: list[GlossaryTermResponse]
+    total: int = 0
+
+
+class GlossaryListResponse(BaseModel):
+    items: list[GlossaryTermResponse]
+    total: int = 0
+    page: int = 1
+    per_page: int = 50
+
+
+class ImportGlossaryResponse(BaseModel):
+    added: int = 0
+    updated: int = 0
+    errors: list[str] = []
+
+
+# ── Style Profiles ────────────────────────────────────────────────────────
+
+class StyleProfileResponse(BaseModel):
+    id: str
+    label: str
+    pronoun_rules: str = ""
+    han_viet_level: str = "balanced"
+    preferred_terms: str = ""
+    banned_modern_terms: str = ""
+    prompt_rules: str = ""
+    is_default: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class StyleProfileListResponse(BaseModel):
+    profiles: list[StyleProfileResponse]
+
+
+class StyleProfileDefaultResponse(BaseModel):
+    profile: StyleProfileResponse
+
+
+class StyleProfileDefaultUpdate(BaseModel):
+    style_profile_id: str
+
+
+# ── Providers ─────────────────────────────────────────────────────────────
+
+class ProviderResponse(BaseModel):
+    id: str
+    label: str
+    base_url: str
+    model: str
+    api_key_env: str = ""
+    api_key_set: bool = False
+    temperature: float = 0.3
+    timeout_seconds: int = 180
+    supports_streaming: int = 0
+    supports_batch: int = 0
+    cost_input_per_1m: float = 0
+    cost_output_per_1m: float = 0
+    enabled: int = 1
+    notes: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class ProviderTestRequest(BaseModel):
+    provider_id: str
+    prompt: str = "Translate this Chinese sentence to Vietnamese: 他拿起灵石。"
+
+
+class ProviderKeyUpdateRequest(BaseModel):
+    api_key: str = Field(..., min_length=1)
+
+
+class CostEstimateRequest(BaseModel):
+    provider_id: str
+    source_chars: int = Field(..., ge=0)
+    chapter_count: int = Field(default=1, ge=1)
+    prompt_overhead_tokens: int = Field(default=1500, ge=0)
+    max_cost_usd: float | None = None
+
+
+class CostEstimateResponse(BaseModel):
+    provider_id: str
+    model: str
+    chapter_count: int
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    estimated_cost_usd: float
+    within_budget: bool
+
+
+# ── QA ───────────────────────────────────────────────────────────────────
+
+class ParagraphPolishRequest(BaseModel):
+    instructions: str = ""  # Optional style instructions
+
+
+class QAResponse(BaseModel):
+    chapter_id: int
+    book_id: int
+    quality_score: float = 0
+    fidelity_score: float = 0
+    style_score: float = 0
+    glossary_score: float = 0
+    audiobook_score: float = 0
+    verdict: str = "UNKNOWN"
+    issues: list[dict[str, Any]] = []
+    raw_report: dict[str, Any] = {}
+    created_at: str = ""
+
+
+class QASummaryResponse(BaseModel):
+    book_id: int
+    total_chapters: int = 0
+    qa_done: int = 0
+    avg_quality_score: float = 0
+    pass_count: int = 0
+    fail_count: int = 0
+    chapters: list[dict[str, Any]] = []
+
+
+# ── Generic ──────────────────────────────────────────────────────────────
+
+class ErrorResponse(BaseModel):
+    detail: str
+    code: str = "error"

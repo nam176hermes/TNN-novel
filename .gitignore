@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (generated)
+data/
+data/pipeline.db
+data/*.db
+data/*.db-*
+data/logs/runtime/
+backups/
+data_restored/
+*.sqlite3
+inbox/
+output/
+work/
+test-results/
+.playwright-cli/
+browser-helper/
+browser-helper.tar.gz
+AUDIT_REPORT*.md
+audit_results.txt
+audit_summary.txt
+docs/superpowers/
+
+# Local novel/content samples and generated audit artifacts
+chapter_*_zh.txt
+chapter_*_final_translation.md
+chapter_*_new_prompt_translation.md
+translated_chapter_*.md
+*_translation_result.md
+full_pipeline_ch*_zh.txt
+test_e2e_*.md
+test_e2e_raw.txt
+test_chapter_*.txt
+pham-nhan-tu-tien-*.md
+yongye_ch*_final_translation.md
+
+# Logs
+*.log
+
+# Frontend
+web/node_modules/
+web/dist/
