@@ -11452,3 +11452,376 @@ body {
     top: 116px;
   }
 }
+
+.review-page {
+  display: grid;
+  gap: 18px;
+  width: min(1040px, 100%);
+  margin: 0 auto;
+  padding: 26px;
+}
+
+.review-banner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px 16px;
+  border: 1px solid rgb(52 211 153 / 28%);
+  border-radius: 8px;
+  background: rgb(6 78 59 / 28%);
+  color: #c7f9df;
+}
+
+.review-banner strong,
+.review-banner span {
+  display: block;
+}
+
+.review-banner span {
+  margin-top: 3px;
+  color: rgb(226 232 240 / 78%);
+}
+
+.review-page-header p {
+  margin: 0 0 6px;
+  color: #34d399;
+  font-size: 0.86rem;
+}
+
+.review-page-header h2 {
+  margin: 0;
+  color: #f8fafc;
+  font-size: clamp(2rem, 4vw, 3rem);
+  line-height: 1.05;
+}
+
+.review-hero-panel,
+.review-card,
+.review-reader {
+  border: 1px solid rgb(148 163 184 / 14%);
+  border-radius: 8px;
+  background: rgb(8 13 18 / 82%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 3%);
+}
+
+.review-hero-panel {
+  display: flex;
+  gap: 28px;
+  align-items: center;
+  min-height: 170px;
+  padding: 32px;
+}
+
+.review-hero-panel svg,
+.review-card svg,
+.review-reader svg {
+  color: #34d399;
+}
+
+.review-hero-panel h3,
+.review-card h3,
+.review-reader h3 {
+  margin: 0 0 8px;
+  color: #f8fafc;
+}
+
+.review-hero-panel p,
+.review-card p,
+.review-reader p {
+  margin: 0;
+  color: rgb(226 232 240 / 72%);
+}
+
+.review-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.review-grid-two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.review-grid-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.review-grid-four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.review-card {
+  padding: 20px;
+}
+
+.review-card > strong {
+  display: block;
+  color: #f8fafc;
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.review-card > span,
+.review-card small {
+  display: block;
+  margin-top: 8px;
+  color: rgb(226 232 240 / 65%);
+}
+
+.review-list,
+.review-table-list {
+  display: grid;
+  gap: 0;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-list li,
+.review-table-list li,
+.review-job-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 48px;
+  border-bottom: 1px solid rgb(148 163 184 / 12%);
+  color: #e5e7eb;
+}
+
+.review-list li:last-child,
+.review-table-list li:last-child {
+  border-bottom: 0;
+}
+
+.review-list span,
+.review-table-list em,
+.review-table-list small,
+.review-job-row span {
+  color: rgb(226 232 240 / 62%);
+  font-style: normal;
+}
+
+.review-table-list em {
+  padding: 4px 8px;
+  border: 1px solid rgb(52 211 153 / 22%);
+  border-radius: 999px;
+  background: rgb(16 185 129 / 12%);
+  color: #86efac;
+  white-space: nowrap;
+}
+
+.review-table-list button,
+.review-actions button,
+.review-export-row button,
+.review-tab-row button,
+.review-toolbar button,
+.review-reader button {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid rgb(148 163 184 / 18%);
+  border-radius: 8px;
+  background: rgb(15 23 42 / 72%);
+  color: #e5e7eb;
+}
+
+.review-library-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px;
+}
+
+.review-book-card {
+  padding: 16px;
+  border: 1px solid rgb(148 163 184 / 14%);
+  border-radius: 8px;
+  background: rgb(8 13 18 / 82%);
+}
+
+.review-book-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  border-radius: 8px;
+}
+
+.review-book-card h3 {
+  margin: 16px 0 6px;
+  color: #f8fafc;
+  font-size: 1.45rem;
+}
+
+.review-book-card p {
+  margin: 0 0 14px;
+  color: rgb(226 232 240 / 65%);
+}
+
+.review-book-stats,
+.review-actions,
+.review-export-row,
+.review-tab-row,
+.review-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.review-book-stats {
+  justify-content: space-between;
+  padding: 14px 0;
+  border-top: 1px solid rgb(148 163 184 / 12%);
+  border-bottom: 1px solid rgb(148 163 184 / 12%);
+}
+
+.review-book-stats span {
+  color: #f8fafc;
+}
+
+.review-book-stats small {
+  display: block;
+  margin-top: 4px;
+  color: rgb(226 232 240 / 56%);
+}
+
+.review-actions {
+  margin-top: 14px;
+}
+
+.review-reader {
+  padding: 26px;
+}
+
+.review-reader header,
+.review-reader footer {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.review-reader header img {
+  width: 58px;
+  height: 76px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.review-reader header button {
+  margin-left: auto;
+}
+
+.review-reader article {
+  max-width: 700px;
+  margin: 40px auto;
+  color: #f4ecd8;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 2rem;
+  line-height: 1.75;
+}
+
+.review-reader article p + p {
+  margin-top: 28px;
+}
+
+.review-reader footer {
+  justify-content: center;
+}
+
+.review-tab-row {
+  margin-bottom: 20px;
+}
+
+.review-tab-row .is-active,
+.review-actions button:first-child,
+.review-export-row button:first-child {
+  border-color: rgb(52 211 153 / 42%);
+  background: rgb(16 185 129 / 20%);
+  color: #bbf7d0;
+}
+
+.review-card label {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  color: rgb(226 232 240 / 78%);
+}
+
+.review-card input,
+.review-card select,
+.review-toolbar input {
+  min-height: 44px;
+  border: 1px solid rgb(148 163 184 / 16%);
+  border-radius: 8px;
+  background: rgb(15 23 42 / 72%);
+  color: #e5e7eb;
+  padding: 0 14px;
+}
+
+.review-dropzone {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  min-height: 190px;
+  margin-top: 18px;
+  border: 1px dashed rgb(148 163 184 / 28%);
+  border-radius: 8px;
+  color: rgb(226 232 240 / 68%);
+}
+
+.review-toolbar {
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.review-toolbar input {
+  width: min(340px, 100%);
+}
+
+.review-job-row {
+  padding: 12px 0;
+}
+
+.review-job-row div {
+  display: grid;
+  gap: 4px;
+  min-width: 190px;
+}
+
+.review-job-row progress {
+  flex: 1;
+  height: 8px;
+  accent-color: #10b981;
+}
+
+@media (max-width: 860px) {
+  .review-page {
+    padding: 18px 14px 92px;
+  }
+
+  .review-grid-two,
+  .review-grid-three,
+  .review-grid-four,
+  .review-library-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .review-hero-panel,
+  .review-list li,
+  .review-table-list li,
+  .review-job-row,
+  .review-book-stats,
+  .review-actions,
+  .review-export-row,
+  .review-tab-row,
+  .review-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .review-reader article {
+    font-size: 1.45rem;
+  }
+}

@@ -11,6 +11,11 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
+if [[ "${NOVEL_PUBLIC_REVIEW_MODE:-0}" == "1" ]]; then
+  export VITE_PUBLIC_REVIEW_MODE=1
+  echo "Public review route enabled at /review with sanitized frontend-only demo data."
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="${PYTHON_BIN_FALLBACK:-python3}"

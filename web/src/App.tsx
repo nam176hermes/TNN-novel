@@ -24,6 +24,7 @@ import type {
 } from './api/types';
 import LoginPanel from './components/LoginPanel';
 import PwaInstallPrompt from './components/PwaInstallPrompt';
+import ReviewModeApp from './components/ReviewModeApp';
 import WorkflowShell, { type WorkflowView } from './components/WorkflowShell';
 import type { WorkbenchDashboardData } from './components/WorkbenchView';
 import { resolveApiBaseUrl } from './api/baseUrl';
@@ -55,6 +56,9 @@ import './styles.css';
 const API_BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 const AUTH_DISABLED = ['1', 'true', 'yes', 'on'].includes(
   String(import.meta.env.VITE_DISABLE_AUTH ?? '').trim().toLowerCase(),
+);
+const PUBLIC_REVIEW_MODE = ['1', 'true', 'yes', 'on'].includes(
+  String(import.meta.env.VITE_PUBLIC_REVIEW_MODE ?? '').trim().toLowerCase(),
 );
 const MAX_JOB_REFRESH_RETRIES = 3;
 const JOB_REFRESH_RETRY_DELAY_MS = 100;
@@ -145,7 +149,13 @@ function DeleteConfirmDialog({
   );
 }
 
-export default function App() {
+function reviewModeRequested(): boolean {
+  if (typeof window === 'undefined') return false;
+  const params = new URLSearchParams(window.location.search);
+  return window.location.pathname === '/review' || params.get('review') === '1';
+}
+
+function AuthenticatedApp() {
   const session = useSession(API_BASE_URL, AUTH_DISABLED);
   const [backendError, setBackendError] = useState('');
   const [backendSuccess, setBackendSuccess] = useState('');
@@ -1767,4 +1777,17 @@ export default function App() {
       ) : null}
     </>
   );
+}
+
+export default function App() {
+  if (PUBLIC_REVIEW_MODE && reviewModeRequested()) {
+    return (
+      <>
+        <PwaInstallPrompt />
+        <ReviewModeApp apiBaseUrl={API_BASE_URL} />
+      </>
+    );
+  }
+
+  return <AuthenticatedApp />;
 }

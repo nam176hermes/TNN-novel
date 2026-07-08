@@ -221,6 +221,20 @@ This does not remove backend authentication. If the session is revoked, expired,
 
 ## Temporary No-Login Review Mode
 
+If the goal is only to let an external reviewer or GPT-like browser inspect the UI, prefer the frontend-only review route. It does not disable backend authentication and does not call private APIs:
+
+```bash
+NOVEL_PUBLIC_REVIEW_MODE=1 scripts/start-cloudflare.sh
+```
+
+Then open:
+
+```text
+https://YOUR_DOMAIN/review
+```
+
+This route renders sanitized sample screens only. It is intended for UI review, screenshots, and layout feedback. It cannot import books, view private book content, update providers, start jobs, download exports, or access private assets.
+
 For local review only, the app can bypass the login page:
 
 ```bash
