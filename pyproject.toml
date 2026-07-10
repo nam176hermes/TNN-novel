@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-pipeline"
+version = "0.1.0"
+description = "Personal Chinese-to-Vietnamese novel translation pipeline for audiobooks"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.15.0",
+    "pydantic>=2.9.2",
+    "pydantic-settings>=2.6.0",
+    "rich>=13.9.2",
+    "requests>=2.32.3",
+    "pyperclip>=1.9.0",
+    "python-dotenv>=1.0.0",
+    "edge-tts>=7.2.8",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0,<4.1",
+    "python-multipart>=0.0.9",
+    "sse-starlette>=2.1.0",
+    "ebooklib>=0.17",
+    "mutagen>=1.47",
+    "jieba>=0.42.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.3", "pytest-asyncio>=0.24.0", "httpx>=0.28.0", "pyflakes>=3.2.0"]
+
+[project.scripts]
+novel = "app.main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "--capture=sys"
+testpaths = ["tests", "app/mobile_api/tests"]
+asyncio_default_fixture_loop_scope = "function"
