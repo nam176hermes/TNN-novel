@@ -36,3 +36,21 @@ An initial 120-chapter fixture correctly failed duplicate-source detection becau
 - Is server-side preview/session architecture justified now? Not solely by the 5 MB preview result. First fix multi-chapter commit transactions. A preview session becomes justified if the limit rises, uploads resume, or low-end mobile evidence degrades.
 - Web Worker or backend? Move pure client detection/cleanup to a Worker if low-end device profiling shows input freezes. Use backend preview sessions for resumable uploads, larger files, and avoiding preview/commit payload duplication.
 - Chunked upload? Future option, not currently justified under the enforced 5 MB text limit.
+
+## P2B Reviewed-Import Commit
+
+P2B measurements used isolated synthetic databases and content directories on WSL ext4. Three runs were collected per fixture. Glossary/QA were stubbed for the transaction-focused numbers and measured separately with actual deterministic follow-up.
+
+| Fixture | P2B service median | Connections | Commits | Duplicate queries |
+| --- | ---: | ---: | ---: | ---: |
+| 1 chapter | 5.938 ms | 1 | 1 | 1 |
+| 10 chapters | 7.207 ms | 1 | 1 | 1 |
+| 120 chapters | 24.724 ms | 1 | 1 | 1 |
+| 500 chapters | 94.859 ms | 1 | 1 | 1 |
+| 4.9 MB single chapter | 20.917 ms | 1 | 1 | 1 |
+
+For 120 chapters, the fresh post-P2A baseline was 366.449 ms with 243 connections, 122 commits, and 240 duplicate queries. The P2B path reduced those counts to 1/1/1 and 139 total traced SQL statements.
+
+The authenticated ASGI endpoint with real glossary follow-up measured 144.083 ms median over three runs. The service with real follow-up measured 149.771 ms median. Follow-up work runs after commit and still uses per-chapter glossary repository calls; it does not extend the SQLite write transaction.
+
+Always pass `--work-root` to the benchmark. On this machine, Python's default temporary directory can resolve to `/mnt/c` even when the checkout is under `/home`, invalidating an ext4 label.

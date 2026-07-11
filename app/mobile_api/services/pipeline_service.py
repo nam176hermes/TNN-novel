@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 import shutil
 import unicodedata
@@ -13,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import struct
 import time
+import uuid
 import zipfile
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -20,10 +22,14 @@ from collections.abc import Callable
 
 from app.database.db import (
     get_book_by_id,
-    get_chapter,
+    find_import_book_with_connection,
+    get_connection,
+    insert_import_chapter_with_connection,
+    list_active_import_chapters_with_connection,
     list_books_with_active_chapters,
     list_translated_book_summaries as db_list_translated_book_summaries,
     add_book,
+    resolve_import_book_with_connection,
     update_book as db_update_book,
     delete_book as db_delete_book,
     delete_chapter_translation_data,
@@ -52,6 +58,7 @@ from app.database.db import (
     soft_delete_reader_annotation,
     soft_delete_chapter,
     update_chapter_paths,
+    update_import_chapter_with_connection,
     add_chapter,
     update_reader_annotation,
     upsert_reader_ai_cache,
@@ -71,6 +78,9 @@ from app.translation.presets import get_translation_preset
 from app.translation.pronoun_memory import render_pronoun_memory
 from app.scheduler.daily_queue import get_pending_chapters, get_failed_chapters
 from app.mobile_api.dependencies import get_data_dir, get_db_path
+
+
+logger = logging.getLogger(__name__)
 
 
 CLASSICAL_PRONOUN_STYLE_GUIDE = """Vietnamese classical web-novel style rules:
@@ -5228,6 +5238,163 @@ class PipelineService:
         path.write_text(text, encoding="utf-8")
         return path
 
+    def _prepare_reviewed_import_items(
+        self,
+        *,
+        chapters: list[dict],
+        content_kind: str,
+    ) -> list[dict]:
+        prepared: list[dict] = []
+        for item in chapters:
+            chapter_number = int(item.get("chapter_number") or 0)
+            chapter_title = str(item.get("chapter_title") or "").strip() or f"Chương {chapter_number}"
+            if chapter_number <= 0:
+                raise ValueError("Chapter number must be positive")
+
+            raw_text = str(item.get("raw_text") or "")
+            translated_text = str(item.get("translated_text") or "")
+            text = str(item.get("text") or "")
+            if content_kind == "raw":
+                raw_text = raw_text or text
+            elif content_kind == "translated":
+                translated_text = translated_text or text
+            else:
+                raw_text = raw_text or text
+
+            raw_text = raw_text.strip()
+            translated_text = translated_text.strip()
+            if not raw_text and not translated_text:
+                raise ValueError(f"Chapter {chapter_number} text is empty")
+            prepared.append(
+                {
+                    "chapter_number": chapter_number,
+                    "chapter_title": chapter_title,
+                    "raw_text": raw_text,
+                    "translated_text": translated_text,
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def _import_chapter_fingerprint(chapter: dict) -> tuple:
+        return (
+            int(chapter.get("id") or 0),
+            int(chapter.get("chapter_number") or 0),
+            str(chapter.get("title") or ""),
+            str(chapter.get("raw_text_path") or ""),
+            str(chapter.get("translated_text_path") or ""),
+            str(chapter.get("source_hash") or ""),
+            str(chapter.get("status") or ""),
+            str(chapter.get("translated_at") or ""),
+            str(chapter.get("deleted_at") or ""),
+        )
+
+    def _classify_reviewed_import_items(
+        self,
+        *,
+        prepared: list[dict],
+        existing_chapters: list[dict],
+        duplicate_strategy: str,
+        book_id: int | None,
+    ) -> list[dict]:
+        by_number = {int(chapter["chapter_number"]): dict(chapter) for chapter in existing_chapters}
+        by_source_hash = {
+            str(chapter.get("source_hash") or ""): dict(chapter)
+            for chapter in existing_chapters
+            if str(chapter.get("source_hash") or "")
+        }
+        classified: list[dict] = []
+
+        for item in prepared:
+            planned = dict(item)
+            chapter_number = int(planned["chapter_number"])
+            source_hash = str(planned["source_hash"])
+            existing = by_number.get(chapter_number)
+            source_duplicate = by_source_hash.get(source_hash)
+            if source_duplicate and int(source_duplicate["chapter_number"]) != chapter_number:
+                raise ValueError(
+                    f"Duplicate chapter content for chapter {chapter_number} in book {book_id or 'new'}"
+                )
+
+            if existing:
+                if duplicate_strategy == "error":
+                    raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id or 'new'}")
+                planned["action"] = "SKIP" if duplicate_strategy == "skip" else "REPLACE"
+                planned["existing_id"] = int(existing.get("id") or 0)
+                planned["existing_fingerprint"] = self._import_chapter_fingerprint(existing)
+            else:
+                planned["action"] = "ADD"
+                planned["existing_id"] = 0
+                planned["existing_fingerprint"] = None
+
+            classified.append(planned)
+            if planned["action"] != "SKIP":
+                synthetic = {
+                    "id": planned["existing_id"],
+                    "chapter_number": chapter_number,
+                    "title": planned["chapter_title"],
+                    "raw_text_path": existing.get("raw_text_path") if existing else "",
+                    "translated_text_path": existing.get("translated_text_path") if existing else "",
+                    "source_hash": source_hash,
+                    "status": "translated" if planned["translated_text"] else "imported",
+                    "translated_at": existing.get("translated_at") if existing else "",
+                    "deleted_at": "",
+                }
+                by_number[chapter_number] = synthetic
+                by_source_hash[source_hash] = synthetic
+        return classified
+
+    def _stage_reviewed_import_files(self, *, plan: list[dict], book_title: str) -> tuple[Path, list[dict]]:
+        staging_dir = self.data_dir / ".import-staging" / uuid.uuid4().hex
+        staged: list[dict] = []
+        try:
+            for index, item in enumerate(plan):
+                if item["action"] == "SKIP":
+                    continue
+                entry = dict(item)
+                for content_kind in ("raw", "translated"):
+                    text = str(item[f"{content_kind}_text"] or "")
+                    if not text:
+                        entry[f"{content_kind}_staged_path"] = None
+                        entry[f"{content_kind}_final_path"] = None
+                        continue
+                    safe_title = self._safe_filename_part(book_title) or "book"
+                    safe_chapter_title = self._safe_filename_part(item["chapter_title"]) or "chapter"
+                    filename = (
+                        f"{safe_title}_ch{item['chapter_number']}_{safe_chapter_title}_"
+                        f"{uuid.uuid4().hex}.txt"
+                    )
+                    staged_path = staging_dir / f"{index}_{content_kind}.txt"
+                    final_path = self.data_dir / content_kind / filename
+                    staged_path.parent.mkdir(parents=True, exist_ok=True)
+                    staged_path.write_text(text, encoding="utf-8")
+                    entry[f"{content_kind}_staged_path"] = staged_path
+                    entry[f"{content_kind}_final_path"] = final_path
+                staged.append(entry)
+            return staging_dir, staged
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _finalize_reviewed_import_files(plan: list[dict]) -> list[Path]:
+        finalized: list[Path] = []
+        try:
+            for item in plan:
+                for content_kind in ("raw", "translated"):
+                    staged_path = item.get(f"{content_kind}_staged_path")
+                    final_path = item.get(f"{content_kind}_final_path")
+                    if not staged_path or not final_path:
+                        continue
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                    staged_path.replace(final_path)
+                    finalized.append(final_path)
+            return finalized
+        except Exception:
+            for path in finalized:
+                path.unlink(missing_ok=True)
+            raise
+
     def import_reviewed_text_plan(
         self,
         *,
@@ -5249,141 +5416,175 @@ class PipelineService:
             raise ValueError("No chapters to import")
 
         target_title = title.strip()
-        if target_book_id is not None:
-            book = get_book_by_id(self.db_path, target_book_id)
-            if not book:
-                raise ValueError(f"Book {target_book_id} not found")
-            book_id = int(book["id"])
-            target_title = target_title or str(book.get("title") or "")
-        else:
-            if not target_title:
-                raise ValueError("Book title is required")
-            book_id = self._book_id_for_import(target_title, author=author, source=source_type)
+        if target_book_id is None and not target_title:
+            raise ValueError("Book title is required")
+        prepared = self._prepare_reviewed_import_items(chapters=chapters, content_kind=content_kind)
 
+        staging_dir: Path | None = None
+        finalized_paths: list[Path] = []
         imported = 0
         skipped = 0
         overwritten = 0
         chapter_ids: list[int] = []
         warnings: list[dict] = []
 
-        for item in chapters:
-            chapter_number = int(item.get("chapter_number") or 0)
-            chapter_title = str(item.get("chapter_title") or "").strip() or f"Chương {chapter_number}"
-            if chapter_number <= 0:
-                raise ValueError("Chapter number must be positive")
+        with get_connection(self.db_path) as conn:
+            initial_book = find_import_book_with_connection(
+                conn,
+                title=target_title,
+                target_book_id=target_book_id,
+            )
+            if target_book_id is not None and not initial_book:
+                raise ValueError(f"Book {target_book_id} not found")
+            target_title = target_title or str((initial_book or {}).get("title") or "")
+            for item in prepared:
+                item["source_hash"] = detect_import_metadata(
+                    title=target_title,
+                    chapter_number=int(item["chapter_number"]),
+                    chapter_title=str(item["chapter_title"]),
+                    text=str(item["raw_text"] or item["translated_text"]),
+                )["source_hash"]
 
-            raw_text = str(item.get("raw_text") or "")
-            translated_text = str(item.get("translated_text") or "")
-            text = str(item.get("text") or "")
-            if content_kind == "raw":
-                raw_text = raw_text or text
-            elif content_kind == "translated":
-                translated_text = translated_text or text
-            elif content_kind == "both":
-                raw_text = raw_text or text
+            initial_book_id = int(initial_book["id"]) if initial_book else None
+            existing = (
+                list_active_import_chapters_with_connection(conn, initial_book_id)
+                if initial_book_id is not None
+                else []
+            )
+            initial_plan = self._classify_reviewed_import_items(
+                prepared=prepared,
+                existing_chapters=existing,
+                duplicate_strategy=duplicate_strategy,
+                book_id=initial_book_id,
+            )
+            staging_dir, staged_plan = self._stage_reviewed_import_files(
+                plan=initial_plan,
+                book_title=target_title,
+            )
 
-            raw_text = raw_text.strip()
-            translated_text = translated_text.strip()
-            if not raw_text and not translated_text:
-                raise ValueError(f"Chapter {chapter_number} text is empty")
-
-            existing = get_chapter(self.db_path, book_id, chapter_number)
-            if existing and duplicate_strategy == "skip":
-                skipped += 1
-                warnings.append(
-                    {
-                        "type": "duplicate_chapter",
-                        "message": f"Skipped existing chapter {chapter_number}",
-                        "chapter_number": chapter_number,
-                        "title": chapter_title,
-                    }
-                )
-                continue
-            if existing and duplicate_strategy == "error":
-                raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id}")
-
-            written_paths: list[Path] = []
-            raw_path: Path | None = None
-            translated_path: Path | None = None
             try:
-                if raw_text:
-                    raw_path = self._write_import_text_file(
-                        book_title=target_title,
-                        chapter_number=chapter_number,
-                        chapter_title=chapter_title,
-                        text=raw_text,
-                        content_kind="raw",
-                    )
-                    written_paths.append(raw_path)
-                if translated_text:
-                    translated_path = self._write_import_text_file(
-                        book_title=target_title,
-                        chapter_number=chapter_number,
-                        chapter_title=chapter_title,
-                        text=translated_text,
-                        content_kind="translated",
-                    )
-                    written_paths.append(translated_path)
+                conn.execute("BEGIN IMMEDIATE")
+                book = resolve_import_book_with_connection(
+                    conn,
+                    title=target_title,
+                    author=author,
+                    source=source_type,
+                    target_book_id=target_book_id,
+                )
+                book_id = int(book["id"])
+                current_plan = self._classify_reviewed_import_items(
+                    prepared=prepared,
+                    existing_chapters=list_active_import_chapters_with_connection(conn, book_id),
+                    duplicate_strategy=duplicate_strategy,
+                    book_id=book_id,
+                )
+                initial_signature = [
+                    (item["action"], item["existing_id"], item["existing_fingerprint"])
+                    for item in initial_plan
+                ]
+                current_signature = [
+                    (item["action"], item["existing_id"], item["existing_fingerprint"])
+                    for item in current_plan
+                ]
+                if current_signature != initial_signature:
+                    raise ValueError("The target book changed after review; preview and confirm the import again")
 
-                status = "translated" if translated_path else "imported"
-                if existing:
-                    update_chapter_paths(
-                        self.db_path,
-                        int(existing["id"]),
-                        title=chapter_title,
-                        raw_text_path=raw_path,
-                        translated_text_path=translated_path,
-                        status=status,
-                    )
-                    chapter_id_for_followup = int(existing["id"])
-                    chapter_ids.append(chapter_id_for_followup)
-                    overwritten += 1
-                else:
-                    source_hash_value = detect_import_metadata(
-                        title=target_title,
-                        chapter_number=chapter_number,
-                        chapter_title=chapter_title,
-                        text=raw_text or translated_text,
-                    )["source_hash"]
-                    chapter_id = add_chapter(
-                        self.db_path,
-                        book_id,
-                        chapter_number,
-                        chapter_title,
-                        "",
-                        raw_text_path=raw_path,
-                        source_hash=source_hash_value if raw_path else "",
-                    )
-                    if translated_path:
-                        update_chapter_paths(
-                            self.db_path,
-                            chapter_id,
+                finalized_paths = self._finalize_reviewed_import_files(staged_plan)
+                inserted_ids_by_number: dict[int, int] = {}
+                batch_paths_by_number: dict[int, dict[str, Path | None]] = {}
+                for item in staged_plan:
+                    chapter_number = int(item["chapter_number"])
+                    raw_path = item.get("raw_final_path")
+                    translated_path = item.get("translated_final_path")
+                    status = "translated" if translated_path else "imported"
+                    if item["action"] == "REPLACE":
+                        chapter_id = int(item["existing_id"]) or inserted_ids_by_number[chapter_number]
+                        update_import_chapter_with_connection(
+                            conn,
+                            chapter_id=chapter_id,
+                            title=str(item["chapter_title"]),
+                            raw_text_path=raw_path,
                             translated_text_path=translated_path,
                             status=status,
                         )
-                    chapter_id_for_followup = chapter_id
-                    chapter_ids.append(chapter_id_for_followup)
-                    imported += 1
-                try:
-                    from app.mobile_api.services.glossary_service import GlossaryService
-                    from app.mobile_api.services.qa_service import QAService
-
-                    GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
-                    if translated_path:
-                        QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
-                except Exception as exc:
-                    warnings.append(
-                        {
-                            "type": "post_import_qa_warning",
-                            "message": "Imported content was saved, but glossary/QA follow-up did not complete.",
-                            "chapter_number": chapter_number,
-                            "reason": str(exc)[:160],
+                        previous_paths = batch_paths_by_number.get(chapter_number, {})
+                        for content_kind, replacement_path in (
+                            ("raw", raw_path),
+                            ("translated", translated_path),
+                        ):
+                            previous_path = previous_paths.get(content_kind)
+                            if replacement_path and previous_path and previous_path != replacement_path:
+                                previous_path.unlink(missing_ok=True)
+                        batch_paths_by_number[chapter_number] = {
+                            "raw": raw_path or previous_paths.get("raw"),
+                            "translated": translated_path or previous_paths.get("translated"),
                         }
-                    )
+                        overwritten += 1
+                    else:
+                        chapter_id = insert_import_chapter_with_connection(
+                            conn,
+                            book_id=book_id,
+                            chapter_number=int(item["chapter_number"]),
+                            title=str(item["chapter_title"]),
+                            raw_text_path=raw_path,
+                            translated_text_path=translated_path,
+                            source_hash=str(item["source_hash"]) if raw_path else "",
+                            status=status,
+                        )
+                        inserted_ids_by_number[chapter_number] = chapter_id
+                        batch_paths_by_number[chapter_number] = {
+                            "raw": raw_path,
+                            "translated": translated_path,
+                        }
+                        imported += 1
+                    item["chapter_id"] = chapter_id
+                    chapter_ids.append(chapter_id)
+
+                skipped_items = [item for item in initial_plan if item["action"] == "SKIP"]
+                skipped = len(skipped_items)
+                conn.commit()
             except Exception:
-                for path in written_paths:
+                conn.rollback()
+                for path in finalized_paths:
                     path.unlink(missing_ok=True)
                 raise
+            finally:
+                if staging_dir is not None:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+        for item in initial_plan:
+            if item["action"] == "SKIP":
+                warnings.append(
+                    {
+                        "type": "duplicate_chapter",
+                        "message": f"Skipped existing chapter {item['chapter_number']}",
+                        "chapter_number": int(item["chapter_number"]),
+                        "title": str(item["chapter_title"]),
+                    }
+                )
+        for item in staged_plan:
+            chapter_id_for_followup = int(item["chapter_id"])
+            try:
+                from app.mobile_api.services.glossary_service import GlossaryService
+                from app.mobile_api.services.qa_service import QAService
+
+                GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
+                if item.get("translated_final_path"):
+                    QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
+            except Exception:
+                logger.warning(
+                    "Post-import glossary/QA follow-up failed for book %s chapter %s",
+                    book_id,
+                    chapter_id_for_followup,
+                )
+                warnings.append(
+                    {
+                        "type": "post_import_qa_warning",
+                        "message": "Imported content was saved, but glossary/QA follow-up did not complete.",
+                        "chapter_number": int(item["chapter_number"]),
+                        "reason": "Follow-up failed; check server logs.",
+                    }
+                )
 
         return {
             "book_id": book_id,

@@ -4775,6 +4775,141 @@ def list_ebook_import_runs(db_path: Path, limit: int = 20) -> list[dict]:
 
 # ── Chapters ───────────────────────────────────────────────────────────────
 
+def find_import_book_with_connection(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    target_book_id: int | None = None,
+) -> Optional[dict]:
+    if target_book_id is not None:
+        row = conn.execute("SELECT * FROM books WHERE id = ?", (target_book_id,)).fetchone()
+        return dict(row) if row else None
+
+    book_key = normalize_book_key(title)
+    row = conn.execute("SELECT * FROM books WHERE title = ?", (title,)).fetchone()
+    if not row and book_key:
+        row = conn.execute(
+            "SELECT * FROM books WHERE book_key = ? ORDER BY id ASC LIMIT 1",
+            (book_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def resolve_import_book_with_connection(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    author: str = "",
+    source: str = "wizard",
+    target_book_id: int | None = None,
+) -> dict:
+    book = find_import_book_with_connection(
+        conn,
+        title=title,
+        target_book_id=target_book_id,
+    )
+    if target_book_id is not None and not book:
+        raise ValueError(f"Book {target_book_id} not found")
+
+    if book:
+        updates: list[str] = []
+        params: list[Any] = []
+        if author and not str(book.get("author") or ""):
+            updates.append("author = ?")
+            params.append(author)
+        current_source = str(book.get("source") or "")
+        if source and (not current_source or current_source == "manual"):
+            updates.append("source = ?")
+            params.append(source)
+        if updates:
+            params.append(int(book["id"]))
+            conn.execute(f"UPDATE books SET {', '.join(updates)} WHERE id = ?", params)
+            row = conn.execute("SELECT * FROM books WHERE id = ?", (int(book["id"]),)).fetchone()
+            book = dict(row)
+        return book
+
+    operator_user = _seed_operator_user_from_env(conn)
+    owner_user_id = str(operator_user.get("id") or "")
+    cursor = conn.execute(
+        """
+        INSERT INTO books (title, book_key, owner_user_id, author, source)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (title, normalize_book_key(title), owner_user_id, author, source),
+    )
+    row = conn.execute("SELECT * FROM books WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def list_active_import_chapters_with_connection(
+    conn: sqlite3.Connection,
+    book_id: int,
+) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM chapters
+        WHERE book_id = ? AND deleted_at IS NULL
+        ORDER BY chapter_number ASC, id ASC
+        """,
+        (book_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def insert_import_chapter_with_connection(
+    conn: sqlite3.Connection,
+    *,
+    book_id: int,
+    chapter_number: int,
+    title: str,
+    raw_text_path: Path | None,
+    translated_text_path: Path | None,
+    source_hash: str,
+    status: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO chapters (
+            book_id, chapter_number, title, raw_text_path, translated_text_path,
+            source_hash, status, translated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END)
+        """,
+        (
+            book_id,
+            chapter_number,
+            title,
+            str(raw_text_path) if raw_text_path else None,
+            str(translated_text_path) if translated_text_path else None,
+            source_hash,
+            status,
+            str(translated_text_path) if translated_text_path else None,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def update_import_chapter_with_connection(
+    conn: sqlite3.Connection,
+    *,
+    chapter_id: int,
+    title: str,
+    raw_text_path: Path | None,
+    translated_text_path: Path | None,
+    status: str,
+) -> None:
+    fields = ["title = ?", "status = ?"]
+    params: list[Any] = [title, status]
+    if raw_text_path is not None:
+        fields.append("raw_text_path = ?")
+        params.append(str(raw_text_path))
+    if translated_text_path is not None:
+        fields.extend(["translated_text_path = ?", "translated_at = CURRENT_TIMESTAMP"])
+        params.append(str(translated_text_path))
+    params.append(chapter_id)
+    conn.execute(f"UPDATE chapters SET {', '.join(fields)} WHERE id = ?", params)
+
+
 def add_chapter(
     db_path: Path,
     book_id: int,
