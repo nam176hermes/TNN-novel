@@ -21,7 +21,8 @@ from collections.abc import Callable
 from app.database.db import (
     get_book_by_id,
     get_chapter,
-    list_books,
+    list_books_with_active_chapters,
+    list_translated_book_summaries as db_list_translated_book_summaries,
     add_book,
     update_book as db_update_book,
     delete_book as db_delete_book,
@@ -2387,59 +2388,14 @@ class PipelineService:
     def list_books(self) -> list[dict]:
         return [
             self._book_payload(book)
-            for book in list_books(self.db_path)
-            if list_chapters(self.db_path, book["id"])
+            for book in list_books_with_active_chapters(self.db_path)
         ]
 
     def list_translated_book_summaries(self) -> list[dict]:
-        summaries: list[dict] = []
-        for book in list_books(self.db_path):
-            chapters = list_chapters(self.db_path, book["id"])
-            translated_chapters = [chapter for chapter in chapters if _chapter_has_translation(chapter)]
-            if not translated_chapters:
-                continue
-
-            translated_by_number = sorted(
-                translated_chapters,
-                key=lambda chapter: (chapter.get("chapter_number") or 0, chapter.get("id") or 0),
-            )
-            first_translated = translated_by_number[0]
-            latest_translated = translated_by_number[-1]
-            last_activity = (
-                latest_translated.get("translated_at")
-                or latest_translated.get("audio_created_at")
-                or book.get("updated_at")
-                or book.get("created_at")
-                or ""
-            )
-
-            summaries.append(
-                {
-                    "id": book["id"],
-                    "title": book["title"],
-                    "author": book.get("author") or "",
-                    "source": book.get("source") or "",
-                    "source_url": book.get("source_url") or "",
-                    "cover_path": book.get("cover_path") or "",
-                    "cover_url": self._cover_url(book.get("cover_path")),
-                    "total_chapters": len(chapters),
-                    "translated_chapters": len(translated_chapters),
-                    "audio_chapters": len([chapter for chapter in chapters if chapter.get("audio_path")]),
-                    "failed_chapters": len([chapter for chapter in chapters if chapter.get("status") == "failed"]),
-                    "qa_low_chapters": len([chapter for chapter in chapters if chapter.get("status") == "qa_low"]),
-                    "first_translated_chapter_id": first_translated.get("id"),
-                    "latest_translated_chapter_id": latest_translated.get("id"),
-                    "latest_chapter_number": latest_translated.get("chapter_number"),
-                    "latest_chapter_title": latest_translated.get("title") or "",
-                    "last_activity": last_activity,
-                }
-            )
-
-        return sorted(
-            summaries,
-            key=lambda summary: (summary.get("last_activity") or "", summary.get("id") or 0),
-            reverse=True,
-        )
+        summaries = db_list_translated_book_summaries(self.db_path)
+        for summary in summaries:
+            summary["cover_url"] = self._cover_url(summary.get("cover_path"))
+        return summaries
 
     def get_book(self, book_id: int) -> dict | None:
         return self._book_payload(get_book_by_id(self.db_path, book_id))

@@ -95,3 +95,23 @@ def test_cli_init_records_current_schema_version(tmp_path: Path, monkeypatch: py
 
     assert migration == (CURRENT_SCHEMA_VERSION,)
     assert not Path("data/pipeline.db").exists()
+
+
+def test_cli_commands_initialize_database_before_normal_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / "runtime-data"
+    monkeypatch.setattr(main_mod.settings, "data_dir", data_dir)
+
+    result = runner.invoke(main_mod.app, ["list"])
+
+    assert result.exit_code == 0
+    assert "No chapters found" in result.output
+    with sqlite3.connect(data_dir / "pipeline.db") as conn:
+        migration = conn.execute(
+            "SELECT version FROM schema_migrations WHERE version = ?",
+            (CURRENT_SCHEMA_VERSION,),
+        ).fetchone()
+    assert migration == (CURRENT_SCHEMA_VERSION,)

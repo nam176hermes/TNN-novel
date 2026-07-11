@@ -53,3 +53,32 @@ The 120-chapter result is consistent with per-chapter file/database operations a
 3. P1: commit reviewed multi-chapter imports in one bounded transaction with rollback and progress semantics.
 4. P1: move backup creation to a tracked job or background operation with visible status.
 5. P2: re-run plans on a larger copied database before adding glossary or QA indexes.
+
+## P2A Database Lifecycle And Library Follow-Up
+
+P2A was measured on an isolated Linux-filesystem synthetic database. Normal project connection setup fell from a fresh 11.921 ms median to 0.035 ms after migration, seeding, backfill, WAL negotiation, and version recording moved behind explicit `init_db()` startup.
+
+Both measured list paths now use one connection and one query instead of one book query plus one chapter query per book:
+
+| Fixture | General list median | Translated library median |
+| ---: | ---: | ---: |
+| 1 book | 0.710 ms | 1.002 ms |
+| 10 books | 0.641 ms | 1.172 ms |
+| 59 books | 0.740 ms | 2.668 ms |
+| 100 books | 0.864 ms | 3.872 ms |
+
+Authenticated-ASGI-equivalent local route measurements with auth bypass limited to the isolated audit app were 3.195 ms median for `/api/books` and 5.188 ms for `/api/library/books` at 59 books. Payloads were 12.1 KB and 22.7 KB respectively.
+
+`EXPLAIN QUERY PLAN` confirms use of `idx_chapters_active_number`. The translated aggregate uses temporary B-trees for window/group/order operations, but the measured 100-book result does not justify another index. No index was added.
+
+Reproduction command:
+
+```bash
+python scripts/benchmark_database_library.py \
+  --work-dir /home/<user>/novel-tnn-p2a-fixtures \
+  --samples 7 \
+  --book-counts 1 10 59 100 \
+  --output /tmp/novel-tnn-p2a.json
+```
+
+The benchmark creates only synthetic databases under the supplied work directory and must not be pointed at the operator data directory.

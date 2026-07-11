@@ -78,6 +78,14 @@ def _ensure_data_dir() -> Path:
     return data_dir
 
 
+@app.callback()
+def initialize_cli_database(ctx: typer.Context) -> None:
+    if not ctx.invoked_subcommand or ctx.invoked_subcommand == "init":
+        return
+    data_dir = _ensure_data_dir()
+    init_db(data_dir / "pipeline.db")
+
+
 @app.command("init")
 def init_cmd(
     force: bool = typer.Option(False, "--force", "-f", help="Re-initialize even if DB exists"),

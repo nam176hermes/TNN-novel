@@ -8,6 +8,7 @@ import pytest
 from app.database.db import init_db
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
+from app.mobile_api.routers import auth as auth_router
 from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api import dependencies as mobile_dependencies
 from app.mobile_api.routers import health as health_router
@@ -66,6 +67,9 @@ async def test_system_status_reports_runtime_without_secrets(
     monkeypatch.setattr(mobile_dependencies, "get_data_dir", lambda: data_dir)
     monkeypatch.setattr(health_router, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(health_router, "get_data_dir", lambda: data_dir)
+    monkeypatch.setattr(auth_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.session_auth.get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.audit.get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(jobs_router, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(jobs_router, "get_shared_job_tracker", lambda: tracker)
     monkeypatch.setattr("app.mobile_api.services.provider_service.get_db_path", lambda: temp_db_path)
@@ -132,6 +136,9 @@ async def test_system_status_reports_sanitized_operational_events(
     monkeypatch.setattr(mobile_dependencies, "get_data_dir", lambda: data_dir)
     monkeypatch.setattr(health_router, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(health_router, "get_data_dir", lambda: data_dir)
+    monkeypatch.setattr(auth_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.session_auth.get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.audit.get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(jobs_router, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(jobs_router, "get_shared_job_tracker", lambda: tracker)
     monkeypatch.setattr("app.mobile_api.services.provider_service.get_db_path", lambda: temp_db_path)

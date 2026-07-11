@@ -27,16 +27,8 @@ def get_db_path(data_dir: Path) -> Path:
 def get_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    _ensure_schema_migrations(conn)
-    _migrate_legacy_schema(conn)
-    seed_default_model_providers(conn)
-    seed_default_style_profiles(conn)
-    operator_user = _seed_operator_user_from_env(conn)
-    _backfill_owner_user_ids(conn, str(operator_user.get("id") or ""))
-    _record_schema_migration(conn, CURRENT_SCHEMA_VERSION)
-    conn.commit()
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -1381,9 +1373,12 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
 
 def init_db(db_path: Path) -> None:
     with get_connection(db_path) as conn:
-        conn.executescript(SCHEMA)
+        # WAL is persistent database configuration; migrations and backfills
+        # belong to explicit startup/CLI initialization, not request opens.
+        conn.execute("PRAGMA journal_mode=WAL")
         _ensure_schema_migrations(conn)
         _migrate_legacy_schema(conn)
+        conn.executescript(SCHEMA)
         seed_default_model_providers(conn)
         seed_default_style_profiles(conn)
         operator_user = _seed_operator_user_from_env(conn)
@@ -4297,6 +4292,112 @@ def list_books(db_path: Path) -> list[dict]:
     with get_connection(db_path) as conn:
         rows = conn.execute("SELECT * FROM books ORDER BY id DESC").fetchall()
         return [dict(r) for r in rows]
+
+
+def list_books_with_active_chapters(db_path: Path) -> list[dict]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT books.*
+            FROM books
+            WHERE EXISTS (
+                SELECT 1
+                FROM chapters
+                WHERE chapters.book_id = books.id
+                  AND chapters.deleted_at IS NULL
+            )
+            ORDER BY books.id DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_translated_book_summaries(db_path: Path) -> list[dict]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            WITH active_chapters AS (
+                SELECT
+                    chapters.*,
+                    CASE
+                        WHEN COALESCE(chapters.translated_text_path, '') != ''
+                          OR COALESCE(chapters.content_html_path, '') != ''
+                          OR chapters.status IN ('translated', 'qa_low', 'audio_done')
+                        THEN 1 ELSE 0
+                    END AS has_translation
+                FROM chapters
+                WHERE chapters.deleted_at IS NULL
+            ),
+            chapter_counts AS (
+                SELECT
+                    book_id,
+                    COUNT(*) AS total_chapters,
+                    SUM(has_translation) AS translated_chapters,
+                    SUM(CASE WHEN COALESCE(audio_path, '') != '' THEN 1 ELSE 0 END) AS audio_chapters,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_chapters,
+                    SUM(CASE WHEN status = 'qa_low' THEN 1 ELSE 0 END) AS qa_low_chapters
+                FROM active_chapters
+                GROUP BY book_id
+            ),
+            translated_ranked AS (
+                SELECT
+                    book_id,
+                    id,
+                    chapter_number,
+                    title,
+                    translated_at,
+                    audio_created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY book_id ORDER BY chapter_number ASC, id ASC
+                    ) AS first_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY book_id ORDER BY chapter_number DESC, id DESC
+                    ) AS latest_rank
+                FROM active_chapters
+                WHERE has_translation = 1
+            ),
+            translated_bounds AS (
+                SELECT
+                    book_id,
+                    MAX(CASE WHEN first_rank = 1 THEN id END) AS first_translated_chapter_id,
+                    MAX(CASE WHEN latest_rank = 1 THEN id END) AS latest_translated_chapter_id,
+                    MAX(CASE WHEN latest_rank = 1 THEN chapter_number END) AS latest_chapter_number,
+                    MAX(CASE WHEN latest_rank = 1 THEN title END) AS latest_chapter_title,
+                    MAX(CASE WHEN latest_rank = 1 THEN translated_at END) AS latest_translated_at,
+                    MAX(CASE WHEN latest_rank = 1 THEN audio_created_at END) AS latest_audio_created_at
+                FROM translated_ranked
+                GROUP BY book_id
+            )
+            SELECT
+                books.id,
+                books.title,
+                books.author,
+                books.source,
+                books.source_url,
+                books.cover_path,
+                chapter_counts.total_chapters,
+                chapter_counts.translated_chapters,
+                chapter_counts.audio_chapters,
+                chapter_counts.failed_chapters,
+                chapter_counts.qa_low_chapters,
+                translated_bounds.first_translated_chapter_id,
+                translated_bounds.latest_translated_chapter_id,
+                translated_bounds.latest_chapter_number,
+                translated_bounds.latest_chapter_title,
+                COALESCE(
+                    NULLIF(translated_bounds.latest_translated_at, ''),
+                    NULLIF(translated_bounds.latest_audio_created_at, ''),
+                    books.created_at,
+                    ''
+                ) AS last_activity
+            FROM books
+            JOIN chapter_counts ON chapter_counts.book_id = books.id
+            JOIN translated_bounds ON translated_bounds.book_id = books.id
+            WHERE chapter_counts.translated_chapters > 0
+            ORDER BY last_activity DESC, books.id DESC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _is_empty_value(value: object) -> bool:

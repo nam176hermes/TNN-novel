@@ -168,6 +168,7 @@ def test_migrates_legacy_qa_reports_without_book_id(tmp_path: Path) -> None:
             """
         )
 
+    init_db(db_path)
     report = get_qa_report(db_path, 1, 10)
 
     assert report is not None
@@ -212,6 +213,7 @@ def test_soft_delete_releases_legacy_unique_chapter_number(tmp_path: Path) -> No
             """
         )
 
+    init_db(db_path)
     assert db_mod.soft_delete_chapter(db_path, 10) is True
     replacement_id = add_chapter(db_path, 1, 1, "Replacement Chapter")
 
@@ -312,6 +314,7 @@ def test_list_books_consolidates_existing_duplicate_book_keys(
     finally:
         raw_conn.close()
 
+    init_db(temp_db_path)
     visible_books = list_books(temp_db_path)
 
     assert [book["id"] for book in visible_books if book["title"] == "Thanh Sơn"] == [target_book_id]
