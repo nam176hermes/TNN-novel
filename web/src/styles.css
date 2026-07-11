@@ -276,7 +276,7 @@ button:disabled {
 @media (max-width: 640px) {
   .pwa-install-prompt {
     grid-template-columns: auto minmax(0, 1fr);
-    inset: auto 14px 14px 14px;
+    inset: auto 14px calc(76px + env(safe-area-inset-bottom)) 14px;
   }
 
   .pwa-network-status {
@@ -11663,6 +11663,10 @@ body {
     z-index: 19;
   }
 
+  .workflow-shell[data-active-view="reader"] .reader-text-mode-switcher {
+    top: 124px;
+  }
+
   .workflow-shell[data-active-view="reader"] .reader-reference-chapter-nav button {
     background: rgb(8 18 22 / 82%);
     border: 1px solid rgb(52 78 79 / 32%);
@@ -11693,7 +11697,7 @@ body {
   }
 
   .workflow-shell[data-active-view="reader"] .reader-immersive-main {
-    padding-top: 132px;
+    padding-top: 172px;
     padding-bottom: 176px;
   }
 
@@ -11763,10 +11767,14 @@ body {
     top: 70px;
   }
 
+  .workflow-shell[data-active-view="reader"] .reader-text-mode-switcher {
+    top: 116px;
+  }
+
   .workflow-shell[data-active-view="reader"] .reader-immersive-main {
     padding-left: 18px;
     padding-right: 18px;
-    padding-top: 124px;
+    padding-top: 164px;
   }
 
   .workflow-shell[data-active-view="reader"] .reader-audio-bar {

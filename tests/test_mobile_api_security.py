@@ -163,6 +163,52 @@ async def test_mobile_api_allows_authenticated_books_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_book_and_chapter_metadata_do_not_expose_internal_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.database.db import add_book, add_chapter, init_db, update_book, update_chapter_paths
+
+    app, db_path = _build_app_with_data_dir(tmp_path, monkeypatch)
+    init_db(db_path)
+    cover_path = tmp_path / "private" / "cover.jpg"
+    raw_path = tmp_path / "private" / "raw.txt"
+    translated_path = tmp_path / "private" / "translated.txt"
+    content_path = tmp_path / "private" / "chapter.html"
+    audio_path = tmp_path / "private" / "chapter.mp3"
+    book_id = add_book(db_path, "Path Safety")
+    update_book(db_path, book_id, cover_path=str(cover_path))
+    chapter_id = add_chapter(db_path, book_id, 1, "Chapter", raw_text_path=raw_path)
+    update_chapter_paths(
+        db_path,
+        chapter_id,
+        cleaned_text_path=raw_path,
+        translated_text_path=translated_path,
+        content_html_path=content_path,
+        audio_path=audio_path,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login(client)
+        headers = _auth_header(token["access_token"])
+        book = await client.get(f"/api/books/{book_id}", headers=headers)
+        chapters = await client.get(f"/api/books/{book_id}/chapters", headers=headers)
+
+    assert book.status_code == 200
+    assert chapters.status_code == 200
+    serialized = book.text + chapters.text
+    assert str(tmp_path) not in serialized
+    assert book.json()["cover_path"] == ""
+    chapter = chapters.json()[0]
+    assert chapter["raw_text_path"] == "available"
+    assert chapter["cleaned_text_path"] == "available"
+    assert chapter["translated_text_path"] == "available"
+    assert chapter["content_html_path"] == "available"
+    assert chapter["audio_path"] == "available"
+
+
+@pytest.mark.asyncio
 async def test_mobile_api_refresh_accepts_json_body() -> None:
     from app.mobile_api.config import mobile_settings
     from app.mobile_api.main import app

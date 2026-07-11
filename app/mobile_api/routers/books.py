@@ -44,19 +44,36 @@ def get_pipeline():
     return PipelineService()
 
 
+def _safe_book_response(book: dict) -> dict:
+    payload = dict(book)
+    payload["cover_path"] = ""
+    return payload
+
+
+def _safe_chapter_response(chapter: dict) -> dict:
+    payload = dict(chapter)
+    for field in ("raw_text_path", "cleaned_text_path", "translated_text_path", "audio_path"):
+        payload[field] = "available" if payload.get(field) else None
+    content_path = str(payload.get("content_html_path") or "")
+    payload["content_html_path"] = (
+        content_path if content_path.startswith("/book-assets/") else "available" if content_path else None
+    )
+    return payload
+
+
 @router.get("/books", response_model=list[dict])
 async def list_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     books = pipeline.list_books()
-    return books
+    return [_safe_book_response(book) for book in books]
 
 
 @router.get("/library/books", response_model=dict)
 async def list_translated_library_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
-    return {"books": pipeline.list_translated_book_summaries()}
+    return {"books": [_safe_book_response(book) for book in pipeline.list_translated_book_summaries()]}
 
 
 @router.post("/books", response_model=dict, status_code=201)
@@ -70,7 +87,7 @@ async def create_book(
         source=book.source,
         source_url=book.source_url,
     )
-    return pipeline.get_book(book_id)
+    return _safe_book_response(pipeline.get_book(book_id))
 
 
 @router.get("/books/{book_id}", response_model=dict)
@@ -81,7 +98,7 @@ async def get_book(
     book = pipeline.get_book(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.patch("/books/{book_id}", response_model=dict)
@@ -93,7 +110,7 @@ async def update_book(
     book = pipeline.update_book(book_id, **update.model_dump(exclude_unset=True))
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.post("/books/{book_id}/cover", response_model=dict)
@@ -117,7 +134,7 @@ async def update_book_cover(
 
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.delete("/books/{book_id}")
@@ -500,7 +517,7 @@ async def list_chapters(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
-    return pipeline.list_chapters(book_id)
+    return [_safe_chapter_response(chapter) for chapter in pipeline.list_chapters(book_id)]
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}", response_model=dict)
@@ -512,7 +529,7 @@ async def get_chapter(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    return chapter
+    return _safe_chapter_response(chapter)
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/source")

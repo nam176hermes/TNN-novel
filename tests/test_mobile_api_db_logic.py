@@ -189,8 +189,12 @@ async def test_patch_book_title_merges_duplicate_book_into_existing_library_entr
     assert [book["title"] for book in library_response.json()["books"]] == ["Thanh Sơn"]
     chapters = chapters_response.json()
     assert len(chapters) == 1
-    assert chapters[0]["raw_text_path"] == str(raw_path)
-    assert chapters[0]["translated_text_path"] == str(translated_path)
+    assert chapters[0]["raw_text_path"] == "available"
+    assert chapters[0]["translated_text_path"] == "available"
+    merged_chapter = get_chapter_by_id(override_books_pipeline.db_path, target_chapter_id)
+    assert merged_chapter is not None
+    assert merged_chapter["raw_text_path"] == str(raw_path)
+    assert merged_chapter["translated_text_path"] == str(translated_path)
     assert get_book_by_id(override_books_pipeline.db_path, source_book_id) is None
 
 
