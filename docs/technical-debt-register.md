@@ -5,9 +5,9 @@
 ### Stale Artifact Paths After Root Move
 
 - Status: RESOLVED_IN_P0A (2026-07-12).
-- Evidence: all sampled/stored raw, translated, content HTML, cover, audio, and TTS artifact paths point to deleted `/home/thenam176/novel_pipeline`; deterministic remapping to the current `data/` root finds the files.
+- Historical evidence: sampled raw, translated, content HTML, cover, audio, and TTS metadata pointed to deleted `/home/thenam176/novel_pipeline`; deterministic remapping found the files under the current data root.
 - Scale: 4,159 raw, 4,159 translated, 3,464 HTML, 8 audio, 3 cover, and 8 TTS artifact path sets were remappable.
-- Impact: library counts remain visible but content/audio/cover reads can fail; direct source retrieval returned no content for a representative chapter.
+- Former impact: library counts remained visible while content/audio/cover reads failed; direct source retrieval returned no content for a representative chapter.
 - Resolution: verified protected backup and restore drill; copied-DB rehearsal; transactional operator apply of 12,151 approved values; zero-update second apply; fallback removed; Reader/audio/cover/TTS/export smoke passed.
 - Acceptance: no old-root paths remain; every migrated path stays under configured data root; representative Reader/audio/cover flows pass; DB integrity and operator content hashes remain valid.
 
@@ -32,9 +32,8 @@
 ### Authenticated Status Exposes Absolute Paths
 
 - Status: RESOLVED_IN_P0A.
-- Evidence: `/api/system/status` returns and UI renders `database_path` and `data_dir` for authenticated non-public requests.
-- Impact: unnecessary host topology disclosure to any compromised authenticated session and inconsistency with protected path policy.
-- Action: return safe labels/availability and sizes only; retain paths in server logs/CLI diagnostics where necessary.
+- Historical evidence: `/api/system/status` returned and the UI rendered `database_path` and `data_dir`.
+- Resolution: API/UI now expose safe labels, availability, sizes, and storage health only; smoke checks reject either legacy path field.
 - Acceptance: API/UI tests assert no absolute path while status remains operationally useful.
 
 ### Reader Request And QA Cost
@@ -56,9 +55,8 @@
 ### Operational Documentation Path Drift
 
 - Status: RESOLVED_IN_P0A.
-- Evidence: current runbooks and deployment/backup docs still contain `/home/thenam176/novel_pipeline` commands after the root move.
-- Impact: operator can execute commands in a nonexistent path or misdiagnose deployment.
-- Action: update active runbooks; clearly label immutable historical plans as archival.
+- Historical evidence: active runbooks previously used the deleted personal root after the move.
+- Resolution: active commands now resolve from repository/configuration variables; historical migration/audit evidence remains explicitly archival.
 - Acceptance: active commands resolve from repository root or configured variables; no stale root in current operational docs.
 
 ## P2
@@ -87,8 +85,8 @@
 ### PWA Install Prompt Backoff
 
 - Status: RESOLVED_FOR_READER.
-- Evidence: prompt occupies substantial lower mobile viewport until dismissed.
-- Impact: competes with navigation and primary actions.
+- Historical evidence: the prompt occupied substantial lower mobile Reader viewport until dismissed.
+- Former impact: it competed with Reader navigation and primary actions.
 - Resolution: existing durable dismissal remains; the prompt is task-aware and hidden only in Reader while remaining available in Library/Status and other workflows.
 
 ### M4B Chapter Markers

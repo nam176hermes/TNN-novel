@@ -235,7 +235,7 @@ Targeted resolver, migration, rollback, backup, Reader, export, audio/TTS,
 status, security, environment, and frontend tests passed. Final backend
 verification passed 696 tests; the complete frontend rerun passed 607 tests in
 71 files; frontend typecheck/lint, package consistency, production build, and
-copied-DB API/Playwright smokes passed. `git diff --check` passed. The only
+copied/operator API/Playwright smokes passed. `git diff --check` passed. The only
 warnings were existing dependency deprecations for Python `crypt` and
 `pkg_resources`. Real-provider validation ran in dry-run mode and explicitly
 reported no provider invocation.
