@@ -4,6 +4,11 @@
 
 P0A repairs active filesystem metadata after the project moved away from the historical root `/home/thenam176/novel_pipeline`. It changes approved SQLite path values only. It does not move, delete, regenerate, or rewrite private artifacts.
 
+Current operator state (2026-07-12): `P0A_FIX_APPLIED`. The operator apply
+updated 12,151 approved active values; post-apply dry-run and second apply both
+reported zero updates; integrity is `ok`; foreign-key violations are zero; and
+the runtime no longer sets `ARTIFACT_LEGACY_ROOT`.
+
 Resolve the active checkout and configured data root before every command:
 
 ```bash
@@ -58,12 +63,17 @@ The summary reports contain record IDs, relative suffixes or hashes, counts, siz
 P0A backup creation must not add an operational-event row before rehearsal:
 
 ```bash
-BACKUP_RECORD_EVENT=0 INCLUDE_ENV=0 \
+BACKUP_RECORD_EVENT=0 BACKUP_CHECKPOINT=0 INCLUDE_ENV=0 \
 BACKUP_INCLUDE_AUDIO=1 BACKUP_INCLUDE_EXPORTS=1 \
 scripts/backup-local.sh
 ```
 
-Verify the archive is non-zero, inspect its sidecar manifest, check `backup_format_version`, confirm secrets are excluded, hash the archive, and run `scripts/ops.py restore-drill`. Create a separate SQLite-consistent rollback copy with the SQLite backup API. A plain file copy is not the canonical backup for a live WAL database.
+Verify the archive is non-zero, inspect its sidecar manifest, check
+`backup_format_version`, confirm secrets are excluded, hash the archive, and
+run `scripts/ops.py restore-drill`. Create a separate SQLite-consistent
+rollback copy with the SQLite backup API, or an exact protected copy only after
+all writers are stopped and WAL state is confirmed stable. A plain file copy
+is not safe while a live WAL database has writers.
 
 ## Rehearsal
 

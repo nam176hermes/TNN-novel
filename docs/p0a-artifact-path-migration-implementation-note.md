@@ -4,7 +4,14 @@
 
 `P0A_FIX_APPLIED` covers the canonical resolver, approved path registry, default-dry-run migration tool, copied-database apply safeguards, backup no-event gate, runtime compatibility, status path redaction, active runbook cleanup, and regression tests.
 
-Operator database result: `NOT_APPLIED_AWAITING_EXPLICIT_APPROVAL`.
+Operator database result: `APPLIED_AND_VERIFIED_2026-07-12`.
+
+The live maintenance run used only the fresh evidence under the protected run
+directory created on 2026-07-12. Earlier apply reports and hashes were treated
+as historical and were not reused. The first maintenance baseline hash changed
+while the SQLite backup API consolidated the database/WAL state, so it was
+invalidated before dry-run or rehearsal review. All later gates used the new
+stable baseline.
 
 ## Baseline
 
@@ -47,12 +54,12 @@ Schema-wide relative paths and removal of absolute storage metadata are `RECOMME
 
 ## Executive Summary
 
-The controlled implementation and copied-database rehearsal passed. All 12,151
-approved active values mapped deterministically, every proposed file existed
-beneath the configured rehearsal data root, no artifact was rewritten, and a
-second copied-DB apply updated zero rows. Reader, cover, audio, TTS, export, and
-protected-access checks passed against the migrated copy. The live operator
-database was not migrated; its hash remained unchanged throughout this phase.
+The controlled implementation, copied-database rehearsal, and operator apply
+passed. All 12,151 approved active values mapped deterministically, every
+proposed file existed beneath the configured data root, no artifact was
+rewritten, and second rehearsal/live applies updated zero rows. Reader, cover,
+audio, TTS, export, protected-access, status-redaction, and mobile browser
+checks passed after restart without the legacy-root fallback.
 
 ## Affected Tables And Columns
 
@@ -91,7 +98,7 @@ approved fields. The following lookalikes are intentionally excluded:
 ## Dry-Run Results
 
 - Migration version: `p0a-artifact-paths-v1`.
-- Reviewed copied-DB SHA-256: `f9b10c4f...eee80ca`.
+- Reviewed maintenance/copy SHA-256: `28274440...410977c`.
 - Remappable: 12,151.
 - Unresolved: 0.
 - Containment failures: 0.
@@ -125,19 +132,21 @@ post-apply smoke checks.
 
 ## Backup And Rollback Evidence
 
-- Backup: `novel-pipeline-backup-20260711-235102.tar.gz`.
-- Created: 2026-07-11 23:51:02 local time.
-- Archive size: 5,602,479,376 bytes.
-- Archive SHA-256: `1463c34b...8b04f56`.
-- Manifest version: 2; 28,864 files/checksums; 6,259,819,454 source bytes.
+- Backup: `novel-pipeline-backup-20260712-122645.tar.gz`.
+- Created: 2026-07-12 12:26:45 local time.
+- Archive size: 5,602,481,822 bytes.
+- Archive SHA-256: `12bc81fc...7320ed29`.
+- Manifest version: 2; 28,864 files/checksums; 6,259,835,838 source bytes.
 - Included: database, uploads, covers, book assets, glossary/QA, managed
   sources, non-secret settings, audio, and exports.
 - Excluded: secrets and job logs. Secrets included: false.
 - Restore drill: passed; restored SQLite integrity: `ok`.
-- Direct SQLite-consistent rollback copy: 47,063,040 bytes,
-  SHA-256 `f9b10c4f...eee80ca`, integrity `ok`, foreign-key violations 0.
+- All 28,864 restored file size/checksum entries matched the manifest.
+- Direct rollback copy: 47,079,424 bytes, SHA-256
+  `28274440...410977c`, integrity `ok`, foreign-key violations 0.
 - Protected rollback mapping: 12,151 exact metadata mappings,
-  SHA-256 `3a7554b2...fbef4c`, mode `0600` on a mode `0700` Linux directory.
+  operator SHA-256 `909c55e1...c903160b`, mode `0600` on a mode `0700`
+  Linux directory.
 
 The archive, direct database copy, and exact rollback mapping remain outside
 the repository. Restoration requires stopping all writers before replacing
@@ -145,25 +154,31 @@ the database. No encryption passphrase or private content appears here.
 
 ## Copied-DB Rehearsal
 
-First copied apply run `a72b08c3-d743-4e47-8370-b7a5ba500027` updated exactly
+Final copied apply run `4ba6c9b2-cd14-4bf2-8c72-9333060cf3c8` updated exactly
 12,151 approved values in one `BEGIN IMMEDIATE` transaction. Post-apply
 integrity was `ok`, foreign-key violations were 0, all unapproved table hashes
 were unchanged, and the only row-count change was one safe migration event.
-All eleven approved columns then contained zero old-root matches.
+All eleven approved columns then contained zero active old-root matches. The
+rehearsal also exposed and fixed a WAL post-hash audit race before live apply;
+the final tool checkpoints/truncates committed WAL before reporting its hash.
 
 ## Idempotency Result
 
 The post-apply dry-run proposed zero updates. Second copied apply run
-`cbcfec8a-3bec-4b81-a8ec-44c07566445d` updated zero rows and left the copied
-database hash unchanged at `cb9519c6...f19d58`.
+`ede6e8de-6301-4955-ac2d-79ac8ed92383` updated zero rows and left the copied
+database hash unchanged at `b25907f0...9b34da5`. The second operator apply run
+`34b936b3-7738-471d-8368-4fa06227d795` also updated zero rows.
 
 ## Operator Apply Result
 
-`NOT_APPLIED_AWAITING_EXPLICIT_APPROVAL`. The operator database remained at
-SHA-256 `fc9bdefd...88606` before backup, after backup, and after rehearsal.
-An active application process was also observed, so the maintenance-mode/no-
-writers gate is not satisfied. A later live apply must recheck the complete
-hash and repeat review if it differs.
+`P0A_FIX_APPLIED`. With API/workers stopped, operator apply run
+`15ab8d7f-91f2-43b1-a09d-3fab4886db07` migrated exactly 12,151 approved rows.
+Reviewed pre-apply SHA-256 was `28274440...410977c`; checkpointed post-apply
+SHA-256 was `78b63908...141e0a0`. Immediate integrity was `ok`, foreign-key
+violations were 0, the post-apply dry-run reported zero remappable/unresolved
+values, and the second apply updated zero rows. Normal startup/auth activity
+may legitimately change the later operator DB file hash, so the recorded
+apply hash remains the durable maintenance evidence.
 
 ## File Identity Checks
 
@@ -175,16 +190,21 @@ changed SQLite metadata only.
 
 ## Reader/Cover/Audio/TTS Smoke Results
 
-Against the migrated copied DB:
+Against the migrated operator DB after fallback removal and restart:
 
 - unauthenticated library and cover requests returned 401;
-- authenticated library, book, chapter list, raw source, translation, HTML,
-  cover, audio stream/download, TTS status/download, export, and status calls
-  returned 200 with non-empty representative artifacts;
+- authenticated library, book, chapter list, raw source (4,912 characters),
+  translation (4,916), HTML (5,397), cover (137,209 bytes), audio range (206),
+  audio/TTS downloads (2,513,884 bytes), export (11,140,711 bytes), and status
+  calls succeeded with non-empty representative artifacts;
 - Playwright logged in, opened Library, opened a migrated book and Reader, and
   observed non-empty translated content;
-- no old root appeared in browser console output and there were no failed
-  non-optional requests (optional absent QA reports returned expected 204s);
+- mobile Playwright confirmed the install prompt appears in Library/Status but
+  is absent in Reader, Reader content is non-empty, fixed controls do not cause
+  horizontal overflow, cover/playlist requests return 200, and service-worker
+  caches are v4;
+- no old/current absolute root appeared in API/UI output and there were no
+  failed non-optional browser requests (view-change QA requests were cancelled);
 - no active raw-only chapter existed in this snapshot, so raw-only behavior is
   covered by automated integration fixtures rather than a live data sample.
 
@@ -213,8 +233,8 @@ provider, content, or broad UI redesign is included.
 
 Targeted resolver, migration, rollback, backup, Reader, export, audio/TTS,
 status, security, environment, and frontend tests passed. Final backend
-verification passed 692 tests; the complete frontend rerun passed 605 tests in
-70 files; frontend typecheck/lint, package consistency, production build, and
+verification passed 696 tests; the complete frontend rerun passed 607 tests in
+71 files; frontend typecheck/lint, package consistency, production build, and
 copied-DB API/Playwright smokes passed. `git diff --check` passed. The only
 warnings were existing dependency deprecations for Python `crypt` and
 `pkg_resources`. Real-provider validation ran in dry-run mode and explicitly
@@ -222,19 +242,16 @@ reported no provider invocation.
 
 ## Remaining Limitations
 
-- Live apply and live post-apply smoke are intentionally pending a separate
-  maintenance-window authorization.
-- The exact-root runtime fallback is temporary and must be removed after a
-  successful live migration stabilization period.
 - The snapshot had no active raw-only chapter for representative live-data
   smoke; automated tests cover that mode.
+- Backup/restore remains operationally slow while the data tree resides on the
+  Windows-mounted filesystem; the verified archive itself is valid.
 - Relative-path schema conversion and a centralized storage architecture are
   `RECOMMENDATION_ONLY` and outside P0A.
 
 ## Backup-Operability Readiness
 
-Ready for a controlled maintenance window: a verified full archive, successful
-restore drill, direct SQLite rollback copy, protected exact mapping, hashes,
-and rollback procedure exist. Not ready for live apply until writers are
-stopped and the operator DB hash matches the reviewed baseline immediately
-before execution.
+Live maintenance is complete. The verified full archive, successful restore
+drill, direct rollback copy, protected mappings, pre/post hashes, integrity
+results, and failed-first-rehearsal evidence remain protected outside the
+repository. The app is running normally without `ARTIFACT_LEGACY_ROOT`.

@@ -4,11 +4,11 @@
 
 ### Stale Artifact Paths After Root Move
 
-- Status: BROKEN, reproduced read-only.
+- Status: RESOLVED_IN_P0A (2026-07-12).
 - Evidence: all sampled/stored raw, translated, content HTML, cover, audio, and TTS artifact paths point to deleted `/home/thenam176/novel_pipeline`; deterministic remapping to the current `data/` root finds the files.
 - Scale: 4,159 raw, 4,159 translated, 3,464 HTML, 8 audio, 3 cover, and 8 TTS artifact path sets were remappable.
 - Impact: library counts remain visible but content/audio/cover reads can fail; direct source retrieval returned no content for a representative chapter.
-- Action: create a fresh protected backup, rehearse a prefix migration on a copied DB, verify hashes/integrity/foreign keys, then run a controlled idempotent migration with rollback.
+- Resolution: verified protected backup and restore drill; copied-DB rehearsal; transactional operator apply of 12,151 approved values; zero-update second apply; fallback removed; Reader/audio/cover/TTS/export smoke passed.
 - Acceptance: no old-root paths remain; every migrated path stays under configured data root; representative Reader/audio/cover flows pass; DB integrity and operator content hashes remain valid.
 
 ## P1
@@ -31,7 +31,7 @@
 
 ### Authenticated Status Exposes Absolute Paths
 
-- Status: SECURITY/PRIVACY REGRESSION.
+- Status: RESOLVED_IN_P0A.
 - Evidence: `/api/system/status` returns and UI renders `database_path` and `data_dir` for authenticated non-public requests.
 - Impact: unnecessary host topology disclosure to any compromised authenticated session and inconsistency with protected path policy.
 - Action: return safe labels/availability and sizes only; retain paths in server logs/CLI diagnostics where necessary.
@@ -55,7 +55,7 @@
 
 ### Operational Documentation Path Drift
 
-- Status: INCORRECT.
+- Status: RESOLVED_IN_P0A.
 - Evidence: current runbooks and deployment/backup docs still contain `/home/thenam176/novel_pipeline` commands after the root move.
 - Impact: operator can execute commands in a nonexistent path or misdiagnose deployment.
 - Action: update active runbooks; clearly label immutable historical plans as archival.
@@ -86,10 +86,10 @@
 
 ### PWA Install Prompt Backoff
 
-- Status: UX_LIMITATION.
+- Status: RESOLVED_FOR_READER.
 - Evidence: prompt occupies substantial lower mobile viewport until dismissed.
 - Impact: competes with navigation and primary actions.
-- Action: durable dismissal/backoff and task-aware presentation.
+- Resolution: existing durable dismissal remains; the prompt is task-aware and hidden only in Reader while remaining available in Library/Status and other workflows.
 
 ### M4B Chapter Markers
 
