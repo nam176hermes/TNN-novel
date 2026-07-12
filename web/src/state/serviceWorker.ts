@@ -1,4 +1,4 @@
-export const READER_OFFLINE_SERVICE_WORKER_URL = '/reader-offline-sw.js?v=20260709';
+export const READER_OFFLINE_SERVICE_WORKER_URL = '/reader-offline-sw.js?v=20260712-p0a';
 
 export type ReaderServiceWorkerNavigator = {
   serviceWorker?: {

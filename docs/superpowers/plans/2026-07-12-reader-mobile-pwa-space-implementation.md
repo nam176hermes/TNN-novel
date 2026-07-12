@@ -22,14 +22,14 @@
 ## File Structure
 
 - `web/src/App.tsx`: owns authenticated workflow view selection and conditionally mounts the existing install prompt.
-- `web/src/AppPwaVisibility.test.ts`: source-level regression contract for the authenticated conditional and unchanged non-workflow prompt surfaces.
+- `web/src/AppPwaVisibility.test.js`: source-level regression contract for the authenticated conditional and unchanged non-workflow prompt surfaces.
 - `web/src/styles.css`: makes Reader content bottom padding explicitly safe-area-aware.
 - `web/src/pwaMobileStyles.test.js`: verifies the mobile Reader spacing contract without depending on a browser's safe-area implementation.
 
 ### Task 1: Hide The Install Prompt In Authenticated Reader
 
 **Files:**
-- Create: `web/src/AppPwaVisibility.test.ts`
+- Create: `web/src/AppPwaVisibility.test.js`
 - Modify: `web/src/App.tsx:1978-1986`
 
 **Interfaces:**
@@ -60,7 +60,7 @@ describe('authenticated PWA install prompt visibility', () => {
 
 - [ ] **Step 2: Run the test and verify RED**
 
-Run: `npm --prefix web test -- --run src/AppPwaVisibility.test.ts`
+Run: `npm --prefix web test -- src/AppPwaVisibility.test.js`
 
 Expected: one failure because `App.tsx` still unconditionally mounts `<PwaInstallPrompt />` beside `WorkflowShell`.
 
@@ -80,13 +80,13 @@ Do not alter the prompt in login, session-restoration, or public-review returns.
 
 - [ ] **Step 4: Run the focused test and existing App tests**
 
-Run: `npm --prefix web test -- --run src/AppPwaVisibility.test.ts src/App.test.tsx src/App.integration.test.tsx`
+Run: `npm --prefix web test -- src/AppPwaVisibility.test.js src/App.test.tsx src/App.integration.test.tsx`
 
 Expected: all tests pass.
 
 - [ ] **Step 5: Review the focused diff**
 
-Run: `git diff -- web/src/App.tsx web/src/AppPwaVisibility.test.ts`
+Run: `git diff -- web/src/App.tsx web/src/AppPwaVisibility.test.js`
 
 Expected: one authenticated render conditional and one focused regression file; no PWA component behavior change.
 
@@ -110,7 +110,7 @@ expect(styles).toContain('padding-bottom: calc(176px + env(safe-area-inset-botto
 
 - [ ] **Step 2: Run the test and verify RED**
 
-Run: `npm --prefix web test -- --run src/pwaMobileStyles.test.js`
+Run: `npm --prefix web test -- src/pwaMobileStyles.test.js`
 
 Expected: failure because the current value is `padding-bottom: 176px;`.
 
@@ -129,7 +129,7 @@ Keep `.reader-bottom-bar` safe-area padding unchanged.
 
 - [ ] **Step 4: Run focused frontend tests**
 
-Run: `npm --prefix web test -- --run src/pwaMobileStyles.test.js src/AppPwaVisibility.test.ts src/App.test.tsx src/App.integration.test.tsx src/components/ReaderView.test.tsx`
+Run: `npm --prefix web test -- src/pwaMobileStyles.test.js src/AppPwaVisibility.test.js src/App.test.tsx src/App.integration.test.tsx src/components/ReaderView.test.tsx`
 
 Expected: all tests pass.
 
@@ -185,7 +185,7 @@ Expected: no failed Reader, cover, or audio application request; no old-root val
 - Modify: `web/src/state/serviceWorker.ts` (already prepared registration-version bump)
 - Modify: `web/src/state/serviceWorker.test.ts` (already prepared regression test)
 - Modify: `web/src/state/serviceWorkerFile.test.ts` (already prepared regression test)
-- Add: `web/src/AppPwaVisibility.test.ts`
+- Add: `web/src/AppPwaVisibility.test.js`
 - Modify: `web/src/App.tsx`
 - Modify: `web/src/styles.css`
 - Modify: `web/src/pwaMobileStyles.test.js`
@@ -200,7 +200,7 @@ Run:
 
 ```bash
 NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest tests/test_mobile_api_system_status.py -q
-npm --prefix web test -- --run src/state/serviceWorker.test.ts src/state/serviceWorkerFile.test.ts src/AppPwaVisibility.test.ts src/pwaMobileStyles.test.js src/App.test.tsx src/App.integration.test.tsx src/components/StatusSettingsView.test.tsx src/components/ReaderView.test.tsx
+npm --prefix web test -- src/state/serviceWorker.test.ts src/state/serviceWorkerFile.test.ts src/AppPwaVisibility.test.js src/pwaMobileStyles.test.js src/App.test.tsx src/App.integration.test.tsx src/components/StatusSettingsView.test.tsx src/components/ReaderView.test.tsx
 ```
 
 Expected: all focused tests pass.
@@ -223,7 +223,7 @@ Expected: only the listed code/test files are pending; `.env`, operator DB, back
 git add app/mobile_api/routers/health.py tests/test_mobile_api_system_status.py \
   web/public/reader-offline-sw.js web/src/state/serviceWorker.ts \
   web/src/state/serviceWorker.test.ts web/src/state/serviceWorkerFile.test.ts \
-  web/src/App.tsx web/src/AppPwaVisibility.test.ts web/src/styles.css \
+  web/src/App.tsx web/src/AppPwaVisibility.test.js web/src/styles.css \
   web/src/pwaMobileStyles.test.js
 git commit -m "fix: restore stable P0A runtime behavior"
 ```

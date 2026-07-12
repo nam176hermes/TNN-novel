@@ -1980,7 +1980,7 @@ function AuthenticatedApp() {
 
   return (
     <>
-      <PwaInstallPrompt />
+      {activeView !== 'reader' ? <PwaInstallPrompt /> : null}
       <PwaNetworkStatus />
       <WorkflowShell
         activeView={activeView}

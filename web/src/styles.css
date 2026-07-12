@@ -11698,7 +11698,7 @@ body {
 
   .workflow-shell[data-active-view="reader"] .reader-immersive-main {
     padding-top: 172px;
-    padding-bottom: 176px;
+    padding-bottom: calc(176px + env(safe-area-inset-bottom));
   }
 
   .workflow-shell[data-active-view="reader"] .reader-reference-actions {

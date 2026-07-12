@@ -3,6 +3,9 @@ from __future__ import annotations
 import shutil
 import os
 import sqlite3
+from pathlib import Path
+import threading
+import time
 
 from fastapi import APIRouter, Request, Response
 
@@ -14,6 +17,11 @@ from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStat
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 
 router = APIRouter(prefix="/api", tags=["health"])
+
+_DATA_SIZE_CACHE_TTL_SECONDS = 60.0
+_data_size_cache: dict[Path, tuple[int, float]] = {}
+_data_size_refreshing: set[Path] = set()
+_data_size_cache_lock = threading.Lock()
 
 
 def _directory_size_bytes(root) -> int:
@@ -34,6 +42,34 @@ def _directory_size_bytes(root) -> int:
         except OSError:
             continue
     return total
+
+
+def _refresh_data_size_snapshot(root: Path) -> None:
+    size_bytes = _directory_size_bytes(root)
+    with _data_size_cache_lock:
+        _data_size_cache[root] = (size_bytes, time.monotonic())
+        _data_size_refreshing.discard(root)
+
+
+def _cached_directory_size_bytes(root: Path, *, minimum_bytes: int = 0) -> int:
+    resolved_root = root.resolve(strict=False)
+    now = time.monotonic()
+    refresh_thread: threading.Thread | None = None
+    with _data_size_cache_lock:
+        cached = _data_size_cache.get(resolved_root)
+        if cached is None or now - cached[1] > _DATA_SIZE_CACHE_TTL_SECONDS:
+            if resolved_root not in _data_size_refreshing:
+                _data_size_refreshing.add(resolved_root)
+                refresh_thread = threading.Thread(
+                    target=_refresh_data_size_snapshot,
+                    args=(resolved_root,),
+                    daemon=True,
+                    name="novel-data-size-snapshot",
+                )
+        cached_size = cached[0] if cached is not None else 0
+    if refresh_thread is not None:
+        refresh_thread.start()
+    return max(cached_size, minimum_bytes)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -175,10 +211,21 @@ async def system_status(request: Request):
     api_ready = data_dir.exists() and db_path.exists()
     data_directory_available = data_dir.is_dir()
     database_available = db_path.is_file()
-    data_size_bytes = _directory_size_bytes(data_dir) if data_directory_available else 0
+    database_inside_data_dir = False
     try:
         db_path.resolve().relative_to(data_dir.resolve())
+        database_inside_data_dir = True
     except ValueError:
+        pass
+    data_size_bytes = (
+        _cached_directory_size_bytes(
+            data_dir,
+            minimum_bytes=db_size if database_inside_data_dir else 0,
+        )
+        if data_directory_available
+        else 0
+    )
+    if not database_inside_data_dir:
         data_size_bytes += db_size
     storage_health = "healthy" if api_ready else "degraded"
 

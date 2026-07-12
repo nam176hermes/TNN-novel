@@ -13,6 +13,7 @@ describe('mobile PWA prompt styles', () => {
     expect(styles).toContain('.workflow-shell[data-active-view="reader"] .reader-text-mode-switcher {');
     expect(styles).toContain('top: 124px;');
     expect(styles).toContain('padding-top: 172px;');
+    expect(styles).toContain('padding-bottom: calc(176px + env(safe-area-inset-bottom));');
     expect(styles).toContain('top: 116px;');
     expect(styles).toContain('padding-top: 164px;');
   });

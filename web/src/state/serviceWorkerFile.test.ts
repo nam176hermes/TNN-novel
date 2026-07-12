@@ -7,7 +7,9 @@ describe('reader offline service worker file', () => {
   });
 
   it('caches the app shell and static assets without caching authenticated API responses', () => {
-    expect(workerSource).toContain('reader-offline-shell');
+    expect(workerSource).toContain("const SHELL_CACHE = 'reader-offline-shell-v4'");
+    expect(workerSource).toContain("const RUNTIME_CACHE = 'reader-offline-runtime-v4'");
+    expect(workerSource).not.toContain("const SHELL_CACHE = 'reader-offline-shell-v3'");
     expect(workerSource).toContain("'/index.html'");
     expect(workerSource).toContain("request.mode === 'navigate'");
     expect(workerSource).toContain("'/api/'");

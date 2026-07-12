@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 
 import httpx
 import pytest
@@ -13,6 +15,37 @@ from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api import dependencies as mobile_dependencies
 from app.mobile_api.routers import health as health_router
 from app.mobile_api.services.job_service import JobTracker
+
+
+def test_data_size_snapshot_does_not_block_on_slow_filesystem_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def slow_scan(_: Path) -> int:
+        scan_started.set()
+        release_scan.wait(timeout=5)
+        return 987_654
+
+    monkeypatch.setattr(health_router, "_directory_size_bytes", slow_scan)
+    started_at = time.perf_counter()
+    snapshot = health_router._cached_directory_size_bytes(tmp_path, minimum_bytes=123_456)
+    elapsed = time.perf_counter() - started_at
+
+    assert snapshot == 123_456
+    assert elapsed < 0.1
+    assert scan_started.wait(timeout=1)
+
+    release_scan.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if health_router._cached_directory_size_bytes(tmp_path, minimum_bytes=123_456) == 987_654:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background data-size scan did not publish its snapshot")
 
 
 async def auth_headers(client: httpx.AsyncClient) -> dict[str, str]:

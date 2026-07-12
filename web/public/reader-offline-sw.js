@@ -1,5 +1,5 @@
-const SHELL_CACHE = 'reader-offline-shell-v3';
-const RUNTIME_CACHE = 'reader-offline-runtime-v3';
+const SHELL_CACHE = 'reader-offline-shell-v4';
+const RUNTIME_CACHE = 'reader-offline-runtime-v4';
 const CACHE_PREFIX = 'reader-offline-';
 const APP_SHELL_URLS = [
   '/',

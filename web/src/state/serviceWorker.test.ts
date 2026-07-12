@@ -29,7 +29,7 @@ describe('registerReaderOfflineServiceWorker', () => {
     });
 
     expect(result).toBe(registration);
-    expect(serviceWorkerModule.READER_OFFLINE_SERVICE_WORKER_URL).toBe('/reader-offline-sw.js?v=20260709');
+    expect(serviceWorkerModule.READER_OFFLINE_SERVICE_WORKER_URL).toBe('/reader-offline-sw.js?v=20260712-p0a');
     expect(register).toHaveBeenCalledWith(
       serviceWorkerModule.READER_OFFLINE_SERVICE_WORKER_URL,
       { scope: '/' },
