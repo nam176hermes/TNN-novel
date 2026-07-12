@@ -464,6 +464,7 @@ def apply_migration(
 
     conn = sqlite3.connect(str(options.db_path), timeout=30, isolation_level=None)
     rows_updated_by_field: dict[str, int] = {}
+    committed = False
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
@@ -491,9 +492,13 @@ def apply_migration(
         if foreign_key_violations:
             raise MigrationApplyError(f"SQLite foreign-key check found {foreign_key_violations} violation(s)")
         conn.commit()
+        committed = True
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0]) != 0:
+            raise MigrationApplyError("committed migration WAL could not be checkpointed")
     except Exception as exc:
         conn.rollback()
-        if mappings:
+        if mappings and not committed:
             rollback_path.unlink(missing_ok=True)
         if isinstance(exc, MigrationApplyError):
             raise

@@ -327,6 +327,29 @@ def test_apply_updates_only_approved_values_and_second_apply_is_idempotent(
     assert second.integrity_check == "ok"
 
 
+def test_apply_post_hash_includes_committed_wal_changes(tmp_path: Path) -> None:
+    db_path, data_root, _ = create_fixture(tmp_path)
+    keeper = sqlite3.connect(db_path)
+    wal_path = db_path.with_name(f"{db_path.name}-wal")
+    try:
+        assert keeper.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        options = apply_options(db_path, data_root, tmp_path / "reports")
+        report = inventory_database(options)
+
+        result = apply_migration(options, report)
+        wal_size_after_apply = wal_path.stat().st_size if wal_path.exists() else 0
+    finally:
+        keeper.close()
+
+    with sqlite3.connect(db_path) as conn:
+        checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+
+    assert checkpoint[0] == 0
+    assert wal_size_after_apply == 0
+    assert result.post_database_sha256 == sha256_file(db_path)
+    assert result.post_database_sha256 != result.pre_database_sha256
+
+
 def test_apply_rolls_back_every_update_when_validation_fails(tmp_path: Path) -> None:
     db_path, data_root, _ = create_fixture(tmp_path)
     options = apply_options(db_path, data_root, tmp_path / "reports")
