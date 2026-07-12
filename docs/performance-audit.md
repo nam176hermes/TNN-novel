@@ -1,84 +1,101 @@
 # Performance Audit
 
-## Measured Baseline
+## Scope And Measurement Quality
 
-### Frontend Build
-- Command: `npm --prefix web run build`
-- Result: passed
-- Duration: 23.52s
-- Notes: Vite emitted a plugin-timing warning; major time was spent in `vite-resolve`, `vite:asset`, and `vite:css-post`
+This report combines the measured P1 runtime audit with verified P2A/P2B results and the `2026-07-11` runtime regression pass. Canonical performance numbers come from isolated WSL Linux filesystem fixtures. Current `/mnt/c` test durations are reported only as environment evidence.
 
-### Frontend Bundle Sizes
-- `web/dist/assets/index-0nrX7BLv.js`: 341.96 kB
-- `web/dist/assets/ReaderView-Cs_yt5uV.js`: 181.73 kB
-- `web/dist/assets/index-Cpg1hn-s.css`: 188.58 kB
-- `web/dist/assets/ImportPanel-BoyT7EyM.js`: 49.70 kB
-- `web/dist/assets/ReaderView-Cs_yt5uV.js` is the single largest route chunk and is a likely first target for future split work
+## Backend Route Findings
 
-### Import Performance Constraints
-- Browser-side text import limit in UI: 5 MB
-- Browser-side ebook upload limit in UI: 95 MB
-- Server-side wizard import limit: 5 MB
-- The import panel does a client-side byte count and encoding check before submission, which is good for correctness but still means the full text sits in browser memory
+- Most isolated P1 read routes were below 100 ms.
+- P2A reduced normal DB connection setup from `11.921 ms` median to `0.035 ms`.
+- P2A reduced the 59-book translated-library route from `645-739 ms` to `5.188 ms` median and bounded the query/connection count at 1/1.
+- P2B reduced the 120-chapter authenticated import route from approximately `5.62 s` to `144.083 ms` median with real glossary follow-up.
+- P2B's transaction-focused 120-chapter service median was `24.724 ms`; real post-commit glossary work increased the service median to `149.771 ms`.
+- Export creation measured approximately `94-106 ms` median on isolated fixtures.
 
-### Database / Data Footprint
-- `data/pipeline.db`: about 47 MB at audit time
-- Rows observed:
-  - `books`: 15
-  - `chapters`: 4175
-  - `translated chapters`: 4159
-  - `glossary_terms`: 3111
-  - `audio files`: 8
+## Current Backup Regression
 
-## Verification Results
+- P1 measured synchronous backup creation at approximately `11.4-17.5 s` on a small fixture.
+- Current `GET /api/system/backups` exceeded a 20-second client timeout against the canonical backup directory.
+- Root cause: `scripts.ops.list_backups()` calls `read_backup_manifest()` for every archive. When a sidecar is absent, the function opens and scans the compressed archive to extract `manifest.json`.
+- The canonical backup directory has two archives (`9.2 MB`, `188.7 MB`) and no sidecar manifests.
+- User impact: the status/settings view can remain blocked while merely listing backups; backup creation also remains synchronous.
+- Priority: P1 correctness/operability. Add sidecar repair/fallback bounds first, then implement the already-designed job-backed backup workflow.
 
-### Passed
-- `npm --prefix web run typecheck`
-- `npm --prefix web run build`
-- `git diff --check`
+## Frontend Bundle
 
-### Failed Or Blocked
-- `scripts/verify.sh` failed early because `python -m pyflakes` is not executable in the active environment
-- `pytest` via the available system interpreter fails on many backend tests because `jose` and `pyperclip` are missing from that environment
-- `app.mobile_api` startup in the current venv fails on an import error involving `fastapi` / `starlette`
-- `npm --prefix web test` has at least one failing integration test:
-  - `web/src/App.integration.test.tsx`
-  - failure: translated-library flow expects heading `Đọc truyện`, but the rendered workflow page did not contain that heading
+| Asset | Raw | Gzip | Assessment |
+|---|---:|---:|---|
+| Main entry | 341.96 KB | 106.78 KB | Acceptable but broad app orchestration remains eager |
+| Global CSS | 188.78 KB | 32.26 KB | Large global payload and maintenance hotspot |
+| Reader route | 181.73 KB | 49.54 KB | Largest route chunk; optional tools are bundled together |
+| Import route | 49.70 KB | not separately recorded | Reasonable transfer size; responsibility split is primarily maintainability-driven |
 
-## Page-Load Findings
+Route-level lazy loading works. A broad dependency upgrade is not justified by bundle evidence.
 
-### Current State
-- Live page-load measurements could not be completed because the local API bootstrap failed in the current environment
-- The frontend test suite and production build are still useful evidence that the static app shell is healthy, but they do not replace runtime timing
+## Browser Runtime
 
-### Inferred Bottlenecks
-- `ReaderView.tsx` is very large and likely contributes to slower initial parse and larger JS execution cost
-- `styles.css` is also very large and may increase style recalculation cost
-- The Reader route is the largest JS chunk in the build output
+- Isolated API process start to health/readiness was approximately `971 ms` in P1.
+- P1 login content appeared in `91-161 ms`; authenticated useful shell took `830-844 ms`.
+- Warm major-route navigation was generally `143-160 ms` with the audit settle allowance.
+- The current synthetic browser pass produced no console errors and no measured horizontal overflow at `1440x1000`, `390x844`, or `360x740`.
+- Current route screenshots confirm the main shell, library, import, jobs, sources, glossary, providers, status, and export surfaces render.
+- The current browser harness switched Reader/Export too quickly in one sequential pass and captured Suspense/stale status content. Standalone export verification succeeded; those two 5-second sequential values are invalid and are excluded from performance conclusions.
 
-## Import Performance Findings
-- 5 MB browser-side parsing is probably acceptable for single-chapter text import, but it is already at the edge of a smooth browser experience
-- The UI correctly guards large text files and shows preview state, but it still parses the whole payload on the client
-- For larger chapter sets or repeated imports, server-side preview/session handling would be the safer next phase
+## Reader
 
-## Reader Performance Findings
-- The reader surface is the heaviest frontend area by bundle size and responsibilities
-- State modules for reader cache, rich content, progress, marks, dictionary, offline cache, and search are already separated, which is good
-- The main issue is not obvious virtualization demand yet; it is the size and complexity of the reader bundle and the amount of behavior packed into one component
+- Reader route chunk: `181.73 KB` raw, `49.54 KB` gzip.
+- P1 normal open and chapter switch were below one second locally.
+- QA mode measured `102-599 ms`; the long fixture reached approximately `5,182 DOM nodes`.
+- Duplicate Reader requests and full QA DOM expansion remain measurable risks.
+- Text is not blocked on audio/dictionary completion, which is the correct dependency direction.
+- Virtualization is not justified for normal chapters. Progressive QA rendering or long-chapter thresholds should be tested before introducing virtualization.
 
-## TTS Performance Findings
-- Non-provider TTS code is split across chunking, merge, QA, and pipeline modules
-- No live provider synthesis was run during this audit
-- The report therefore treats provider time as NOT TESTED and only comments on non-provider overhead structurally
+## Import
 
-## Backend Performance Findings
-- `app/database/db.py` is large and probably contains multiple hot paths that deserve targeted profiling
-- `app/mobile_api/services/pipeline_service.py` is the next largest backend hotspot
-- Many endpoints are domain-separated already, but several routers remain large enough that import-time cost and local reasoning cost are both noticeable
+- One 4.9 MB chapter was approximately `0.80 s` end-to-end in the P1 path; preview itself stayed under approximately `0.45 s`.
+- Before P2B, 120 small chapters took `5.62 s` despite a 96 KB payload.
+- After P2B, the route median was `144.083 ms`, with one connection, one transaction/commit, and one bounded duplicate query.
+- The existing 5 MB text limit remains acceptable for this private operator app. Structure and chapter count mattered more than bytes before P2B.
+- Server-side preview sessions and chunked upload are not currently justified. Reconsider only after measuring larger approved limits or browser memory pressure.
 
-## Priority Summary
-- P0: fix local environment drift so the API boots and pytest can run under the intended interpreter
-- P1: reduce reader bundle and CSS size
-- P1: address the failing translated-library integration test
-- P2: consider server-side import preview for larger payloads
-- P2: split the largest backend service/router modules by domain
+## TTS And Audio
+
+- Fixture normalization/chunking overhead is small.
+- Three complete fixture runs, each producing two MP3 chapters and one M4B, took `6.89`, `6.91`, and `7.09 s`; all 9 checks passed.
+- Merge cost scales with file/chunk count and ffmpeg startup.
+- Fixture M4B was valid media but lacked chapter markers.
+- These measurements do not predict provider synthesis speed.
+
+## Database And Storage
+
+- SQLite integrity and foreign keys are healthy.
+- Existing chapter/job indexes were effective in P1/P2A query plans.
+- The largest logical DB consumers were translation-memory fuzzy data, translation cache, operational events, auth sessions, chapters, and QA reports.
+- `operational_events` has 16,396 rows and no demonstrated retention ceiling.
+- Filesystem metadata drift makes thousands of content paths unusable through the current root, even though files exist after deterministic remapping. This is a correctness blocker, not a raw storage-performance issue.
+
+## WSL Filesystem Effect
+
+Prior controlled comparison found `/mnt/c` materially slower for frontend build, SQLite, Python file operations, and lazy imports. Development and benchmark work should run from a Linux filesystem checkout, with Windows storage used for reviewed backups or access as needed.
+
+## Directional Targets
+
+| Flow | Current evidence | Target | Status |
+|---|---|---|---|
+| Normal DB connection | 0.035 ms median | materially below prior 11.921 ms | Met |
+| 59-book library | 5.188 ms median | under 200 ms local | Met |
+| 120-chapter commit | 144.083 ms route median | under 1.5 s local | Met |
+| Normal authenticated page | usually under 1 s isolated | under 2 s local | Met |
+| Reader normal chapter | under 1 s local | under 1 s after API | Met |
+| Reader long QA | up to 599 ms, 5,182 nodes | no visible long freeze | Needs improvement |
+| Backup list | over 20 s with legacy archives | under 250 ms warm | Not met |
+| Backup create request | 11.4-17.5 s synchronous | quick 202 job response | Not met |
+
+## Recommended Order
+
+1. P0: migrate stale artifact paths safely on a copied DB, then controlled operator DB migration with backup and rollback.
+2. P1: make backup listing metadata-only and backup creation job-backed.
+3. P1: remove duplicate Reader request ownership and progressively render heavy QA.
+4. P2: split Reader optional tools and CSS by feature after behavior tests are stable.
+5. P3: formal low-end Android and WAN measurements.

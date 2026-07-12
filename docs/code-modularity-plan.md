@@ -1,123 +1,108 @@
 # Code Modularity Plan
 
-## Answer
-Yes. The codebase should be divided further, but not as a wholesale rewrite. The right move is to split the few largest modules that currently mix orchestration, business logic, and UI rendering.
+## Direct Answer
 
-## Backend Splits
+Yes, the code should be divided further, but only along measured responsibility and test boundaries. A rewrite or line-count-driven split is not justified. P2A and P2B proved that high-value performance fixes can be delivered through narrow seams while preserving the current architecture.
 
-### `app/database/db.py`
-- Current responsibilities: schema helpers, CRUD, auth/session storage, reader state, glossary, jobs, source catalog, operational events, backup-related queries
-- Problem: one module is acting as a database layer, repository layer, and operational utility layer
-- Proposed split:
-  - `app/database/core.py`
-  - `app/database/books.py`
-  - `app/database/jobs.py`
-  - `app/database/auth.py`
-  - `app/database/glossary.py`
-  - `app/database/reader.py`
-  - `app/database/operations.py`
-- Dependency direction: feature services import only the feature repository module, not the entire DB surface
-- Sequence: extract reader/auth/job queries first, then glossary/source catalog, then operational helpers
-- Risk: medium, because callers are widespread
+## Evidence
 
-### `app/mobile_api/services/pipeline_service.py`
-- Current responsibilities: import, book/chapter CRUD, reader state, glossary, QA, source adapters, dictionary cache, annotations, export support, TTS-adjacent helpers
-- Problem: too many domain behaviors in one service
-- Proposed split:
-  - `services/book_service.py`
-  - `services/reader_service.py`
-  - `services/import_service.py`
-  - `services/glossary_service.py`
-  - `services/source_service.py`
-  - `services/annotation_service.py`
-- Dependency direction: routers call thin domain services, domain services call repository helpers
-- Sequence: reader/book extraction first, then import and glossary
-- Risk: medium-high
+| Module | Lines | Approx. functions | Why it matters |
+|---|---:|---:|---|
+| `web/src/styles.css` | 12,244 | n/a | Entire visual system and responsive behavior share one change surface |
+| `app/database/db.py` | 6,225 | 186 | Repositories for unrelated domains and lifecycle helpers are coupled |
+| `app/mobile_api/services/pipeline_service.py` | 5,700 | 172 | Book, Reader, import, source, dictionary, annotation, and file behavior share one service |
+| `web/src/components/ReaderView.tsx` | 5,251 | n/a | Fetching, text rendering, QA, audio, dictionary, annotations, offline state, and controls |
+| `web/src/App.tsx` | 2,026 | n/a | Auth bootstrap, workflow routing, global fetch ownership, and orchestration |
+| `web/src/components/ImportPanel.tsx` | 1,991 | n/a | Paste/file/ebook/URL/catalog review and commit state |
+| `app/mobile_api/services/job_service.py` | 1,551 | n/a | Lifecycle, scheduling, retries, stale recovery, and job-domain execution |
+| `web/src/components/SourcesView.tsx` | 982 | n/a | Catalog, managed sources, review/testing, and filters |
+| `app/mobile_api/routers/import_routes.py` | 825 | n/a | Multiple import transports and commit orchestration |
+| `app/mobile_api/routers/books.py` | 806 | n/a | Books, chapters, Reader, annotations, dictionaries, X-Ray, and cover routes |
 
-### `app/mobile_api/routers/import_routes.py`
-- Current responsibilities: paste import, wizard import, URL preview, ebook upload/preview, source list, source catalog actions, import job creation
-- Problem: import orchestration and catalog management are coupled
-- Proposed split:
-  - `routers/import_text.py`
-  - `routers/import_ebook.py`
-  - `routers/import_url.py`
-  - `routers/source_catalog.py`
-- Sequence: extract ebook and wizard flows first because they are the most isolated
+The local import graph also contains a direct circular dependency: `pipeline_service -> qa_service -> pipeline_service`. Remove this through a small interface/extracted pure QA dependency before larger service moves.
 
-### `app/mobile_api/routers/books.py`
-- Current responsibilities: books, chapters, reader progress, annotations, dictionaries, X-ray, reader sync, cover upload, raw/translation access
-- Problem: this is effectively multiple routers in one file
-- Proposed split:
-  - `routers/books.py`
-  - `routers/reader.py`
-  - `routers/dictionaries.py`
-  - `routers/annotations.py`
-- Keep the public route shape stable during migration
+## Recommended Splits
 
-### `app/mobile_api/routers/jobs.py`
-- Current responsibilities: job create/start, job lists, logs, attempts, SSE, cost estimation, cancellation, retries
-- Problem: jobs orchestration plus diagnostics plus transport concerns
-- Proposed split:
-  - `routers/jobs.py`
-  - `routers/job_logs.py`
-  - `routers/job_estimates.py`
-  - `routers/job_events.py`
+### Reader
 
-## Frontend Splits
+- Current: `web/src/components/ReaderView.tsx`.
+- Problem: route data ownership, text transformations, optional tools, polling, and UI chrome are coupled; P1 measured duplicate requests and QA up to 599 ms/5,182 DOM nodes.
+- Proposed modules: `ReaderPage`, `ReaderDataController`, `ReaderTextStage`, `ReaderChrome`, `ReaderQaLayer`, and lazy `ReaderAudioPanel`/`ReaderDictionaryPanel`/`ReaderAnnotationPanel`.
+- Dependency direction: page/controller owns data; pure text stage receives prepared view data; optional panels depend on narrow APIs.
+- Sequence: first eliminate duplicate request ownership, then extract pure rendering, then lazy optional panels.
+- Risk: high.
+- Timing: after stale path migration and backup P1 work; regression coverage must remain green.
 
-### `web/src/components/ReaderView.tsx`
-- Current responsibilities: chapter loading, reader mode logic, QA overlay, search, audio, dictionary, marks, offline cache, progress, AI/X-Ray, drawers, selection popovers, and scroll state
-- Problem: too many concerns for one component
-- Proposed split:
-  - `reader/ReaderPage.tsx`
-  - `reader/ReaderChrome.tsx`
-  - `reader/ReaderTextStage.tsx`
-  - `reader/ReaderModeSwitch.tsx`
-  - `reader/ReaderOverlayHost.tsx`
-- Sequence: extract rendering shell first, then mode-specific subviews
-- Risk: high if done without tests; lower if done incrementally with snapshot/integration coverage
+### Import
 
-### `web/src/components/ImportPanel.tsx`
-- Current responsibilities: paste, file, ebook, URL, catalog, wizard imports, preview, validation, and job launching
-- Proposed split:
-  - `import/ImportPaste.tsx`
-  - `import/ImportFile.tsx`
-  - `import/ImportEbook.tsx`
-  - `import/ImportUrl.tsx`
-  - `import/ImportCatalog.tsx`
-  - `import/ImportWizard.tsx`
+- Current: `web/src/components/ImportPanel.tsx`, `app/mobile_api/routers/import_routes.py`.
+- Problem: transport selection, parsing UI, reviewed plan, duplicate decisions, and job actions share state. Performance is no longer the reason: P2B reduced 120 chapters to 144 ms route median.
+- Proposed frontend: source selector, text/file adapter, ebook adapter, URL/catalog adapter, review screen, commit result.
+- Proposed backend: keep route paths, extract text/ebook/URL orchestration functions behind current router.
+- Dependency direction: adapters produce one reviewed-plan type; commit owns mutation; post-commit actions consume committed IDs.
+- Sequence: add contract tests, extract pure review/result components, then adapters.
+- Risk: medium-high.
+- Timing: P2/P3, not before Reader correctness work.
 
-### `web/src/App.tsx`
-- Current responsibilities: global routing, auth, state orchestration, workflow switching, loading/error handling, and coordination of many feature hooks
-- Proposed split:
-  - keep shell orchestration in `App.tsx`
-  - move workflow composition into `WorkflowCoordinator.tsx`
-  - move auth/session bootstrap into `AuthGate.tsx`
+### Database
 
-### `web/src/styles.css`
-- Current responsibilities: essentially the whole visual system
-- Proposed split:
-  - `styles/tokens.css`
-  - `styles/layout.css`
-  - `styles/reader.css`
-  - `styles/import.css`
-  - `styles/jobs.css`
-  - `styles/admin.css`
+- Current: `app/database/db.py`.
+- Problem: lifecycle plus repositories for auth, books, jobs, glossary, sources, Reader, TTS, and operations.
+- Proposed modules: `connection`, `auth_repository`, `book_repository`, `job_repository`, `reader_repository`, `glossary_repository`, `source_repository`, `tts_repository`, `operations_repository`.
+- Dependency direction: services import domain repositories; repositories depend only on connection/schema primitives.
+- Sequence: preserve a compatibility facade; extract one domain at a time, starting with jobs or auth, not the newly optimized library/import seams.
+- Risk: medium-high due many callers.
+- Timing: after a clean post-audit baseline and explicit contract/query-count tests.
 
-## Files That Should Stay Put For Now
-- `app/mobile_api/config.py`
-- `app/mobile_api/security.py`
-- `web/src/state/*` hooks that already encapsulate focused behavior
-- `app/services/tts/*` unless a TTS-specific refactor is separately scoped
+### Pipeline Service
 
-## Recommended Sequence
-1. Fix environment drift and test baselines
-2. Extract backend reader and auth/session repositories
-3. Split `ReaderView.tsx`
-4. Split `ImportPanel.tsx`
-5. Split `styles.css`
-6. Split router files only after the frontend and service seams are stable
+- Current: `app/mobile_api/services/pipeline_service.py`.
+- Problem: unrelated domain behavior and circular QA dependency.
+- Proposed modules: `book_service`, `reader_service`, `annotation_service`, `dictionary_service`, `import_commit_service`, `content_file_service`.
+- Dependency direction: routers -> domain services -> repositories/file adapters; QA consumes a protocol/pure content input rather than importing PipelineService.
+- Sequence: break circular dependency, extract content-file resolver, then Reader/annotation services.
+- Risk: high.
+- Timing: after DB repository seams exist.
 
-## Bottom Line
-- The codebase does not require a rewrite
-- It does require smaller domain modules for reader, import, and database access if future change speed matters
+### App Shell And API Client
+
+- Current: `web/src/App.tsx` and broad API client/types.
+- Problem: route orchestration and feature loading/error ownership are concentrated.
+- Proposed modules: `AuthGate`, `WorkflowRouter`, feature loaders, and domain API clients retaining shared transport/auth handling.
+- Dependency direction: domain hooks -> domain clients -> shared authenticated transport.
+- Risk: medium.
+- Timing: alongside feature extraction, not as a standalone rewrite.
+
+### CSS
+
+- Current: `web/src/styles.css`.
+- Problem: 12,244-line global regression surface.
+- Proposed files: tokens/base, shell/navigation, reader, import, library, operations, and responsive overrides.
+- Dependency direction: shared tokens/base first, route styles imported with route chunks where Vite behavior remains verified.
+- Sequence: add screenshot/overflow assertions, extract unchanged blocks, compare build and screenshots after every feature.
+- Risk: medium-high visual regression risk.
+- Timing: last.
+
+## Files To Keep Unchanged For Now
+
+- `app/mobile_api/security.py` and session/auth middleware: focused and security-sensitive.
+- `app/mobile_api/config.py`: focused settings boundary.
+- `app/database/schema.py`: keep additive schema ownership centralized until repository extraction stabilizes.
+- `app/services/tts/*`: already domain-oriented; no measured structural blocker.
+- Reader state modules under `web/src/state` that already have narrow ownership.
+- Public API route paths and response contracts.
+
+## Minimum-Risk Sequence
+
+1. Migrate stale artifact paths with backup, copied-DB rehearsal, integrity checks, and rollback.
+2. Fix backup listing and implement job-backed backup without changing restore format.
+3. Remove Reader duplicate requests and establish data-contract tests.
+4. Break the PipelineService/QA circular dependency.
+5. Extract Reader pure rendering and optional panels.
+6. Extract one database repository domain at a time behind compatibility exports.
+7. Split Import by reviewed-plan adapters.
+8. Split CSS only with screenshot and responsive regression coverage.
+
+## Acceptance Rule
+
+Each extraction must preserve API contracts, full verification, E2E library-to-Reader/import workflows, security tests, and measured route performance. No phase should combine behavior changes with broad file movement.
