@@ -1008,7 +1008,11 @@ def run_smoke(
     if "providers" not in providers:
         raise RuntimeError(f"Providers endpoint returned unexpected payload: {providers}")
     status = _request_json("GET", f"{base}/api/system/status", headers=auth_headers)
-    if "data_dir" not in status:
+    exposed_path_fields = {"database_path", "data_dir"}.intersection(status)
+    if exposed_path_fields:
+        raise RuntimeError(f"System status exposed absolute path fields: {sorted(exposed_path_fields)}")
+    required_status_fields = {"database_available", "data_directory_available", "storage_health"}
+    if not required_status_fields.issubset(status):
         raise RuntimeError(f"System status returned unexpected payload: {status}")
 
     if web_url:

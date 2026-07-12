@@ -184,6 +184,68 @@ def test_ops_parser_exposes_expected_commands() -> None:
     assert "smoke-public" in help_text
 
 
+def test_smoke_accepts_redacted_system_status_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith("/api/health"):
+            return {"status": "ok"}
+        if url.endswith("/api/ready"):
+            return {"status": "ok"}
+        if url.endswith("/api/auth/login"):
+            return {"access_token": "access-token"}
+        if url.endswith("/api/providers"):
+            return {"providers": []}
+        if url.endswith("/api/system/status"):
+            return {
+                "api_ready": True,
+                "database_available": True,
+                "data_directory_available": True,
+                "storage_health": "healthy",
+                "storage_label": "Configured data storage",
+            }
+        raise AssertionError(f"unexpected json request: {method} {url} {kwargs}")
+
+    monkeypatch.setattr(ops, "_request_json", fake_request_json)
+
+    result = ops.run_smoke(
+        base_url="http://127.0.0.1:7860",
+        username="operator",
+        password="strong-password",
+    )
+
+    assert result == 0
+    assert "OK smoke" in capsys.readouterr().out
+
+
+def test_smoke_rejects_absolute_path_fields_in_system_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith("/api/health") or url.endswith("/api/ready"):
+            return {"status": "ok"}
+        if url.endswith("/api/auth/login"):
+            return {"access_token": "access-token"}
+        if url.endswith("/api/providers"):
+            return {"providers": []}
+        if url.endswith("/api/system/status"):
+            return {
+                "api_ready": True,
+                "database_available": True,
+                "data_directory_available": True,
+                "database_path": "/private/operator/pipeline.db",
+            }
+        raise AssertionError(f"unexpected json request: {method} {url} {kwargs}")
+
+    monkeypatch.setattr(ops, "_request_json", fake_request_json)
+
+    with pytest.raises(RuntimeError, match="absolute path fields"):
+        ops.run_smoke(
+            base_url="http://127.0.0.1:7860",
+            username="operator",
+            password="strong-password",
+        )
+
+
 def test_batch_local_script_help_status_and_logs(tmp_path: Path) -> None:
     script = Path("scripts/batch-local.sh")
     subprocess.run(["bash", "-n", str(script)], check=True)
