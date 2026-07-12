@@ -16,6 +16,26 @@ from app.mobile_api.dependencies import get_db_path, get_data_dir
 router = APIRouter(prefix="/api", tags=["health"])
 
 
+def _directory_size_bytes(root) -> int:
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="ok", version=mobile_settings.version)
@@ -132,10 +152,9 @@ async def system_status(request: Request):
     job_counts = count_mobile_jobs_by_status(db_path)
     recent_operational_errors = list_operational_events(db_path, limit=10)
     recent_events = list_operational_events(db_path, limit=50, severities=())
-    if public_request:
-        last_failed = sanitize_public_payload(last_failed)
-        recent_operational_errors = sanitize_public_payload(recent_operational_errors)
-        recent_events = sanitize_public_payload(recent_events)
+    last_failed = sanitize_public_payload(last_failed)
+    recent_operational_errors = sanitize_public_payload(recent_operational_errors)
+    recent_events = sanitize_public_payload(recent_events)
     recent_backup_events = [
         event for event in recent_events
         if str(event.get("event_type") or "").startswith("backup_")
@@ -154,14 +173,26 @@ async def system_status(request: Request):
             active_provider = ""
 
     api_ready = data_dir.exists() and db_path.exists()
+    data_directory_available = data_dir.is_dir()
+    database_available = db_path.is_file()
+    data_size_bytes = _directory_size_bytes(data_dir) if data_directory_available else 0
+    try:
+        db_path.resolve().relative_to(data_dir.resolve())
+    except ValueError:
+        data_size_bytes += db_size
+    storage_health = "healthy" if api_ready else "degraded"
 
     return SystemStatusResponse(
         db_size_bytes=db_size,
         cache_count=cache.get("count", 0),
         cache_size_bytes=cache.get("total_bytes", 0),
+        data_size_bytes=data_size_bytes,
         ollama_host="" if public_request else settings.ollama_host,
         ollama_model="" if public_request else settings.ollama_model,
-        data_dir="" if public_request else str(data_dir),
+        database_available=database_available,
+        data_directory_available=data_directory_available,
+        storage_health=storage_health,
+        storage_label="Configured data storage",
         public_deploy=mobile_settings.public_deploy,
         api_ready=api_ready,
         active_provider=active_provider,
@@ -179,6 +210,5 @@ async def system_status(request: Request):
         recent_backup_events=recent_backup_events,
         app_version=mobile_settings.version,
         build="phase1",
-        database_path="" if (public_request or mobile_settings.public_deploy) else str(db_path),
         backup_recommendation="System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.",
     )

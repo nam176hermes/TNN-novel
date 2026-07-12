@@ -67,6 +67,78 @@ def test_create_backup_can_exclude_exports_and_job_logs(tmp_path: Path) -> None:
     assert "data/logs/runtime.log" not in names
 
 
+def test_create_backup_can_skip_operational_event_for_pre_rehearsal_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.database import db as database_db
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with sqlite3.connect(data_dir / "pipeline.db") as conn:
+        conn.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    calls: list[Path] = []
+
+    def record_event(db_path: Path, **_: object) -> None:
+        calls.append(db_path)
+
+    monkeypatch.setattr(database_db, "record_operational_event", record_event)
+
+    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-default", record_event=True)
+    assert calls == [data_dir / "pipeline.db"]
+
+    calls.clear()
+    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-gated", record_event=False)
+    assert calls == []
+
+
+def test_backup_cli_and_shell_expose_no_event_gate() -> None:
+    parser = ops.build_parser()
+    args = parser.parse_args(["backup", "--no-record-event"])
+
+    assert args.no_record_event is True
+    shell = Path("scripts/backup-local.sh").read_text(encoding="utf-8")
+    assert 'record_event = os.getenv("BACKUP_RECORD_EVENT", "1") != "0"' in shell
+    assert "record_event=record_event" in shell
+
+
+def test_create_backup_can_skip_checkpoint_without_changing_source_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "pipeline.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES ('unchanged')")
+        conn.commit()
+    before = ops.sha256_file(db_path)
+    checkpoint_calls: list[Path] = []
+    monkeypatch.setattr(ops, "sqlite_checkpoint", lambda path: checkpoint_calls.append(path))
+
+    backup_path = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "backups",
+        record_event=False,
+        checkpoint_database=False,
+    )
+
+    assert backup_path.is_file()
+    assert checkpoint_calls == []
+    assert ops.sha256_file(db_path) == before
+
+
+def test_backup_cli_and_shell_expose_no_checkpoint_gate() -> None:
+    parser = ops.build_parser()
+    args = parser.parse_args(["backup", "--no-checkpoint"])
+
+    assert args.no_checkpoint is True
+    shell = Path("scripts/backup-local.sh").read_text(encoding="utf-8")
+    assert 'checkpoint_database = os.getenv("BACKUP_CHECKPOINT", "1") != "0"' in shell
+    assert "checkpoint_database=checkpoint_database" in shell
+
+
 def test_restore_rejects_unsafe_archive_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "unsafe.tar.gz"
     payload = b"owned"

@@ -39,6 +39,7 @@ from app.services.tts.f5_vietnamese_engine import (
 from app.services.tts.text_normalizer import normalize_text
 from app.translation.idiom_correction import clean_translation_layout
 from app.utils.asyncio_bridge import run_coro_sync
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class TTSPipeline:
         self.data_dir = data_dir or settings.resolved_data_dir
         self.engine_factory = engine_factory
         self.legacy_fallback = legacy_fallback
+        self.legacy_artifact_root = settings.artifact_legacy_root
 
     def generate_chapter(
         self,
@@ -342,11 +344,21 @@ class TTSPipeline:
             list_chapters(self.db_path, book_id),
             key=lambda item: int(item.get("chapter_number") or 0),
         )
-        chapter_paths = [
-            Path(ch["audio_path"])
-            for ch in chapter_rows
-            if ch.get("audio_path") and Path(ch["audio_path"]).exists()
-        ]
+        chapter_paths: list[Path] = []
+        for chapter in chapter_rows:
+            if not chapter.get("audio_path"):
+                continue
+            try:
+                chapter_paths.append(
+                    require_artifact_file(
+                        chapter["audio_path"],
+                        artifact_class=ArtifactClass.AUDIO,
+                        data_root=self.data_dir,
+                        old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+                    )
+                )
+            except ArtifactPathError:
+                continue
         output_path = self.data_dir / "audio" / f"book{book_id}_{job_id or uuid.uuid4().hex[:8]}.m4b"
         result = merge_book_m4b(
             chapter_paths,
@@ -463,8 +475,14 @@ class TTSPipeline:
         path_value = chapter.get("translated_text_path")
         if not path_value:
             return ""
-        path = Path(path_value)
-        if not path.exists():
+        try:
+            path = require_artifact_file(
+                path_value,
+                artifact_class=ArtifactClass.TRANSLATED,
+                data_root=self.data_dir,
+                old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+            )
+        except ArtifactPathError:
             return ""
         return clean_translation_layout(path.read_text(encoding="utf-8"))
 
@@ -675,10 +693,14 @@ class TTSPipeline:
         raw = str(value or "").strip()
         if not raw:
             return None
-        path = Path(raw)
-        if not path.exists():
-            return None
-        if path.is_dir():
+        try:
+            path = require_artifact_file(
+                raw,
+                artifact_class=ArtifactClass.AUDIO,
+                data_root=self.data_dir,
+                old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+            )
+        except ArtifactPathError:
             return None
         if path.stat().st_size <= 0:
             return None

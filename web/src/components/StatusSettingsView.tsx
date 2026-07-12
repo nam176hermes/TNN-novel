@@ -61,8 +61,11 @@ function statusRows(status: SystemStatus) {
       `${interruptedJobs.toLocaleString()} interrupted · ${failedJobs.toLocaleString()} failed`,
     ],
     ['Version', [status.app_version, status.build].filter(Boolean).join(' · ') || '-'],
-    ['Database', status.database_path || 'Ẩn trong public deploy'],
-    ['Data directory', status.data_dir || '-'],
+    ['Database available', yesNo(status.database_available, 'Available', 'Unavailable')],
+    ['Data storage available', yesNo(status.data_directory_available, 'Available', 'Unavailable')],
+    ['Storage health', status.storage_health || 'unknown'],
+    ['Storage label', status.storage_label || 'Configured data storage'],
+    ['Data size', formatBytes(status.data_size_bytes)],
     ['Cache', `${status.cache_count.toLocaleString()} mục · ${formatBytes(status.cache_size_bytes)}`],
     ['Database size', formatBytes(status.db_size_bytes)],
   ];

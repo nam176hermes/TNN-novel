@@ -2,21 +2,27 @@
 
 System backup is separate from Book Export. Use book export for reader-facing EPUB/TXT/DOCX/audio files. Use system backup for operational recovery.
 
-This app stores personal data under `/home/thenam176/novel_pipeline/data` by default. Backups are written to `/home/thenam176/novel_pipeline/backups` unless `BACKUP_DIR` or `--out-dir` is set.
+The configured data tree defaults to `$REPO_ROOT/data`. Backups default to `$REPO_ROOT/backups` unless `BACKUP_DIR` or `--out-dir` is set. Resolve these variables before running operator commands:
+
+```bash
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+export DATA_DIR="${DATA_DIR:-$REPO_ROOT/data}"
+cd "$REPO_ROOT"
+```
 
 ## Create a Backup
 
 Plain local backup:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 scripts/backup-local.sh
 ```
 
 Keep only the newest local backups:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 BACKUP_KEEP=14 scripts/backup-local.sh
 ```
 
@@ -60,21 +66,21 @@ The manifest records:
 Use encryption for private backups that include secrets or leave the machine:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 BACKUP_PASSPHRASE='use-a-long-passphrase' ENCRYPT_BACKUP=1 scripts/backup-local.sh
 ```
 
 Encrypted backups can use the same retention policy:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 BACKUP_PASSPHRASE='use-a-long-passphrase' ENCRYPT_BACKUP=1 BACKUP_KEEP=14 scripts/backup-local.sh
 ```
 
 To include `.env`, use encryption and opt in explicitly:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 BACKUP_PASSPHRASE='use-a-long-passphrase' ENCRYPT_BACKUP=1 INCLUDE_ENV=1 scripts/backup-local.sh
 ```
 
@@ -101,14 +107,14 @@ Run a restore drill regularly. It unpacks or decrypts a backup into a separate d
 Plain backup drill:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 .venv/bin/python scripts/ops.py restore-drill backups/novel-pipeline-backup-YYYYMMDD-HHMMSS.tar.gz
 ```
 
 Encrypted backup drill:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 BACKUP_PASSPHRASE='use-a-long-passphrase' \
 .venv/bin/python scripts/ops.py restore-drill backups/novel-pipeline-backup-YYYYMMDD-HHMMSS.tar.gz.enc
 ```
@@ -130,7 +136,7 @@ Monthly:  restore-drill the newest plain and encrypted backup
 Stop the server before replacing `data/`:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 scripts/stop-local.sh
 ```
 

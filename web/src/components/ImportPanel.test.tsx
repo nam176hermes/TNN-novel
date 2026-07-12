@@ -305,7 +305,7 @@ describe('ImportPanel', () => {
 
     render(
       <Panel
-        ebookInboxDirectory="/home/thenam176/novel_pipeline/inbox/ebooks"
+        ebookInboxDirectory="/srv/novel-tnn/inbox/ebooks"
         onCancel={() => undefined}
         onImportPaste={() => undefined}
         onPreviewTranslatedEbook={onPreviewTranslatedEbook}
@@ -394,7 +394,7 @@ describe('ImportPanel', () => {
 
     render(
       <Panel
-        ebookInboxDirectory="/home/thenam176/novel_pipeline/inbox/ebooks"
+        ebookInboxDirectory="/srv/novel-tnn/inbox/ebooks"
         ebookInboxFiles={[{ name: 'translated-from-inbox.epub', size: 130 * 1024 * 1024, modified_at: '2026-06-27T00:00:00Z' }]}
         onCancel={() => undefined}
         onImportPaste={() => undefined}

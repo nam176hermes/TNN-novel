@@ -35,10 +35,14 @@ from app.mobile_api.services.audio_service import AudioService
 from app.mobile_api.services.pipeline_service import PipelineService
 
 
+LEGACY_ROOT = Path("/legacy/novel-pipeline")
+
+
 def make_pipeline(db_path: Path, data_dir: Path) -> PipelineService:
     pipeline = object.__new__(PipelineService)
     pipeline.db_path = db_path
     pipeline.data_dir = data_dir
+    pipeline.legacy_artifact_root = None
     return pipeline
 
 
@@ -468,6 +472,109 @@ async def test_audio_playlist_returns_client_urls_without_local_paths(
         }
     ]
     assert "audio_path" not in payload["chapters"][0]
+
+
+@pytest.mark.asyncio
+async def test_reader_cover_and_audio_resolve_exact_legacy_artifact_paths(
+    override_books_pipeline: PipelineService,
+    tmp_path: Path,
+) -> None:
+    pipeline = override_books_pipeline
+    pipeline.legacy_artifact_root = LEGACY_ROOT
+    for directory in ("raw", "translated", "audio", "covers"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    raw_target = tmp_path / "raw" / "chapter.txt"
+    translated_target = tmp_path / "translated" / "chapter.txt"
+    html_target = tmp_path / "translated" / "chapter.html"
+    audio_target = tmp_path / "audio" / "chapter.mp3"
+    cover_target = tmp_path / "covers" / "cover.jpg"
+    raw_target.write_text("原文章节", encoding="utf-8")
+    translated_target.write_text("Bản dịch chương", encoding="utf-8")
+    html_target.write_text("<p>Bản dịch chương</p>", encoding="utf-8")
+    audio_target.write_bytes(b"fake mp3")
+    cover_target.write_bytes(b"cover")
+
+    book_id = add_book(
+        pipeline.db_path,
+        "Legacy Artifacts",
+        cover_path=str(LEGACY_ROOT / "data/covers/cover.jpg"),
+    )
+    chapter_id = add_chapter(
+        pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=LEGACY_ROOT / "data/raw/chapter.txt",
+    )
+    update_chapter_paths(
+        pipeline.db_path,
+        chapter_id,
+        translated_text_path=LEGACY_ROOT / "data/translated/chapter.txt",
+        content_html_path=LEGACY_ROOT / "data/translated/chapter.html",
+        audio_path=LEGACY_ROOT / "data/audio/chapter.mp3",
+        status="audio_done",
+    )
+    app.dependency_overrides[audio_router.get_audio_service] = lambda: AudioService(pipeline)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            source = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+            translation = await client.get(
+                f"/api/books/{book_id}/chapters/{chapter_id}/translation", headers=headers
+            )
+            content = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/content", headers=headers)
+            audio = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/audio", headers=headers)
+            download = await client.get(
+                f"/api/books/{book_id}/chapters/{chapter_id}/audio/download", headers=headers
+            )
+    finally:
+        app.dependency_overrides.pop(audio_router.get_audio_service, None)
+
+    assert source.json() == {"text": "原文章节", "chapter_id": chapter_id, "missing": False}
+    assert translation.json() == {"text": "Bản dịch chương", "chapter_id": chapter_id, "missing": False}
+    assert content.json() == {
+        "chapter_id": chapter_id,
+        "text": "Bản dịch chương",
+        "html": "<p>Bản dịch chương</p>",
+    }
+    assert audio.status_code == 200 and audio.content == b"fake mp3"
+    assert download.status_code == 200 and download.content == b"fake mp3"
+    assert pipeline.get_book(book_id)["cover_url"] == "/covers/cover.jpg"
+    combined = source.text + translation.text + content.text
+    assert str(LEGACY_ROOT) not in combined
+    assert str(tmp_path) not in combined
+
+
+@pytest.mark.asyncio
+async def test_reader_distinguishes_missing_file_and_outside_root(
+    override_books_pipeline: PipelineService,
+) -> None:
+    pipeline = override_books_pipeline
+    pipeline.legacy_artifact_root = LEGACY_ROOT
+    book_id = add_book(pipeline.db_path, "Invalid Artifacts")
+    chapter_id = add_chapter(
+        pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=LEGACY_ROOT / "data/raw/missing.txt",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        missing = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+        with get_connection(pipeline.db_path) as conn:
+            conn.execute("UPDATE chapters SET raw_text_path = '/etc/passwd' WHERE id = ?", (chapter_id,))
+            conn.commit()
+        outside = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+
+    assert missing.status_code == 200
+    assert missing.json()["missing_reason"] == "file_missing"
+    assert outside.status_code == 403
+    assert outside.json()["detail"] == "Artifact path outside allowed root"
+    assert "/etc/passwd" not in outside.text
 
 
 def test_audio_playlist_openapi_documents_client_url_payload() -> None:

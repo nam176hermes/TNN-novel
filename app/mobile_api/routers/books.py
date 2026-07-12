@@ -25,6 +25,7 @@ from app.mobile_api.schemas import (
 )
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.upload_limits import read_upload_bytes_limited
+from app.storage.artifact_paths import ArtifactPathError, ResolutionStatus
 
 router = APIRouter(prefix="/api", tags=["books"])
 logger = logging.getLogger(__name__)
@@ -38,6 +39,11 @@ READER_DICTIONARY_MEDIA_TYPES = {
     ".txt": "text/plain; charset=utf-8",
     ".u8": "text/plain; charset=utf-8",
 }
+
+
+def _artifact_http_exception(exc: ArtifactPathError) -> HTTPException:
+    status_code = 403 if exc.status is ResolutionStatus.OUTSIDE_ALLOWED_ROOT else 404
+    return HTTPException(status_code=status_code, detail=str(exc))
 
 
 def get_pipeline():
@@ -541,7 +547,12 @@ async def get_chapter_source(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    text = pipeline.get_chapter_source(chapter_id)
+    try:
+        text = pipeline.get_chapter_source(chapter_id)
+    except ArtifactPathError as exc:
+        if exc.status is ResolutionStatus.FILE_MISSING:
+            return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
+        raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
     return {"text": text, "chapter_id": chapter_id, "missing": False}
@@ -556,7 +567,12 @@ async def get_chapter_translation(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    text = pipeline.get_chapter_translation(chapter_id)
+    try:
+        text = pipeline.get_chapter_translation(chapter_id)
+    except ArtifactPathError as exc:
+        if exc.status is ResolutionStatus.FILE_MISSING:
+            return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
+        raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
     return {"text": text, "chapter_id": chapter_id, "missing": False}
@@ -571,7 +587,10 @@ async def get_chapter_content(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    content = pipeline.get_chapter_content(chapter_id)
+    try:
+        content = pipeline.get_chapter_content(chapter_id)
+    except ArtifactPathError as exc:
+        raise _artifact_http_exception(exc) from exc
     if content is None:
         raise HTTPException(status_code=404, detail="Translation not found")
     return {"chapter_id": chapter_id, **content}

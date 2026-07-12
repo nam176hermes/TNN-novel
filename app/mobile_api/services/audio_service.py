@@ -6,6 +6,7 @@ from pathlib import Path
 from mutagen import File as MutagenFile
 
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 
 def audio_duration_seconds(audio_path: Path) -> float:
@@ -27,8 +28,7 @@ class AudioService:
         chapter = self.pipeline.get_chapter(chapter_id)
         if not chapter or not chapter.get("audio_path"):
             return None
-        path = Path(chapter["audio_path"])
-        return path if path.exists() else None
+        return self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
 
     def stream_audio(self, chapter_id: int):
         """Yield audio file in chunks for streaming."""
@@ -63,8 +63,11 @@ class AudioService:
         order = 0
         for chapter in chapters:
             if chapter.get("audio_path"):
-                audio_path = Path(chapter["audio_path"])
-                if audio_path.exists():
+                try:
+                    audio_path = self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
+                except ArtifactPathError:
+                    continue
+                if audio_path.is_file():
                     chapter_id = chapter["id"]
                     playlist.append({
                         "chapter_id": chapter_id,

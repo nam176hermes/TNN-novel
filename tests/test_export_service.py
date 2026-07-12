@@ -90,6 +90,29 @@ def test_export_service_sanitizes_export_filename(temp_db_path: Path, tmp_path: 
     assert exported["filename"] == "Ph_m_Nh_n.txt"
 
 
+def test_export_service_resolves_legacy_translated_path(temp_db_path: Path, tmp_path: Path) -> None:
+    init_db(temp_db_path)
+    translated = tmp_path / "translated" / "chapter.txt"
+    translated.parent.mkdir(parents=True)
+    translated.write_text("Bản dịch được phục hồi", encoding="utf-8")
+    book_id = add_book(temp_db_path, "Legacy Export")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
+    old_root = Path("/legacy/novel-pipeline")
+    update_chapter_paths(
+        temp_db_path,
+        chapter_id,
+        translated_text_path=old_root / "data/translated/chapter.txt",
+        status="translated",
+    )
+    service = make_export_service(temp_db_path, tmp_path)
+    service.pipeline.legacy_artifact_root = old_root
+
+    exported = service.export_book(book_id, "txt")
+
+    assert exported["chapter_count"] == 1
+    assert "Bản dịch được phục hồi" in Path(exported["path"]).read_text(encoding="utf-8")
+
+
 def test_export_service_embeds_book_cover_in_epub(temp_db_path: Path, tmp_path: Path) -> None:
     book_id = seed_translated_book(temp_db_path, tmp_path)
     cover_path = tmp_path / "cover.png"

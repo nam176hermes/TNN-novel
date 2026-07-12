@@ -10,6 +10,7 @@ from app.export.epub_exporter import export_epub
 from app.export.m4b_exporter import export_m4b
 from app.export.text_exporter import export_txt
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 
 EXPORT_FORMATS = {"txt", "docx", "epub"}
@@ -49,19 +50,31 @@ class ExportService:
 
     def translated_chapters(self, book_id: int) -> list[dict]:
         chapters = self.pipeline.list_chapters(book_id)
-        return [
-            chapter
-            for chapter in chapters
-            if chapter.get("translated_text_path") and Path(chapter["translated_text_path"]).exists()
-        ]
+        resolved: list[dict] = []
+        for chapter in chapters:
+            if not chapter.get("translated_text_path"):
+                continue
+            try:
+                path = self.pipeline.resolve_artifact_file(
+                    chapter["translated_text_path"], ArtifactClass.TRANSLATED
+                )
+            except ArtifactPathError:
+                continue
+            resolved.append({**chapter, "translated_text_path": str(path)})
+        return resolved
 
     def audio_chapters(self, book_id: int) -> list[dict]:
         chapters = self.pipeline.list_chapters(book_id)
-        return [
-            chapter
-            for chapter in chapters
-            if chapter.get("audio_path") and Path(chapter["audio_path"]).exists()
-        ]
+        resolved: list[dict] = []
+        for chapter in chapters:
+            if not chapter.get("audio_path"):
+                continue
+            try:
+                path = self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
+            except ArtifactPathError:
+                continue
+            resolved.append({**chapter, "audio_path": str(path)})
+        return resolved
 
     @staticmethod
     def _empty_annotation_kind_counts() -> dict[str, int]:
@@ -232,12 +245,18 @@ class ExportService:
         elif export_format == "docx":
             export_docx(book["title"], book.get("author", ""), chapters, output_path)
         else:
+            cover_path = None
+            if book.get("cover_path"):
+                try:
+                    cover_path = self.pipeline.resolve_artifact_file(book["cover_path"], ArtifactClass.COVER)
+                except ArtifactPathError:
+                    cover_path = None
             export_epub(
                 book["title"],
                 book.get("author", ""),
                 chapters,
                 output_path,
-                cover_path=book.get("cover_path") or None,
+                cover_path=cover_path,
             )
 
         size_bytes = output_path.stat().st_size

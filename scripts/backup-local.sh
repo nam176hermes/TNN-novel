@@ -37,6 +37,8 @@ include_env = os.getenv("INCLUDE_ENV", "0") == "1"
 include_audio = os.getenv("BACKUP_INCLUDE_AUDIO", "1") != "0"
 include_exports = os.getenv("BACKUP_INCLUDE_EXPORTS", "0") == "1"
 include_job_logs = os.getenv("BACKUP_INCLUDE_JOB_LOGS", "0") == "1"
+record_event = os.getenv("BACKUP_RECORD_EVENT", "1") != "0"
+checkpoint_database = os.getenv("BACKUP_CHECKPOINT", "1") != "0"
 keep_raw = os.getenv("BACKUP_KEEP", "").strip()
 keep = int(keep_raw) if keep_raw else None
 
@@ -47,6 +49,8 @@ backup_path = create_backup(
     include_audio=include_audio,
     include_exports=include_exports,
     include_job_logs=include_job_logs,
+    record_event=record_event,
+    checkpoint_database=checkpoint_database,
 )
 
 if os.getenv("ENCRYPT_BACKUP", "0") == "1":
@@ -61,29 +65,6 @@ if os.getenv("ENCRYPT_BACKUP", "0") == "1":
 
 if keep is not None:
     rotate_backup_files(BACKUP_DIR, keep=keep)
-
-try:
-    from app.database.db import record_operational_event
-
-    db_path = data_dir / "pipeline.db"
-    if db_path.exists():
-        record_operational_event(
-            db_path,
-            event_type="backup_success",
-            severity="info",
-            source="backup-local",
-            message="Backup completed",
-            details={
-                "backup_name": backup_path.name,
-                "encrypted": backup_path.name.endswith(".enc"),
-                "include_audio": include_audio,
-                "include_exports": include_exports,
-                "include_job_logs": include_job_logs,
-                "include_secrets": include_env,
-            },
-        )
-except Exception:
-    pass
 
 try:
     backup_path.chmod(0o600)

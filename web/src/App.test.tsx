@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
@@ -201,12 +201,14 @@ describe('App', () => {
         body: JSON.stringify({ refresh_token: 'stored-refresh' }),
       }),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:7860/api/providers',
-      expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: 'Bearer fresh-access' }),
-      }),
-    );
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:7860/api/providers',
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer fresh-access' }),
+        }),
+      );
+    });
   });
 
   it('logs out locally and returns to the login screen', async () => {

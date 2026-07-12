@@ -40,12 +40,11 @@ def _api_tts_job_payload(job: dict[str, Any], *, request: Request) -> dict[str, 
     payload = dict(job)
     resolved_job_id = str(payload.get("job_id") or payload.get("id") or "")
     payload.pop("report_json_path", None)
-    output_mp3_raw = str(payload.pop("output_mp3_path", "") or "").strip()
-    output_m4b_raw = str(payload.pop("output_m4b_path", "") or "").strip()
-    output_mp3_path = Path(output_mp3_raw) if output_mp3_raw else None
-    output_m4b_path = Path(output_m4b_raw) if output_m4b_raw else None
-    payload["output_mp3_ready"] = bool(output_mp3_path and output_mp3_path.exists() and output_mp3_path.is_file() and output_mp3_path.stat().st_size > 0)
-    payload["output_m4b_ready"] = bool(output_m4b_path and output_m4b_path.exists() and output_m4b_path.is_file() and output_m4b_path.stat().st_size > 0)
+    payload.pop("output_mp3_path", None)
+    payload.pop("output_m4b_path", None)
+    audio_summary = payload.get("audio_summary") if isinstance(payload.get("audio_summary"), dict) else {}
+    payload["output_mp3_ready"] = bool(audio_summary.get("output_mp3_ready"))
+    payload["output_m4b_ready"] = bool(audio_summary.get("output_m4b_ready"))
     if resolved_job_id:
         payload["output_mp3_download_url"] = _tts_download_url(resolved_job_id, "mp3")
         payload["output_m4b_download_url"] = _tts_download_url(resolved_job_id, "m4b")

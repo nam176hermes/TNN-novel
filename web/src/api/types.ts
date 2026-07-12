@@ -203,14 +203,17 @@ export type SystemStatus = {
   }>;
   app_version: string;
   build: string;
-  database_path: string;
+  database_available: boolean;
+  data_directory_available: boolean;
+  data_size_bytes: number;
+  storage_health: string;
+  storage_label: string;
   backup_recommendation: string;
   db_size_bytes: number;
   cache_count: number;
   cache_size_bytes: number;
   ollama_host: string;
   ollama_model: string;
-  data_dir: string;
 };
 
 export type ExportFormat = 'txt' | 'docx' | 'epub';

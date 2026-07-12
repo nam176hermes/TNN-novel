@@ -16,8 +16,9 @@ const status: SystemStatus = {
   build: 'phase1',
   cache_count: 4,
   cache_size_bytes: 2048,
-  data_dir: '/home/thenam176/novel_pipeline/data',
-  database_path: '/home/thenam176/novel_pipeline/data/pipeline.db',
+  data_directory_available: true,
+  data_size_bytes: 8192,
+  database_available: true,
   db_size_bytes: 4096,
   last_failed_job: {
     job_id: 'job-restarted',
@@ -37,6 +38,8 @@ const status: SystemStatus = {
   interrupted_jobs: 0,
   failed_jobs: 1,
   upload_max_bytes: 104857600,
+  storage_health: 'healthy',
+  storage_label: 'Configured data storage',
 };
 
 const latestBackup: SystemBackupItem = {
@@ -81,7 +84,10 @@ describe('StatusSettingsView', () => {
 
     const failedJob = screen.getByRole('region', { name: 'Job lỗi gần nhất' });
     expect(within(failedJob).getByText('Server đã restart khi job đang chạy. Hãy chạy lại job.')).toBeVisible();
-    expect(screen.getByText('/home/thenam176/novel_pipeline/data/pipeline.db')).toBeVisible();
+    expect(screen.getByText('Database available')).toBeVisible();
+    expect(screen.getByText('Data storage available')).toBeVisible();
+    expect(screen.getByText('Configured data storage')).toBeVisible();
+    expect(screen.queryByText(/\/home\/|\/mnt\/|[A-Z]:\\/)).not.toBeInTheDocument();
     expect(screen.getByText(/System backup is separate from book export/)).toBeVisible();
     expect(screen.queryByText(/api[_-]?key/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/sk-test|top-secret|provider-secret/i)).not.toBeInTheDocument();

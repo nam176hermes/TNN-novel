@@ -7,7 +7,8 @@ Personal runbook for running the Novel Pipeline FastAPI backend and P4 operator 
 From the project checkout:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 python3.11 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
@@ -24,14 +25,14 @@ Minimum personal-use values:
 MOBILE_API_SECRET=replace-with-a-long-random-secret
 MOBILE_API_ADMIN_USERNAME=admin
 MOBILE_API_ADMIN_PASSWORD=replace-this-password
-DATA_DIR=/home/thenam176/novel_pipeline/data
+DATA_DIR="$REPO_ROOT/data"
 ```
 
 Build the dashboard when serving everything from the backend:
 
 ```bash
 npm --prefix web run build
-MOBILE_API_SERVE_WEB=1 WEB_DIST_DIR=/home/thenam176/novel_pipeline/web/dist python -m app.mobile_api
+MOBILE_API_SERVE_WEB=1 WEB_DIST_DIR="$REPO_ROOT/web/dist" python -m app.mobile_api
 ```
 
 `python -m app.mobile_api` loads `.env` from the project root before reading
@@ -71,7 +72,7 @@ npm --prefix web test
 npm --prefix web run build
 python -m compileall -q app scripts tests
 python -m pytest -q -s
-MOBILE_API_SERVE_WEB=1 WEB_DIST_DIR=/home/thenam176/novel_pipeline/web/dist python -m app.mobile_api
+MOBILE_API_SERVE_WEB=1 WEB_DIST_DIR="$REPO_ROOT/web/dist" python -m app.mobile_api
 ```
 
 Open `http://127.0.0.1:7860/`.
@@ -135,7 +136,7 @@ stops local dev services, starts FastAPI on `127.0.0.1:7860`, and verifies both
 Build the dashboard first:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 npm --prefix web ci
 npm --prefix web run build
 ```
@@ -210,7 +211,7 @@ System status is at `/api/system/status` after login.
 Reader browser smoke:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+cd "$REPO_ROOT"
 .venv/bin/python scripts/smoke_reader_page.py
 ```
 

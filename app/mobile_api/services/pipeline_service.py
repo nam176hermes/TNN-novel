@@ -78,6 +78,8 @@ from app.translation.presets import get_translation_preset
 from app.translation.pronoun_memory import render_pronoun_memory
 from app.scheduler.daily_queue import get_pending_chapters, get_failed_chapters
 from app.mobile_api.dependencies import get_data_dir, get_db_path
+from app.config import settings
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
 
 
 logger = logging.getLogger(__name__)
@@ -2103,6 +2105,7 @@ class PipelineService:
     def __init__(self):
         self.data_dir = get_data_dir()
         self.db_path = get_db_path()
+        self.legacy_artifact_root = settings.artifact_legacy_root
 
     @staticmethod
     def _safe_filename_part(value: str) -> str:
@@ -2118,12 +2121,27 @@ class PipelineService:
         if not cover_path:
             return ""
         covers_dir = self.data_dir / "covers"
-        path = Path(cover_path)
+        try:
+            path = self.resolve_artifact_file(cover_path, ArtifactClass.COVER)
+        except ArtifactPathError:
+            return ""
         try:
             relative_path = path.relative_to(covers_dir)
         except ValueError:
             return ""
         return f"/covers/{relative_path.as_posix()}"
+
+    def resolve_artifact_file(self, value: str | Path | None, artifact_class: ArtifactClass) -> Path:
+        data_root = getattr(self, "data_dir", None)
+        if data_root is None:
+            database_path = getattr(self, "db_path", None)
+            data_root = Path(database_path).resolve().parent if database_path is not None else settings.resolved_data_dir
+        return require_artifact_file(
+            value,
+            artifact_class=artifact_class,
+            data_root=data_root,
+            old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+        )
 
     def _book_cover_extension(self, filename: str, content_type: str) -> str:
         normalized_type = content_type.lower().split(";", 1)[0].strip()
@@ -2498,18 +2516,14 @@ class PipelineService:
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or not chapter.get("raw_text_path"):
             return None
-        path = Path(chapter["raw_text_path"])
-        if not path.exists():
-            return None
+        path = self.resolve_artifact_file(chapter["raw_text_path"], ArtifactClass.RAW)
         return clean_translation_layout(path.read_text(encoding="utf-8"))
 
     def get_chapter_translation(self, chapter_id: int) -> str | None:
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or not chapter.get("translated_text_path"):
             return None
-        path = Path(chapter["translated_text_path"])
-        if not path.exists():
-            return None
+        path = self.resolve_artifact_file(chapter["translated_text_path"], ArtifactClass.TRANSLATED)
         return path.read_text(encoding="utf-8")
 
     def get_chapter_content(self, chapter_id: int) -> dict | None:
@@ -2519,9 +2533,8 @@ class PipelineService:
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         html = ""
         if chapter and chapter.get("content_html_path"):
-            path = Path(chapter["content_html_path"])
-            if path.exists():
-                html = path.read_text(encoding="utf-8")
+            path = self.resolve_artifact_file(chapter["content_html_path"], ArtifactClass.HTML)
+            html = path.read_text(encoding="utf-8")
         return {"text": text, "html": html}
 
     # Reader state

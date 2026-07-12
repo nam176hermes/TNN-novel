@@ -19,8 +19,8 @@ MOBILE_API_ADMIN_PASSWORD=<strong-password>
 MOBILE_API_CORS_ORIGINS=https://YOUR_DOMAIN
 MOBILE_API_UPLOAD_MAX_BYTES=104857600
 MOBILE_API_SERVE_WEB=1
-WEB_DIST_DIR=/home/thenam176/novel_pipeline/web/dist
-DATA_DIR=/home/thenam176/novel_pipeline/data
+WEB_DIST_DIR="$REPO_ROOT/web/dist"
+DATA_DIR="$DATA_DIR"
 ```
 
 Generate strong local values instead of reusing examples:
@@ -83,9 +83,9 @@ Do not expose the FastAPI port directly to the public internet unless it is behi
 Never configure nginx, Apache, Cloudflare Pages, or any static file server to serve:
 
 ```text
-/home/thenam176/novel_pipeline/data/
-/home/thenam176/novel_pipeline/data/covers/
-/home/thenam176/novel_pipeline/data/book_assets/
+$DATA_DIR/
+$DATA_DIR/covers/
+$DATA_DIR/book_assets/
 ```
 
 Covers and rich ebook assets must go through FastAPI routes:
@@ -382,7 +382,8 @@ Operational events intentionally avoid raw provider keys, stack traces, and priv
 Run a backup before upgrades, migrations, large imports, or public deployment changes:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 scripts/backup-local.sh
 ```
 
@@ -392,7 +393,7 @@ Keep only the newest local backups:
 BACKUP_KEEP=14 scripts/backup-local.sh
 ```
 
-This creates a tarball under `/home/thenam176/novel_pipeline/backups/` unless `BACKUP_DIR` is set. It contains:
+This creates a tarball under `$REPO_ROOT/backups/` unless `BACKUP_DIR` is set. It contains:
 
 - a consistent SQLite backup of `data/pipeline.db`
 - imported raw/cleaned/translated text

@@ -308,8 +308,11 @@ async def test_public_host_status_import_and_export_hide_local_paths(
 
     assert status.status_code == 200
     status_data = status.json()
-    assert status_data["data_dir"] == ""
-    assert status_data["database_path"] == ""
+    assert "data_dir" not in status_data
+    assert "database_path" not in status_data
+    assert status_data["database_available"] is True
+    assert status_data["data_directory_available"] is True
+    assert status_data["storage_label"] == "Configured data storage"
     assert status_data["ollama_host"] == ""
     assert imported.status_code == 200
     assert imported.json()["path"] == ""

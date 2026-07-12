@@ -243,6 +243,8 @@ def create_backup(
     include_job_logs: bool = False,
     label: str | None = None,
     keep: int | None = None,
+    record_event: bool = True,
+    checkpoint_database: bool = True,
 ) -> Path:
     source_dir = (data_dir or resolve_data_dir()).resolve()
     if not source_dir.exists():
@@ -251,7 +253,8 @@ def create_backup(
     destination_dir = (out_dir or DEFAULT_BACKUP_DIR).resolve()
     destination_dir.mkdir(parents=True, exist_ok=True)
 
-    sqlite_checkpoint(source_dir / "pipeline.db")
+    if checkpoint_database:
+        sqlite_checkpoint(source_dir / "pipeline.db")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = f"-{label}" if label else ""
     backup_path = destination_dir / f"novel-pipeline-backup-{stamp}{suffix}.tar.gz"
@@ -301,7 +304,8 @@ def create_backup(
         db_exists = live_db_path.exists()
         db_size_bytes = 0
         if db_exists:
-            with sqlite3.connect(str(live_db_path)) as src, sqlite3.connect(str(db_copy_path)) as dst:
+            live_db_uri = f"file:{live_db_path.resolve()}?mode=ro"
+            with sqlite3.connect(live_db_uri, uri=True) as src, sqlite3.connect(str(db_copy_path)) as dst:
                 src.backup(dst)
             db_size_bytes = db_copy_path.stat().st_size
             copied_files += 1
@@ -390,7 +394,7 @@ def create_backup(
         rotate_backup_files(destination_dir, keep=keep)
 
     db_path = source_dir / "pipeline.db"
-    if db_path.exists():
+    if record_event and db_path.exists():
         try:
             from app.database.db import record_operational_event
 
@@ -1031,6 +1035,16 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--include-env", action="store_true", help="Include .env in the archive")
     backup.add_argument("--label", default=None, help="Optional filename suffix")
     backup.add_argument("--keep", type=int, default=None, help="Keep only the newest N local backups after creating one")
+    backup.add_argument(
+        "--no-record-event",
+        action="store_true",
+        help="Do not write a backup event to the source database",
+    )
+    backup.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Do not checkpoint the source WAL before the SQLite backup API copy",
+    )
 
     restore = subparsers.add_parser("restore", help="Restore data/ from a backup archive")
     restore.add_argument("archive", type=Path)
@@ -1116,6 +1130,8 @@ def main(argv: list[str] | None = None) -> int:
             include_env=args.include_env,
             label=args.label,
             keep=args.keep,
+            record_event=not args.no_record_event,
+            checkpoint_database=not args.no_checkpoint,
         )
         print(backup_path)
         return 0

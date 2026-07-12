@@ -5,17 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=thenam176
-Group=thenam176
-WorkingDirectory=/home/thenam176/novel_pipeline
+User=novel-tnn
+Group=novel-tnn
+WorkingDirectory=/opt/novel-tnn
 EnvironmentFile=/etc/novel-pipeline/novel-pipeline.env
 Environment=PYTHONUNBUFFERED=1
 Environment=MOBILE_API_HOST=0.0.0.0
 Environment=MOBILE_API_PORT=7860
 Environment=MOBILE_API_SERVE_WEB=1
-Environment=WEB_DIST_DIR=/home/thenam176/novel_pipeline/web/dist
-Environment=DATA_DIR=/home/thenam176/novel_pipeline/data
-ExecStart=/home/thenam176/novel_pipeline/.venv/bin/python -m app.mobile_api
+Environment=WEB_DIST_DIR=/opt/novel-tnn/web/dist
+Environment=DATA_DIR=/var/lib/novel-tnn
+ExecStart=/opt/novel-tnn/.venv/bin/python -m app.mobile_api
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

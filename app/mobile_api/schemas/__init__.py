@@ -46,11 +46,15 @@ class VersionResponse(BaseModel):
 
 class SystemStatusResponse(BaseModel):
     db_size_bytes: int = 0
+    data_size_bytes: int = 0
     cache_count: int = 0
     cache_size_bytes: int = 0
     ollama_host: str = ""
     ollama_model: str = ""
-    data_dir: str = ""
+    database_available: bool = False
+    data_directory_available: bool = False
+    storage_health: str = "unknown"
+    storage_label: str = "Configured data storage"
     public_deploy: bool = False
     api_ready: bool = False
     active_provider: str = ""
@@ -68,7 +72,6 @@ class SystemStatusResponse(BaseModel):
     recent_backup_events: list[dict[str, Any]] = Field(default_factory=list)
     app_version: str = ""
     build: str = ""
-    database_path: str = ""
     backup_recommendation: str = ""
 
 

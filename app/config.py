@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     tts_qa_retries: int = 2
 
     data_dir: Path = Path("data")
+    artifact_legacy_root: Path | None = None
     log_level: str = "INFO"
 
     @property

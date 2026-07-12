@@ -148,3 +148,47 @@ async def test_tts_download_endpoint_requires_authentication_and_hides_internal_
     assert unauthenticated.status_code == 401
     assert authenticated.status_code == 200
     assert authenticated.content == b"mp3-bytes"
+
+
+@pytest.mark.asyncio
+async def test_tts_status_and_download_resolve_exact_legacy_output_path(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Legacy TTS")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
+    output_path = tmp_path / "audio" / "tts-output.mp3"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"legacy-mp3")
+    old_root = Path("/legacy/novel-pipeline")
+    now = "2026-07-01T00:00:00+00:00"
+    with __import__("sqlite3").connect(temp_db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO tts_jobs
+            (id, book_id, chapter_id, status, provider, model, progress, output_mp3_path, created_at, updated_at)
+            VALUES ('tts-legacy', ?, ?, 'completed', 'f5_vietnamese', 'vivioice', 100, ?, ?, ?)
+            """,
+            (book_id, chapter_id, str(old_root / "data/audio/tts-output.mp3"), now, now),
+        )
+        conn.commit()
+
+    pipeline = TTSPipeline(temp_db_path, tmp_path)
+    pipeline.legacy_artifact_root = old_root
+    app.dependency_overrides[tts_router.get_tts_pipeline] = lambda: pipeline
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            status = await client.get("/api/tts/jobs/tts-legacy", headers=headers)
+            download = await client.get("/api/tts/jobs/tts-legacy/download", headers=headers)
+    finally:
+        app.dependency_overrides.pop(tts_router.get_tts_pipeline, None)
+
+    assert status.status_code == 200
+    assert status.json()["output_mp3_ready"] is True
+    assert str(old_root) not in status.text
+    assert str(tmp_path) not in status.text
+    assert download.status_code == 200
+    assert download.content == b"legacy-mp3"

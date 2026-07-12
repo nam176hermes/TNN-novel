@@ -17,6 +17,14 @@ PYTHON_CONSUMER_SCRIPTS = (
     "verify.sh",
 )
 
+ACTIVE_OPERATIONAL_FILES = (
+    "deploy/systemd/novel-pipeline.service.example",
+    "docs/backup-restore.md",
+    "docs/deployment-hardening.md",
+    "docs/local-development.md",
+    "docs/operations/P5_RUNBOOK.md",
+)
+
 
 def test_python_resolver_rejects_missing_explicit_interpreter(tmp_path: Path) -> None:
     missing_python = tmp_path / "missing-python"
@@ -50,6 +58,19 @@ def test_scripts_do_not_reference_the_old_repository_root() -> None:
         if not script.is_file():
             continue
         assert "/home/thenam176/novel_pipeline" not in script.read_text(encoding="utf-8")
+
+
+def test_active_operational_files_do_not_reference_the_old_repository_root() -> None:
+    for relative_path in ACTIVE_OPERATIONAL_FILES:
+        content = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "/home/thenam176/novel_pipeline" not in content, relative_path
+
+
+def test_systemd_example_uses_deploy_placeholders_not_personal_paths() -> None:
+    content = (ROOT / "deploy/systemd/novel-pipeline.service.example").read_text(encoding="utf-8")
+
+    assert "WorkingDirectory=/opt/novel-tnn" in content
+    assert "Environment=DATA_DIR=/var/lib/novel-tnn" in content
 
 
 def test_env_example_uses_only_safe_secret_placeholders() -> None:

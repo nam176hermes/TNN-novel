@@ -143,7 +143,11 @@ describe('ApiClient', () => {
       },
       app_version: '0.1.0',
       build: 'phase1',
-      database_path: '',
+      database_available: true,
+      data_directory_available: true,
+      data_size_bytes: 8192,
+      storage_health: 'healthy',
+      storage_label: 'Configured data storage',
       backup_recommendation: 'System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.',
     };
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => status });
@@ -499,7 +503,7 @@ describe('ApiClient', () => {
 
   it('loads, previews, and imports a translated ebook from the server inbox', async () => {
     const inbox = {
-      directory: '/home/thenam176/novel_pipeline/inbox/ebooks',
+      directory: '/srv/novel-tnn/inbox/ebooks',
       files: [{ name: 'translated-from-inbox.epub', size: 130000000, modified_at: '2026-06-27T00:00:00Z' }],
     };
     const preview = {

@@ -90,7 +90,15 @@ async def test_system_status_reports_runtime_without_secrets(
     assert payload["running_jobs"] == 1
     assert payload["last_failed_job"]["job_id"] == failed.job_id
     assert payload["last_failed_job"]["message"] == "Provider failed"
-    assert payload["database_path"] == str(temp_db_path)
+    assert payload["database_available"] is True
+    assert payload["data_directory_available"] is True
+    assert payload["data_size_bytes"] >= payload["db_size_bytes"]
+    assert payload["storage_health"] == "healthy"
+    assert payload["storage_label"] == "Configured data storage"
+    assert "database_path" not in payload
+    assert "data_dir" not in payload
+    assert str(temp_db_path) not in response.text
+    assert str(data_dir) not in response.text
     assert "secret" not in response.text.lower()
     assert "api_key" not in response.text.lower()
 
@@ -159,3 +167,4 @@ async def test_system_status_reports_sanitized_operational_events(
     assert payload["recent_backup_events"][0]["message"] == "Backup completed"
     assert "provider-secret" not in response.text
     assert "sk-test-secret" not in response.text
+    assert "/tmp/" not in response.text

@@ -29,6 +29,8 @@ from app.database.db import (
     get_connection,
 )
 from app.mobile_api.dependencies import get_db_path
+from app.config import settings
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
 
 
 PRIORITY_TERM_TYPE_WEIGHTS = {
@@ -421,8 +423,18 @@ class GlossaryService:
             raise ValueError("Chapter not found")
         raw_path = str(chapter.get("raw_text_path") or "").strip()
         raw_text = ""
-        if raw_path and Path(raw_path).exists():
-            raw_text = Path(raw_path).read_text(encoding="utf-8", errors="replace")
+        if raw_path:
+            try:
+                resolved_raw_path = require_artifact_file(
+                    raw_path,
+                    artifact_class=ArtifactClass.RAW,
+                    data_root=self.db_path.parent,
+                    old_root=settings.artifact_legacy_root,
+                )
+            except ArtifactPathError:
+                resolved_raw_path = None
+            if resolved_raw_path is not None:
+                raw_text = resolved_raw_path.read_text(encoding="utf-8", errors="replace")
         if not raw_text:
             return {"created": 0, "updated": 0, "skipped": 0, "candidates": []}
 
