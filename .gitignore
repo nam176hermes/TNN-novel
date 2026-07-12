@@ -52,6 +52,7 @@ AUDIT_REPORT*.md
 audit_results.txt
 audit_summary.txt
 docs/superpowers/
+.worktrees/
 
 # Local novel/content samples and generated audit artifacts
 chapter_*_zh.txt
