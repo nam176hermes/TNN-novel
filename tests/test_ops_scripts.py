@@ -133,6 +133,203 @@ def test_create_backup_writes_compact_sidecar(tmp_path: Path) -> None:
     assert internal["checksums"][0]["path"] == "data/chapter.txt"
 
 
+def test_create_backup_cancellation_does_not_publish_partial_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter-1.txt").write_text("first", encoding="utf-8")
+    (data_dir / "chapter-2.txt").write_text("second", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    cancel_flag = [False]
+
+    def record_progress(step: str) -> None:
+        if step == "writing":
+            cancel_flag[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            cancel_check=lambda: cancel_flag[0],
+            progress_callback=record_progress,
+        )
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_validation_failure_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    staging_modes: list[int] = []
+    real_chmod = Path.chmod
+
+    def record_staging_mode(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        if ".partial" in path.name:
+            staging_modes.append(mode)
+        real_chmod(path, mode, *args, **kwargs)
+
+    def fail_validation(archive_path: Path) -> dict[str, object]:
+        assert archive_path.parent.parent == backup_dir
+        raise ValueError("validation failed")
+
+    monkeypatch.setattr(Path, "chmod", record_staging_mode)
+    monkeypatch.setattr(ops, "_validate_backup_archive", fail_validation, raising=False)
+
+    with pytest.raises(ValueError, match="validation failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+    assert staging_modes == [0o700]
+
+
+def test_create_backup_cancellation_before_archive_publication_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    cancel_flag = [False]
+
+    def record_progress(step: str) -> None:
+        if step == "publishing":
+            cancel_flag[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            record_event=False,
+            cancel_check=lambda: cancel_flag[0],
+            progress_callback=record_progress,
+        )
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+
+
+def test_create_backup_sidecar_publication_failure_leaves_visible_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_replace = ops.os.replace
+
+    def fail_final_sidecar_replace(source: Path | str, destination: Path | str) -> None:
+        destination_path = Path(destination)
+        if destination_path.parent == backup_dir and destination_path.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
+            raise OSError("sidecar publication failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(ops.os, "replace", fail_final_sidecar_replace)
+
+    with pytest.raises(OSError, match="sidecar publication failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    archives = list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))
+    assert len(archives) == 1
+    assert not ops.backup_sidecar_path(archives[0]).exists()
+    assert ops.list_backups(backup_dir)[0]["metadata_status"] == "METADATA_MISSING"
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_archive_publication_failure_publishes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_replace = ops.os.replace
+
+    def fail_final_archive_replace(source: Path | str, destination: Path | str) -> None:
+        destination_path = Path(destination)
+        if destination_path.parent == backup_dir and destination_path.name.endswith(".tar.gz"):
+            raise OSError("archive publication failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(ops.os, "replace", fail_final_archive_replace)
+
+    with pytest.raises(OSError, match="archive publication failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_encryption_failure_does_not_publish_encrypted_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    archive = ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    def fail_encryption(command: list[str], **_: object) -> None:
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"partial encrypted output")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fail_encryption)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        ops.encrypt_backup_archive(archive, passphrase="secret")
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz.enc")) == []
+    assert list(backup_dir.glob("*.tar.gz.enc.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_backup_listing_ignores_staging_and_partial_publication_names(tmp_path: Path) -> None:
+    (tmp_path / ".novel-pipeline-backup-20260712-100000.tar.gz.staging").mkdir()
+    (tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz.partial").write_bytes(b"partial")
+    (tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz.manifest.json.tmp").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    assert ops.list_backups(tmp_path) == []
+
+
+def test_backup_staging_permission_failure_cleans_owned_publication_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_chmod = Path.chmod
+
+    def fail_staging_chmod(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        if ".partial" in path.name:
+            raise OSError("chmod failed")
+        real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", fail_staging_chmod)
+
+    with pytest.raises(OSError, match="chmod failed"):
+        ops._backup_staging_path(tmp_path, "novel-pipeline-backup-20260712-100000.tar.gz")
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_atomic_sidecar_failure_cleans_temporary_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

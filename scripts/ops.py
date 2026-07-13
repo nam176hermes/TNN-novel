@@ -19,7 +19,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +74,45 @@ class CheckResult:
     ok: bool
     message: str
     severity: str = "error"
+
+
+class BackupCancelled(RuntimeError):
+    pass
+
+
+def _raise_if_backup_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise BackupCancelled("Backup creation was cancelled")
+
+
+def _notify_backup_progress(callback: Callable[[str], None] | None, step: str) -> None:
+    if callback is not None:
+        callback(step)
+
+
+def _backup_staging_path(out_dir: Path, final_name: str) -> Path:
+    staging_path = Path(
+        tempfile.mkdtemp(
+            prefix=f".{final_name}.",
+            suffix=".partial",
+            dir=out_dir,
+        )
+    )
+    try:
+        staging_path.chmod(0o700)
+    except Exception:
+        shutil.rmtree(staging_path)
+        raise
+    return staging_path
+
+
+def _validate_backup_archive(archive_path: Path) -> dict[str, Any]:
+    return _inspect_plain_backup_archive(archive_path)
+
+
+def _fsync_backup_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -273,7 +312,11 @@ def create_backup(
     keep: int | None = None,
     record_event: bool = True,
     checkpoint_database: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> Path:
+    _notify_backup_progress(progress_callback, "preparing")
+    _raise_if_backup_cancelled(cancel_check)
     source_dir = (data_dir or resolve_data_dir()).resolve()
     if not source_dir.exists():
         raise FileNotFoundError(f"Data directory does not exist: {source_dir}")
@@ -297,15 +340,18 @@ def create_backup(
 
     backup_started_at = datetime.now()
     env_file = ROOT / ".env"
-    with tempfile.TemporaryDirectory(prefix="novel-pipeline-backup-") as tmp_root:
-        tmp_root_path = Path(tmp_root)
-        staging_data_dir = tmp_root_path / "data"
+    staging_root = _backup_staging_path(destination_dir, backup_path.name)
+    staging_data_dir = staging_root / "data"
+    staged_archive_path = staging_root / backup_path.name
+    staged_sidecar_path = backup_sidecar_path(staged_archive_path)
+    try:
         staging_data_dir.mkdir(parents=True, exist_ok=True)
 
         copied_files = 0
         total_size = 0
         checksums: list[dict[str, Any]] = []
 
+        _notify_backup_progress(progress_callback, "collecting")
         for source_path in sorted(source_dir.rglob("*")):
             if source_path.is_dir():
                 continue
@@ -314,6 +360,7 @@ def create_backup(
                 continue
             if relative.name in {"pipeline.db", "pipeline.db-wal", "pipeline.db-shm"}:
                 continue
+            _raise_if_backup_cancelled(cancel_check)
             destination = staging_data_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, destination)
@@ -332,6 +379,7 @@ def create_backup(
         db_exists = live_db_path.exists()
         db_size_bytes = 0
         if db_exists:
+            _raise_if_backup_cancelled(cancel_check)
             live_db_uri = f"file:{live_db_path.resolve()}?mode=ro"
             with sqlite3.connect(live_db_uri, uri=True) as src, sqlite3.connect(str(db_copy_path)) as dst:
                 src.backup(dst)
@@ -404,16 +452,43 @@ def create_backup(
         manifest_info.size = len(manifest_bytes)
         manifest_info.mtime = int(time.time())
 
-        with tarfile.open(backup_path, "w:gz") as archive:
-            archive.add(staging_data_dir, arcname="data")
+        _notify_backup_progress(progress_callback, "writing")
+        _raise_if_backup_cancelled(cancel_check)
+        with tarfile.open(staged_archive_path, "w:gz") as archive:
+            archive.add(staging_data_dir, arcname="data", recursive=False)
+            for staged_path in sorted(staging_data_dir.rglob("*")):
+                _raise_if_backup_cancelled(cancel_check)
+                relative = staged_path.relative_to(staging_data_dir)
+                archive.add(
+                    staged_path,
+                    arcname=f"data/{relative.as_posix()}",
+                    recursive=False,
+                )
+            _raise_if_backup_cancelled(cancel_check)
             archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
             env_example = ROOT / ".env.example"
             if env_example.exists():
-                archive.add(env_example, arcname=".env.example")
+                _raise_if_backup_cancelled(cancel_check)
+                archive.add(env_example, arcname=".env.example", recursive=False)
             if include_env and env_file.exists():
-                archive.add(env_file, arcname=".env")
+                _raise_if_backup_cancelled(cancel_check)
+                archive.add(env_file, arcname=".env", recursive=False)
 
-        write_backup_sidecar_atomic(backup_path, build_backup_sidecar(manifest, backup_path))
+        _fsync_backup_file(staged_archive_path)
+        _notify_backup_progress(progress_callback, "validating")
+        _raise_if_backup_cancelled(cancel_check)
+        _validate_backup_archive(staged_archive_path)
+        write_backup_sidecar_atomic(
+            staged_archive_path,
+            build_backup_sidecar(manifest, staged_archive_path),
+        )
+
+        _notify_backup_progress(progress_callback, "publishing")
+        _raise_if_backup_cancelled(cancel_check)
+        os.replace(staged_archive_path, backup_path)
+        os.replace(staged_sidecar_path, backup_sidecar_path(backup_path))
+    finally:
+        shutil.rmtree(staging_root)
 
     if keep is not None:
         rotate_backup_files(destination_dir, keep=keep)
@@ -442,6 +517,8 @@ def encrypt_backup_archive(
     *,
     passphrase: str,
     iterations: int = 200000,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> Path:
     if not passphrase:
         raise ValueError("Backup passphrase is required")
@@ -449,32 +526,50 @@ def encrypt_backup_archive(
         raise RuntimeError("openssl is required for encrypted backups")
     backup_path = backup_path.resolve()
     encrypted_path = backup_path.with_suffix(backup_path.suffix + ".enc")
-    env = {**os.environ, "BACKUP_PASSPHRASE": passphrase}
-    subprocess.run(
-        [
-            "openssl",
-            "enc",
-            "-aes-256-cbc",
-            "-salt",
-            "-pbkdf2",
-            "-iter",
-            str(iterations),
-            "-in",
-            str(backup_path),
-            "-out",
-            str(encrypted_path),
-            "-pass",
-            "env:BACKUP_PASSPHRASE",
-        ],
-        check=True,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
     manifest = read_backup_manifest(backup_path)
-    manifest["encrypted"] = True
-    manifest["secrets_included"] = bool(manifest.get("secrets_included"))
-    write_backup_sidecar_atomic(encrypted_path, build_backup_sidecar(manifest, encrypted_path))
+    staging_root = _backup_staging_path(backup_path.parent, encrypted_path.name)
+    staged_encrypted_path = staging_root / encrypted_path.name
+    staged_sidecar_path = backup_sidecar_path(staged_encrypted_path)
+    try:
+        _notify_backup_progress(progress_callback, "encrypting")
+        _raise_if_backup_cancelled(cancel_check)
+        env = {**os.environ, "BACKUP_PASSPHRASE": passphrase}
+        subprocess.run(
+            [
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-salt",
+                "-pbkdf2",
+                "-iter",
+                str(iterations),
+                "-in",
+                str(backup_path),
+                "-out",
+                str(staged_encrypted_path),
+                "-pass",
+                "env:BACKUP_PASSPHRASE",
+            ],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _fsync_backup_file(staged_encrypted_path)
+        _raise_if_backup_cancelled(cancel_check)
+        manifest["encrypted"] = True
+        manifest["secrets_included"] = bool(manifest.get("secrets_included"))
+        write_backup_sidecar_atomic(
+            staged_encrypted_path,
+            build_backup_sidecar(manifest, staged_encrypted_path),
+        )
+        _notify_backup_progress(progress_callback, "publishing")
+        _raise_if_backup_cancelled(cancel_check)
+        os.replace(staged_encrypted_path, encrypted_path)
+        os.replace(staged_sidecar_path, backup_sidecar_path(encrypted_path))
+    finally:
+        shutil.rmtree(staging_root)
+
     backup_path.unlink(missing_ok=True)
     plain_manifest_path = backup_path.with_suffix(backup_path.suffix + BACKUP_MANIFEST_SUFFIX)
     plain_manifest_path.unlink(missing_ok=True)
@@ -778,6 +873,8 @@ def list_backups(out_dir: Path | None = None) -> list[dict[str, Any]]:
     sidecar_names = {f"{name}{BACKUP_MANIFEST_SUFFIX}" for name in supported_names | orphan_names}
     for path in entries:
         if path.name in supported_names or path.name in sidecar_names:
+            continue
+        if ".partial" in path.name or path.name.endswith(".tmp"):
             continue
         if path.name.startswith("novel-pipeline-backup-"):
             try:
