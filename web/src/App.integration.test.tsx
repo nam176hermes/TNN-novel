@@ -395,7 +395,7 @@ describe('App live data wiring', () => {
         return {
           ok: true,
           body: streamFromText(
-            'data: {"job_id":"job-import-ebook","job_type":"import_ebook","status":"completed","progress":1,"total":1,"message":"Imported 1 translated ebook chapter(s), skipped 0."}\n\n',
+            'data: {"job_id":"job-import-ebook","job_type":"import_ebook","status":"completed","progress":1,"total":1,"message":"Imported 0 translated ebook chapter(s), skipped 1."}\n\n',
           ),
         };
       }
@@ -409,7 +409,7 @@ describe('App live data wiring', () => {
             status: 'completed',
             progress: 1,
             total: 1,
-            message: 'Imported 1 translated ebook chapter(s), skipped 0.',
+            message: 'Imported 0 translated ebook chapter(s), skipped 1.',
           }),
         };
       }
@@ -425,7 +425,7 @@ describe('App live data wiring', () => {
                 status: 'completed',
                 progress: 1,
                 total: 1,
-                message: 'Imported 1 translated ebook chapter(s), skipped 0.',
+                message: 'Imported 0 translated ebook chapter(s), skipped 1.',
               },
             ],
           }),
@@ -486,7 +486,7 @@ describe('App live data wiring', () => {
 
     expect(await screen.findByRole('heading', { name: 'Tác vụ' })).toBeInTheDocument();
     expect(screen.getByText('Đã bắt đầu import ebook. Theo dõi tác vụ job-impo.')).toBeInTheDocument();
-    expect(await screen.findAllByText('Imported 1 translated ebook chapter(s), skipped 0.')).not.toHaveLength(0);
+    expect(await screen.findAllByText('Imported 0 translated ebook chapter(s), skipped 1.')).not.toHaveLength(0);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/import/ebook/job',
       expect.objectContaining({ method: 'POST' }),
@@ -581,6 +581,15 @@ describe('App live data wiring', () => {
     expect(screen.getByRole('heading', { name: 'Ebook bản dịch' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Tác vụ' })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeInTheDocument();
+
+    const retryButton = screen.getByRole('button', { name: 'Preview lại' });
+    expect(retryButton).toBeEnabled();
+    await userEvent.click(retryButton);
+
+    expect(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeChecked();
+    expect(fetchMock.mock.calls.filter(([url, init]) => (
+      String(url).endsWith('/api/import/ebook/preview') && init?.method === 'POST'
+    ))).toHaveLength(2);
   });
 
   it('opens translated library and reader as separate workflow pages', async () => {

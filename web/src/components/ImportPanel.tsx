@@ -261,14 +261,18 @@ function EbookPreviewPanel({
   error,
   file,
   onConfirmedExistingBookIdChange,
+  onRetry,
   preview,
+  retryDisabled,
   state,
 }: {
   confirmedExistingBookId: number | null;
   error: string;
   file: EbookPreviewFile | null;
   onConfirmedExistingBookIdChange: (bookId: number | null) => void;
+  onRetry: () => void;
   preview: EbookPreview | null;
+  retryDisabled: boolean;
   state: EbookPreviewState;
 }) {
   if (!file) {
@@ -276,14 +280,27 @@ function EbookPreviewPanel({
   }
 
   if (state === 'loading') {
-    return <p>Đang đọc metadata và mục lục ebook.</p>;
+    return (
+      <div>
+        <p>Đang đọc metadata và mục lục ebook.</p>
+        <button className="secondary-action" disabled onClick={onRetry} type="button">
+          <Loader2 aria-hidden="true" className="status-spinner" size={15} />
+          Preview lại
+        </button>
+      </div>
+    );
   }
 
   if (state === 'error') {
     return (
-      <p className="status-error" role="alert">
-        {error || 'Không đọc được ebook này.'}
-      </p>
+      <div>
+        <p className="status-error" role="alert">
+          {error || 'Không đọc được ebook này.'}
+        </p>
+        <button className="secondary-action" disabled={retryDisabled} onClick={onRetry} type="button">
+          Preview lại
+        </button>
+      </div>
     );
   }
 
@@ -714,6 +731,16 @@ export default function ImportPanel({
   );
   const existingBookConfirmed = !requiresExistingBookConfirmation
     || (existingBookId !== null && confirmedExistingBookId === existingBookId);
+  const ebookPreviewRetryAvailable =
+    !loading
+    && ebookPreviewState !== 'loading'
+    && (ebookSource === 'inbox'
+      ? Boolean(selectedInboxFile && onPreviewInboxEbook)
+      : Boolean(
+        ebookFile
+        && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES
+        && onPreviewTranslatedEbook,
+      ));
   const titleReady = title.trim().length > 0;
   const pastedTextReady = text.trim().length > 0;
   const wizardDuplicateCount = textPreview?.duplicateChapterNumbers.length ?? 0;
@@ -1187,6 +1214,17 @@ export default function ImportPanel({
       void previewInboxFile(selectedInboxFile, splitMode, nextDuplicateStrategy, targetBookId);
     } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
       void previewEbookFile(ebookFile, splitMode, nextDuplicateStrategy, targetBookId);
+    }
+  }
+
+  function retryEbookPreview(): void {
+    if (!ebookPreviewRetryAvailable) return;
+    if (ebookSource === 'inbox') {
+      void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, targetBookId);
+      return;
+    }
+    if (ebookFile) {
+      void previewEbookFile(ebookFile, splitMode, duplicateStrategy, targetBookId);
     }
   }
 
@@ -1973,7 +2011,9 @@ export default function ImportPanel({
                 error={ebookPreviewError}
                 file={selectedEbookFile}
                 onConfirmedExistingBookIdChange={setConfirmedExistingBookId}
+                onRetry={retryEbookPreview}
                 preview={ebookPreview}
+                retryDisabled={!ebookPreviewRetryAvailable}
                 state={ebookPreviewState}
               />
             </section>

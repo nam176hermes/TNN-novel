@@ -271,6 +271,52 @@ describe('ImportPanel', () => {
     });
   });
 
+  it('retries the retained upload after an import conflict with the current preview options', async () => {
+    let resolveRetryPreview!: (preview: EbookPreview) => void;
+    const retryPreview = new Promise<EbookPreview>((resolve) => {
+      resolveRetryPreview = resolve;
+    });
+    const preview = existingBookPreview({ bookMatchReason: 'selected' });
+    const onPreviewTranslatedEbook = vi.fn()
+      .mockResolvedValueOnce(preview)
+      .mockImplementationOnce(() => retryPreview);
+    const onImportTranslatedEbook = vi.fn().mockRejectedValue(
+      new Error('Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có.'),
+    );
+    const file = new File(['ebook'], 'retained.epub', { type: 'application/epub+zip' });
+
+    render(
+      <ImportPanel
+        books={[{ id: 7, title: 'Trường Thiên Lục' }]}
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={onImportTranslatedEbook}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.selectOptions(screen.getByLabelText('Cách tách chương'), 'single');
+    await userEvent.selectOptions(screen.getByLabelText('Gộp vào truyện có sẵn'), '7');
+    await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
+    await userEvent.upload(screen.getByLabelText('Ebook file'), file);
+    await userEvent.click(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.'));
+    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+
+    const retryButton = await screen.findByRole('button', { name: 'Preview lại' });
+    expect(retryButton).toBeEnabled();
+    await userEvent.click(retryButton);
+
+    expect(screen.getByRole('button', { name: 'Preview lại' })).toBeDisabled();
+    expect(onPreviewTranslatedEbook).toHaveBeenLastCalledWith(file, 'single', {
+      duplicateStrategy: 'error',
+      targetBookId: 7,
+    });
+
+    resolveRetryPreview(preview);
+    expect(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeChecked();
+  });
+
   it('shows a guided ebook import flow and success summary', async () => {
     const onPreviewTranslatedEbook = vi.fn().mockResolvedValue({
       title: 'Đấu Phá Thương Khung',
@@ -362,6 +408,7 @@ describe('ImportPanel', () => {
     expect(await screen.findByText(/File lớn hơn 95 MB/i)).toBeInTheDocument();
     expect(screen.getByText(/inbox\/ebooks/i)).toBeInTheDocument();
     expect(onPreviewTranslatedEbook).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Preview lại' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Import vào Library' })).toBeDisabled();
   });
 
@@ -464,6 +511,43 @@ describe('ImportPanel', () => {
       splitMode: 'auto',
       targetBookId: undefined,
     });
+  });
+
+  it('retries the retained inbox selection with the current preview options', async () => {
+    const preview = existingBookPreview({
+      bookMatchReason: 'selected',
+      existingBookTitle: 'Inbox preview',
+    });
+    const onPreviewInboxEbook = vi.fn()
+      .mockRejectedValueOnce(new Error('Preview inbox failed'))
+      .mockResolvedValueOnce(preview);
+
+    render(
+      <ImportPanel
+        books={[{ id: 7, title: 'Inbox preview' }]}
+        ebookInboxFiles={[{ name: 'retained.epub', size: 1024, modified_at: '2026-07-12T00:00:00Z' }]}
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={() => undefined}
+        onPreviewInboxEbook={onPreviewInboxEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.selectOptions(screen.getByLabelText('Cách tách chương'), 'single');
+    await userEvent.selectOptions(screen.getByLabelText('Gộp vào truyện có sẵn'), '7');
+    await userEvent.click(screen.getByRole('radio', { name: 'Ghi đè chương trùng' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Server inbox' }));
+    await userEvent.selectOptions(screen.getByLabelText('Server inbox ebook'), 'retained.epub');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Preview inbox failed');
+    await userEvent.click(screen.getByRole('button', { name: 'Preview lại' }));
+
+    expect(onPreviewInboxEbook).toHaveBeenLastCalledWith('retained.epub', 'single', {
+      duplicateStrategy: 'overwrite',
+      targetBookId: 7,
+    });
+    expect(await screen.findByRole('heading', { name: 'Inbox preview' })).toBeInTheDocument();
   });
 
   it('defaults ebook duplicate handling to skipping existing chapters', async () => {
