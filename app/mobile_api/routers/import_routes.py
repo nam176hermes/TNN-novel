@@ -30,7 +30,7 @@ from app.mobile_api.schemas import (
     WizardTextImport,
     WizardTextImportResult,
 )
-from app.mobile_api.services.ebook_import_service import EbookImportService
+from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
 from app.mobile_api.services.job_service import JobService, get_shared_job_tracker
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
@@ -42,6 +42,9 @@ EBOOK_UPLOAD_TTL_SECONDS = 6 * 60 * 60
 EBOOK_UPLOAD_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 SUPPORTED_EBOOK_SUFFIXES = {".epub", ".azw3", ".mobi", ".prc", ".txt", ".html", ".htm"}
 MAX_WIZARD_TEXT_IMPORT_BYTES = 5 * 1024 * 1024
+EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
+    "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+)
 
 
 def get_pipeline():
@@ -372,6 +375,7 @@ async def _run_translated_ebook_import_job(
     target_book_id: int | None,
     duplicate_strategy: str,
     split_mode: str,
+    confirmed_existing_book_id: int | None,
     cleanup_upload_id: str = "",
     cleanup_temp_path: bool = False,
 ) -> None:
@@ -384,6 +388,7 @@ async def _run_translated_ebook_import_job(
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
             original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
         )
         imported = int(result.get("imported_chapters") or 0)
         skipped = int(result.get("skipped_chapters") or 0)
@@ -562,6 +567,7 @@ async def import_translated_ebook(
     target_book_id: int | None = Form(default=None),
     duplicate_strategy: str = Form(default="skip"),
     split_mode: str = Form(default="auto"),
+    confirmed_existing_book_id: int | None = Form(default=None),
     service: EbookImportService = Depends(get_ebook_import_service),
 ):
     """Import an already-translated ebook directly into the Library."""
@@ -576,6 +582,7 @@ async def import_translated_ebook(
         using_uploaded_file = True
     else:
         raise HTTPException(status_code=400, detail="No file uploaded")
+    confirmation_conflict = False
     try:
         result = service.import_translated_ebook(
             temp_path,
@@ -583,7 +590,19 @@ async def import_translated_ebook(
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
             original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
         )
+    except ExistingBookConfirmationRequired as exc:
+        confirmation_conflict = True
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Translated ebook import requires existing book confirmation",
+            request=request,
+            details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
+        )
+        raise HTTPException(status_code=409, detail=EBOOK_CONFIRMATION_REQUIRED_DETAIL) from exc
     except ValueError as exc:
         message = str(exc)
         status = 409 if "Duplicate chapter" in message else 400
@@ -597,7 +616,7 @@ async def import_translated_ebook(
         )
         raise HTTPException(status_code=status, detail=message) from exc
     finally:
-        if using_staged_upload and upload_id:
+        if using_staged_upload and upload_id and not confirmation_conflict:
             _delete_staged_ebook_upload(service, upload_id)
         elif using_uploaded_file:
             temp_path.unlink(missing_ok=True)
@@ -626,6 +645,7 @@ async def start_translated_ebook_import_job(
     target_book_id: int | None = Form(default=None),
     duplicate_strategy: str = Form(default="skip"),
     split_mode: str = Form(default="auto"),
+    confirmed_existing_book_id: int | None = Form(default=None),
     service: EbookImportService = Depends(get_ebook_import_service),
 ):
     """Start a background import job for an already-translated ebook."""
@@ -645,6 +665,23 @@ async def start_translated_ebook_import_job(
     else:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
+    try:
+        service.validate_existing_book_confirmation(
+            ebook_path,
+            target_book_id=target_book_id,
+            split_mode=split_mode,
+            original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
+        )
+    except ExistingBookConfirmationRequired as exc:
+        if cleanup_temp_path:
+            ebook_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail=EBOOK_CONFIRMATION_REQUIRED_DETAIL) from exc
+    except ValueError as exc:
+        if cleanup_temp_path:
+            ebook_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     tracker = get_shared_job_tracker(service.db_path)
     job = tracker.create_job(
         "import_ebook",
@@ -656,6 +693,7 @@ async def start_translated_ebook_import_job(
             "duplicate_strategy": duplicate_strategy,
             "split_mode": split_mode,
             "target_book_id": target_book_id,
+            "confirmed_existing_book_id": confirmed_existing_book_id,
         },
     )
     tracker.start_background_task(
@@ -669,6 +707,7 @@ async def start_translated_ebook_import_job(
             target_book_id=target_book_id,
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
+            confirmed_existing_book_id=confirmed_existing_book_id,
             cleanup_upload_id=cleanup_upload_id,
             cleanup_temp_path=cleanup_temp_path,
         ),
