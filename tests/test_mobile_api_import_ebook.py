@@ -7,7 +7,14 @@ import zipfile
 import httpx
 import pytest
 
-from app.database.db import get_book_by_title, init_db, list_chapters
+from app.database.db import (
+    add_book,
+    get_book_by_title,
+    init_db,
+    list_books,
+    list_chapters,
+    list_ebook_import_runs,
+)
 from app.mobile_api import upload_limits
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
@@ -514,6 +521,7 @@ async def test_confirmed_existing_ebook_job_is_created_only_after_staged_preflig
         upload_dir = override_ebook_service.data_dir / "import_uploads"
         assert (upload_dir / f"{upload_id}.epub").exists()
         assert (upload_dir / f"{upload_id}.json").exists()
+        books_before_confirmed_import = list_books(override_ebook_service.db_path)
 
         confirmed = await client.post(
             "/api/import/ebook/job",
@@ -547,6 +555,66 @@ async def test_confirmed_existing_ebook_job_is_created_only_after_staged_preflig
         await asyncio.sleep(0.02)
     assert job is not None
     assert job.status == "completed"
+    books_after_confirmed_import = list_books(override_ebook_service.db_path)
+    assert len(books_after_confirmed_import) == 1
+    assert [
+        (book["id"], book["book_key"])
+        for book in books_after_confirmed_import
+    ] == [
+        (book["id"], book["book_key"])
+        for book in books_before_confirmed_import
+    ]
+    assert books_after_confirmed_import[0]["book_key"] == "đấupháthươngkhung"
+
+
+@pytest.mark.asyncio
+async def test_new_title_preview_race_requires_confirmation_before_any_import_mutation(
+    override_ebook_service: EbookImportService,
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        preview = await client.post(
+            "/api/import/ebook/preview",
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        assert preview.status_code == 200
+        assert preview.json()["dry_run"]["book_match_reason"] == "new"
+        upload_id = preview.json()["upload_id"]
+
+        raced_book_id = add_book(
+            override_ebook_service.db_path,
+            "Đấu Phá Thương Khung",
+            "Thiên Tằm Thổ Đậu",
+            "manual",
+        )
+        artifact_root = override_ebook_service.data_dir
+        artifacts_before = sorted(
+            path.relative_to(artifact_root).as_posix()
+            for path in artifact_root.rglob("*")
+            if path.is_file()
+        )
+        chapters_before = list_chapters(override_ebook_service.db_path, raced_book_id)
+        history_before = list_ebook_import_runs(override_ebook_service.db_path)
+
+        conflict = await client.post(
+            "/api/import/ebook/job",
+            data={"duplicate_strategy": "skip", "upload_id": upload_id},
+            headers=headers,
+        )
+
+    safe_detail = "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == safe_detail
+    assert list_chapters(override_ebook_service.db_path, raced_book_id) == chapters_before == []
+    assert list_ebook_import_runs(override_ebook_service.db_path) == history_before == []
+    assert sorted(
+        path.relative_to(artifact_root).as_posix()
+        for path in artifact_root.rglob("*")
+        if path.is_file()
+    ) == artifacts_before
+    assert get_shared_job_tracker(override_ebook_service.db_path).list_jobs() == []
 
 
 @pytest.mark.asyncio

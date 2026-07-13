@@ -1345,6 +1345,7 @@ function AuthenticatedApp() {
       setActiveView('jobs');
     } catch (error) {
       handleJobError(error, 'Import ebook failed');
+      throw error;
     } finally {
       setBackendLoading(false);
     }

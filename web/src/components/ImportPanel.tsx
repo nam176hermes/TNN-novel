@@ -1234,18 +1234,25 @@ export default function ImportPanel({
     if (ebookSource === 'upload' && !ebookFile) return;
     if (ebookSource === 'inbox' && !selectedInboxFile) return;
 
-    const result = await onImportTranslatedEbook({
-      ...(ebookSource === 'upload'
-        ? { file: ebookFile ?? undefined, uploadId: ebookPreview?.upload_id }
-        : { inboxFile: ebookPreview?.inbox_file ?? selectedInboxFile }),
-      duplicateStrategy,
-      splitMode,
-      targetBookId: targetBookId ? Number.parseInt(targetBookId, 10) : undefined,
-      ...(confirmedExistingBookId !== null && confirmedExistingBookId === existingBookId
-        ? { confirmedExistingBookId }
-        : {}),
-    });
-    setLastEbookImportResult(result ?? null);
+    try {
+      const result = await onImportTranslatedEbook({
+        ...(ebookSource === 'upload'
+          ? { file: ebookFile ?? undefined, uploadId: ebookPreview?.upload_id }
+          : { inboxFile: ebookPreview?.inbox_file ?? selectedInboxFile }),
+        duplicateStrategy,
+        splitMode,
+        targetBookId: targetBookId ? Number.parseInt(targetBookId, 10) : undefined,
+        ...(confirmedExistingBookId !== null && confirmedExistingBookId === existingBookId
+          ? { confirmedExistingBookId }
+          : {}),
+      });
+      setLastEbookImportResult(result ?? null);
+    } catch (error) {
+      setConfirmedExistingBookId(null);
+      setEbookPreview(null);
+      setEbookPreviewState('error');
+      setEbookPreviewError(errorMessage(error));
+    }
   }
 
   return (
