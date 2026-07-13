@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from typing import Any
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urldefrag
 import zipfile
@@ -20,6 +21,7 @@ from app.database.db import (
     get_book_by_id,
     get_book_by_title,
     get_chapter,
+    list_chapters,
     record_ebook_import_run,
     update_book,
     update_chapter_paths,
@@ -41,6 +43,10 @@ GARBAGE_DOCUMENT_MARKERS = ("cover", "titlepage", "toc", "contents", "copyright"
 SUSPECT_DOCUMENT_MARKERS = ("titlepage", "part0000")
 MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_BOOK_ASSET_BYTES = 50 * 1024 * 1024
+
+
+class ExistingBookConfirmationRequired(ValueError):
+    pass
 
 
 def _normalize_page_break_token(value: str | None) -> str:
@@ -850,13 +856,18 @@ class EbookImportService:
         duplicate_strategy: str = "skip",
         split_mode: str = "auto",
         original_filename: str = "",
+        confirmed_existing_book_id: int | None = None,
     ) -> dict:
         if duplicate_strategy not in {"error", "skip", "overwrite"}:
             raise ValueError("duplicate_strategy must be one of: error, skip, overwrite")
 
         parsed = self._parse(file_path, split_mode=split_mode, original_filename=original_filename)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        self._assert_existing_book_confirmed(match, confirmed_existing_book_id)
         self._raise_if_unreadable(parsed)
-        book_id = self._resolve_book_id(parsed, target_book_id)
+        book_id = match["existing_book_id"]
+        if book_id is None:
+            book_id = add_book(self.db_path, parsed.title, parsed.author, "ebook", "")
         cover_path, cover_url = self._save_cover(parsed, "", f"book_{book_id}")
         if cover_path:
             update_book(self.db_path, book_id, cover_path=cover_path)
@@ -940,7 +951,8 @@ class EbookImportService:
         target_book_id: int | None,
         duplicate_strategy: str,
     ) -> dict:
-        book_id = self._existing_book_id(parsed, target_book_id)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        book_id = match["existing_book_id"]
         duplicate_count = 0
         if book_id is not None:
             for chapter in parsed.chapters:
@@ -963,7 +975,50 @@ class EbookImportService:
             "would_skip": would_skip,
             "would_overwrite": would_overwrite,
             "would_error": would_error,
+            **match,
         }
+
+    def _book_match_for_parsed(self, parsed: ParsedEbook, target_book_id: int | None) -> dict[str, Any]:
+        if target_book_id is not None:
+            book = get_book_by_id(self.db_path, target_book_id)
+            if not book:
+                raise ValueError(f"Book {target_book_id} not found")
+            reason = "selected"
+        else:
+            book = get_book_by_title(self.db_path, parsed.title)
+            reason = "title" if book else "new"
+        existing_id = int(book["id"]) if book else None
+        return {
+            "existing_book_id": existing_id,
+            "existing_book_title": str(book.get("title") or parsed.title) if book else "",
+            "existing_chapter_count": len(list_chapters(self.db_path, existing_id)) if existing_id else 0,
+            "book_match_reason": reason,
+            "requires_existing_book_confirmation": existing_id is not None,
+        }
+
+    def _assert_existing_book_confirmed(
+        self,
+        match: dict[str, Any],
+        confirmed_existing_book_id: int | None,
+    ) -> None:
+        existing_id = match["existing_book_id"]
+        if existing_id is not None and confirmed_existing_book_id != existing_id:
+            raise ExistingBookConfirmationRequired(
+                "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+            )
+
+    def validate_existing_book_confirmation(
+        self,
+        file_path: Path,
+        *,
+        target_book_id: int | None,
+        split_mode: str,
+        original_filename: str,
+        confirmed_existing_book_id: int | None,
+    ) -> None:
+        parsed = self._parse(file_path, split_mode=split_mode, original_filename=original_filename)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        self._assert_existing_book_confirmed(match, confirmed_existing_book_id)
 
     def _warnings_with_content_quality(
         self,
@@ -991,26 +1046,6 @@ class EbookImportService:
             "Ebook này gần như chỉ có tên chương/ảnh minh họa, không có nội dung chữ để đọc hoặc dịch. "
             "Hãy dùng EPUB/TXT/HTML có text thật, hoặc chạy OCR trước rồi import lại."
         )
-
-    def _existing_book_id(self, parsed: ParsedEbook, target_book_id: int | None) -> int | None:
-        if target_book_id is not None:
-            if not get_book_by_id(self.db_path, target_book_id):
-                raise ValueError(f"Book {target_book_id} not found")
-            return target_book_id
-
-        existing = get_book_by_title(self.db_path, parsed.title)
-        return int(existing["id"]) if existing else None
-
-    def _resolve_book_id(self, parsed: ParsedEbook, target_book_id: int | None) -> int:
-        if target_book_id is not None:
-            if not get_book_by_id(self.db_path, target_book_id):
-                raise ValueError(f"Book {target_book_id} not found")
-            return target_book_id
-
-        existing = get_book_by_title(self.db_path, parsed.title)
-        if existing:
-            return int(existing["id"])
-        return add_book(self.db_path, parsed.title, parsed.author, "ebook", "")
 
     def _write_raw_chapter(self, book_title: str, chapter: ParsedEbookChapter) -> Path:
         raw_dir = self.data_dir / "raw"
