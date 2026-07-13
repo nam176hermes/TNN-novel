@@ -27,3 +27,18 @@ def test_active_translation_job_cannot_jump_to_earlier_or_retry_states(invalid_n
 
 def test_allowed_transition_map_covers_every_canonical_state() -> None:
     assert set(job_states.ALLOWED_JOB_STATE_TRANSITIONS) == job_states.CANONICAL_JOB_STATES
+
+
+def test_backup_job_state_flow_is_forward_only() -> None:
+    states = [
+        "QUEUED",
+        "CLAIMED",
+        "PREPARING_BACKUP",
+        "WRITING_BACKUP",
+        "VALIDATING_BACKUP",
+        "ENCRYPTING_BACKUP",
+        "PUBLISHING_BACKUP",
+        "COMPLETED",
+    ]
+    assert all(job_states.is_valid_job_state_transition(a, b) for a, b in zip(states, states[1:]))
+    assert not job_states.is_valid_job_state_transition("PUBLISHING_BACKUP", "WRITING_BACKUP")

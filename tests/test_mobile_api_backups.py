@@ -28,6 +28,35 @@ async def auth_headers(client: httpx.AsyncClient) -> dict[str, str]:
     return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
+def test_backup_route_exposes_coordinator_dependency() -> None:
+    assert callable(backups_router.get_backup_job_coordinator)
+
+
+class RecordingBackupJobCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def start_backup_job(
+        self,
+        *,
+        include_audio: bool,
+        include_exports: bool,
+        include_job_logs: bool,
+        include_secrets: bool,
+        passphrase: str,
+    ) -> str:
+        self.calls.append(
+            {
+                "include_audio": include_audio,
+                "include_exports": include_exports,
+                "include_job_logs": include_job_logs,
+                "include_secrets": include_secrets,
+                "passphrase": passphrase,
+            }
+        )
+        return "backup-job-1"
+
+
 @pytest.fixture
 def backup_service_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> BackupService:
     project_root = tmp_path / "project"
@@ -56,6 +85,14 @@ def backup_service_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> B
     app.dependency_overrides.pop(backups_router.get_backup_service, None)
 
 
+@pytest.fixture
+def backup_job_coordinator_fixture() -> RecordingBackupJobCoordinator:
+    coordinator = RecordingBackupJobCoordinator()
+    app.dependency_overrides[backups_router.get_backup_job_coordinator] = lambda: coordinator
+    yield coordinator
+    app.dependency_overrides.pop(backups_router.get_backup_job_coordinator, None)
+
+
 @pytest.mark.asyncio
 async def test_system_backup_routes_require_authentication(backup_service_fixture: BackupService) -> None:
     transport = httpx.ASGITransport(app=app)
@@ -68,25 +105,48 @@ async def test_system_backup_routes_require_authentication(backup_service_fixtur
 
 
 @pytest.mark.asyncio
-async def test_authenticated_backup_create_and_download_with_manifest(
+async def test_authenticated_backup_create_queues_job(
     backup_service_fixture: BackupService,
+    backup_job_coordinator_fixture: RecordingBackupJobCoordinator,
 ) -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
-        create_response = await client.post(
+        response = await client.post(
             "/api/system/backups",
-            json={"include_audio": True, "include_exports": False, "include_job_logs": False},
             headers=headers,
+            json={"include_audio": True},
         )
-        assert create_response.status_code == 200
-        payload = create_response.json()
-        assert payload["encrypted"] is False
-        assert payload["secrets_included"] is False
-        assert "database" in payload["included_modules"]
-        assert "exports" in payload["excluded_modules"]
-        assert payload["download_url"].endswith("/download")
 
+    assert response.status_code == 202
+    assert response.json() == {"job_id": "backup-job-1", "status": "queued", "message": "Backup queued"}
+    assert backup_job_coordinator_fixture.calls == [
+        {
+            "include_audio": True,
+            "include_exports": False,
+            "include_job_logs": False,
+            "include_secrets": False,
+            "passphrase": "",
+        }
+    ]
+    assert list(backup_service_fixture.backup_dir.glob("*.tar.gz")) == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_backup_list_and_download_with_manifest(
+    backup_service_fixture: BackupService,
+) -> None:
+    payload = backup_service_fixture.create_backup(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
         list_response = await client.get("/api/system/backups", headers=headers)
         assert list_response.status_code == 200
         assert list_response.json()["items"][0]["filename"] == payload["filename"]
@@ -116,7 +176,10 @@ async def test_authenticated_backup_create_and_download_with_manifest(
 
 
 @pytest.mark.asyncio
-async def test_encrypted_secrets_backup_requires_passphrase(backup_service_fixture: BackupService) -> None:
+async def test_backup_create_rejects_encrypted_secrets_without_passphrase(
+    backup_service_fixture: BackupService,
+    backup_job_coordinator_fixture: RecordingBackupJobCoordinator,
+) -> None:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
@@ -128,6 +191,7 @@ async def test_encrypted_secrets_backup_requires_passphrase(backup_service_fixtu
 
     assert response.status_code == 400
     assert "passphrase" in response.json()["detail"].lower()
+    assert backup_job_coordinator_fixture.calls == []
 
 
 def test_backup_service_blocks_path_traversal(backup_service_fixture: BackupService) -> None:

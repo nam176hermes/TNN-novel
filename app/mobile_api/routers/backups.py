@@ -1,13 +1,44 @@
 from __future__ import annotations
 
+from typing import Protocol
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from app.mobile_api.audit import record_audit_event
-from app.mobile_api.schemas import SystemBackupItem, SystemBackupListResponse, SystemBackupRequest
+from app.mobile_api.schemas import JobResponse, SystemBackupItem, SystemBackupListResponse, SystemBackupRequest
 from app.mobile_api.services.backup_service import BackupService
 
 router = APIRouter(prefix="/api/system/backups", tags=["backups"])
+
+
+class BackupJobCoordinator(Protocol):
+    def start_backup_job(
+        self,
+        *,
+        include_audio: bool,
+        include_exports: bool,
+        include_job_logs: bool,
+        include_secrets: bool,
+        passphrase: str,
+    ) -> str: ...
+
+
+class _UnavailableBackupJobCoordinator:
+    def start_backup_job(
+        self,
+        *,
+        include_audio: bool,
+        include_exports: bool,
+        include_job_logs: bool,
+        include_secrets: bool,
+        passphrase: str,
+    ) -> str:
+        raise RuntimeError("Backup job coordinator is not configured")
+
+
+def get_backup_job_coordinator() -> BackupJobCoordinator:
+    return _UnavailableBackupJobCoordinator()
 
 
 def get_backup_service() -> BackupService:
@@ -19,14 +50,15 @@ async def list_system_backups(service: BackupService = Depends(get_backup_servic
     return SystemBackupListResponse(items=[SystemBackupItem(**item) for item in service.list_backups()])
 
 
-@router.post("", response_model=SystemBackupItem)
+@router.post("", response_model=JobResponse, status_code=202)
 async def create_system_backup(
     payload: SystemBackupRequest,
     request: Request,
-    service: BackupService = Depends(get_backup_service),
+    coordinator: BackupJobCoordinator = Depends(get_backup_job_coordinator),
 ):
     try:
-        item = service.create_backup(
+        payload.validate_for_queue()
+        job_id = coordinator.start_backup_job(
             include_audio=payload.include_audio,
             include_exports=payload.include_exports,
             include_job_logs=payload.include_job_logs,
@@ -39,19 +71,15 @@ async def create_system_backup(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     record_audit_event(
-        event_type="backup_create",
+        event_type="backup_job_queued",
         severity="info",
         source="backups",
-        message="System backup created",
+        message="Backup job queued",
         request=request,
-        details={
-            "backup_name": item["filename"],
-            "encrypted": item["encrypted"],
-            "secrets_included": item["secrets_included"],
-            "result": "success",
-        },
+        job_id=job_id,
+        details={"result": "queued"},
     )
-    return SystemBackupItem(**item)
+    return JobResponse(job_id=job_id, status="queued", message="Backup queued")
 
 
 @router.get("/{filename}/download")

@@ -612,6 +612,10 @@ class SystemBackupRequest(BaseModel):
     include_secrets: bool = False
     passphrase: str = ""
 
+    def validate_for_queue(self) -> None:
+        if self.include_secrets and not self.passphrase.strip():
+            raise ValueError("A passphrase is required when including secrets")
+
 
 class SystemBackupItem(BaseModel):
     filename: str
