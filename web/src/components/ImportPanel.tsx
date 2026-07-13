@@ -12,7 +12,8 @@ import {
   Upload,
   UploadCloud,
 } from 'lucide-react';
-import { useMemo, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
+import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
+import { ApiError } from '../api/client';
 import type {
   EbookDuplicateStrategy,
   EbookInboxFile,
@@ -256,6 +257,16 @@ function ebookSplitMethodLabel(preview: EbookPreview): string {
   return 'Tự động: ưu tiên mục lục';
 }
 
+function ebookDuplicateStrategySummary(dryRun: NonNullable<EbookPreview['dry_run']>): string {
+  if (dryRun.duplicate_strategy === 'error') {
+    return `Chiến lược đã chọn: Dừng khi trùng. Sẽ dừng vì ${dryRun.would_error.toLocaleString('vi-VN')} chương trùng; chưa import chương nào.`;
+  }
+  if (dryRun.duplicate_strategy === 'overwrite') {
+    return `Chiến lược đã chọn: Ghi đè chương trùng. Sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương, gồm ghi đè ${dryRun.would_overwrite.toLocaleString('vi-VN')} chương trùng.`;
+  }
+  return `Chiến lược đã chọn: Bỏ qua chương trùng. Sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương mới và bỏ qua ${dryRun.would_skip.toLocaleString('vi-VN')} chương trùng.`;
+}
+
 function EbookPreviewPanel({
   confirmedExistingBookId,
   error,
@@ -345,6 +356,11 @@ function EbookPreviewPanel({
 
   return (
     <div className="ebook-preview-card">
+      {error ? (
+        <p className="status-error" role="alert">
+          {error}
+        </p>
+      ) : null}
       <div className="ebook-preview-header">
         {coverUrl ? (
           <img
@@ -412,6 +428,7 @@ function EbookPreviewPanel({
                 {dryRun.new_chapters.toLocaleString('vi-VN')} chương mới ·{' '}
                 {dryRun.duplicate_chapters.toLocaleString('vi-VN')} chương trùng
               </p>
+              <p>{ebookDuplicateStrategySummary(dryRun)}</p>
               <label>
                 <input
                   checked={dryRun.existing_book_id !== null && confirmedExistingBookId === dryRun.existing_book_id}
@@ -661,6 +678,8 @@ export default function ImportPanel({
   const [ebookPreviewState, setEbookPreviewState] = useState<EbookPreviewState>('idle');
   const [ebookPreviewError, setEbookPreviewError] = useState('');
   const [confirmedExistingBookId, setConfirmedExistingBookId] = useState<number | null>(null);
+  const [ebookSubmissionBlocked, setEbookSubmissionBlocked] = useState(false);
+  const ebookPreviewRequestToken = useRef(0);
   const [lastEbookImportResult, setLastEbookImportResult] = useState<EbookImportResult | null>(null);
   const [duplicateStrategy, setDuplicateStrategy] = useState<EbookDuplicateStrategy>('skip');
   const [targetBookId, setTargetBookId] = useState('');
@@ -766,6 +785,7 @@ export default function ImportPanel({
             : Boolean(
               ebookPreview
               && ebookPreviewState === 'ready'
+              && !ebookSubmissionBlocked
               && onImportTranslatedEbook
               && !ebookHasBlockingWarning
               && existingBookConfirmed,
@@ -800,6 +820,8 @@ export default function ImportPanel({
     importActionStatus = 'Reading ebook preview.';
   } else if (mode === 'ebook' && ebookPreviewState === 'error') {
     importActionStatus = 'Resolve the ebook preview error before import.';
+  } else if (mode === 'ebook' && ebookSubmissionBlocked) {
+    importActionStatus = 'Chưa xác nhận được trạng thái import. Hãy kiểm tra Jobs hoặc lịch sử trước khi thử lại.';
   } else if (mode === 'ebook' && ebookHasBlockingWarning) {
     importActionStatus = 'Ebook preview không có nội dung chữ đủ để import.';
   } else if (mode === 'ebook' && !ebookPreview) {
@@ -1061,15 +1083,22 @@ export default function ImportPanel({
     return value ? Number.parseInt(value, 10) : null;
   }
 
+  function invalidateEbookPreviewRequests(): number {
+    ebookPreviewRequestToken.current += 1;
+    return ebookPreviewRequestToken.current;
+  }
+
   async function previewEbookFile(
     nextFile: File,
     nextSplitMode: EbookSplitMode,
     nextDuplicateStrategy = duplicateStrategy,
     nextTargetBookId = targetBookId,
   ): Promise<void> {
+    const requestToken = invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setEbookPreview(null);
     setEbookPreviewError('');
+    setEbookSubmissionBlocked(false);
 
     if (!onPreviewTranslatedEbook) {
       setEbookPreviewState('error');
@@ -1083,9 +1112,11 @@ export default function ImportPanel({
         duplicateStrategy: nextDuplicateStrategy,
         targetBookId: parsedTargetBookId(nextTargetBookId),
       });
+      if (requestToken !== ebookPreviewRequestToken.current) return;
       setEbookPreview(preview);
       setEbookPreviewState('ready');
     } catch (error) {
+      if (requestToken !== ebookPreviewRequestToken.current) return;
       setEbookPreviewState('error');
       setEbookPreviewError(errorMessage(error));
     }
@@ -1097,9 +1128,11 @@ export default function ImportPanel({
     nextDuplicateStrategy = duplicateStrategy,
     nextTargetBookId = targetBookId,
   ): Promise<void> {
+    const requestToken = invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setEbookPreview(null);
     setEbookPreviewError('');
+    setEbookSubmissionBlocked(false);
 
     if (!filename) {
       setEbookPreviewState('idle');
@@ -1118,21 +1151,25 @@ export default function ImportPanel({
         duplicateStrategy: nextDuplicateStrategy,
         targetBookId: parsedTargetBookId(nextTargetBookId),
       });
+      if (requestToken !== ebookPreviewRequestToken.current) return;
       setEbookPreview(preview);
       setEbookPreviewState('ready');
     } catch (error) {
+      if (requestToken !== ebookPreviewRequestToken.current) return;
       setEbookPreviewState('error');
       setEbookPreviewError(errorMessage(error));
     }
   }
 
   function handleEbookFile(nextFile: File | null): void {
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setEbookSource('upload');
     setEbookFile(nextFile);
     setSelectedInboxFile('');
     setEbookPreview(null);
     setEbookPreviewError('');
+    setEbookSubmissionBlocked(false);
     setLastEbookImportResult(null);
     if (nextFile && nextFile.size > MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
       setEbookPreviewState('error');
@@ -1157,10 +1194,12 @@ export default function ImportPanel({
   }
 
   function handleEbookSourceChange(nextSource: EbookSource): void {
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setEbookSource(nextSource);
     setEbookPreview(null);
     setEbookPreviewError('');
+    setEbookSubmissionBlocked(false);
     setLastEbookImportResult(null);
     if (nextSource === 'upload') {
       setSelectedInboxFile('');
@@ -1176,6 +1215,7 @@ export default function ImportPanel({
 
   function handleInboxFileChange(event: ChangeEvent<HTMLSelectElement>): void {
     const filename = event.target.value;
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setEbookSource('inbox');
     setEbookFile(null);
@@ -1186,6 +1226,7 @@ export default function ImportPanel({
 
   function handleSplitModeChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextSplitMode = event.target.value as EbookSplitMode;
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setSplitMode(nextSplitMode);
     if (ebookSource === 'inbox' && selectedInboxFile) {
@@ -1197,6 +1238,7 @@ export default function ImportPanel({
 
   function handleTargetBookChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextTargetBookId = event.target.value;
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setTargetBookId(nextTargetBookId);
     if (ebookSource === 'inbox' && selectedInboxFile) {
@@ -1207,6 +1249,7 @@ export default function ImportPanel({
   }
 
   function handleDuplicateStrategyChange(nextDuplicateStrategy: EbookDuplicateStrategy): void {
+    invalidateEbookPreviewRequests();
     setConfirmedExistingBookId(null);
     setDuplicateStrategy(nextDuplicateStrategy);
     setLastEbookImportResult(null);
@@ -1272,6 +1315,7 @@ export default function ImportPanel({
     if (ebookSource === 'upload' && !ebookFile) return;
     if (ebookSource === 'inbox' && !selectedInboxFile) return;
 
+    setEbookPreviewError('');
     try {
       const result = await onImportTranslatedEbook({
         ...(ebookSource === 'upload'
@@ -1286,11 +1330,44 @@ export default function ImportPanel({
       });
       setLastEbookImportResult(result ?? null);
     } catch (error) {
-      setConfirmedExistingBookId(null);
-      setEbookPreview(null);
-      setEbookPreviewState('error');
+      if (error instanceof ApiError && error.status === 409) {
+        invalidateEbookPreviewRequests();
+        setConfirmedExistingBookId(null);
+        setEbookPreview(null);
+        setEbookPreviewState('error');
+        setEbookSubmissionBlocked(false);
+      } else {
+        setEbookSubmissionBlocked(true);
+      }
       setEbookPreviewError(errorMessage(error));
     }
+  }
+
+  function handleModeChange(nextMode: ImportMode): void {
+    if (mode === 'ebook' && nextMode !== 'ebook') {
+      invalidateEbookPreviewRequests();
+      setConfirmedExistingBookId(null);
+      setEbookPreview(null);
+      setEbookPreviewState('idle');
+      setEbookPreviewError('');
+      setEbookSubmissionBlocked(false);
+    }
+    setMode(nextMode);
+    if (mode !== 'ebook' && nextMode === 'ebook') {
+      if (ebookSource === 'inbox' && selectedInboxFile) {
+        void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, targetBookId);
+      } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
+        void previewEbookFile(ebookFile, splitMode, duplicateStrategy, targetBookId);
+      }
+    }
+  }
+
+  function handleCancel(): void {
+    if (mode === 'ebook') {
+      invalidateEbookPreviewRequests();
+      setConfirmedExistingBookId(null);
+    }
+    onCancel();
   }
 
   return (
@@ -1332,7 +1409,7 @@ export default function ImportPanel({
           aria-label="Paste"
           aria-pressed={mode === 'paste'}
           className="secondary-action"
-          onClick={() => setMode('paste')}
+          onClick={() => handleModeChange('paste')}
           type="button"
         >
           <Clipboard aria-hidden="true" size={24} />
@@ -1345,7 +1422,7 @@ export default function ImportPanel({
           aria-label="File"
           aria-pressed={mode === 'file'}
           className="secondary-action"
-          onClick={() => setMode('file')}
+          onClick={() => handleModeChange('file')}
           type="button"
         >
           <FileText aria-hidden="true" size={24} />
@@ -1358,7 +1435,7 @@ export default function ImportPanel({
           aria-label="Ebook bản dịch"
           aria-pressed={mode === 'ebook'}
           className="secondary-action"
-          onClick={() => setMode('ebook')}
+          onClick={() => handleModeChange('ebook')}
           type="button"
         >
           <BookOpen aria-hidden="true" size={24} />
@@ -1371,7 +1448,7 @@ export default function ImportPanel({
           aria-label="URL"
           aria-pressed={mode === 'url'}
           className="secondary-action"
-          onClick={() => setMode('url')}
+          onClick={() => handleModeChange('url')}
           type="button"
         >
           <Globe2 aria-hidden="true" size={24} />
@@ -1384,7 +1461,7 @@ export default function ImportPanel({
           aria-label="Kho nguồn"
           aria-pressed={mode === 'catalog'}
           className="secondary-action"
-          onClick={() => setMode('catalog')}
+          onClick={() => handleModeChange('catalog')}
           type="button"
         >
           <Search aria-hidden="true" size={24} />
@@ -2079,7 +2156,7 @@ export default function ImportPanel({
           >
             {importActionStatus}
           </p>
-          <button aria-label="Cancel" className="secondary-action" disabled={loading} onClick={onCancel} type="button">
+          <button aria-label="Cancel" className="secondary-action" disabled={loading} onClick={handleCancel} type="button">
             Hủy
           </button>
           <button

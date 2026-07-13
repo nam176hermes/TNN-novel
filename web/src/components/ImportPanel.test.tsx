@@ -1,8 +1,18 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../api/client';
 import type { EbookBookMatchReason, EbookPreview } from '../api/types';
 import ImportPanel from './ImportPanel';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+
+  return { promise, resolve };
+}
 
 function existingBookPreview({
   bookMatchReason = 'title',
@@ -10,12 +20,14 @@ function existingBookPreview({
   existingBookId = 7,
   existingBookTitle = 'Trường Thiên Lục',
   newChapters = 43,
+  duplicateStrategy = 'skip',
 }: {
   bookMatchReason?: EbookBookMatchReason;
   duplicateChapters?: number;
   existingBookId?: number | null;
   existingBookTitle?: string;
   newChapters?: number;
+  duplicateStrategy?: 'skip' | 'error' | 'overwrite';
 } = {}): EbookPreview {
   const chapterCount = newChapters + duplicateChapters;
   return {
@@ -30,14 +42,14 @@ function existingBookPreview({
     dry_run: {
       target_book_id: existingBookId,
       target_title: existingBookTitle,
-      duplicate_strategy: 'skip' as const,
+      duplicate_strategy: duplicateStrategy,
       chapter_count: chapterCount,
       new_chapters: newChapters,
       duplicate_chapters: duplicateChapters,
-      would_import: newChapters,
-      would_skip: duplicateChapters,
-      would_overwrite: 0,
-      would_error: 0,
+      would_import: newChapters + (duplicateStrategy === 'overwrite' ? duplicateChapters : 0),
+      would_skip: duplicateStrategy === 'skip' ? duplicateChapters : 0,
+      would_overwrite: duplicateStrategy === 'overwrite' ? duplicateChapters : 0,
+      would_error: duplicateStrategy === 'error' ? duplicateChapters : 0,
       existing_book_id: existingBookId,
       existing_book_title: existingBookTitle,
       existing_chapter_count: 120,
@@ -280,9 +292,10 @@ describe('ImportPanel', () => {
     const onPreviewTranslatedEbook = vi.fn()
       .mockResolvedValueOnce(preview)
       .mockImplementationOnce(() => retryPreview);
-    const onImportTranslatedEbook = vi.fn().mockRejectedValue(
-      new Error('Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có.'),
-    );
+    const onImportTranslatedEbook = vi.fn().mockRejectedValue(new ApiError(
+      'Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có.',
+      409,
+    ));
     const file = new File(['ebook'], 'retained.epub', { type: 'application/epub+zip' });
 
     render(
@@ -315,6 +328,45 @@ describe('ImportPanel', () => {
 
     resolveRetryPreview(preview);
     expect(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeChecked();
+  });
+
+  it.each([
+    {
+      error: new ApiError('Máy chủ chưa thể xác nhận trạng thái import.', 500),
+      message: 'Máy chủ chưa thể xác nhận trạng thái import.',
+      name: 'a non-409 API failure',
+    },
+    {
+      error: new TypeError('Failed to fetch'),
+      message: 'Failed to fetch',
+      name: 'network uncertainty',
+    },
+  ])('preserves the confirmed preview after $name without encouraging another submit', async ({ error, message }) => {
+    const preview = existingBookPreview({ bookMatchReason: 'selected' });
+    const onImportTranslatedEbook = vi.fn().mockRejectedValue(error);
+    const file = new File(['ebook'], 'uncertain.epub', { type: 'application/epub+zip' });
+
+    render(
+      <ImportPanel
+        books={[{ id: 7, title: 'Trường Thiên Lục' }]}
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={onImportTranslatedEbook}
+        onPreviewTranslatedEbook={vi.fn().mockResolvedValue(preview)}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.upload(screen.getByLabelText('Ebook file'), file);
+    const confirmation = await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.');
+    await userEvent.click(confirmation);
+    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Trường Thiên Lục' })).toBeInTheDocument();
+    expect(confirmation).toBeChecked();
+    expect(screen.queryByRole('button', { name: 'Preview lại' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Import vào Library' })).toBeDisabled();
   });
 
   it('shows a guided ebook import flow and success summary', async () => {
@@ -812,6 +864,143 @@ describe('ImportPanel', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Upload file' }));
     expect(screen.getByRole('button', { name: 'Import vào Library' })).toBeDisabled();
+  });
+
+  it('ignores an older strategy preview that resolves after the newest strategy preview', async () => {
+    const errorPreview = deferred<EbookPreview>();
+    const overwritePreview = deferred<EbookPreview>();
+    const initialPreview = existingBookPreview();
+    const newestPreview = existingBookPreview({
+      duplicateStrategy: 'overwrite',
+      existingBookId: 9,
+      existingBookTitle: 'Preview ghi đè mới nhất',
+    });
+    const stalePreview = existingBookPreview({
+      duplicateStrategy: 'error',
+      existingBookId: 8,
+      existingBookTitle: 'Preview dừng cũ',
+    });
+    const onPreviewTranslatedEbook = vi.fn()
+      .mockResolvedValueOnce(initialPreview)
+      .mockImplementationOnce(() => errorPreview.promise)
+      .mockImplementationOnce(() => overwritePreview.promise);
+    const onImportTranslatedEbook = vi.fn();
+    const file = new File(['ebook'], 'strategy-race.epub', { type: 'application/epub+zip' });
+
+    render(
+      <ImportPanel
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={onImportTranslatedEbook}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.upload(screen.getByLabelText('Ebook file'), file);
+    await screen.findByRole('heading', { name: 'Trường Thiên Lục' });
+    await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Ghi đè chương trùng' }));
+
+    overwritePreview.resolve(newestPreview);
+    expect(await screen.findByRole('heading', { name: 'Preview ghi đè mới nhất' })).toBeInTheDocument();
+    errorPreview.resolve(stalePreview);
+    await errorPreview.promise;
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Preview dừng cũ' })).not.toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Preview ghi đè mới nhất' })).toBeInTheDocument();
+    });
+
+    const warning = screen.getByRole('alert');
+    expect(warning).toHaveTextContent('Chiến lược đã chọn: Ghi đè chương trùng');
+    expect(warning).toHaveTextContent('Sẽ import 45 chương, gồm ghi đè 2 chương trùng.');
+    await userEvent.click(screen.getByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.'));
+    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+
+    expect(onImportTranslatedEbook).toHaveBeenCalledWith(expect.objectContaining({
+      confirmedExistingBookId: 9,
+      duplicateStrategy: 'overwrite',
+      uploadId: 'preview-upload-9',
+    }));
+  });
+
+  it('ignores an older source preview that resolves after the newest file preview', async () => {
+    const firstPreview = deferred<EbookPreview>();
+    const secondPreview = deferred<EbookPreview>();
+    const onPreviewTranslatedEbook = vi.fn()
+      .mockImplementationOnce(() => firstPreview.promise)
+      .mockImplementationOnce(() => secondPreview.promise);
+    const onImportTranslatedEbook = vi.fn();
+    const firstFile = new File(['old'], 'old.epub', { type: 'application/epub+zip' });
+    const secondFile = new File(['new'], 'new.epub', { type: 'application/epub+zip' });
+
+    render(
+      <ImportPanel
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={onImportTranslatedEbook}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.upload(screen.getByLabelText('Ebook file'), firstFile);
+    await userEvent.upload(screen.getByLabelText('Ebook file'), secondFile);
+    secondPreview.resolve(existingBookPreview({ existingBookId: 12, existingBookTitle: 'Nguồn mới' }));
+    expect(await screen.findByRole('heading', { name: 'Nguồn mới' })).toBeInTheDocument();
+    firstPreview.resolve(existingBookPreview({ existingBookId: 11, existingBookTitle: 'Nguồn cũ' }));
+    await firstPreview.promise;
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Nguồn cũ' })).not.toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Nguồn mới' })).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.'));
+    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+    expect(onImportTranslatedEbook).toHaveBeenCalledWith(expect.objectContaining({
+      confirmedExistingBookId: 12,
+      file: secondFile,
+      uploadId: 'preview-upload-12',
+    }));
+  });
+
+  it.each([
+    {
+      duplicateStrategy: 'skip' as const,
+      expected: 'Chiến lược đã chọn: Bỏ qua chương trùng. Sẽ import 43 chương mới và bỏ qua 2 chương trùng.',
+    },
+    {
+      duplicateStrategy: 'error' as const,
+      expected: 'Chiến lược đã chọn: Dừng khi trùng. Sẽ dừng vì 2 chương trùng; chưa import chương nào.',
+    },
+    {
+      duplicateStrategy: 'overwrite' as const,
+      expected: 'Chiến lược đã chọn: Ghi đè chương trùng. Sẽ import 45 chương, gồm ghi đè 2 chương trùng.',
+    },
+  ])('names the selected $duplicateStrategy strategy beside its expected result', async ({ duplicateStrategy, expected }) => {
+    const onPreviewTranslatedEbook = vi.fn().mockResolvedValue(existingBookPreview({ duplicateStrategy }));
+
+    render(
+      <ImportPanel
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={() => undefined}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    if (duplicateStrategy === 'error') {
+      await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
+    } else if (duplicateStrategy === 'overwrite') {
+      await userEvent.click(screen.getByRole('radio', { name: 'Ghi đè chương trùng' }));
+    }
+    await userEvent.upload(
+      screen.getByLabelText('Ebook file'),
+      new File(['ebook'], `${duplicateStrategy}.epub`, { type: 'application/epub+zip' }),
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(expected);
   });
 
   it('blocks translated ebook import when preview has no readable chapter body', async () => {

@@ -380,6 +380,7 @@ async def _run_translated_ebook_import_job(
     cleanup_temp_path: bool = False,
 ) -> None:
     tracker.update_job(job_id, status="running", progress=0, message="Importing translated ebook")
+    confirmation_conflict = False
     try:
         result = await asyncio.to_thread(
             service.import_translated_ebook,
@@ -423,6 +424,33 @@ async def _run_translated_ebook_import_job(
                 "skipped_chapters": skipped,
             },
         )
+    except ExistingBookConfirmationRequired:
+        confirmation_conflict = True
+        job = tracker.get_job(job_id)
+        params = dict(job.params or {}) if job else {}
+        params["confirmed_existing_book_id"] = None
+        if cleanup_upload_id:
+            params["retry_upload_id"] = cleanup_upload_id
+        elif cleanup_temp_path:
+            params["retry_upload_id"] = _stage_ebook_upload(service, ebook_path, original_name)
+        else:
+            params["retry_inbox_file"] = original_name
+        logger.info("Translated ebook import job %s requires a fresh Preview and confirmation", job_id)
+        tracker.update_job(
+            job_id,
+            status="failed",
+            error=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+            message=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+            params=params,
+        )
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Translated ebook import requires existing book confirmation",
+            job_id=job_id,
+            details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
+        )
     except ValueError as exc:
         logger.info("Translated ebook import job %s failed: %s", job_id, exc)
         tracker.update_job(
@@ -456,10 +484,11 @@ async def _run_translated_ebook_import_job(
             details={"import_type": "ebook", "result": "failure"},
         )
     finally:
-        if cleanup_upload_id:
-            _delete_staged_ebook_upload(service, cleanup_upload_id)
-        if cleanup_temp_path:
-            ebook_path.unlink(missing_ok=True)
+        if not confirmation_conflict:
+            if cleanup_upload_id:
+                _delete_staged_ebook_upload(service, cleanup_upload_id)
+            if cleanup_temp_path:
+                ebook_path.unlink(missing_ok=True)
 
 
 def _ebook_inbox_dir() -> Path:
