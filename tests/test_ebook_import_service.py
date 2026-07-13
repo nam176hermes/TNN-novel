@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -9,6 +11,76 @@ import pytest
 from app.database.db import add_book, get_book_by_title, init_db, list_chapters, list_ebook_import_runs
 from app.mobile_api.services import ebook_import_service
 from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
+
+
+def test_epub_archive_limits_member_count_and_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "limits.epub"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("a", b"123456")
+        archive.writestr("b", b"123456")
+        archive.writestr("c", b"1")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_MEMBERS", 2)
+        with pytest.raises(ValueError, match="too many files"):
+            ebook_import_service._validate_epub_archive(archive)
+
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_MEMBERS", 10)
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES", 10)
+        with pytest.raises(ValueError, match="uncompressed size"):
+            ebook_import_service._validate_epub_archive(archive)
+
+
+def test_epub_archive_rejects_excessive_compression_ratio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "ratio.epub"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("chapter.xhtml", b"A" * 100_000)
+
+    monkeypatch.setattr(ebook_import_service, "MAX_EPUB_COMPRESSION_RATIO", 10.0)
+    with zipfile.ZipFile(archive_path) as archive:
+        with pytest.raises(ValueError, match="compression ratio"):
+            ebook_import_service._validate_epub_archive(archive)
+
+
+def test_epub_member_reader_enforces_document_and_stream_caps() -> None:
+    class FakeArchive:
+        def getinfo(self, _name: str):
+            return SimpleNamespace(filename="chapter.xhtml", file_size=10, compress_size=10, is_dir=lambda: False)
+
+        def open(self, _member, _mode: str):
+            return io.BytesIO(b"x" * 20)
+
+    with pytest.raises(ValueError, match="document exceeds"):
+        ebook_import_service._read_epub_member_bounded(
+            FakeArchive(),  # type: ignore[arg-type]
+            "chapter.xhtml",
+            max_bytes=10,
+            kind="document",
+        )
+
+
+def test_epub_preview_never_uses_unbounded_zipfile_read(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    epub_path = tmp_path / "translated.epub"
+    write_minimal_epub(epub_path)
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "read",
+        lambda *args, **kwargs: pytest.fail("EPUB parser used unbounded ZipFile.read"),
+    )
+
+    preview = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data").preview(epub_path)
+
+    assert preview["chapter_count"] == 2
 
 
 def write_minimal_epub(path: Path) -> None:
