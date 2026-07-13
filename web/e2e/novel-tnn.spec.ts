@@ -318,11 +318,14 @@ test('import wizard loads the current paste flow with mocked backend data', asyn
   await signIn(page, state);
 
   await page.getByRole('navigation', { name: 'Quy trình' }).getByRole('button', { name: 'Nhập chương' }).click();
-  await expect(page.getByRole('heading', { name: 'Paste source chapter' })).toBeVisible();
-  await expect(page.getByRole('list', { name: 'Import wizard steps' })).toContainText('Chọn nguồn');
-  const importMode = page.getByLabel('Import mode');
-  await expect(importMode.getByRole('button', { name: 'Paste', exact: true })).toBeVisible();
-  await expect(importMode.getByRole('button', { name: 'File', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Dán chương nguồn' })).toBeVisible();
+  const wizardSteps = page.getByRole('list', { name: 'Các bước nhập' });
+  await expect(wizardSteps).toContainText('Chọn nguồn');
+  await expect(wizardSteps.locator('li').first()).toHaveCSS('display', 'grid');
+  await expect(wizardSteps.locator('li').first().locator('strong')).toHaveCSS('display', 'block');
+  const importMode = page.getByLabel('Chế độ nhập');
+  await expect(importMode.getByRole('button', { name: 'Dán văn bản', exact: true })).toBeVisible();
+  await expect(importMode.getByRole('button', { name: 'Tải file', exact: true })).toBeVisible();
   await expect(importMode.getByRole('button', { name: 'Ebook bản dịch', exact: true })).toBeVisible();
   await expect(importMode.getByRole('button', { name: 'URL', exact: true })).toBeVisible();
   await expect(importMode.getByRole('button', { name: 'Kho nguồn', exact: true })).toBeVisible();

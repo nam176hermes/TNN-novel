@@ -7052,6 +7052,65 @@ button:disabled {
   gap: 10px;
 }
 
+.backup-inventory-list {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.backup-inventory-list > li {
+  align-items: center;
+  background: rgb(255 255 255 / 2.5%);
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 10px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 12px;
+}
+
+.backup-inventory-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.backup-inventory-main strong,
+.backup-inventory-main span,
+.backup-inventory-main small {
+  overflow-wrap: anywhere;
+}
+
+.backup-inventory-main span,
+.backup-inventory-main small {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.backup-inventory-actions {
+  align-items: flex-end;
+  display: grid;
+  flex: 0 0 auto;
+  gap: 8px;
+  justify-items: end;
+}
+
+@media (max-width: 600px) {
+  .backup-inventory-list > li {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .backup-inventory-actions {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+  }
+}
+
 .provider-identity {
   align-items: center;
   display: inline-flex;

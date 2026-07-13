@@ -15,7 +15,11 @@ class BackupService:
     def list_backups(self) -> list[dict]:
         items = ops.list_backups(self.backup_dir)
         for item in items:
-            item["download_url"] = f"/api/system/backups/{item['filename']}/download"
+            item["download_url"] = (
+                f"/api/system/backups/{item['filename']}/download"
+                if item.get("metadata_status") == "READY"
+                else ""
+            )
         return items
 
     def create_backup(
@@ -43,7 +47,7 @@ class BackupService:
 
         backups = self.list_backups()
         for item in backups:
-            if item["filename"] == backup_path.name:
+            if item["filename"] == backup_path.name and item.get("metadata_status") == "READY":
                 return item
         raise FileNotFoundError(f"Backup metadata missing for {backup_path.name}")
 

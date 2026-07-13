@@ -622,6 +622,11 @@ class SystemBackupItem(BaseModel):
     included_modules: list[str] = Field(default_factory=list)
     excluded_modules: list[str] = Field(default_factory=list)
     manifest: dict[str, Any] = Field(default_factory=dict)
+    metadata_status: str = "METADATA_MISSING"
+    repair_needed: bool = False
+    manifest_available: bool = False
+    archive_available: bool = False
+    warning: str = ""
     download_url: str = ""
 
 

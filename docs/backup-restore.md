@@ -46,6 +46,8 @@ Every backup now includes:
   - `novel-pipeline-backup-...tar.gz.manifest.json`
   - `novel-pipeline-backup-...tar.gz.enc.manifest.json`
 
+The adjacent sidecar is a compact, versioned, backup-level summary used by normal API listing. The complete file-level manifest remains inside the archive for explicit validation and compatibility. Normal `GET /api/system/backups` reads sidecar/stat metadata only and never opens or decompresses an archive.
+
 The manifest records:
 
 - app name
@@ -60,6 +62,40 @@ The manifest records:
 - whether the backup is encrypted
 
 `.env` is never included by default. Do not include it in routine backups because it can contain credentials.
+
+## Repair Legacy Sidecars
+
+Legacy archives without metadata remain visible as `METADATA_MISSING`; malformed metadata is shown as `METADATA_INVALID`. Neither state triggers archive inspection from an API request.
+
+Repair is an explicit operator workflow and defaults to dry-run. Rehearse against copied archives first:
+
+```bash
+REHEARSAL_DIR="$(mktemp -d /tmp/novel-tnn-backup-rehearsal-XXXXXX)"
+cp --preserve=timestamps backups/SAFE_ARCHIVE_NAME.tar.gz "$REHEARSAL_DIR/"
+sha256sum "$REHEARSAL_DIR"/*.tar.gz
+
+.venv/bin/python scripts/ops.py backup-metadata-repair \
+  --backup-dir "$REHEARSAL_DIR" \
+  --all-missing \
+  --dry-run
+
+.venv/bin/python scripts/ops.py backup-metadata-repair \
+  --backup-dir "$REHEARSAL_DIR" \
+  --all-missing \
+  --apply
+```
+
+Run apply a second time and require zero writes, re-check archive hashes, list the repaired copies, and run a representative restore drill. Only then apply to the configured operator backup directory:
+
+```bash
+.venv/bin/python scripts/ops.py backup-metadata-repair \
+  --backup-dir "${BACKUP_DIR:-$REPO_ROOT/backups}" \
+  --all-missing \
+  --apply \
+  --report-dir /tmp/novel-tnn-backup-metadata-report
+```
+
+The tool never rewrites the archive. Existing valid sidecars are preserved unless `--overwrite` is explicit. Encrypted archives require a passphrase from the named environment variable; never place the passphrase in command arguments or reports. See [`backup-metadata-sidecars.md`](backup-metadata-sidecars.md) for the schema and failure states.
 
 ## Optional Encrypted Backup
 

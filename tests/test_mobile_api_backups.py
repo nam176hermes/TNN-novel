@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tarfile
 from pathlib import Path
 
@@ -132,6 +133,55 @@ async def test_encrypted_secrets_backup_requires_passphrase(backup_service_fixtu
 def test_backup_service_blocks_path_traversal(backup_service_fixture: BackupService) -> None:
     with pytest.raises(ValueError, match="Invalid backup filename"):
         backup_service_fixture.resolve_download_path("../etc/passwd")
+
+
+@pytest.mark.asyncio
+async def test_backup_list_is_sidecar_only_and_gates_download_urls(
+    backup_service_fixture: BackupService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_dir = backup_service_fixture.backup_dir
+    ready = backup_dir / "novel-pipeline-backup-20260712-100000.tar.gz"
+    ready.write_bytes(b"artifact")
+    ops.backup_sidecar_path(ready).write_text(
+        json.dumps(
+            {
+                "backup_format_version": 2,
+                "created_at": "2026-07-12T10:00:00",
+                "encrypted": False,
+                "secrets_included": False,
+                "included_modules": ["database"],
+                "excluded_modules": ["secrets"],
+                "file_count": 1,
+                "total_size_bytes": 8,
+                "checksums": [{"path": "data/private.txt", "sha256": "a" * 64}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    missing = backup_dir / "novel-pipeline-backup-20260712-090000.tar.gz"
+    missing.write_bytes(b"archive-content-must-not-be-opened")
+    malformed = backup_dir / "novel-pipeline-backup-20260712-080000.tar.gz"
+    malformed.write_bytes(b"artifact")
+    ops.backup_sidecar_path(malformed).write_text("{", encoding="utf-8")
+    monkeypatch.setattr(ops.tarfile, "open", lambda *args, **kwargs: pytest.fail("API list opened archive"))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        response = await client.get("/api/system/backups", headers=headers)
+
+    assert response.status_code == 200
+    payload = {item["filename"]: item for item in response.json()["items"]}
+    assert payload[ready.name]["metadata_status"] == "READY"
+    assert payload[ready.name]["download_url"].endswith("/download")
+    assert payload[missing.name]["metadata_status"] == "METADATA_MISSING"
+    assert payload[missing.name]["download_url"] == ""
+    assert payload[malformed.name]["metadata_status"] == "METADATA_INVALID"
+    assert payload[malformed.name]["download_url"] == ""
+    assert "checksums" not in response.text
+    assert "private.txt" not in response.text
+    assert not re.search(r"/home/|/mnt/|[A-Za-z]:\\\\", response.text)
 
 
 @pytest.mark.asyncio

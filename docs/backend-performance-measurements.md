@@ -54,6 +54,35 @@ The 120-chapter result is consistent with per-chapter file/database operations a
 4. P1: move backup creation to a tracked job or background operation with visible status.
 5. P2: re-run plans on a larger copied database before adding glossary or QA indexes.
 
+## P1A Backup Metadata-Only Listing
+
+The previous current-inventory list path opened two legacy compressed archives, took about 14.35 seconds, and returned about 5 MiB of manifest data. P1A moved normal listing to bounded sidecar/stat reads and repaired the two missing legacy sidecars through an explicit copied-directory rehearsal.
+
+Current operator inventory after repair:
+
+| Metric | Result |
+| --- | ---: |
+| Entries | 3 `READY` |
+| Warm median | 102.943 ms |
+| Warm maximum | 115.650 ms |
+| Normal-list archive opens | 0 |
+| Service JSON payload | 2,638 B |
+
+The current median is below the required 250 ms. It is slightly above the preferred 100 ms because one compatible legacy sidecar is approximately 5.85 MiB; the parser reads it but allowlists only a compact summary. The corresponding 5.6 GB archive is never opened.
+
+Isolated `scripts/benchmark_backup_listing.py` results (three iterations):
+
+| Scenario | Service median | Archive opens | Bytes read |
+| --- | ---: | ---: | ---: |
+| zero | 0.038 ms | 0 | 0 |
+| two compact sidecars | 0.189 ms | 0 | 964 |
+| ten compact sidecars | 0.729 ms | 0 | 4,822 |
+| missing sidecar | 0.066 ms | 0 | 0 |
+| malformed sidecar | 0.102 ms | 0 | 1 |
+| sparse 512 MiB archive, missing sidecar | 0.065 ms | 0 | 0 |
+
+This confirms normal-list time depends on entry and sidecar count rather than archive size. No list cache was added. Backup creation remains synchronous and is still the P2C operational follow-up.
+
 ## P2A Database Lifecycle And Library Follow-Up
 
 P2A was measured on an isolated Linux-filesystem synthetic database. Normal project connection setup fell from a fresh 11.921 ms median to 0.035 ms after migration, seeding, backfill, WAL negotiation, and version recording moved behind explicit `init_db()` startup.

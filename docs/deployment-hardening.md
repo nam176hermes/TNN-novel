@@ -246,6 +246,8 @@ System backup routes are authenticated only:
 - `POST /api/system/backups`
 - `GET /api/system/backups/{filename}/download`
 
+Normal backup listing is metadata-only. It may read safe filename/stat data and a bounded adjacent sidecar, but must not open, decompress, decrypt, checksum, or walk an archive. Missing or invalid sidecars are entry-specific warnings and cannot block the core Status page or other backup entries. Only `READY` entries receive a protected download action.
+
 Rules:
 
 - backup filenames are sanitized
@@ -255,6 +257,8 @@ Rules:
 - restore stays a documented CLI workflow, not a one-click public UI action
 
 Run restore drills regularly and keep backups outside any public static root.
+
+Legacy sidecar repair is never triggered by the browser. Rehearse and invoke the dry-run-first operator command documented in [`docs/backup-metadata-sidecars.md`](backup-metadata-sidecars.md). Do not supply passphrases on the command line, do not overwrite valid sidecars without explicit review, and verify archive hashes before and after repair.
 
 ## Sessions, Refresh Tokens, and Password Changes
 

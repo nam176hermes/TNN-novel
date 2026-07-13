@@ -27,6 +27,8 @@ type StatusSettingsViewProps = {
   status: SystemStatus | null;
   backupBusy?: boolean;
   backupError?: string;
+  backupItems?: SystemBackupItem[];
+  backupListLoading?: boolean;
   latestBackup?: SystemBackupItem | null;
   onCreateBackup?(): void | Promise<void>;
   onCreateEncryptedBackup?(): void | Promise<void>;
@@ -41,6 +43,17 @@ function formatBytes(value: number): string {
 
 function yesNo(value: boolean, yes = 'Bật', no = 'Tắt'): string {
   return value ? yes : no;
+}
+
+function backupStatusLabel(status: SystemBackupItem['metadata_status']): string {
+  return {
+    READY: 'Sẵn sàng',
+    METADATA_MISSING: 'Thiếu metadata',
+    METADATA_INVALID: 'Metadata không hợp lệ',
+    ARTIFACT_MISSING: 'Thiếu archive',
+    ARTIFACT_INVALID: 'Archive không hợp lệ',
+    UNSUPPORTED_FORMAT: 'Định dạng không hỗ trợ',
+  }[status];
 }
 
 function statusRows(status: SystemStatus) {
@@ -82,6 +95,8 @@ export default function StatusSettingsView({
   status,
   backupBusy = false,
   backupError = '',
+  backupItems,
+  backupListLoading = false,
   latestBackup = null,
   onCreateBackup,
   onCreateEncryptedBackup,
@@ -94,6 +109,8 @@ export default function StatusSettingsView({
   const retryCount = failedJob?.retry_count ?? 0;
   const recentOperationalErrors = status?.recent_operational_errors ?? [];
   const recentBackupEvent = status?.recent_backup_events?.[0] ?? null;
+  const visibleBackups = backupItems ?? (latestBackup ? [latestBackup] : []);
+  const newestBackup = visibleBackups[0] ?? latestBackup;
   const rows = status ? statusRows(status) : [];
   const firstColumnRows = rows.slice(0, 7);
   const secondColumnRows = rows.slice(7);
@@ -334,7 +351,7 @@ export default function StatusSettingsView({
           <summary>
             <span>
               <strong>Sao lưu hệ thống</strong>
-              <small>{latestBackup ? `Mới nhất: ${latestBackup.filename}` : 'Tạo và tải backup vận hành.'}</small>
+              <small>{newestBackup ? `Mới nhất: ${newestBackup.filename}` : 'Tạo và tải backup vận hành.'}</small>
             </span>
             <div className="backup-action-row">
               <button
@@ -391,34 +408,47 @@ export default function StatusSettingsView({
             </div>
           ) : null}
           {backupError ? <p className="status-error">{backupError}</p> : null}
-          {latestBackup ? (
-            <div className="inline-help-panel">
-              <p>
-                Backup mới nhất: <strong>{latestBackup.filename}</strong> · {formatBytes(latestBackup.size_bytes)} ·{' '}
-                {latestBackup.encrypted ? 'mã hóa' : 'plain'} · secrets {latestBackup.secrets_included ? 'có' : 'không'}
-              </p>
-              <p>
-                Bao gồm: {latestBackup.included_modules.join(', ') || '-'}
-              </p>
-              {latestBackup.excluded_modules.length > 0 ? (
-                <p>
-                  Loại trừ: {latestBackup.excluded_modules.join(', ')}
-                </p>
-              ) : null}
-              <div className="backup-action-row">
-                <button
-                  className="secondary-action"
-                  disabled={!onDownloadBackup}
-                  onClick={() => {
-                    void onDownloadBackup?.(latestBackup.filename);
-                  }}
-                  type="button"
-                >
-                  <HardDrive aria-hidden="true" size={16} />
-                  Tải backup
-                </button>
-              </div>
-            </div>
+          {backupListLoading ? <p className="empty-detail">Đang tải danh sách backup...</p> : null}
+          {!backupListLoading && visibleBackups.length === 0 ? (
+            <p className="empty-detail">Chưa có backup hệ thống.</p>
+          ) : null}
+          {visibleBackups.length > 0 ? (
+            <ul aria-label="Danh sách backup" className="backup-inventory-list">
+              {visibleBackups.map((backup) => (
+                <li key={backup.filename}>
+                  <div className="backup-inventory-main">
+                    <strong>{backup.filename}</strong>
+                    <span>
+                      {formatBytes(backup.size_bytes)} · {backup.encrypted ? 'mã hóa' : 'plain'} · secrets{' '}
+                      {backup.secrets_included ? 'có' : 'không'}
+                    </span>
+                    {backup.repair_needed ? (
+                      <small>Chạy lệnh backup-metadata-repair trên máy chủ để sửa metadata.</small>
+                    ) : null}
+                  </div>
+                  <div className="backup-inventory-actions">
+                    <span
+                      className={`status-chip ${backup.metadata_status === 'READY' ? 'status-chip-success' : 'status-chip-warning'}`}
+                    >
+                      {backupStatusLabel(backup.metadata_status)}
+                    </span>
+                    {backup.download_url && backup.archive_available ? (
+                      <button
+                        className="secondary-action"
+                        disabled={!onDownloadBackup}
+                        onClick={() => {
+                          void onDownloadBackup?.(backup.filename);
+                        }}
+                        type="button"
+                      >
+                        <HardDrive aria-hidden="true" size={16} />
+                        Tải backup
+                      </button>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
           ) : null}
           {recentBackupEvent ? (
             <p className="empty-detail">

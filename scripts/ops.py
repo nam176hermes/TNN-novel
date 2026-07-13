@@ -6,6 +6,7 @@ import io
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -29,6 +30,33 @@ DEFAULT_USER_AGENT = "novel-pipeline-smoke/1.0"
 PROVIDER_KEY_NAMES = ("GEMINI_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
 BACKUP_GLOB_PATTERNS = ("novel-pipeline-backup-*.tar.gz", "novel-pipeline-backup-*.tar.gz.enc")
 BACKUP_MANIFEST_SUFFIX = ".manifest.json"
+BACKUP_SIDECAR_SCHEMA_VERSION = 1
+# P1A_FIX_APPLIED: normal backup listing consumes bounded sidecar/stat metadata only.
+MAX_BACKUP_SIDECAR_BYTES = 8 * 1024 * 1024
+MAX_INTERNAL_BACKUP_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_BACKUP_ARCHIVE_MEMBERS = 1_000_000
+MAX_BACKUP_METADATA_STRING = 512
+MAX_BACKUP_METADATA_MODULES = 64
+SAFE_MANIFEST_FIELDS = {
+    "app_name",
+    "app_version",
+    "artifact_state",
+    "archive_checksum",
+    "archive_size_bytes",
+    "backup_filename",
+    "backup_format_version",
+    "created_at",
+    "encrypted",
+    "excluded_modules",
+    "file_count",
+    "included_modules",
+    "manifest_version",
+    "secrets_included",
+    "sidecar_schema_version",
+    "total_size_bytes",
+}
+_SAFE_MODULE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_SAFE_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 BACKUP_MODULE_SUBDIRS = {
     "uploads": ("raw", "cleaned", "translated", "inbox"),
     "covers": ("covers",),
@@ -385,10 +413,7 @@ def create_backup(
             if include_env and env_file.exists():
                 archive.add(env_file, arcname=".env")
 
-        backup_path.with_suffix(backup_path.suffix + BACKUP_MANIFEST_SUFFIX).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        write_backup_sidecar_atomic(backup_path, build_backup_sidecar(manifest, backup_path))
 
     if keep is not None:
         rotate_backup_files(destination_dir, keep=keep)
@@ -448,9 +473,8 @@ def encrypt_backup_archive(
     )
     manifest = read_backup_manifest(backup_path)
     manifest["encrypted"] = True
-    manifest["secrets_included"] = True if manifest.get("secrets_included") else False
-    encrypted_manifest_path = encrypted_path.with_suffix(encrypted_path.suffix + BACKUP_MANIFEST_SUFFIX)
-    encrypted_manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest["secrets_included"] = bool(manifest.get("secrets_included"))
+    write_backup_sidecar_atomic(encrypted_path, build_backup_sidecar(manifest, encrypted_path))
     backup_path.unlink(missing_ok=True)
     plain_manifest_path = backup_path.with_suffix(backup_path.suffix + BACKUP_MANIFEST_SUFFIX)
     plain_manifest_path.unlink(missing_ok=True)
@@ -477,9 +501,150 @@ def rotate_backup_files(out_dir: Path, *, keep: int) -> list[str]:
     return removed
 
 
+def backup_sidecar_path(archive_path: Path) -> Path:
+    return archive_path.with_suffix(archive_path.suffix + BACKUP_MANIFEST_SUFFIX)
+
+
+def build_backup_sidecar(manifest: dict[str, Any], archive_path: Path) -> dict[str, Any]:
+    archive_path = archive_path.resolve()
+    stat = archive_path.lstat()
+    if archive_path.is_symlink() or not archive_path.is_file() or stat.st_size <= 0:
+        raise ValueError("backup artifact must be a regular non-empty file")
+    metadata: dict[str, Any] = {
+        "sidecar_schema_version": BACKUP_SIDECAR_SCHEMA_VERSION,
+        "manifest_version": str(manifest.get("backup_format_version", "")),
+        "backup_filename": archive_path.name,
+        "backup_format_version": int(manifest.get("backup_format_version", 0)),
+        "created_at": str(manifest.get("created_at", "")),
+        "archive_size_bytes": stat.st_size,
+        "encrypted": bool(manifest.get("encrypted") or archive_path.name.endswith(".enc")),
+        "secrets_included": bool(manifest.get("secrets_included")),
+        "included_modules": list(manifest.get("included_modules", [])),
+        "excluded_modules": list(manifest.get("excluded_modules", [])),
+        "file_count": int(manifest.get("file_count", 0)),
+        "total_size_bytes": int(manifest.get("total_size_bytes", 0)),
+        "app_version": str(manifest.get("app_version", "")),
+        "artifact_state": "READY",
+    }
+    if manifest.get("archive_checksum"):
+        metadata["archive_checksum"] = str(manifest["archive_checksum"])
+    return _safe_manifest_summary(metadata)
+
+
+def write_backup_sidecar_atomic(archive_path: Path, metadata: dict[str, Any]) -> Path:
+    archive_path = archive_path.resolve()
+    sidecar_path = backup_sidecar_path(archive_path)
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{sidecar_path.name}.",
+        suffix=".tmp",
+        dir=sidecar_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, sidecar_path)
+        return sidecar_path
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _bounded_string(value: Any, *, field: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) > MAX_BACKUP_METADATA_STRING:
+        raise ValueError(f"invalid {field}")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError(f"invalid {field}")
+    if (
+        Path(value).is_absolute()
+        or re.match(r"^[A-Za-z]:[\\/]", value)
+        or value.startswith("\\\\")
+        or re.search(r"(?:^|[\s=:])/(?:[^/\s]+/)+", value)
+    ):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _bounded_nonnegative_int(value: Any, *, field: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _bounded_bool(value: Any, *, field: str) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _bounded_modules(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_BACKUP_METADATA_MODULES:
+        raise ValueError(f"invalid {field}")
+    modules: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SAFE_MODULE_RE.fullmatch(item):
+            raise ValueError(f"invalid {field}")
+        modules.append(item)
+    return modules
+
+
+def _safe_manifest_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for field in SAFE_MANIFEST_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if field in {"encrypted", "secrets_included"}:
+            summary[field] = _bounded_bool(value, field=field)
+        elif field in {
+            "archive_size_bytes",
+            "backup_format_version",
+            "file_count",
+            "sidecar_schema_version",
+            "total_size_bytes",
+        }:
+            summary[field] = _bounded_nonnegative_int(value, field=field)
+        elif field in {"included_modules", "excluded_modules"}:
+            summary[field] = _bounded_modules(value, field=field)
+        else:
+            summary[field] = _bounded_string(value, field=field)
+    return summary
+
+
+def read_backup_sidecar(archive_path: Path) -> dict[str, Any]:
+    sidecar_path = backup_sidecar_path(archive_path)
+    stat = sidecar_path.lstat()
+    if sidecar_path.is_symlink() or not sidecar_path.is_file():
+        raise ValueError("invalid backup sidecar")
+    if stat.st_size <= 0 or stat.st_size > MAX_BACKUP_SIDECAR_BYTES:
+        raise ValueError("invalid backup sidecar")
+    with sidecar_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("backup sidecar must be an object")
+    summary = _safe_manifest_summary(payload)
+    backup_filename = summary.get("backup_filename")
+    if backup_filename and backup_filename != archive_path.name:
+        raise ValueError("backup sidecar filename does not match artifact")
+    return summary
+
+
 def read_backup_manifest(archive_path: Path) -> dict[str, Any]:
     archive_path = archive_path.resolve()
-    sidecar_path = archive_path.with_suffix(archive_path.suffix + BACKUP_MANIFEST_SUFFIX)
+    sidecar_path = backup_sidecar_path(archive_path)
     if sidecar_path.exists():
         return json.loads(sidecar_path.read_text(encoding="utf-8"))
 
@@ -494,32 +659,362 @@ def read_backup_manifest(archive_path: Path) -> dict[str, Any]:
         return json.loads(extracted.read().decode("utf-8"))
 
 
+def _is_supported_backup_name(name: str) -> bool:
+    return name.startswith("novel-pipeline-backup-") and (
+        name.endswith(".tar.gz") or name.endswith(".tar.gz.enc")
+    )
+
+
+def _backup_listing_item(
+    *,
+    filename: str,
+    size_bytes: int,
+    created_at: str,
+    encrypted: bool,
+    status: str,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_manifest = manifest or {}
+    warnings = {
+        "METADATA_MISSING": "Backup metadata is missing. Run the explicit metadata repair command.",
+        "METADATA_INVALID": "Backup metadata is invalid. Run the explicit metadata repair command.",
+        "ARTIFACT_MISSING": "Backup artifact is missing.",
+        "ARTIFACT_INVALID": "Backup artifact is not a valid regular non-empty file.",
+        "UNSUPPORTED_FORMAT": "Backup format is not supported.",
+    }
+    return {
+        "filename": filename,
+        "size_bytes": size_bytes,
+        "created_at": safe_manifest.get("created_at") or created_at,
+        "encrypted": bool(safe_manifest.get("encrypted", encrypted)),
+        "secrets_included": bool(safe_manifest.get("secrets_included", False)),
+        "included_modules": list(safe_manifest.get("included_modules", [])),
+        "excluded_modules": list(safe_manifest.get("excluded_modules", [])),
+        "manifest": safe_manifest,
+        "metadata_status": status,
+        "repair_needed": status in {"METADATA_MISSING", "METADATA_INVALID"},
+        "manifest_available": status == "READY",
+        "archive_available": status in {"READY", "METADATA_MISSING", "METADATA_INVALID"},
+        "warning": warnings.get(status, ""),
+    }
+
+
 def list_backups(out_dir: Path | None = None) -> list[dict[str, Any]]:
     backup_dir = (out_dir or DEFAULT_BACKUP_DIR).resolve()
     if not backup_dir.exists():
         return []
-    backup_files: list[Path] = []
-    for pattern in BACKUP_GLOB_PATTERNS:
-        backup_files.extend(path for path in backup_dir.glob(pattern) if path.is_file())
+    entries = list(backup_dir.iterdir())
+    archive_paths: dict[str, Path] = {
+        path.name: path for path in entries if _is_supported_backup_name(path.name)
+    }
+    orphan_names: set[str] = set()
+    for path in entries:
+        if not path.name.endswith(BACKUP_MANIFEST_SUFFIX):
+            continue
+        archive_name = path.name.removesuffix(BACKUP_MANIFEST_SUFFIX)
+        if _is_supported_backup_name(archive_name) and archive_name not in archive_paths:
+            orphan_names.add(archive_name)
+
     results: list[dict[str, Any]] = []
-    for path in sorted(set(backup_files), key=lambda item: item.stat().st_mtime, reverse=True):
+    for name, path in archive_paths.items():
+        encrypted = name.endswith(".enc")
         try:
-            manifest = read_backup_manifest(path)
-        except Exception:
+            stat = path.lstat()
+        except OSError:
+            results.append(_backup_listing_item(
+                filename=name, size_bytes=0, created_at="", encrypted=encrypted, status="ARTIFACT_INVALID"
+            ))
+            continue
+        created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
+        if path.is_symlink() or not path.is_file() or stat.st_size <= 0:
+            results.append(_backup_listing_item(
+                filename=name,
+                size_bytes=max(0, stat.st_size),
+                created_at=created_at,
+                encrypted=encrypted,
+                status="ARTIFACT_INVALID",
+            ))
+            continue
+        sidecar = backup_sidecar_path(path)
+        if not sidecar.exists() and not sidecar.is_symlink():
+            results.append(_backup_listing_item(
+                filename=name,
+                size_bytes=stat.st_size,
+                created_at=created_at,
+                encrypted=encrypted,
+                status="METADATA_MISSING",
+            ))
+            continue
+        try:
+            manifest = read_backup_sidecar(path)
+            status = "READY"
+        except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
             manifest = {}
-        results.append(
-            {
-                "filename": path.name,
-                "size_bytes": path.stat().st_size,
-                "created_at": manifest.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
-                "encrypted": bool(manifest.get("encrypted") or path.name.endswith(".enc")),
-                "secrets_included": bool(manifest.get("secrets_included")),
-                "included_modules": manifest.get("included_modules", []),
-                "excluded_modules": manifest.get("excluded_modules", []),
-                "manifest": manifest,
-            }
-        )
-    return results
+            status = "METADATA_INVALID"
+        results.append(_backup_listing_item(
+            filename=name,
+            size_bytes=stat.st_size,
+            created_at=created_at,
+            encrypted=encrypted,
+            status=status,
+            manifest=manifest,
+        ))
+
+    for name in orphan_names:
+        sidecar = backup_dir / f"{name}{BACKUP_MANIFEST_SUFFIX}"
+        try:
+            created_at = datetime.fromtimestamp(sidecar.lstat().st_mtime).isoformat()
+        except OSError:
+            created_at = ""
+        results.append(_backup_listing_item(
+            filename=name,
+            size_bytes=0,
+            created_at=created_at,
+            encrypted=name.endswith(".enc"),
+            status="ARTIFACT_MISSING",
+        ))
+
+    supported_names = set(archive_paths)
+    sidecar_names = {f"{name}{BACKUP_MANIFEST_SUFFIX}" for name in supported_names | orphan_names}
+    for path in entries:
+        if path.name in supported_names or path.name in sidecar_names:
+            continue
+        if path.name.startswith("novel-pipeline-backup-"):
+            try:
+                stat = path.lstat()
+                size_bytes = max(0, stat.st_size)
+                created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            except OSError:
+                size_bytes = 0
+                created_at = ""
+            results.append(_backup_listing_item(
+                filename=path.name,
+                size_bytes=size_bytes,
+                created_at=created_at,
+                encrypted=False,
+                status="UNSUPPORTED_FORMAT",
+            ))
+
+    return sorted(results, key=lambda item: (item["created_at"], item["filename"]), reverse=True)
+
+
+def _derive_legacy_backup_manifest(
+    archive_path: Path,
+    members: list[tarfile.TarInfo],
+) -> dict[str, Any]:
+    if len(members) > MAX_BACKUP_ARCHIVE_MEMBERS:
+        raise ValueError("backup archive has too many members")
+    for member in members:
+        _validate_tar_member(member)
+
+    data_files = [
+        member
+        for member in members
+        if member.isreg() and member.name.startswith("data/")
+    ]
+    if not data_files:
+        raise ValueError("backup archive does not contain data files")
+
+    names = {member.name for member in members}
+    included_modules: list[str] = []
+    module_prefixes = (
+        ("database", ("data/pipeline.db", "data/novel_pipeline.db")),
+        ("uploads", ("data/raw/", "data/cleaned/", "data/translated/", "data/inbox/")),
+        ("covers", ("data/covers/",)),
+        ("book_assets", ("data/book_assets/",)),
+        ("audio", ("data/audio/",)),
+        ("exports", ("data/exports/",)),
+        ("job_logs", ("data/logs/",)),
+        ("glossary_qa", ("data/glossary/",)),
+    )
+    for module, prefixes in module_prefixes:
+        if any(name == prefix or name.startswith(prefix) for name in names for prefix in prefixes):
+            included_modules.append(module)
+
+    secrets_included = ".env" in names
+    return {
+        "app_name": "Novel-TNN Translator",
+        "backup_format_version": 1,
+        "created_at": datetime.fromtimestamp(archive_path.stat().st_mtime).isoformat(timespec="seconds"),
+        "app_version": "",
+        "included_modules": included_modules,
+        "excluded_modules": [] if secrets_included else ["secrets"],
+        "file_count": len(data_files),
+        "total_size_bytes": sum(member.size for member in data_files),
+        "secrets_included": secrets_included,
+        "encrypted": False,
+    }
+
+
+def _inspect_plain_backup_archive(archive_path: Path) -> dict[str, Any]:
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > MAX_BACKUP_ARCHIVE_MEMBERS:
+                raise ValueError("backup archive has too many members")
+            for current in members:
+                _validate_tar_member(current)
+            member = next((current for current in members if current.name == "manifest.json"), None)
+            if member is None:
+                return _derive_legacy_backup_manifest(archive_path, members)
+            if not member.isreg() or member.size <= 0 or member.size > MAX_INTERNAL_BACKUP_MANIFEST_BYTES:
+                raise ValueError("invalid internal backup manifest")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise ValueError("invalid internal backup manifest")
+            payload_bytes = extracted.read(MAX_INTERNAL_BACKUP_MANIFEST_BYTES + 1)
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError("backup archive metadata inspection failed") from exc
+    if len(payload_bytes) > MAX_INTERNAL_BACKUP_MANIFEST_BYTES:
+        raise ValueError("invalid internal backup manifest")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid internal backup manifest") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid internal backup manifest")
+    return payload
+
+
+def inspect_backup_archive_explicitly(
+    archive_path: Path,
+    *,
+    passphrase_env: str = "BACKUP_PASSPHRASE",
+) -> dict[str, Any]:
+    archive_path = archive_path.resolve()
+    if not archive_path.exists() or not archive_path.is_file() or archive_path.stat().st_size <= 0:
+        raise ValueError("backup artifact is unavailable")
+    if not archive_path.name.endswith(".enc"):
+        return _inspect_plain_backup_archive(archive_path)
+
+    if not _SAFE_ENV_NAME_RE.fullmatch(passphrase_env):
+        raise ValueError("invalid environment variable name")
+    secret = os.getenv(passphrase_env, "")
+    if not secret:
+        raise ValueError("encrypted backup metadata is unavailable")
+    if not shutil.which("openssl"):
+        raise RuntimeError("encrypted backup metadata inspection is unavailable")
+    with tempfile.TemporaryDirectory(prefix="novel-pipeline-backup-inspect-") as tmp_root:
+        decrypted = Path(tmp_root) / archive_path.name.removesuffix(".enc")
+        env = {**os.environ, passphrase_env: secret}
+        try:
+            subprocess.run(
+                [
+                    "openssl",
+                    "enc",
+                    "-d",
+                    "-aes-256-cbc",
+                    "-pbkdf2",
+                    "-iter",
+                    os.getenv("OPENSSL_KDF_ITERATIONS", "200000"),
+                    "-in",
+                    str(archive_path),
+                    "-out",
+                    str(decrypted),
+                    "-pass",
+                    f"env:{passphrase_env}",
+                ],
+                check=True,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise ValueError("encrypted backup metadata inspection failed") from exc
+        return _inspect_plain_backup_archive(decrypted)
+
+
+def _write_safe_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def repair_backup_metadata(
+    backup_dir: Path,
+    *,
+    filename: str | None,
+    all_missing: bool,
+    apply: bool,
+    overwrite: bool,
+    passphrase_env: str,
+    report_dir: Path | None,
+) -> dict[str, Any]:
+    if bool(filename) == bool(all_missing):
+        raise ValueError("select exactly one filename or all missing metadata")
+    backup_dir = backup_dir.resolve()
+    if not backup_dir.exists() or not backup_dir.is_dir():
+        raise ValueError("backup directory is unavailable")
+
+    if filename:
+        if Path(filename).name != filename or not _is_supported_backup_name(filename):
+            raise ValueError("invalid backup filename")
+        selected_names = [filename]
+    else:
+        selected_names = [
+            item["filename"]
+            for item in list_backups(backup_dir)
+            if item["metadata_status"] in {"METADATA_MISSING", "METADATA_INVALID"}
+        ]
+
+    report: dict[str, Any] = {
+        "mode": "apply" if apply else "dry-run",
+        "selected": len(selected_names),
+        "would_write": 0,
+        "written": 0,
+        "skipped_valid": 0,
+        "failed": 0,
+        "entries": [],
+    }
+    for name in selected_names:
+        archive = backup_dir / name
+        sidecar = backup_sidecar_path(archive)
+        if not archive.exists() or archive.is_symlink() or not archive.is_file():
+            report["failed"] += 1
+            report["entries"].append({"filename": name, "result": "FAILED", "warning": "Backup artifact is unavailable."})
+            continue
+        if sidecar.exists() and not overwrite:
+            try:
+                read_backup_sidecar(archive)
+            except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            else:
+                report["skipped_valid"] += 1
+                report["entries"].append({"filename": name, "result": "SKIPPED_VALID", "warning": ""})
+                continue
+        try:
+            manifest = inspect_backup_archive_explicitly(archive, passphrase_env=passphrase_env)
+            metadata = build_backup_sidecar(manifest, archive)
+        except (OSError, RuntimeError, ValueError):
+            report["failed"] += 1
+            report["entries"].append({"filename": name, "result": "FAILED", "warning": "Backup metadata could not be inspected."})
+            continue
+        report["would_write"] += 1
+        if apply:
+            write_backup_sidecar_atomic(archive, metadata)
+            report["written"] += 1
+            result = "WRITTEN"
+        else:
+            result = "WOULD_WRITE"
+        report["entries"].append({"filename": name, "result": result, "warning": ""})
+
+    if report_dir is not None:
+        report_path = report_dir.resolve() / "backup-metadata-repair.json"
+        _write_safe_json_atomic(report_path, report)
+    return report
 
 
 def _validate_tar_member(member: tarfile.TarInfo) -> None:
@@ -1067,6 +1562,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Environment variable containing the encrypted backup passphrase",
     )
 
+    metadata_repair = subparsers.add_parser(
+        "backup-metadata-repair",
+        help="Inspect backups explicitly and repair compact metadata sidecars",
+    )
+    metadata_repair.add_argument("--backup-dir", type=Path, required=True)
+    metadata_selection = metadata_repair.add_mutually_exclusive_group(required=True)
+    metadata_selection.add_argument("--filename")
+    metadata_selection.add_argument("--all-missing", action="store_true")
+    metadata_mode = metadata_repair.add_mutually_exclusive_group()
+    metadata_mode.add_argument("--dry-run", action="store_true")
+    metadata_mode.add_argument("--apply", action="store_true")
+    metadata_repair.add_argument("--overwrite", action="store_true")
+    metadata_repair.add_argument("--passphrase-env", default="BACKUP_PASSPHRASE")
+    metadata_repair.add_argument("--report-dir", type=Path, default=None)
+
     repair = subparsers.add_parser("repair-db", help="Back up data and repair safe SQLite consistency issues")
     repair.add_argument("--data-dir", type=Path, default=None)
     repair.add_argument("--out-dir", type=Path, default=DEFAULT_BACKUP_DIR)
@@ -1151,6 +1661,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, indent=2))
         return 0
+    if args.command == "backup-metadata-repair":
+        result = repair_backup_metadata(
+            args.backup_dir,
+            filename=args.filename,
+            all_missing=args.all_missing,
+            apply=args.apply,
+            overwrite=args.overwrite,
+            passphrase_env=args.passphrase_env,
+            report_dir=args.report_dir,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1 if result["failed"] else 0
     if args.command == "repair-db":
         result = repair_database(
             data_dir=args.data_dir,

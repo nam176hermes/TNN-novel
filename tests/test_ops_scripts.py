@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -12,6 +13,300 @@ from pathlib import Path
 import pytest
 
 from scripts import ops
+
+
+def _write_backup_sidecar(archive: Path, **overrides: object) -> Path:
+    payload: dict[str, object] = {
+        "backup_format_version": 2,
+        "created_at": "2026-07-12T10:00:00",
+        "encrypted": False,
+        "secrets_included": False,
+        "included_modules": ["database"],
+        "excluded_modules": ["secrets"],
+        "file_count": 1,
+        "total_size_bytes": 8,
+        "checksums": [{"path": "data/private.txt", "sha256": "a" * 64}],
+    }
+    payload.update(overrides)
+    sidecar = archive.with_suffix(archive.suffix + ops.BACKUP_MANIFEST_SUFFIX)
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    return sidecar
+
+
+def test_list_backups_never_opens_archives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    ready.write_bytes(b"artifact")
+    _write_backup_sidecar(ready)
+    missing = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    missing.write_bytes(b"large-content-is-irrelevant")
+    monkeypatch.setattr(ops.tarfile, "open", lambda *args, **kwargs: pytest.fail("listing opened archive"))
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[ready.name]["metadata_status"] == "READY"
+    assert items[missing.name]["metadata_status"] == "METADATA_MISSING"
+    assert "checksums" not in items[ready.name]["manifest"]
+    assert "private.txt" not in json.dumps(items)
+
+
+def test_list_backups_classifies_entries_independently(tmp_path: Path) -> None:
+    malformed = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    malformed.write_bytes(b"artifact")
+    malformed.with_suffix(malformed.suffix + ops.BACKUP_MANIFEST_SUFFIX).write_text("{", encoding="utf-8")
+
+    zero = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    zero.touch()
+
+    orphan_archive = tmp_path / "novel-pipeline-backup-20260712-080000.tar.gz"
+    _write_backup_sidecar(orphan_archive)
+
+    unsupported = tmp_path / "novel-pipeline-backup-20260712-070000.zip"
+    unsupported.write_bytes(b"zip")
+    (tmp_path / "notes.txt").write_text("ignore", encoding="utf-8")
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[malformed.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[zero.name]["metadata_status"] == "ARTIFACT_INVALID"
+    assert items[orphan_archive.name]["metadata_status"] == "ARTIFACT_MISSING"
+    assert items[unsupported.name]["metadata_status"] == "UNSUPPORTED_FORMAT"
+    assert "notes.txt" not in items
+    assert all(not item.get("download_url") for item in items.values())
+
+
+def test_list_backups_rejects_oversized_and_symlink_sidecars(tmp_path: Path) -> None:
+    oversized = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    oversized.write_bytes(b"artifact")
+    oversized_sidecar = oversized.with_suffix(oversized.suffix + ops.BACKUP_MANIFEST_SUFFIX)
+    oversized_sidecar.write_bytes(b"x" * (ops.MAX_BACKUP_SIDECAR_BYTES + 1))
+
+    linked = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    linked.write_bytes(b"artifact")
+    external = tmp_path / "external.json"
+    external.write_text("{}", encoding="utf-8")
+    linked.with_suffix(linked.suffix + ops.BACKUP_MANIFEST_SUFFIX).symlink_to(external)
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[oversized.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[linked.name]["metadata_status"] == "METADATA_INVALID"
+
+
+def test_list_backups_rejects_absolute_or_mismatched_sidecar_metadata(tmp_path: Path) -> None:
+    absolute = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    absolute.write_bytes(b"artifact")
+    _write_backup_sidecar(absolute, app_version="/home/private/build")
+    mismatched = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    mismatched.write_bytes(b"artifact")
+    _write_backup_sidecar(mismatched, backup_filename="different.tar.gz")
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[absolute.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[mismatched.name]["metadata_status"] == "METADATA_INVALID"
+    assert "/home/private" not in json.dumps(items)
+
+
+def test_create_backup_writes_compact_sidecar(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("private", encoding="utf-8")
+
+    archive = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "backups",
+        record_event=False,
+    )
+
+    sidecar = ops.backup_sidecar_path(archive)
+    sidecar_text = sidecar.read_text(encoding="utf-8")
+    metadata = json.loads(sidecar_text)
+    assert metadata["sidecar_schema_version"] == 1
+    assert metadata["backup_filename"] == archive.name
+    assert metadata["archive_size_bytes"] == archive.stat().st_size
+    assert metadata["artifact_state"] == "READY"
+    assert "checksums" not in metadata
+    assert "chapter.txt" not in sidecar_text
+
+    with tarfile.open(archive, "r:gz") as handle:
+        internal = json.loads(handle.extractfile("manifest.json").read().decode("utf-8"))
+    assert internal["checksums"][0]["path"] == "data/chapter.txt"
+
+
+def test_atomic_sidecar_failure_cleans_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    archive.write_bytes(b"artifact")
+    monkeypatch.setattr(
+        ops.os,
+        "replace",
+        lambda *args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        ops.write_backup_sidecar_atomic(archive, {"sidecar_schema_version": 1})
+
+    assert not ops.backup_sidecar_path(archive).exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_metadata_repair_dry_run_apply_and_idempotency(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    source = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "source",
+        record_event=False,
+    )
+    rehearsal = tmp_path / "rehearsal"
+    rehearsal.mkdir()
+    archive = rehearsal / source.name
+    shutil.copy2(source, archive)
+    ops.backup_sidecar_path(archive).unlink(missing_ok=True)
+    before = ops.sha256_file(archive)
+
+    dry = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=False,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+    assert dry["would_write"] == 1
+    assert dry["written"] == 0
+    assert not ops.backup_sidecar_path(archive).exists()
+
+    first = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+    second = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert first["written"] == 1
+    assert second["written"] == 0
+    assert second["skipped_valid"] == 1
+    assert ops.sha256_file(archive) == before
+    assert ops.list_backups(rehearsal)[0]["metadata_status"] == "READY"
+
+
+def test_metadata_repair_derives_safe_metadata_for_manifestless_legacy_archive(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "data" / "raw").mkdir(parents=True)
+    (source / "data" / "pipeline.db").write_bytes(b"sqlite-fixture")
+    (source / "data" / "raw" / "chapter.txt").write_text("private", encoding="utf-8")
+    (source / ".env.example").write_text("SAFE=example\n", encoding="utf-8")
+    archive = tmp_path / "novel-pipeline-backup-20260630-101633.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(source / "data", arcname="data")
+        handle.add(source / ".env.example", arcname=".env.example")
+    before = ops.sha256_file(archive)
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    metadata = ops.read_backup_sidecar(archive)
+    assert result["written"] == 1
+    assert metadata["backup_format_version"] == 1
+    assert metadata["secrets_included"] is False
+    assert metadata["included_modules"] == ["database", "uploads"]
+    assert metadata["file_count"] == 2
+    assert metadata["total_size_bytes"] == len(b"sqlite-fixture") + len(b"private")
+    assert ops.sha256_file(archive) == before
+
+
+def test_metadata_repair_rejects_unsafe_manifestless_archive(tmp_path: Path) -> None:
+    archive = tmp_path / "novel-pipeline-backup-20260630-101633.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        member = tarfile.TarInfo("../escape.txt")
+        member.size = 1
+        handle.addfile(member, io.BytesIO(b"x"))
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert result["failed"] == 1
+    assert not ops.backup_sidecar_path(archive).exists()
+
+
+def test_metadata_repair_reports_corrupt_and_encrypted_archives_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corrupt = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    corrupt.write_bytes(b"not-a-tar")
+    encrypted = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz.enc"
+    encrypted.write_bytes(b"encrypted")
+    monkeypatch.delenv("BACKUP_PASSPHRASE", raising=False)
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=None,
+        all_missing=True,
+        apply=False,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert result["failed"] == 2
+    serialized = json.dumps(result)
+    assert str(tmp_path) not in serialized
+    assert "passphrase" not in serialized.lower()
+    assert not ops.backup_sidecar_path(corrupt).exists()
+    assert not ops.backup_sidecar_path(encrypted).exists()
+
+
+def test_explicit_archive_inspection_rejects_unsafe_passphrase_env_name(tmp_path: Path) -> None:
+    encrypted = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz.enc"
+    encrypted.write_bytes(b"encrypted")
+
+    with pytest.raises(ValueError, match="environment variable name"):
+        ops.inspect_backup_archive_explicitly(
+            encrypted,
+            passphrase_env="BACKUP-PASSPHRASE",
+        )
+
+
+def test_backup_metadata_repair_cli_defaults_to_dry_run() -> None:
+    args = ops.build_parser().parse_args(
+        ["backup-metadata-repair", "--backup-dir", "backups", "--all-missing"]
+    )
+
+    assert args.command == "backup-metadata-repair"
+    assert args.apply is False
+    assert args.all_missing is True
 
 
 def test_backup_and_restore_round_trip(tmp_path: Path) -> None:

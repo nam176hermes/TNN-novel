@@ -270,6 +270,17 @@ export type SystemBackupItem = {
   excluded_modules: string[];
   manifest: Record<string, unknown>;
   download_url: string;
+  metadata_status:
+    | 'READY'
+    | 'METADATA_MISSING'
+    | 'METADATA_INVALID'
+    | 'ARTIFACT_MISSING'
+    | 'ARTIFACT_INVALID'
+    | 'UNSUPPORTED_FORMAT';
+  repair_needed: boolean;
+  manifest_available: boolean;
+  archive_available: boolean;
+  warning: string;
 };
 
 export type SystemBackupList = {

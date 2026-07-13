@@ -43,6 +43,7 @@ const status: SystemStatus = {
 };
 
 const latestBackup: SystemBackupItem = {
+  archive_available: true,
   created_at: '2026-07-09T10:00:00Z',
   download_url: '/api/system/backups/novel-pipeline-backup-test.tar.gz/download',
   encrypted: false,
@@ -50,8 +51,12 @@ const latestBackup: SystemBackupItem = {
   filename: 'novel-pipeline-backup-test.tar.gz',
   included_modules: ['database', 'uploads', 'covers', 'book_assets', 'glossary_qa', 'managed_sources', 'settings', 'audio'],
   manifest: {},
+  manifest_available: true,
+  metadata_status: 'READY',
+  repair_needed: false,
   secrets_included: false,
   size_bytes: 4096,
+  warning: '',
 };
 
 describe('StatusSettingsView', () => {
@@ -225,6 +230,64 @@ describe('StatusSettingsView', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Tải backup' }));
     expect(onDownloadBackup).toHaveBeenCalledWith('novel-pipeline-backup-test.tar.gz');
+  });
+
+  it('renders backup metadata states independently and only offers valid downloads', async () => {
+    const onDownloadBackup = vi.fn();
+    const missing = {
+      ...latestBackup,
+      archive_available: true,
+      download_url: '',
+      filename: 'novel-pipeline-backup-missing.tar.gz',
+      manifest_available: false,
+      metadata_status: 'METADATA_MISSING',
+      repair_needed: true,
+      warning: 'Backup metadata is missing.',
+    } as SystemBackupItem;
+    const invalid = {
+      ...missing,
+      filename: 'novel-pipeline-backup-invalid.tar.gz',
+      metadata_status: 'METADATA_INVALID',
+    } as SystemBackupItem;
+
+    render(
+      <StatusSettingsView
+        backupError=""
+        backupItems={[latestBackup, missing, invalid]}
+        error=""
+        loading={false}
+        onDownloadBackup={onDownloadBackup}
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
+    expect(screen.getByText('Thiếu metadata')).toBeVisible();
+    expect(screen.getByText('Metadata không hợp lệ')).toBeVisible();
+    expect(screen.getAllByRole('button', { name: /Tải backup/ })).toHaveLength(1);
+    await userEvent.click(screen.getByRole('button', { name: /Tải backup/ }));
+    expect(onDownloadBackup).toHaveBeenCalledWith(latestBackup.filename);
+  });
+
+  it('keeps core status visible while the backup list is loading or failed', async () => {
+    render(
+      <StatusSettingsView
+        backupError="Không tải được danh sách backup."
+        backupListLoading
+        error=""
+        loading={false}
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Trạng thái hệ thống' })).toBeVisible();
+    await userEvent.click(screen.getByText('Thông tin Runtime'));
+    expect(screen.getByText('API readiness')).toBeVisible();
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
+    expect(screen.getByText('Đang tải danh sách backup...')).toBeVisible();
+    expect(screen.getByText('Không tải được danh sách backup.')).toBeVisible();
   });
 
   it('shows loading and error states', () => {

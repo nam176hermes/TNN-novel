@@ -175,7 +175,8 @@ function AuthenticatedApp() {
   const [lastExport, setLastExport] = useState<ExportResponse | null>(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupError, setBackupError] = useState('');
-  const [latestBackup, setLatestBackup] = useState<SystemBackupItem | null>(null);
+  const [backupListLoading, setBackupListLoading] = useState(false);
+  const [backups, setBackups] = useState<SystemBackupItem[]>([]);
   const [selectedPresetId, setSelectedPresetId] = useState(defaultTranslationPresetId);
   const [workbenchMode, setWorkbenchMode] = useState<'edit' | 'reader'>('edit');
   const [translatedBooks, setTranslatedBooks] = useState<AsyncState<TranslatedBookSummary[]>>(emptyTranslatedBooks);
@@ -377,18 +378,22 @@ function AuthenticatedApp() {
 
   const loadLatestBackup = useCallback(async (): Promise<void> => {
     if (!session.isAuthenticated) {
-      setLatestBackup(null);
+      setBackups([]);
       return;
     }
+    setBackupError('');
+    setBackupListLoading(true);
     try {
       const response = await session.client.listSystemBackups();
-      setLatestBackup(response.items[0] ?? null);
+      setBackups(response.items);
     } catch (error) {
       if (isAuthError(error)) {
         expireSession();
         return;
       }
       setBackupError(formatError(error));
+    } finally {
+      setBackupListLoading(false);
     }
   }, [expireSession, session.client, session.isAuthenticated]);
 
@@ -1464,7 +1469,7 @@ function AuthenticatedApp() {
         include_secrets: options.includeSecrets ?? false,
         passphrase: options.passphrase ?? '',
       });
-      setLatestBackup(item);
+      setBackups((current) => [item, ...current.filter((backup) => backup.filename !== item.filename)]);
       setBackendSuccess(`Đã tạo system backup ${item.filename}`);
     } catch (error) {
       if (isAuthError(error)) {
@@ -1922,8 +1927,9 @@ function AuthenticatedApp() {
             <StatusSettingsView
               backupBusy={backupBusy}
               backupError={backupError}
+              backupItems={backups}
+              backupListLoading={backupListLoading}
               error={systemStatus.error}
-              latestBackup={latestBackup}
               loading={systemStatus.state === 'loading'}
               onCreateBackup={() => {
                 void handleCreateBackup();
