@@ -483,6 +483,7 @@ describe('ApiClient', () => {
         uploadId: 'preview-upload-1',
         duplicateStrategy: 'skip',
         targetBookId: 7,
+        confirmedExistingBookId: 7,
       }),
     ).resolves.toEqual(job);
 
@@ -499,6 +500,7 @@ describe('ApiClient', () => {
     expect(body.get('file')).toBeNull();
     expect(body.get('duplicate_strategy')).toBe('skip');
     expect(body.get('target_book_id')).toBe('7');
+    expect(body.get('confirmed_existing_book_id')).toBe('7');
   });
 
   it('loads, previews, and imports a translated ebook from the server inbox', async () => {
@@ -652,6 +654,7 @@ describe('ApiClient', () => {
 
     const body = fetchMock.mock.calls[0]?.[1]?.body as FormData;
     expect(body.get('duplicate_strategy')).toBe('skip');
+    expect(body.get('confirmed_existing_book_id')).toBeNull();
   });
 
   it('loads books and chapters with auth headers', async () => {

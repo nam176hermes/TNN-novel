@@ -423,6 +423,9 @@ export class ApiClient {
     if (request.targetBookId != null) {
       body.append('target_book_id', String(request.targetBookId));
     }
+    if (request.confirmedExistingBookId != null) {
+      body.append('confirmed_existing_book_id', String(request.confirmedExistingBookId));
+    }
     return body;
   }
 

@@ -665,6 +665,8 @@ export type WizardTextImportResult = {
 
 export type EbookDuplicateStrategy = 'error' | 'skip' | 'overwrite';
 
+export type EbookBookMatchReason = 'title' | 'selected' | 'new';
+
 export type EbookSplitMode = 'auto' | 'single';
 
 export type EbookSplitMethod = 'toc' | 'heading' | 'spine' | 'single' | 'regex';
@@ -693,6 +695,11 @@ export type EbookImportDryRun = {
   would_skip: number;
   would_overwrite: number;
   would_error: number;
+  existing_book_id: number | null;
+  existing_book_title: string;
+  existing_chapter_count: number;
+  book_match_reason: EbookBookMatchReason;
+  requires_existing_book_confirmation: boolean;
 };
 
 export type EbookPreview = {
@@ -731,6 +738,7 @@ export type EbookImportRequest = {
   uploadId?: string;
   inboxFile?: string;
   targetBookId?: number | null;
+  confirmedExistingBookId?: number | null;
   duplicateStrategy?: EbookDuplicateStrategy;
   splitMode?: EbookSplitMode;
 };

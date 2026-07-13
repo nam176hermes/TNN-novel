@@ -257,13 +257,17 @@ function ebookSplitMethodLabel(preview: EbookPreview): string {
 }
 
 function EbookPreviewPanel({
+  confirmedExistingBookId,
   error,
   file,
+  onConfirmedExistingBookIdChange,
   preview,
   state,
 }: {
+  confirmedExistingBookId: number | null;
   error: string;
   file: EbookPreviewFile | null;
+  onConfirmedExistingBookIdChange: (bookId: number | null) => void;
   preview: EbookPreview | null;
   state: EbookPreviewState;
 }) {
@@ -357,25 +361,53 @@ function EbookPreviewPanel({
         </div>
       </dl>
       {dryRun ? (
-        <dl className="ebook-dry-run">
-          <div>
-            <dt>Chương mới</dt>
-            <dd>{dryRun.new_chapters.toLocaleString()}</dd>
-          </div>
-          <div>
-            <dt>Chương trùng</dt>
-            <dd>{dryRun.duplicate_chapters.toLocaleString()}</dd>
-          </div>
-          <div>
-            <dt>Khi import</dt>
-            <dd>
-              <span>Sẽ import {dryRun.would_import.toLocaleString()} chương</span>
-              {dryRun.would_skip ? <span>Bỏ qua {dryRun.would_skip.toLocaleString()} chương trùng</span> : null}
-              {dryRun.would_overwrite ? <span>Ghi đè {dryRun.would_overwrite.toLocaleString()} chương trùng</span> : null}
-              {dryRun.would_error ? <span>Sẽ dừng vì {dryRun.would_error.toLocaleString()} chương trùng</span> : null}
-            </dd>
-          </div>
-        </dl>
+        <>
+          <dl className="ebook-dry-run">
+            <div>
+              <dt>Chương mới</dt>
+              <dd>{dryRun.new_chapters.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Chương trùng</dt>
+              <dd>{dryRun.duplicate_chapters.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Khi import</dt>
+              <dd>
+                <span>Sẽ import {dryRun.would_import.toLocaleString()} chương</span>
+                {dryRun.would_skip ? <span>Bỏ qua {dryRun.would_skip.toLocaleString()} chương trùng</span> : null}
+                {dryRun.would_overwrite ? <span>Ghi đè {dryRun.would_overwrite.toLocaleString()} chương trùng</span> : null}
+                {dryRun.would_error ? <span>Sẽ dừng vì {dryRun.would_error.toLocaleString()} chương trùng</span> : null}
+              </dd>
+            </div>
+          </dl>
+          {dryRun.requires_existing_book_confirmation ? (
+            <section className="ebook-preview-warnings" role="alert">
+              <h5>
+                {dryRun.book_match_reason === 'title'
+                  ? 'Truyện này đã có trong Library'
+                  : 'Sẽ gộp vào truyện đã chọn'}
+              </h5>
+              <p>
+                {dryRun.existing_book_title} · {dryRun.existing_chapter_count.toLocaleString('vi-VN')} chương hiện có
+              </p>
+              <p>
+                {dryRun.new_chapters.toLocaleString('vi-VN')} chương mới ·{' '}
+                {dryRun.duplicate_chapters.toLocaleString('vi-VN')} chương trùng
+              </p>
+              <label>
+                <input
+                  checked={dryRun.existing_book_id !== null && confirmedExistingBookId === dryRun.existing_book_id}
+                  onChange={(event) => onConfirmedExistingBookIdChange(
+                    event.target.checked ? dryRun.existing_book_id : null,
+                  )}
+                  type="checkbox"
+                />
+                <span>Tôi xác nhận gộp ebook này vào truyện đã có.</span>
+              </label>
+            </section>
+          ) : null}
+        </>
       ) : null}
       {warnings.length > 0 ? (
         <section className="ebook-preview-warnings" aria-label="Cảnh báo preview">
@@ -611,6 +643,7 @@ export default function ImportPanel({
   const [ebookPreview, setEbookPreview] = useState<EbookPreview | null>(null);
   const [ebookPreviewState, setEbookPreviewState] = useState<EbookPreviewState>('idle');
   const [ebookPreviewError, setEbookPreviewError] = useState('');
+  const [confirmedExistingBookId, setConfirmedExistingBookId] = useState<number | null>(null);
   const [lastEbookImportResult, setLastEbookImportResult] = useState<EbookImportResult | null>(null);
   const [duplicateStrategy, setDuplicateStrategy] = useState<EbookDuplicateStrategy>('skip');
   const [targetBookId, setTargetBookId] = useState('');
@@ -675,6 +708,12 @@ export default function ImportPanel({
   const ebookHasBlockingWarning = Boolean(
     ebookPreview?.warnings?.some((warning) => BLOCKING_EBOOK_WARNING_TYPES.has(warning.type)),
   );
+  const existingBookId = ebookPreview?.dry_run?.existing_book_id ?? null;
+  const requiresExistingBookConfirmation = Boolean(
+    ebookPreview?.dry_run?.requires_existing_book_confirmation,
+  );
+  const existingBookConfirmed = !requiresExistingBookConfirmation
+    || (existingBookId !== null && confirmedExistingBookId === existingBookId);
   const titleReady = title.trim().length > 0;
   const pastedTextReady = text.trim().length > 0;
   const wizardDuplicateCount = textPreview?.duplicateChapterNumbers.length ?? 0;
@@ -697,7 +736,13 @@ export default function ImportPanel({
           ? Boolean(sourcePreview && sourcePreviewState === 'ready' && sourcePreview.automation_allowed && onStartImportUrlJob)
           : mode === 'catalog'
             ? Boolean(sourcePreview && sourcePreviewState === 'ready' && sourcePreview.automation_allowed && onStartImportUrlJob)
-            : Boolean(ebookPreview && ebookPreviewState === 'ready' && onImportTranslatedEbook && !ebookHasBlockingWarning));
+            : Boolean(
+              ebookPreview
+              && ebookPreviewState === 'ready'
+              && onImportTranslatedEbook
+              && !ebookHasBlockingWarning
+              && existingBookConfirmed,
+            ));
   const importActionStatusId = 'import-action-status';
   let importActionStatus = 'Ready to import.';
   if (loading) {
@@ -732,6 +777,8 @@ export default function ImportPanel({
     importActionStatus = 'Ebook preview không có nội dung chữ đủ để import.';
   } else if (mode === 'ebook' && !ebookPreview) {
     importActionStatus = 'Preview the ebook before import.';
+  } else if (mode === 'ebook' && !existingBookConfirmed) {
+    importActionStatus = 'Xác nhận gộp ebook vào truyện đã có trước khi import.';
   }
   const panelTitle =
     mode === 'ebook'
@@ -993,6 +1040,7 @@ export default function ImportPanel({
     nextDuplicateStrategy = duplicateStrategy,
     nextTargetBookId = targetBookId,
   ): Promise<void> {
+    setConfirmedExistingBookId(null);
     setEbookPreview(null);
     setEbookPreviewError('');
 
@@ -1022,6 +1070,7 @@ export default function ImportPanel({
     nextDuplicateStrategy = duplicateStrategy,
     nextTargetBookId = targetBookId,
   ): Promise<void> {
+    setConfirmedExistingBookId(null);
     setEbookPreview(null);
     setEbookPreviewError('');
 
@@ -1051,6 +1100,7 @@ export default function ImportPanel({
   }
 
   function handleEbookFile(nextFile: File | null): void {
+    setConfirmedExistingBookId(null);
     setEbookSource('upload');
     setEbookFile(nextFile);
     setSelectedInboxFile('');
@@ -1080,6 +1130,7 @@ export default function ImportPanel({
   }
 
   function handleEbookSourceChange(nextSource: EbookSource): void {
+    setConfirmedExistingBookId(null);
     setEbookSource(nextSource);
     setEbookPreview(null);
     setEbookPreviewError('');
@@ -1098,6 +1149,7 @@ export default function ImportPanel({
 
   function handleInboxFileChange(event: ChangeEvent<HTMLSelectElement>): void {
     const filename = event.target.value;
+    setConfirmedExistingBookId(null);
     setEbookSource('inbox');
     setEbookFile(null);
     setSelectedInboxFile(filename);
@@ -1107,6 +1159,7 @@ export default function ImportPanel({
 
   function handleSplitModeChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextSplitMode = event.target.value as EbookSplitMode;
+    setConfirmedExistingBookId(null);
     setSplitMode(nextSplitMode);
     if (ebookSource === 'inbox' && selectedInboxFile) {
       void previewInboxFile(selectedInboxFile, nextSplitMode);
@@ -1117,6 +1170,7 @@ export default function ImportPanel({
 
   function handleTargetBookChange(event: ChangeEvent<HTMLSelectElement>): void {
     const nextTargetBookId = event.target.value;
+    setConfirmedExistingBookId(null);
     setTargetBookId(nextTargetBookId);
     if (ebookSource === 'inbox' && selectedInboxFile) {
       void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, nextTargetBookId);
@@ -1126,6 +1180,7 @@ export default function ImportPanel({
   }
 
   function handleDuplicateStrategyChange(nextDuplicateStrategy: EbookDuplicateStrategy): void {
+    setConfirmedExistingBookId(null);
     setDuplicateStrategy(nextDuplicateStrategy);
     setLastEbookImportResult(null);
     if (ebookSource === 'inbox' && selectedInboxFile) {
@@ -1186,6 +1241,9 @@ export default function ImportPanel({
       duplicateStrategy,
       splitMode,
       targetBookId: targetBookId ? Number.parseInt(targetBookId, 10) : undefined,
+      ...(confirmedExistingBookId !== null && confirmedExistingBookId === existingBookId
+        ? { confirmedExistingBookId }
+        : {}),
     });
     setLastEbookImportResult(result ?? null);
   }
@@ -1904,8 +1962,10 @@ export default function ImportPanel({
           <>
             <section aria-label="Import preview" className="import-preview">
               <EbookPreviewPanel
+                confirmedExistingBookId={confirmedExistingBookId}
                 error={ebookPreviewError}
                 file={selectedEbookFile}
+                onConfirmedExistingBookIdChange={setConfirmedExistingBookId}
                 preview={ebookPreview}
                 state={ebookPreviewState}
               />
