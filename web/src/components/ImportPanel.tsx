@@ -151,23 +151,23 @@ function PasteTextStatus({
         <Loader2 aria-hidden="true" className="status-spinner" size={36} />
         <div>
           <p className="section-label">Trạng thái xử lý</p>
-          <h4 id="paste-status-title">{canImport ? 'Ready to import' : 'Missing metadata'}</h4>
+          <h4 id="paste-status-title">{canImport ? 'Sẵn sàng import' : 'Thiếu metadata'}</h4>
           <p>Đã nhận nội dung, kiểm tra metadata trước khi import.</p>
         </div>
         <span className={`status-chip ${canImport ? 'status-chip-success' : 'status-chip-warning'}`}>
-          {canImport ? 'Ready' : 'Needs title'}
+          {canImport ? 'Sẵn sàng' : 'Cần tiêu đề'}
         </span>
       </div>
       <dl className="paste-status-grid">
         <div>
-          <dt>Source text</dt>
+          <dt>Nội dung nguồn</dt>
           <dd>
-            {stats.characters.toLocaleString()} chars · {stats.lines.toLocaleString()} lines · {stats.cjkCharacters.toLocaleString()} Chinese chars
+            {stats.characters.toLocaleString()} ký tự · {stats.lines.toLocaleString()} dòng · {stats.cjkCharacters.toLocaleString()} ký tự Hán
           </dd>
         </div>
         <div>
-          <dt>Book</dt>
-          <dd>{hasTitle ? title.trim() : 'Book title is missing'}</dd>
+          <dt>Truyện</dt>
+          <dd>{hasTitle ? title.trim() : 'Thiếu tên truyện'}</dd>
         </div>
         <div>
           <dt>Chapter</dt>
@@ -202,14 +202,14 @@ function FileImportStatus({
         <Loader2 aria-hidden="true" className="status-spinner" size={36} />
         <div>
           <p className="section-label">Trạng thái xử lý</p>
-          <h4>Ready to import</h4>
+          <h4>Sẵn sàng import</h4>
           <p>File đã sẵn sàng, kiểm tra metadata trước khi import.</p>
         </div>
-        <span className="status-chip status-chip-success">Ready</span>
+        <span className="status-chip status-chip-success">Sẵn sàng</span>
       </div>
       <dl className="paste-status-grid">
         <div>
-          <dt>Source file</dt>
+          <dt>File nguồn</dt>
           <dd>{file.name}</dd>
         </div>
         <div>
@@ -217,8 +217,8 @@ function FileImportStatus({
           <dd>{formatBytes(file.size)}</dd>
         </div>
         <div>
-          <dt>Book</dt>
-          <dd>{hasTitle ? title.trim() : 'Book title is missing'}</dd>
+          <dt>Truyện</dt>
+          <dd>{hasTitle ? title.trim() : 'Thiếu tên truyện'}</dd>
         </div>
         <div>
           <dt>Chapter</dt>
@@ -290,7 +290,7 @@ function EbookPreviewPanel({
   state: EbookPreviewState;
 }) {
   if (!file) {
-    return <p>No ebook selected.</p>;
+    return <p>Chưa chọn ebook.</p>;
   }
 
   if (state === 'loading') {
@@ -476,7 +476,7 @@ function EbookImportFlow({
   const steps = [
     {
       label: '1. Chọn nguồn',
-      detail: selectedFile ? selectedFile.name : 'Upload file hoặc chọn từ Server inbox',
+      detail: selectedFile ? selectedFile.name : 'Tải file hoặc chọn từ server inbox',
       state: selectedFile ? 'done' : 'active',
     },
     {
@@ -525,14 +525,14 @@ function contentKindLabel(value: ImportContentKind): string {
 
 function WizardSteps({ activeStep }: { activeStep: number }) {
   const steps = [
-    ['Chọn nguồn', 'Paste, TXT, EPUB, URL hoặc kho nguồn'],
+    ['Chọn nguồn', 'Dán văn bản, TXT, EPUB, URL hoặc kho nguồn'],
     ['Phát hiện cấu trúc', 'Tựa truyện, ngôn ngữ, danh sách chương'],
     ['Làm sạch & preview', 'Kiểm tra cảnh báo và sửa metadata'],
     ['Chọn hành động', 'Lưu, dịch hoặc tạo audio'],
   ];
 
   return (
-    <ol aria-label="Import wizard steps" className="import-wizard-steps">
+    <ol aria-label="Các bước nhập" className="import-wizard-steps">
       {steps.map(([label, detail], index) => {
         const stepNumber = index + 1;
         const state = stepNumber < activeStep ? 'done' : stepNumber === activeStep ? 'active' : 'pending';
@@ -571,7 +571,7 @@ function TextWizardPreview({
     <section aria-label="Wizard structure preview" className="import-preview wizard-preview-card">
       <div className="ebook-preview-header">
         <div>
-          <p className="section-label">Step 2 · Detect structure</p>
+          <p className="section-label">Bước 2 · Phát hiện cấu trúc</p>
           <h4>{chapters.length.toLocaleString('vi-VN')} chương được phát hiện</h4>
         </div>
         <span className={`status-chip ${contentKind === 'unknown' ? 'status-chip-warning' : 'status-chip-success'}`}>
@@ -794,15 +794,15 @@ export default function ImportPanel({
               && existingBookConfirmed,
             ));
   const importActionStatusId = 'import-action-status';
-  let importActionStatus = 'Ready to import.';
+  let importActionStatus = 'Sẵn sàng import.';
   if (loading) {
-    importActionStatus = 'Import is running.';
+    importActionStatus = 'Đang chạy import.';
   } else if (mode === 'paste' && !pastedTextReady) {
-    importActionStatus = 'Paste source text to continue.';
+    importActionStatus = 'Dán nội dung nguồn để tiếp tục.';
   } else if ((mode === 'paste' || mode === 'file') && !titleReady) {
-    importActionStatus = 'Book title is required before import.';
+    importActionStatus = 'Cần tên truyện trước khi import.';
   } else if (mode === 'file' && !file) {
-    importActionStatus = 'Select a source file to continue.';
+    importActionStatus = 'Chọn file nguồn để tiếp tục.';
   } else if ((mode === 'paste' || mode === 'file') && onImportWizardText && contentKind === 'unknown') {
     importActionStatus = 'Chọn raw tiếng Trung hoặc bản dịch tiếng Việt trước khi lưu.';
   } else if ((mode === 'paste' || mode === 'file') && onImportWizardText && contentKind === 'both') {
@@ -816,19 +816,19 @@ export default function ImportPanel({
   } else if ((mode === 'url' || mode === 'catalog') && sourcePreview && !sourcePreview.automation_allowed) {
     importActionStatus = sourcePreview.automation_reason || 'Chỉ nguồn VERIFIED mới có thể tạo job import tự động.';
   } else if (mode === 'ebook' && ebookSource === 'upload' && !ebookFile) {
-    importActionStatus = 'Select an EPUB, AZW3, MOBI, PRC, TXT, or HTML file.';
+    importActionStatus = 'Chọn file EPUB, AZW3, MOBI, PRC, TXT hoặc HTML.';
   } else if (mode === 'ebook' && ebookSource === 'inbox' && !selectedInboxFile) {
-    importActionStatus = 'Select an ebook from the server inbox.';
+    importActionStatus = 'Chọn ebook từ server inbox.';
   } else if (mode === 'ebook' && ebookPreviewState === 'loading') {
-    importActionStatus = 'Reading ebook preview.';
+    importActionStatus = 'Đang đọc preview ebook.';
   } else if (mode === 'ebook' && ebookPreviewState === 'error') {
-    importActionStatus = 'Resolve the ebook preview error before import.';
+    importActionStatus = 'Sửa lỗi preview ebook trước khi import.';
   } else if (mode === 'ebook' && ebookSubmissionBlocked) {
     importActionStatus = 'Chưa xác nhận được trạng thái import. Hãy kiểm tra Jobs hoặc lịch sử trước khi thử lại.';
   } else if (mode === 'ebook' && ebookHasBlockingWarning) {
     importActionStatus = 'Ebook preview không có nội dung chữ đủ để import.';
   } else if (mode === 'ebook' && !ebookPreview) {
-    importActionStatus = 'Preview the ebook before import.';
+    importActionStatus = 'Preview ebook trước khi import.';
   } else if (mode === 'ebook' && !existingBookConfirmed) {
     importActionStatus = 'Xác nhận gộp ebook vào truyện đã có trước khi import.';
   }
@@ -836,17 +836,17 @@ export default function ImportPanel({
     mode === 'ebook'
       ? 'Ebook bản dịch'
       : mode === 'file'
-        ? 'Import source file'
+        ? 'Import file nguồn'
         : mode === 'url'
           ? 'Import từ URL'
           : mode === 'catalog'
             ? 'Kho nguồn'
-            : 'Paste source chapter';
+            : 'Dán chương nguồn';
   const panelSubtitle =
     mode === 'ebook'
       ? 'Import ebook và thêm vào thư viện.'
       : mode === 'file'
-        ? 'Upload file chứa nội dung chương cần import vào hệ thống.'
+        ? 'Tải file chứa nội dung chương cần import vào hệ thống.'
         : mode === 'url'
           ? 'Preview nguồn được hỗ trợ rồi tạo job import an toàn.'
           : mode === 'catalog'
@@ -1407,9 +1407,9 @@ export default function ImportPanel({
 
       <WizardSteps activeStep={wizardActiveStep} />
 
-      <div aria-label="Import mode" className="segmented-actions import-mode-tabs">
+      <div aria-label="Chế độ nhập" className="segmented-actions import-mode-tabs">
         <button
-          aria-label="Paste"
+          aria-label="Dán văn bản"
           aria-pressed={mode === 'paste'}
           className="secondary-action"
           onClick={() => handleModeChange('paste')}
@@ -1417,12 +1417,12 @@ export default function ImportPanel({
         >
           <Clipboard aria-hidden="true" size={24} />
           <span>
-            <strong>Paste</strong>
+            <strong>Dán văn bản</strong>
             <small>Dán văn bản</small>
           </span>
         </button>
         <button
-          aria-label="File"
+          aria-label="Tải file"
           aria-pressed={mode === 'file'}
           className="secondary-action"
           onClick={() => handleModeChange('file')}
@@ -1430,8 +1430,8 @@ export default function ImportPanel({
         >
           <FileText aria-hidden="true" size={24} />
           <span>
-            <strong>File</strong>
-            <small>Upload file</small>
+            <strong>Tải file</strong>
+            <small>TXT / MD / HTML</small>
           </span>
         </button>
         <button
@@ -1493,7 +1493,7 @@ export default function ImportPanel({
                 type="button"
               >
                 <Upload aria-hidden="true" size={15} />
-                Upload file
+                Tải file
               </button>
               <button
                 aria-label="Server inbox"
@@ -1535,12 +1535,12 @@ export default function ImportPanel({
               <section aria-labelledby="ebook-inbox-title" className="ebook-inbox-panel">
                 <div className="ebook-inbox-header">
                   <div>
-                    <p className="section-label">Local file bypass</p>
+                    <p className="section-label">Bypass file local</p>
                     <h4 id="ebook-inbox-title">Server inbox</h4>
                   </div>
                   {onRefreshEbookInbox ? (
                     <button className="secondary-action" onClick={() => void onRefreshEbookInbox()} type="button">
-                      Refresh
+                      Làm mới
                     </button>
                   ) : null}
                 </div>
@@ -1549,8 +1549,8 @@ export default function ImportPanel({
                 </p>
                 {ebookInboxError ? <p className="status-error">{ebookInboxError}</p> : null}
                 <label>
-                  <span>Server inbox ebook</span>
-                  <select onChange={handleInboxFileChange} value={selectedInboxFile}>
+                  <span>Ebook trong server inbox</span>
+                  <select aria-label="Server inbox ebook" onChange={handleInboxFileChange} value={selectedInboxFile}>
                     <option value="">Chọn file trong inbox</option>
                     {ebookInboxFiles.map((entry) => (
                       <option key={entry.name} value={entry.name}>
@@ -1682,7 +1682,7 @@ export default function ImportPanel({
             <section aria-labelledby="url-import-title" className="ebook-inbox-panel">
               <div className="ebook-inbox-header">
                 <div>
-                  <p className="section-label">Step 2 · Preview nguồn</p>
+                  <p className="section-label">Bước 2 · Preview nguồn</p>
                   <h4 id="url-import-title">Import từ URL được hỗ trợ</h4>
                 </div>
                 <button
@@ -1696,8 +1696,9 @@ export default function ImportPanel({
                 </button>
               </div>
               <label>
-                <span>Source URL</span>
+                <span>URL nguồn</span>
                 <input
+                  aria-label="Source URL"
                   inputMode="url"
                   onChange={(event) => {
                     setSourceUrl(event.target.value);
@@ -1770,8 +1771,9 @@ export default function ImportPanel({
         ) : (
           <>
             <label>
-              <span>Book title</span>
+              <span>Tên truyện</span>
               <input
+                aria-label="Book title"
                 name="title"
                 onChange={handleTitleChange}
                 placeholder="Nhập tên truyện hoặc để trống nếu đã chọn từ Library"
@@ -1781,8 +1783,9 @@ export default function ImportPanel({
             </label>
 
             <label>
-              <span>Chapter number</span>
+              <span>Số chương</span>
               <input
+                aria-label="Chapter number"
                 min="1"
                 name="chapter_number"
                 onChange={handleChapterNumberChange}
@@ -1792,8 +1795,9 @@ export default function ImportPanel({
             </label>
 
             <label>
-              <span>Chapter title</span>
+              <span>Tiêu đề chương</span>
               <input
+                aria-label="Chapter title"
                 name="chapter_title"
                 onChange={handleChapterTitleChange}
                 placeholder="Nhập tiêu đề chương"
@@ -1807,8 +1811,9 @@ export default function ImportPanel({
         {mode === 'paste' ? (
           <>
             <label>
-              <span>Source text</span>
+              <span>Nội dung nguồn</span>
               <textarea
+                aria-label="Source text"
                 name="text"
                 onChange={handleTextChange}
                 placeholder="Dán nội dung chương vào đây..."
@@ -1826,7 +1831,7 @@ export default function ImportPanel({
           </>
         ) : mode === 'file' ? (
           <label className="source-file-dropzone">
-            <span>Source file</span>
+            <span>File nguồn</span>
             <UploadCloud aria-hidden="true" size={54} />
             <strong>Chọn file hoặc kéo & thả vào đây</strong>
             <small>Hỗ trợ: TXT, HTML, EPUB, AZW3, MOBI, PRC</small>

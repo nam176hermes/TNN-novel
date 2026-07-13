@@ -70,21 +70,21 @@ describe('ImportPanel', () => {
     const submit = screen.getByRole('button', { name: 'Import chapter' });
 
     expect(submit).toBeDisabled();
-    expect(screen.getByText('Paste source text to continue.')).toBeInTheDocument();
+    expect(screen.getByText('Dán nội dung nguồn để tiếp tục.')).toBeInTheDocument();
     expect(screen.queryByText('Trạng thái xử lý')).not.toBeInTheDocument();
     expect(screen.queryByText('Waiting for text')).not.toBeInTheDocument();
     expect(screen.queryByText('Đang chờ bạn dán nội dung...')).not.toBeInTheDocument();
 
     await userEvent.type(screen.getByLabelText('Book title'), 'Phàm Nhân Tu Tiên');
     expect(submit).toBeDisabled();
-    expect(screen.getByText('Paste source text to continue.')).toBeInTheDocument();
+    expect(screen.getByText('Dán nội dung nguồn để tiếp tục.')).toBeInTheDocument();
     expect(screen.queryByText('Trạng thái xử lý')).not.toBeInTheDocument();
 
     await userEvent.clear(screen.getByLabelText('Book title'));
     await userEvent.type(screen.getByLabelText('Source text'), '二愣子 đứng bên triền núi.');
     expect(submit).toBeDisabled();
-    expect(screen.getByText('Book title is required before import.')).toBeInTheDocument();
-    expect(screen.getByText('Book title is missing')).toBeInTheDocument();
+    expect(screen.getByText('Cần tên truyện trước khi import.')).toBeInTheDocument();
+    expect(screen.getByText('Thiếu tên truyện')).toBeInTheDocument();
   });
 
   it('opens import guidance instead of leaving the help button inert', async () => {
@@ -103,10 +103,10 @@ describe('ImportPanel', () => {
       target: { value: '第一章 山边小村\n张铁睁开双眼。' },
     });
 
-    expect(screen.getByRole('heading', { name: 'Ready to import' })).toBeInTheDocument();
-    expect(screen.getByText(/2 lines/i)).toBeInTheDocument();
-    expect(screen.getByText(/Chinese chars/i)).toBeInTheDocument();
-    expect(screen.getByText('Ready to import.')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Sẵn sàng import' })).toBeInTheDocument();
+    expect(screen.getByText(/2 dòng/i)).toBeInTheDocument();
+    expect(screen.getByText(/ký tự Hán/i)).toBeInTheDocument();
+    expect(screen.getByText('Sẵn sàng import.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Import chapter' })).toBeEnabled();
   });
 
@@ -121,14 +121,14 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
 
-    expect(screen.getByText('Book title is required before import.')).toBeInTheDocument();
+    expect(screen.getByText('Cần tên truyện trước khi import.')).toBeInTheDocument();
     expect(screen.queryByText('Trạng thái xử lý')).not.toBeInTheDocument();
     expect(screen.queryByText('Chưa có file được chọn')).not.toBeInTheDocument();
 
     await userEvent.type(screen.getByLabelText('Book title'), 'Phàm Nhân Tu Tiên');
-    expect(screen.getByText('Select a source file to continue.')).toBeInTheDocument();
+    expect(screen.getByText('Chọn file nguồn để tiếp tục.')).toBeInTheDocument();
     expect(screen.queryByText('Trạng thái xử lý')).not.toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText('Source file'), { target: { files: [file] } });
@@ -191,7 +191,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     await userEvent.type(screen.getByLabelText('Book title'), 'Phàm Nhân Tu Tiên');
     await userEvent.clear(screen.getByLabelText('Chapter number'));
     await userEvent.type(screen.getByLabelText('Chapter number'), '3');
@@ -1199,11 +1199,11 @@ describe('ImportPanel', () => {
   it('exposes URL and catalog as guided import sources', () => {
     render(<ImportPanel onCancel={() => undefined} onImportPaste={() => undefined} />);
 
-    expect(screen.getByRole('button', { name: 'Paste' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'File' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dán văn bản' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Tải file' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'URL' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Kho nguồn' })).toBeInTheDocument();
-    expect(screen.getByRole('list', { name: 'Import wizard steps' })).toHaveTextContent('Chọn nguồn');
+    expect(screen.getByRole('list', { name: 'Các bước nhập' })).toHaveTextContent('Chọn nguồn');
   });
 
   it('commits multi-chapter paste through the reviewed wizard endpoint', async () => {
@@ -1527,7 +1527,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     fireEvent.change(screen.getByLabelText('Source file'), { target: { files: [file] } });
 
     expect(await screen.findByText('2 chương được phát hiện')).toBeInTheDocument();
@@ -1554,7 +1554,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     fireEvent.change(screen.getByLabelText('Source file'), { target: { files: [file] } });
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Unsupported TXT import file type');
@@ -1575,7 +1575,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     fireEvent.change(screen.getByLabelText('Source file'), { target: { files: [file] } });
 
     expect(await screen.findByRole('alert')).toHaveTextContent('TXT file is too large');
@@ -1596,7 +1596,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     fireEvent.change(screen.getByLabelText('Source file'), { target: { files: [file] } });
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Encoding không được hỗ trợ');
@@ -1616,7 +1616,7 @@ describe('ImportPanel', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'File' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải file' }));
     await userEvent.upload(screen.getByLabelText('Source file'), file);
 
     await waitFor(() => {

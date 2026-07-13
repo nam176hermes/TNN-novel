@@ -179,10 +179,13 @@ export default function StatusSettingsView({
             </div>
           </section>
 
-          <section aria-label="Thông tin runtime" className="panel status-runtime-panel">
-            <div className="panel-header">
-              <h3>Thông tin Runtime</h3>
-            </div>
+          <details aria-label="Thông tin runtime" className="panel status-runtime-panel status-detail-panel">
+            <summary>
+              <span>
+                <strong>Thông tin Runtime</strong>
+                <small>Provider, jobs, storage và cấu hình vận hành.</small>
+              </span>
+            </summary>
             <div className="status-runtime-grid">
               {[firstColumnRows, secondColumnRows].map((column, index) => (
                 <table className="provider-table status-settings-table" key={index}>
@@ -197,12 +200,15 @@ export default function StatusSettingsView({
                 </table>
               ))}
             </div>
-          </section>
+          </details>
 
-          <section aria-label="Hiệu suất hệ thống" className="panel status-performance-panel">
-            <div className="panel-header">
-              <h3>Hiệu suất hệ thống</h3>
-            </div>
+          <details aria-label="Hiệu suất hệ thống" className="panel status-performance-panel status-detail-panel">
+            <summary>
+              <span>
+                <strong>Hiệu suất hệ thống</strong>
+                <small>Queue, job đang chạy, cache và kích thước DB.</small>
+              </span>
+            </summary>
             <div className="status-performance-grid">
               <article>
                 <ListChecks aria-hidden="true" size={18} />
@@ -233,7 +239,7 @@ export default function StatusSettingsView({
                 <i className="sparkline sparkline-gold" />
               </article>
             </div>
-          </section>
+          </details>
         </>
       ) : !loading ? (
         <p className="empty-detail">Chưa tải được trạng thái hệ thống.</p>
@@ -305,13 +311,13 @@ export default function StatusSettingsView({
       ) : null}
 
       {recentOperationalErrors.length > 0 ? (
-        <section aria-label="Recent operational errors" className="panel">
-          <div className="section-heading-row">
-            <div>
-              <p className="section-label">Operations</p>
-              <h3>Recent operational errors</h3>
-            </div>
-          </div>
+        <details aria-label="Recent operational errors" className="panel status-detail-panel">
+          <summary>
+            <span>
+              <strong>Lỗi vận hành gần đây</strong>
+              <small>{recentOperationalErrors.length.toLocaleString('vi-VN')} sự kiện cần kiểm tra.</small>
+            </span>
+          </summary>
           <ul className="compact-list">
             {recentOperationalErrors.slice(0, 5).map((event) => (
               <li key={event.id}>
@@ -320,21 +326,24 @@ export default function StatusSettingsView({
               </li>
             ))}
           </ul>
-        </section>
+        </details>
       ) : null}
 
       {status?.backup_recommendation ? (
-        <section aria-label="System backup" className="panel backup-status-panel">
-          <div className="section-heading-row">
-            <div>
-              <p className="section-label">System Backup</p>
-              <h3>Sao lưu hệ thống</h3>
-            </div>
+        <details aria-label="System backup" className="panel backup-status-panel status-detail-panel">
+          <summary>
+            <span>
+              <strong>Sao lưu hệ thống</strong>
+              <small>{latestBackup ? `Mới nhất: ${latestBackup.filename}` : 'Tạo và tải backup vận hành.'}</small>
+            </span>
             <div className="backup-action-row">
               <button
                 aria-expanded={backupHelpOpen}
                 className="secondary-action"
-                onClick={() => setBackupHelpOpen((current) => !current)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setBackupHelpOpen((current) => !current);
+                }}
                 type="button"
               >
                 <ArchiveRestore aria-hidden="true" size={16} />
@@ -343,7 +352,8 @@ export default function StatusSettingsView({
               <button
                 className="secondary-action"
                 disabled={backupBusy || !onCreateEncryptedBackup}
-                onClick={() => {
+                onClick={(event) => {
+                  event.stopPropagation();
                   void onCreateEncryptedBackup?.();
                 }}
                 type="button"
@@ -354,7 +364,8 @@ export default function StatusSettingsView({
               <button
                 className="primary-action"
                 disabled={backupBusy || !onCreateBackup}
-                onClick={() => {
+                onClick={(event) => {
+                  event.stopPropagation();
                   void onCreateBackup?.();
                 }}
                 type="button"
@@ -363,7 +374,7 @@ export default function StatusSettingsView({
                 {backupBusy ? 'Đang tạo backup...' : 'Tạo backup'}
               </button>
             </div>
-          </div>
+          </summary>
           <p>{status.backup_recommendation}</p>
           <p className="empty-detail">
             Book Export nằm ở mục Xuất file. System Backup dùng để khôi phục DB, private assets, glossary, QA, jobs và cấu hình vận hành.
@@ -414,7 +425,7 @@ export default function StatusSettingsView({
               Last backup event: {recentBackupEvent.event_type} · {recentBackupEvent.message}
             </p>
           ) : null}
-        </section>
+        </details>
       ) : null}
     </section>
   );

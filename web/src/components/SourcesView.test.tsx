@@ -172,7 +172,7 @@ describe('SourcesView', () => {
     const onRefresh = vi.fn();
     render(<SourcesView error="" onRefresh={onRefresh} sources={[]} state="empty" />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Làm mới' }));
 
     expect(onRefresh).toHaveBeenCalledOnce();
   });
@@ -184,6 +184,49 @@ describe('SourcesView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Mở domain chính 69shuba' }));
 
     expect(openSpy).toHaveBeenCalledWith('https://69shuba.com', '_blank', 'noopener,noreferrer');
+  });
+
+  it('renders mobile card layouts for supported sources and catalog entries', async () => {
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        addEventListener: vi.fn(),
+        addListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+        matches: query === '(max-width: 760px)',
+        media: query,
+        onchange: null,
+        removeEventListener: vi.fn(),
+        removeListener: vi.fn(),
+      })),
+    });
+    try {
+      const loadCatalog = vi.fn().mockResolvedValue(catalog);
+      const { container } = render(
+        <SourcesView
+          error=""
+          loadCatalog={loadCatalog}
+          onRefresh={() => undefined}
+          sources={sources}
+          state="ready"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('.source-support-card').length).toBe(sources.length);
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: 'Kho nguồn' }));
+      await screen.findByRole('row', { name: /69 Catalog/i });
+
+      expect(container.querySelectorAll('.source-catalog-card').length).toBe(catalog.items.length);
+    } finally {
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        value: originalMatchMedia,
+      });
+    }
   });
 
   it('shows loading and error states honestly', () => {
@@ -390,7 +433,7 @@ describe('SourcesView', () => {
     await waitFor(() => expect(loadParserCandidates).toHaveBeenCalledOnce());
     expect(await screen.findByText('69 Candidate Novel')).toBeInTheDocument();
     expect(screen.getByText('needs_review')).toBeInTheDocument();
-    expect(screen.getByText(/Candidate is not a supported source/i)).toBeInTheDocument();
+    expect(screen.getByText(/Ứng viên parser chưa phải nguồn được hỗ trợ/i)).toBeInTheDocument();
   });
 
   it('creates a parser candidate from a catalog row without showing import action', async () => {

@@ -55,7 +55,7 @@ const latestBackup: SystemBackupItem = {
 };
 
 describe('StatusSettingsView', () => {
-  it('renders runtime status without exposing secrets', () => {
+  it('renders runtime status without exposing secrets', async () => {
     const onRetryJob = vi.fn();
     render(
       <StatusSettingsView
@@ -69,6 +69,7 @@ describe('StatusSettingsView', () => {
     );
 
     expect(screen.getByRole('heading', { name: 'Trạng thái hệ thống' })).toBeVisible();
+    await userEvent.click(screen.getByText('Thông tin Runtime'));
     expect(screen.getByText('Public deploy')).toBeVisible();
     expect(screen.getByText('Bật')).toBeVisible();
     expect(screen.getByText('API readiness')).toBeVisible();
@@ -88,12 +89,13 @@ describe('StatusSettingsView', () => {
     expect(screen.getByText('Data storage available')).toBeVisible();
     expect(screen.getByText('Configured data storage')).toBeVisible();
     expect(screen.queryByText(/\/home\/|\/mnt\/|[A-Z]:\\/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
     expect(screen.getByText(/System backup is separate from book export/)).toBeVisible();
     expect(screen.queryByText(/api[_-]?key/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/sk-test|top-secret|provider-secret/i)).not.toBeInTheDocument();
   });
 
-  it('shows durable job and operational error visibility', () => {
+  it('shows durable job and operational error visibility', async () => {
     const opsStatus = {
       ...status,
       active_jobs: 3,
@@ -143,13 +145,15 @@ describe('StatusSettingsView', () => {
       />,
     );
 
+    await userEvent.click(screen.getByText('Thông tin Runtime'));
     expect(screen.getByText('Queued jobs')).toBeVisible();
     expect(screen.getByText('1 queued · 1 retrying')).toBeVisible();
     expect(screen.getByText('Interrupted / failed')).toBeVisible();
     expect(screen.getByText('1 interrupted · 2 failed')).toBeVisible();
-    expect(screen.getByRole('region', { name: 'Recent operational errors' })).toBeVisible();
+    await userEvent.click(screen.getByText('Lỗi vận hành gần đây'));
     expect(screen.getByText('provider_failure · job-provider')).toBeVisible();
     expect(screen.getByText('Provider attempt failed. Check server logs.')).toBeVisible();
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
     expect(screen.getByText('Last backup event: backup_success · Backup completed')).toBeVisible();
     expect(screen.queryByText(/provider-secret|sk-test/i)).not.toBeInTheDocument();
   });
@@ -208,6 +212,7 @@ describe('StatusSettingsView', () => {
     await userEvent.selectOptions(screen.getByLabelText('Chu kỳ tự động làm mới'), '30');
     expect(onRefreshIntervalChange).toHaveBeenCalledWith(30);
 
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
     await userEvent.click(screen.getByRole('button', { name: 'Mở hướng dẫn' }));
     expect(screen.getByText(/Dừng server trước khi restore/)).toBeVisible();
     expect(screen.getByText(/Secrets và provider API keys bị loại khỏi backup mặc định/)).toBeVisible();

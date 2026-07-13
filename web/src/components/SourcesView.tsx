@@ -120,6 +120,28 @@ function managedTrustLabel(entry: SourceCatalogEntry): string {
   return entry.managed_trust_level || 'UNKNOWN';
 }
 
+function useMobileSourcesLayout(): boolean {
+  const [isMobileLayout, setIsMobileLayout] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+
+    const media = window.matchMedia('(max-width: 760px)');
+    const update = () => setIsMobileLayout(media.matches);
+    update();
+
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', update);
+      return () => media.removeEventListener('change', update);
+    }
+
+    media.addListener(update);
+    return () => media.removeListener(update);
+  }, []);
+
+  return isMobileLayout;
+}
+
 export default function SourcesView({
   checkCatalogSource,
   createParserCandidate,
@@ -157,6 +179,7 @@ export default function SourcesView({
   const [candidateError, setCandidateError] = useState('');
   const [candidateMessage, setCandidateMessage] = useState('');
   const [candidateLoadingId, setCandidateLoadingId] = useState('');
+  const isMobileSourcesLayout = useMobileSourcesLayout();
 
   const entries = useMemo(() => catalogEntries(catalog), [catalog]);
   const selectedEntries = useMemo(() => selectedCatalogEntries(entries, selectedIds), [entries, selectedIds]);
@@ -426,13 +449,13 @@ export default function SourcesView({
     <section aria-labelledby="sources-view-title" className="workflow-management-view sources-view sources-reference-view panel">
       <div className="management-view-header sources-reference-header">
         <div>
-          <p className="sources-eyebrow">Source Hub</p>
+          <p className="sources-eyebrow">Nguồn truyện</p>
           <h2 id="sources-view-title">Nguồn truyện</h2>
           <p className="view-subtitle">Quản lý nguồn hỗ trợ và tra cứu kho metadata nguồn truyện.</p>
         </div>
         <button className="secondary-action sources-refresh-button" disabled={state === 'loading'} onClick={() => void onRefresh()} type="button">
           <RefreshCw aria-hidden="true" size={15} />
-          Refresh
+          Làm mới
         </button>
       </div>
 
@@ -447,68 +470,98 @@ export default function SourcesView({
           Ứng viên parser
         </button>
         <button aria-pressed={activeTab === 'health'} onClick={() => setActiveTab('health')} type="button">
-          Health check
+          Kiểm tra
         </button>
       </div>
 
       {activeTab === 'supported' ? (
         <>
-          {state === 'loading' ? <p className="source-support-note">Loading source policies...</p> : null}
+          {state === 'loading' ? <p className="source-support-note">Đang tải chính sách nguồn...</p> : null}
           {error ? (
             <p className="status-error" role="alert">
               {error}
             </p>
           ) : null}
           {state !== 'loading' && !error && sources.length === 0 ? (
-            <p className="source-support-note">No source policies returned by backend.</p>
+            <p className="source-support-note">Backend chưa trả về chính sách nguồn nào.</p>
           ) : null}
 
           {sources.length > 0 ? (
-            <div className="source-support-table-wrap">
-              <table className="source-support-table sources-table">
-                <thead>
-                  <tr>
-                    <th scope="col">Source</th>
-                    <th scope="col">Domains</th>
-                    <th scope="col">Parser</th>
-                    <th scope="col">Policy</th>
-                    <th aria-label="Actions" scope="col" />
-                  </tr>
-                </thead>
-                <tbody>
+            <>
+              <div className="source-support-table-wrap">
+                <table className="source-support-table sources-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Nguồn</th>
+                      <th scope="col">Domain</th>
+                      <th scope="col">Parser</th>
+                      <th scope="col">Chính sách</th>
+                      <th aria-label="Actions" scope="col" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sources.map((source) => {
+                      const policyLabel = `${source.delay_seconds}s delay · ${source.max_concurrency} concurrent · ${source.retry_limit} retries`;
+                      const primaryDomain = source.domains[0] ?? '';
+                      return (
+                        <tr key={source.source_id}>
+                          <th scope="row">
+                            <span className="source-name-cell">
+                              <Globe2 aria-hidden="true" size={16} />
+                              {source.label}
+                            </span>
+                          </th>
+                          <td>
+                            <ul className="source-domain-list">
+                              {source.domains.map((domain) => (
+                                <li key={domain}>
+                                  <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
+                                    {domain}
+                                  </a>
+                                </li>
+                              ))}
+                            </ul>
+                          </td>
+                          <td>{source.adapter_label || source.adapter_id}</td>
+                          <td>
+                            <span className="source-policy-cell">
+                              <Clock3 aria-hidden="true" size={15} />
+                              <span aria-hidden="true">
+                                {source.delay_seconds}s delay · {source.max_concurrency} concurrent
+                              </span>
+                              <span className="sr-only">{policyLabel}</span>
+                            </span>
+                          </td>
+                          <td>
+                            <button
+                              aria-label={`Mở domain chính ${source.label}`}
+                              className="icon-action source-row-action"
+                              disabled={!primaryDomain}
+                              onClick={() => {
+                                if (primaryDomain) window.open(domainHref(primaryDomain), '_blank', 'noopener,noreferrer');
+                              }}
+                              type="button"
+                            >
+                              <MoreVertical aria-hidden="true" size={16} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {isMobileSourcesLayout ? (
+                <div className="source-support-card-list">
                   {sources.map((source) => {
-                    const policyLabel = `${source.delay_seconds}s delay · ${source.max_concurrency} concurrent · ${source.retry_limit} retries`;
                     const primaryDomain = source.domains[0] ?? '';
                     return (
-                      <tr key={source.source_id}>
-                        <th scope="row">
+                      <article className="source-support-card" key={source.source_id}>
+                        <header>
                           <span className="source-name-cell">
-                            <Globe2 aria-hidden="true" size={16} />
+                            <Globe2 aria-hidden="true" size={17} />
                             {source.label}
                           </span>
-                        </th>
-                        <td>
-                          <ul className="source-domain-list">
-                            {source.domains.map((domain) => (
-                              <li key={domain}>
-                                <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
-                                  {domain}
-                                </a>
-                              </li>
-                            ))}
-                          </ul>
-                        </td>
-                        <td>{source.adapter_label || source.adapter_id}</td>
-                        <td>
-                          <span className="source-policy-cell">
-                            <Clock3 aria-hidden="true" size={15} />
-                            <span aria-hidden="true">
-                              {source.delay_seconds}s delay · {source.max_concurrency} concurrent
-                            </span>
-                            <span className="sr-only">{policyLabel}</span>
-                          </span>
-                        </td>
-                        <td>
                           <button
                             aria-label={`Mở domain chính ${source.label}`}
                             className="icon-action source-row-action"
@@ -520,13 +573,32 @@ export default function SourcesView({
                           >
                             <MoreVertical aria-hidden="true" size={16} />
                           </button>
-                        </td>
-                      </tr>
+                        </header>
+                        <ul className="source-domain-list">
+                          {source.domains.map((domain) => (
+                            <li key={domain}>
+                              <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
+                                {domain}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                        <dl>
+                          <div>
+                            <dt>Parser</dt>
+                            <dd>{source.adapter_label || source.adapter_id}</dd>
+                          </div>
+                          <div>
+                          <dt>Chính sách</dt>
+                            <dd>{source.delay_seconds}s delay · {source.max_concurrency} concurrent · {source.retry_limit} retries</dd>
+                          </div>
+                        </dl>
+                      </article>
                     );
                   })}
-                </tbody>
-              </table>
-            </div>
+                </div>
+              ) : null}
+            </>
           ) : null}
         </>
       ) : null}
@@ -672,15 +744,15 @@ export default function SourcesView({
 
           {entries.length > 0 ? (
             <>
-              <div className="source-support-table-wrap source-catalog-table-wrap">
+              <div className="source-support-table-wrap source-catalog-table-wrap source-catalog-main-table-wrap">
                 <table className="source-support-table sources-table source-catalog-table">
                   <thead>
                     <tr>
                       <th aria-label="Select" scope="col" />
-                      <th scope="col">Name</th>
+                      <th scope="col">Tên nguồn</th>
                       <th scope="col">Domain</th>
                       <th scope="col">Tags</th>
-                      <th scope="col">Status</th>
+                      <th scope="col">Trạng thái</th>
                       <th scope="col">Meta</th>
                       <th aria-label="Actions" scope="col" />
                     </tr>
@@ -876,6 +948,98 @@ export default function SourcesView({
                   </tbody>
                 </table>
               </div>
+              {isMobileSourcesLayout ? (
+                <div className="source-catalog-card-list">
+                  {entries.map((entry) => {
+                    const jsonUrl = sourceJsonHref(entry);
+                    const managedStatus = managedStatusLabel(entry);
+                    const managedSourceId = entry.managed_source_id;
+                    const managedBusy = managedSourceId !== '' && managedLoadingId === managedSourceId;
+                    return (
+                      <article className="source-catalog-card" key={entry.id}>
+                        <header>
+                          <label>
+                            <input
+                              aria-label={`Chọn nguồn ${entry.name || entry.domain}`}
+                              checked={selectedIds.has(entry.id)}
+                              onChange={() => toggleSelected(entry.id)}
+                              type="checkbox"
+                            />
+                            <span>{entry.name || entry.domain || 'Nguồn chưa đặt tên'}</span>
+                          </label>
+                          <span className={`source-status-badge ${statusTone(entry)}`}>
+                            {entry.supported ? <CheckCircle2 aria-hidden="true" size={13} /> : <ShieldAlert aria-hidden="true" size={13} />}
+                            {statusLabel(entry)}
+                          </span>
+                        </header>
+                        {entry.url ? (
+                          <a className="source-catalog-url" href={entry.url} rel="noreferrer" target="_blank">
+                            {entry.url}
+                          </a>
+                        ) : null}
+                        <dl>
+                          <div>
+                            <dt>Domain</dt>
+                            <dd>{entry.domain || '-'}</dd>
+                          </div>
+                          <div>
+                            <dt>Review</dt>
+                            <dd>{managedStatus} · Trust {managedTrustLabel(entry)}</dd>
+                          </div>
+                          <div>
+                            <dt>Meta</dt>
+                            <dd>{entry.author || 'Không rõ tác giả'} · {entry.version ? `v${entry.version}` : 'chưa có version'}</dd>
+                          </div>
+                        </dl>
+                        <span className="source-tag-list">
+                          {[...entry.tags, ...entry.unknown_tags].map((tag) => (
+                            <span className="source-tag-chip" key={tag}>
+                              {tag}
+                            </span>
+                          ))}
+                        </span>
+                        <div className="source-row-actions">
+                          <button
+                            disabled={Boolean(managedSourceId) || !importCatalogSources}
+                            onClick={() => {
+                              void handleImportCatalogEntries([entry.id]);
+                            }}
+                            type="button"
+                          >
+                            <Database aria-hidden="true" size={15} />
+                            Import
+                          </button>
+                          <button disabled={!entry.url} onClick={() => void copyText(entry.url, 'URL nguồn')} type="button">
+                            <Copy aria-hidden="true" size={15} />
+                            URL
+                          </button>
+                          <button disabled={!jsonUrl} onClick={() => void copyText(jsonUrl, 'source JSON URL')} type="button">
+                            <FileJson aria-hidden="true" size={15} />
+                            JSON
+                          </button>
+                          <button disabled={!checkCatalogSource || healthLoadingId === entry.id} onClick={() => void handleCheckCatalogSource(entry)} type="button">
+                            <RefreshCw aria-hidden="true" size={15} />
+                            Check
+                          </button>
+                        </div>
+                        {managedSourceId ? (
+                          <div className="source-row-actions">
+                            <button disabled={!testManagedSource || managedBusy} onClick={() => void handleTestManagedSource(entry)} type="button">
+                              Test
+                            </button>
+                            <button disabled={!verifyManagedSource || managedBusy} onClick={() => void handleVerifyManagedSource(entry)} type="button">
+                              Verify
+                            </button>
+                            <button disabled={!markManagedSourceStatus || managedBusy} onClick={() => void handleSetManagedStatus(entry, 'NEEDS_REVIEW')} type="button">
+                              Review
+                            </button>
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : null}
               <div className="source-catalog-pagination">
                 <button disabled={catalogPage <= 1 || catalogState === 'loading'} onClick={() => setCatalogPage((page) => Math.max(1, page - 1))} type="button">
                   <ChevronLeft aria-hidden="true" size={15} />
@@ -898,7 +1062,7 @@ export default function SourcesView({
         <div className="source-catalog-panel">
           <div className="source-catalog-notice">
             <ShieldAlert aria-hidden="true" size={18} />
-            <p>Candidate is not a supported source. Import remains blocked until a developer/operator adds a real source policy and parser.</p>
+            <p>Ứng viên parser chưa phải nguồn được hỗ trợ. Import vẫn bị chặn cho đến khi có source policy và parser thật.</p>
           </div>
           {candidateMessage ? <p className="source-copy-message">{candidateMessage}</p> : null}
           {candidateError ? (
@@ -914,13 +1078,13 @@ export default function SourcesView({
               <table className="source-support-table sources-table source-catalog-table source-candidate-table">
                 <thead>
                   <tr>
-                    <th scope="col">Title</th>
+                    <th scope="col">Tiêu đề</th>
                     <th scope="col">Domain</th>
-                    <th scope="col">Sample URL</th>
-                    <th scope="col">Confidence</th>
-                    <th scope="col">Status</th>
-                    <th scope="col">Signals</th>
-                    <th scope="col">Created</th>
+                    <th scope="col">URL mẫu</th>
+                    <th scope="col">Độ tin cậy</th>
+                    <th scope="col">Trạng thái</th>
+                    <th scope="col">Tín hiệu</th>
+                    <th scope="col">Ngày tạo</th>
                   </tr>
                 </thead>
                 <tbody>
