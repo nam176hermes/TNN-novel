@@ -8,11 +8,18 @@ import sqlite3
 import subprocess
 import tarfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from scripts import ops
+
+
+class _FrozenBackupDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 7, 13, 20, 15, 30, tzinfo=tz)
 
 
 def _write_backup_sidecar(archive: Path, **overrides: object) -> Path:
@@ -225,15 +232,14 @@ def test_create_backup_sidecar_publication_failure_leaves_visible_archive(
     data_dir.mkdir()
     (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
     backup_dir = tmp_path / "backups"
-    real_replace = ops.os.replace
+    real_publish = ops._publish_backup_file
 
-    def fail_final_sidecar_replace(source: Path | str, destination: Path | str) -> None:
-        destination_path = Path(destination)
-        if destination_path.parent == backup_dir and destination_path.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
+    def fail_final_sidecar_publication(source: Path, destination: Path) -> None:
+        if destination.parent == backup_dir and destination.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
             raise OSError("sidecar publication failed")
-        real_replace(source, destination)
+        real_publish(source, destination)
 
-    monkeypatch.setattr(ops.os, "replace", fail_final_sidecar_replace)
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_final_sidecar_publication)
 
     with pytest.raises(OSError, match="sidecar publication failed"):
         ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
@@ -254,15 +260,14 @@ def test_create_backup_archive_publication_failure_publishes_nothing(
     data_dir.mkdir()
     (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
     backup_dir = tmp_path / "backups"
-    real_replace = ops.os.replace
+    real_publish = ops._publish_backup_file
 
-    def fail_final_archive_replace(source: Path | str, destination: Path | str) -> None:
-        destination_path = Path(destination)
-        if destination_path.parent == backup_dir and destination_path.name.endswith(".tar.gz"):
+    def fail_final_archive_publication(source: Path, destination: Path) -> None:
+        if destination.parent == backup_dir and destination.name.endswith(".tar.gz"):
             raise OSError("archive publication failed")
-        real_replace(source, destination)
+        real_publish(source, destination)
 
-    monkeypatch.setattr(ops.os, "replace", fail_final_archive_replace)
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_final_archive_publication)
 
     with pytest.raises(OSError, match="archive publication failed"):
         ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
@@ -271,6 +276,78 @@ def test_create_backup_archive_publication_failure_publishes_nothing(
     assert list(backup_dir.glob("*.manifest.json")) == []
     assert list(backup_dir.glob("*.partial*")) == []
     assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_same_timestamp_collision_preserves_both_backups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first version", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second version", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+
+    first = ops.create_backup(data_dir=first_data, out_dir=backup_dir, record_event=False)
+    first_hash = ops.sha256_file(first)
+    first_sidecar = ops.backup_sidecar_path(first).read_bytes()
+    second = ops.create_backup(data_dir=second_data, out_dir=backup_dir, record_event=False)
+
+    assert first != second
+    assert first.name.startswith("novel-pipeline-backup-20260713-201530")
+    assert second.name.startswith("novel-pipeline-backup-20260713-201530")
+    assert ops.sha256_file(first) == first_hash
+    assert ops.backup_sidecar_path(first).read_bytes() == first_sidecar
+    assert first.is_file() and ops.backup_sidecar_path(first).is_file()
+    assert second.is_file() and ops.backup_sidecar_path(second).is_file()
+    assert len(list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))) == 2
+
+    first_restore = ops.restore_backup(first, tmp_path / "first-restore")
+    second_restore = ops.restore_backup(second, tmp_path / "second-restore")
+    assert (first_restore / "chapter.txt").read_text(encoding="utf-8") == "first version"
+    assert (second_restore / "chapter.txt").read_text(encoding="utf-8") == "second version"
+
+
+def test_create_backup_collision_sidecar_publication_failure_inherits_no_stale_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first version", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second version with different size", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+
+    first = ops.create_backup(data_dir=first_data, out_dir=backup_dir, record_event=False)
+    first_hash = ops.sha256_file(first)
+    first_sidecar = ops.backup_sidecar_path(first).read_bytes()
+
+    def fail_sidecar_publication(source: Path, destination: Path) -> None:
+        if destination.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
+            raise OSError("sidecar publication failed")
+        os.link(source, destination)
+        source.unlink()
+
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_sidecar_publication, raising=False)
+
+    with pytest.raises(OSError, match="sidecar publication failed"):
+        ops.create_backup(data_dir=second_data, out_dir=backup_dir, record_event=False)
+
+    archives = list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))
+    assert len(archives) == 2
+    second = next(path for path in archives if path != first)
+    assert ops.sha256_file(first) == first_hash
+    assert ops.backup_sidecar_path(first).read_bytes() == first_sidecar
+    assert not ops.backup_sidecar_path(second).exists()
+    items = {item["filename"]: item for item in ops.list_backups(backup_dir)}
+    assert items[first.name]["metadata_status"] == "READY"
+    assert items[second.name]["metadata_status"] == "METADATA_MISSING"
 
 
 def test_encryption_failure_does_not_publish_encrypted_artifacts(

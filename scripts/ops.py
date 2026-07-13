@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -91,19 +92,47 @@ def _notify_backup_progress(callback: Callable[[str], None] | None, step: str) -
 
 
 def _backup_staging_path(out_dir: Path, final_name: str) -> Path:
-    staging_path = Path(
-        tempfile.mkdtemp(
-            prefix=f".{final_name}.",
-            suffix=".partial",
-            dir=out_dir,
-        )
-    )
+    staging_path = out_dir / f".{final_name}.partial"
+    staging_path.mkdir(mode=0o700, exist_ok=False)
     try:
         staging_path.chmod(0o700)
     except Exception:
         shutil.rmtree(staging_path)
         raise
     return staging_path
+
+
+def _backup_collision_name(base_name: str) -> str:
+    for extension in (".tar.gz.enc", ".tar.gz"):
+        if base_name.endswith(extension):
+            stem = base_name.removesuffix(extension)
+            return f"{stem}-{secrets.token_hex(6)}{extension}"
+    raise ValueError("unsupported backup filename")
+
+
+def _reserve_backup_output(out_dir: Path, base_name: str) -> tuple[Path, Path]:
+    candidate = base_name
+    while True:
+        final_path = out_dir / candidate
+        sidecar_path = backup_sidecar_path(final_path)
+        if os.path.lexists(final_path) or os.path.lexists(sidecar_path):
+            candidate = _backup_collision_name(base_name)
+            continue
+        try:
+            staging_path = _backup_staging_path(out_dir, candidate)
+        except FileExistsError:
+            candidate = _backup_collision_name(base_name)
+            continue
+        if os.path.lexists(final_path) or os.path.lexists(sidecar_path):
+            shutil.rmtree(staging_path)
+            candidate = _backup_collision_name(base_name)
+            continue
+        return final_path, staging_path
+
+
+def _publish_backup_file(source: Path, destination: Path) -> None:
+    os.link(source, destination)
+    source.unlink()
 
 
 def _validate_backup_archive(archive_path: Path) -> dict[str, Any]:
@@ -328,7 +357,6 @@ def create_backup(
         sqlite_checkpoint(source_dir / "pipeline.db")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = f"-{label}" if label else ""
-    backup_path = destination_dir / f"novel-pipeline-backup-{stamp}{suffix}.tar.gz"
 
     excluded_roots: set[str] = set()
     if not include_audio:
@@ -340,7 +368,10 @@ def create_backup(
 
     backup_started_at = datetime.now()
     env_file = ROOT / ".env"
-    staging_root = _backup_staging_path(destination_dir, backup_path.name)
+    backup_path, staging_root = _reserve_backup_output(
+        destination_dir,
+        f"novel-pipeline-backup-{stamp}{suffix}.tar.gz",
+    )
     staging_data_dir = staging_root / "data"
     staged_archive_path = staging_root / backup_path.name
     staged_sidecar_path = backup_sidecar_path(staged_archive_path)
@@ -485,8 +516,8 @@ def create_backup(
 
         _notify_backup_progress(progress_callback, "publishing")
         _raise_if_backup_cancelled(cancel_check)
-        os.replace(staged_archive_path, backup_path)
-        os.replace(staged_sidecar_path, backup_sidecar_path(backup_path))
+        _publish_backup_file(staged_archive_path, backup_path)
+        _publish_backup_file(staged_sidecar_path, backup_sidecar_path(backup_path))
     finally:
         shutil.rmtree(staging_root)
 
@@ -525,9 +556,11 @@ def encrypt_backup_archive(
     if not shutil.which("openssl"):
         raise RuntimeError("openssl is required for encrypted backups")
     backup_path = backup_path.resolve()
-    encrypted_path = backup_path.with_suffix(backup_path.suffix + ".enc")
     manifest = read_backup_manifest(backup_path)
-    staging_root = _backup_staging_path(backup_path.parent, encrypted_path.name)
+    encrypted_path, staging_root = _reserve_backup_output(
+        backup_path.parent,
+        f"{backup_path.name}.enc",
+    )
     staged_encrypted_path = staging_root / encrypted_path.name
     staged_sidecar_path = backup_sidecar_path(staged_encrypted_path)
     try:
@@ -565,8 +598,8 @@ def encrypt_backup_archive(
         )
         _notify_backup_progress(progress_callback, "publishing")
         _raise_if_backup_cancelled(cancel_check)
-        os.replace(staged_encrypted_path, encrypted_path)
-        os.replace(staged_sidecar_path, backup_sidecar_path(encrypted_path))
+        _publish_backup_file(staged_encrypted_path, encrypted_path)
+        _publish_backup_file(staged_sidecar_path, backup_sidecar_path(encrypted_path))
     finally:
         shutil.rmtree(staging_root)
 

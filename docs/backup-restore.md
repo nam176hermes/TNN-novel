@@ -48,9 +48,9 @@ Every backup now includes:
 
 The adjacent sidecar is a compact, versioned, backup-level summary used by normal API listing. The complete file-level manifest remains inside the archive for explicit validation and compatibility. Normal `GET /api/system/backups` reads sidecar/stat metadata only and never opens or decompresses an archive.
 
-Backup creation uses a private `0700` staging directory inside the selected output directory. Files are collected and added to the archive in deterministic path order, with cooperative cancellation checks between bounded file operations. The completed archive is validated before publication. The archive and compact sidecar then move into their established final names with same-filesystem atomic renames; staging and partial names are ignored by normal backup listing.
+Backup creation uses a private `0700` staging directory inside the selected output directory. Files are collected and added to the archive in deterministic path order, with cooperative cancellation checks between bounded file operations. The completed archive is validated before publication. Each invocation atomically reserves a collision-resistant final basename, adding a short suffix only when the timestamped name is already reserved or present. The archive and compact sidecar then move into their established filename patterns with same-filesystem, no-clobber publication; staging and partial names are ignored by normal backup listing.
 
-Cancellation or failure before archive publication leaves no final artifact or sidecar. If the archive rename succeeds but the sidecar rename fails, the valid archive is preserved and appears as `METADATA_MISSING` so an operator can use the explicit metadata repair workflow. Encrypted output is staged the same way, so a failed encryption does not expose a partial `.enc` artifact under a final backup name.
+Cancellation or failure before archive publication leaves no final artifact or sidecar. If archive publication succeeds but sidecar publication fails, the valid archive is preserved and appears as `METADATA_MISSING` so an operator can use the explicit metadata repair workflow. Encrypted output is staged the same way, so a failed encryption does not expose a partial `.enc` artifact under a final backup name.
 
 The manifest records:
 
