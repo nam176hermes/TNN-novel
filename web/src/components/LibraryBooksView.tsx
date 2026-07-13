@@ -157,8 +157,8 @@ export default function LibraryBooksView({
             <BookOpenCheck size={24} />
           </span>
           <div>
-            <h2 id="translated-library-title">Thư viện đã dịch</h2>
-            <p>Quản lý và đọc các truyện đã dịch</p>
+            <h2 id="translated-library-title">Thư viện</h2>
+            <p>Truyện đã dịch và tiến độ đọc của bạn</p>
           </div>
         </div>
         <button className="secondary-action" disabled={books.state === 'loading'} onClick={onRefresh} type="button">
@@ -226,7 +226,15 @@ export default function LibraryBooksView({
           </p>
         ) : null}
         {books.data.length === 0 && (books.state === 'idle' || books.state === 'empty') ? (
-          <p className="empty-detail">Chưa có truyện đã dịch.</p>
+          <section className="translated-library-empty" aria-label="Thư viện trống">
+            <span aria-hidden="true"><BookOpenCheck size={34} /></span>
+            <h3>Thư viện trống</h3>
+            <p>Bạn chưa có truyện nào. Nhập truyện ngay để bắt đầu đọc.</p>
+            <button className="primary-action" onClick={onOpenImport} type="button">
+              <Plus aria-hidden="true" size={17} />
+              Nhập truyện
+            </button>
+          </section>
         ) : null}
         {books.data.length > 0 && visibleBooks.length === 0 ? (
           <p className="panel empty-detail">Không có truyện phù hợp với bộ lọc hiện tại.</p>
@@ -274,8 +282,22 @@ export default function LibraryBooksView({
                         role="menuitem"
                         type="button"
                       >
-                        Mở bàn dịch
+                        Sửa
                       </button>
+                      {onUpdateCover ? (
+                        <label className="translated-book-menu-upload" role="menuitem">
+                          {book.cover_url ? 'Đổi bìa' : 'Thêm bìa'}
+                          <input
+                            accept="image/jpeg,image/png,image/webp,image/gif"
+                            aria-label={`${book.cover_url ? 'Đổi bìa' : 'Thêm bìa'} sách ${book.title}`}
+                            onChange={(event) => {
+                              handleCoverChange(book, event);
+                              setOpenMenuBookId(null);
+                            }}
+                            type="file"
+                          />
+                        </label>
+                      ) : null}
                       {onDeleteBook ? (
                         <button
                           className="danger-menu-item"
@@ -286,7 +308,7 @@ export default function LibraryBooksView({
                           role="menuitem"
                           type="button"
                         >
-                          Xóa sách
+                          Xóa
                         </button>
                       ) : null}
                     </div>
@@ -322,6 +344,10 @@ export default function LibraryBooksView({
 
                   <div className="translated-book-card-body">
                     <p className="translated-book-reading-state">{readerState}</p>
+                    <div className="translated-book-reader-progress">
+                      <span>{readerProgress ? `Tiến độ đọc ${readerPercent}%` : 'Chưa bắt đầu đọc'}</span>
+                      <progress aria-label={`Tiến độ đọc ${book.title}`} max={100} value={readerPercent} />
+                    </div>
                     <div className="translated-book-stats">
                       <span>
                         <strong>{book.translated_chapters}/{book.total_chapters}</strong>
@@ -358,7 +384,7 @@ export default function LibraryBooksView({
                     type="button"
                   >
                     <BookOpenCheck aria-hidden="true" size={16} />
-                    Đọc <span className="sr-only">{book.title}</span>
+                    Đọc tiếp <span className="sr-only">{book.title}</span>
                   </button>
                   <button
                     className="secondary-action"

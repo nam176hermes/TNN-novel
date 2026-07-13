@@ -1,8 +1,9 @@
-import { Moon, Sun, X } from 'lucide-react';
+import { Headphones, Moon, Sun, X } from 'lucide-react';
 import type {
   ReaderFontFamily,
   ReaderMode,
   ReaderSettings,
+  ReaderTextMode,
   ReaderTheme,
   ReaderWidth,
 } from '../ReaderView';
@@ -11,13 +12,21 @@ export type ReaderSettingsSheetProps = {
   open: boolean;
   settings: ReaderSettings;
   onClose(): void;
+  audioAvailable?: boolean;
+  audioBusy?: boolean;
+  autoScrollEnabled?: boolean;
+  rawAvailable?: boolean;
+  textMode?: ReaderTextMode;
+  onAudioAction?(): void;
+  onAutoScrollChange?(enabled: boolean): void;
+  onTextModeChange?(mode: ReaderTextMode): void;
   onUpdate(patch: Partial<ReaderSettings>): void;
 };
 
 const themeOptions: Array<{ id: ReaderTheme; label: string }> = [
-  { id: 'light', label: 'Light' },
-  { id: 'dark', label: 'Dark' },
-  { id: 'sepia', label: 'Sepia' },
+  { id: 'light', label: 'Sáng' },
+  { id: 'dark', label: 'Tối' },
+  { id: 'sepia', label: 'Giấy' },
   { id: 'eink', label: 'E-ink' },
 ];
 
@@ -38,9 +47,17 @@ const readingModeOptions: Array<{ id: ReaderMode; label: string }> = [
 ];
 
 export default function ReaderSettingsSheet({
+  audioAvailable = false,
+  audioBusy = false,
+  autoScrollEnabled = false,
   open,
+  rawAvailable = true,
   settings,
+  textMode = 'translation',
+  onAudioAction,
+  onAutoScrollChange,
   onClose,
+  onTextModeChange,
   onUpdate,
 }: ReaderSettingsSheetProps) {
   if (!open) return null;
@@ -55,7 +72,7 @@ export default function ReaderSettingsSheet({
         <header className="reader-sheet-header">
           <div>
             <p className="section-label">Aa</p>
-            <h2>Cài đặt đọc</h2>
+            <h2>Tùy chỉnh đọc</h2>
           </div>
           <button
             aria-label="Đóng cài đặt đọc"
@@ -69,6 +86,38 @@ export default function ReaderSettingsSheet({
         </header>
 
         <div className="reader-settings-grid">
+          <section className="reader-setting-group reader-setting-full reader-content-mode-group">
+            <span>Nội dung</span>
+            <div aria-label="Nội dung đọc" className="reader-content-mode-grid" role="group">
+              {([
+                ['translation', 'Bản dịch'],
+                ['split', 'Song song'],
+                ['raw-collapsed', 'Raw gọn'],
+                ['qa-overlay', 'QA'],
+              ] as Array<[ReaderTextMode, string]>).map(([mode, label]) => (
+                <button
+                  aria-pressed={textMode === mode}
+                  disabled={!onTextModeChange || (mode !== 'translation' && mode !== 'qa-overlay' && !rawAvailable)}
+                  key={mode}
+                  onClick={() => onTextModeChange?.(mode)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button
+              aria-pressed={textMode === 'raw'}
+              className="reader-raw-mode-row"
+              disabled={!onTextModeChange || !rawAvailable}
+              onClick={() => onTextModeChange?.('raw')}
+              type="button"
+            >
+              <span>Raw tiếng Trung</span>
+              {!rawAvailable ? <small>Truyện này chưa có nội dung raw tiếng Trung.</small> : null}
+            </button>
+          </section>
+
           <div className="reader-setting-group">
             <span>Nền đọc</span>
             <div aria-label="Nền đọc" className="segmented-control reader-theme-control" role="group">
@@ -233,6 +282,31 @@ export default function ReaderSettingsSheet({
               ))}
             </div>
           </div>
+
+          <label className="reader-toggle-control reader-setting-full">
+            <input
+              aria-label="Tự động cuộn"
+              checked={autoScrollEnabled}
+              disabled={!onAutoScrollChange}
+              onChange={(event) => onAutoScrollChange?.(event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>Tự động cuộn</strong>
+              <small>Chỉ hoạt động trong chế độ cuộn.</small>
+            </span>
+          </label>
+
+          <section className="reader-setting-group reader-setting-full reader-audio-setting">
+            <span>Âm thanh</span>
+            <button disabled={!onAudioAction || audioBusy} onClick={onAudioAction} type="button">
+              <Headphones aria-hidden="true" size={18} />
+              <span>
+                <strong>{audioAvailable ? 'Nghe audio chương' : 'Tạo audio'}</strong>
+                <small>{audioAvailable ? 'Mở trình phát thu gọn.' : 'Audio không tự động được tạo.'}</small>
+              </span>
+            </button>
+          </section>
 
           <label className="reader-toggle-control reader-setting-full">
             <input

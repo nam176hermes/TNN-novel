@@ -183,7 +183,15 @@ export default function ReaderTextSurface({
         </header>
       ) : null}
 
-      {textState === 'loading' ? <p>Đang tải bản đọc...</p> : null}
+      {textState === 'loading' ? (
+        <div aria-label="Đang tải nội dung chương" className="reader-loading-skeleton" role="status">
+          {!selectedChapter ? <span className="reader-skeleton-title" /> : null}
+          {[92, 78, 96, 69, 88, 74].map((width, index) => (
+            <span key={`${width}-${index}`} style={{ '--reader-skeleton-width': `${width}%` } as CSSProperties} />
+          ))}
+          <small>Đang tải nội dung chương…</small>
+        </div>
+      ) : null}
       {textError ? (
         <p className="status-error" role="alert">
           {textError}

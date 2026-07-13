@@ -393,7 +393,7 @@ export type ReaderTheme = 'light' | 'dark' | 'sepia' | 'eink';
 export type ReaderWidth = 'narrow' | 'medium' | 'wide';
 export type ReaderFontFamily = 'serif' | 'sans';
 export type ReaderMode = 'scroll' | 'paginated';
-type ReaderTextMode = 'translation' | 'raw' | 'split' | 'raw-collapsed' | 'qa-overlay';
+export type ReaderTextMode = 'translation' | 'raw' | 'split' | 'raw-collapsed' | 'qa-overlay';
 
 export type ReaderSettings = {
   characterSpacing: number;
@@ -1763,6 +1763,7 @@ export default function ReaderView({
   const [scrollTextProgress, setScrollTextProgress] = useState<ReaderTextProgress | null>(null);
   const [chromeVisible, setChromeVisible] = useState(true);
   const [tocOpen, setTocOpen] = useState(false);
+  const [tocOrder, setTocOrder] = useState<'asc' | 'desc'>('asc');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [readerSearchOpen, setReaderSearchOpen] = useState(false);
@@ -1854,6 +1855,52 @@ export default function ReaderView({
   const [readerQaReport, setReaderQaReport] = useState<QaReport | null>(null);
   const [readerQaState, setReaderQaState] = useState<LoadState>('idle');
   const [readerQaError, setReaderQaError] = useState('');
+  const exitReader = useCallback(() => {
+    const state = window.history.state as Record<string, unknown> | null;
+    if (state?.novelTnnReader === true) {
+      window.history.back();
+      return;
+    }
+    onBackToLibrary();
+  }, [onBackToLibrary]);
+
+  useEffect(() => {
+    const currentState = (window.history.state ?? {}) as Record<string, unknown>;
+    if (currentState.novelTnnReader !== true) {
+      window.history.pushState({ ...currentState, novelTnnReader: true }, '');
+    }
+
+    const handlePopState = () => onBackToLibrary();
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      const state = (window.history.state ?? {}) as Record<string, unknown>;
+      if (state.novelTnnReader === true) {
+        window.history.replaceState({ ...state, novelTnnReader: false }, '');
+      }
+    };
+  }, [onBackToLibrary]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (tocOpen) {
+        setTocOpen(false);
+        return;
+      }
+      if (settingsOpen) {
+        setSettingsOpen(false);
+        return;
+      }
+      exitReader();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [exitReader, settingsOpen, tocOpen]);
+
   const setReaderTextMode = useCallback((mode: ReaderTextMode) => {
     setReaderTextModeState(mode);
     saveReaderTextMode(mode);
@@ -1869,13 +1916,16 @@ export default function ReaderView({
   );
   const normalizedChapterQuery = chapterQuery.trim().toLowerCase();
   const visibleChapters = useMemo(
-    () => (normalizedChapterQuery
+    () => {
+      const filtered = normalizedChapterQuery
       ? translatedChapters.filter((chapter) => (
         String(chapter.chapter_number).includes(normalizedChapterQuery)
         || chapter.title.toLowerCase().includes(normalizedChapterQuery)
       ))
-      : translatedChapters),
-    [normalizedChapterQuery, translatedChapters],
+      : translatedChapters;
+      return tocOrder === 'desc' ? [...filtered].reverse() : filtered;
+    },
+    [normalizedChapterQuery, tocOrder, translatedChapters],
   );
   const selectedBook = books.find((book) => book.id === activeBookId);
   const audioPlaylistByChapterId = useMemo(
@@ -4184,16 +4234,17 @@ export default function ReaderView({
       <header className="reader-top-bar" data-visible={chromeVisible}>
         <button
           aria-label="Quay lại thư viện"
-          className="reader-icon-button"
-          onClick={onBackToLibrary}
+          className="reader-icon-button reader-back-button"
+          onClick={exitReader}
           title="Quay lại thư viện"
           type="button"
         >
           <ArrowLeft aria-hidden="true" size={22} />
+          <span>Thư viện</span>
         </button>
 
         <button
-          aria-label="Mục lục"
+          aria-label="Mở mục lục từ thanh trên"
           className="reader-icon-button"
           disabled={translatedChapters.length === 0}
           onClick={() => setTocOpen(true)}
@@ -4997,6 +5048,7 @@ export default function ReaderView({
         bookProgressLabel={bookProgressLabel}
         canGoNext={canGoNext}
         canGoPrevious={canGoPrevious}
+        chapterPositionLabel={`${Math.max(currentPosition, 1).toLocaleString('vi-VN')} / ${Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}`}
         locationLabel={locationLabel}
         progressLabel={progressLabel}
         progressPercent={progressPercent}
@@ -5004,6 +5056,7 @@ export default function ReaderView({
         visible={chromeVisible}
         wordsRemainingLabel={wordsRemainingLabel}
         onNext={handleNextPageOrChapter}
+        onOpenToc={translatedChapters.length > 0 ? () => setTocOpen(true) : undefined}
         onPrevious={handlePreviousPageOrChapter}
       />
 
@@ -5093,6 +5146,46 @@ export default function ReaderView({
                 value={chapterQuery}
               />
             </label>
+
+            <div aria-label="Thứ tự chương" className="reader-toc-order" role="group">
+              <button
+                aria-pressed={tocOrder === 'asc'}
+                onClick={() => setTocOrder('asc')}
+                type="button"
+              >
+                Đầu → cuối
+              </button>
+              <button
+                aria-pressed={tocOrder === 'desc'}
+                onClick={() => setTocOrder('desc')}
+                type="button"
+              >
+                Cuối → đầu
+              </button>
+            </div>
+
+            <div className="reader-toc-shortcuts">
+              <button
+                disabled={translatedChapters.length === 0}
+                onClick={() => {
+                  const firstChapter = translatedChapters[0];
+                  if (firstChapter) handleSelectChapter(firstChapter.id);
+                }}
+                type="button"
+              >
+                Về chương đầu
+              </button>
+              <button
+                disabled={translatedChapters.length === 0}
+                onClick={() => {
+                  const latestChapter = translatedChapters[translatedChapters.length - 1];
+                  if (latestChapter) handleSelectChapter(latestChapter.id);
+                }}
+                type="button"
+              >
+                Đến chương mới nhất
+              </button>
+            </div>
 
             <div className="reader-toc-list reader-drawer-list">
               {visibleChapters.map((chapter) => {
@@ -5190,9 +5283,32 @@ export default function ReaderView({
       />
 
       <ReaderSettingsSheet
+        audioAvailable={canPlayAudio}
+        audioBusy={audioJobLoading}
+        autoScrollEnabled={autoScrollEnabled}
         open={settingsOpen}
+        rawAvailable={rawContentAvailable}
         settings={readerSettings}
+        textMode={readerTextMode}
+        onAudioAction={() => {
+          setSettingsOpen(false);
+          if (canPlayAudio) {
+            setAudioOpen(true);
+            return;
+          }
+          startReaderAudioJob();
+        }}
+        onAutoScrollChange={(enabled) => {
+          if (enabled && readerSettings.readingMode !== 'scroll') {
+            updateReaderSettings({ readingMode: 'scroll' });
+          }
+          setAutoScrollEnabled(enabled);
+        }}
         onClose={() => setSettingsOpen(false)}
+        onTextModeChange={(mode) => {
+          setReaderTextMode(mode);
+          setSettingsOpen(false);
+        }}
         onUpdate={updateReaderSettings}
       />
 

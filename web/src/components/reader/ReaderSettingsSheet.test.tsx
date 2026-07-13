@@ -45,7 +45,7 @@ describe('ReaderSettingsSheet', () => {
     );
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     expect(onUpdate).toHaveBeenCalledWith({ theme: 'dark' });
 
     await userEvent.click(within(sheet).getByRole('button', { name: 'E-ink' }));

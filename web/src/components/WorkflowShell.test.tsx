@@ -55,24 +55,18 @@ describe('WorkflowShell', () => {
 
   it('keeps mobile workflow navigation wired to the same routes', async () => {
     const { onOpenImport, onViewChange } = renderShell('workbench');
-    const mobileNav = screen.getByRole('navigation', { name: 'Quy trình di động' });
+    const mobileNav = screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
 
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thư viện' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Raw chưa dịch' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Đọc truyện' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Tác vụ' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Trạng thái' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Nguồn truyện' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Xuất file' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Nhập' }));
+    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
+    const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    await userEvent.click(within(moreSheet).getByRole('button', { name: 'Nhập chương' }));
 
     expect(onViewChange).toHaveBeenCalledWith('library');
-    expect(onViewChange).toHaveBeenCalledWith('raw');
     expect(onViewChange).toHaveBeenCalledWith('reader');
     expect(onViewChange).toHaveBeenCalledWith('jobs');
-    expect(onViewChange).toHaveBeenCalledWith('status');
-    expect(onViewChange).toHaveBeenCalledWith('sources');
-    expect(onViewChange).toHaveBeenCalledWith('export');
     expect(onOpenImport).toHaveBeenCalledTimes(1);
   });
 

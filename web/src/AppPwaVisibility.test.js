@@ -6,12 +6,13 @@ const appSource = readFileSync(resolve(__dirname, 'App.tsx'), 'utf-8');
 
 describe('authenticated PWA install prompt visibility', () => {
   it('does not mount the install prompt in Reader', () => {
-    expect(appSource).toContain(
-      "{activeView !== 'reader' ? <PwaInstallPrompt /> : null}",
-    );
+    const readerCase = appSource.slice(appSource.indexOf("case 'reader':"), appSource.indexOf("case 'import':"));
+    expect(readerCase).not.toContain('<PwaInstallPrompt />');
   });
 
-  it('retains install prompts outside the authenticated workflow', () => {
+  it('places the authenticated install card inside Status instead of the global shell', () => {
+    const statusCase = appSource.slice(appSource.indexOf("case 'status':"), appSource.indexOf("case 'export':"));
+    expect(statusCase).toContain('<PwaInstallPrompt />');
     expect(appSource.match(/<PwaInstallPrompt \/>/g)?.length).toBeGreaterThanOrEqual(3);
   });
 });

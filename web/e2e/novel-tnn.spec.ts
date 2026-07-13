@@ -291,7 +291,11 @@ async function authenticatedPage(page: Page, state: MockState) {
     localStorage.setItem('novel-operator-token', 'access-token');
   });
   await page.goto('/');
-  await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeVisible();
+  const viewport = page.viewportSize();
+  const navigationName = viewport && viewport.width < 900
+    ? 'Điều hướng chính trên di động'
+    : 'Quy trình';
+  await expect(page.getByRole('navigation', { name: navigationName })).toBeVisible();
 }
 
 test('login works and protected shell is blocked without a token', async ({ page }) => {
@@ -360,8 +364,8 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await authenticatedPage(page, state);
 
   await page.getByRole('navigation', { name: 'Quy trình' }).getByRole('button', { name: 'Thư viện' }).click();
-  await expect(page.getByRole('heading', { name: 'Thư viện đã dịch' })).toBeVisible();
-  await page.getByRole('button', { name: `Đọc ${book.title}` }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
   await expect(page.getByText('Trời dần trở lạnh')).toBeVisible();
 
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
@@ -370,6 +374,60 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(VI_TEXT);
   await page.getByRole('button', { name: 'Ẩn bản dịch' }).click();
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveCount(0);
+});
+
+test('mobile shell and Reader follow the approved handoff at 390px and 360px', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await expect(mobileNav).toBeVisible();
+  await expect(mobileNav.getByRole('button')).toHaveCount(5);
+  await expect(mobileNav.getByRole('button', { name: 'Thêm' })).toBeVisible();
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+  const moreSheet = page.getByRole('dialog', { name: 'Thêm' });
+  await expect(moreSheet).toContainText('Quản lý');
+  await expect(moreSheet).toContainText('Hệ thống');
+  await expect(moreSheet).toContainText('Tài khoản');
+  await moreSheet.getByRole('button', { name: 'Đóng menu Thêm' }).click();
+
+  await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+
+  await expect(page.getByRole('button', { name: 'Quay lại thư viện' })).toContainText('Thư viện');
+  await expect(mobileNav).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Chương trước' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Mục lục' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Chương sau' })).toBeVisible();
+  const undersizedReaderButtons = await page.locator('button:visible').evaluateAll((buttons) => (
+    buttons
+      .map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { label: button.getAttribute('aria-label') || button.textContent?.trim(), width: rect.width, height: rect.height };
+      })
+      .filter(({ width, height }) => width < 44 || height < 44)
+  ));
+  expect(undersizedReaderButtons).toEqual([]);
+
+  await page.getByRole('button', { name: 'Mục lục' }).click();
+  const toc = page.getByRole('dialog', { name: 'Mục lục' });
+  await expect(toc.getByRole('button', { name: 'Đầu → cuối' })).toBeVisible();
+  await expect(toc.getByRole('button', { name: 'Cuối → đầu' })).toBeVisible();
+  await toc.getByRole('button', { name: 'Cuối → đầu' }).click();
+  await toc.getByRole('button', { name: 'Đóng mục lục' }).click();
+
+  await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
+  await expect(page.getByRole('dialog', { name: 'Cài đặt đọc' })).toContainText('Tùy chỉnh đọc');
+  await page.getByRole('button', { name: 'Đóng cài đặt đọc' }).click();
+
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.setViewportSize({ width: 360, height: 740 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+  await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
 });
 
 test('exports a translated book as TXT without calling a live API', async ({ page }) => {

@@ -26,7 +26,7 @@ describe('ReviewModeApp', () => {
     render(<ReviewModeApp apiBaseUrl="https://review.example" />);
 
     await userEvent.click(screen.getAllByRole('button', { name: 'Thư viện' })[0]);
-    expect(await screen.findByRole('heading', { name: 'Thư viện đã dịch' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     expect(screen.getByText('Độc Tu')).toBeInTheDocument();
 
     await userEvent.click(screen.getAllByRole('button', { name: 'Trạng thái' })[0]);

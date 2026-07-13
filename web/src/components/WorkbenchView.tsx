@@ -130,6 +130,7 @@ export default function WorkbenchView({
   onViewModeChange,
 }: WorkbenchViewProps) {
   const [mobileSection, setMobileSection] = useState<'editor' | 'assist'>('editor');
+  const [mobileEditorMode, setMobileEditorMode] = useState<'source' | 'translation' | 'parallel'>('translation');
   const [expandedPane, setExpandedPane] = useState<'source' | 'translation' | null>(null);
   const [translationHidden, setTranslationHidden] = useState(false);
   const readerParagraphs = splitReaderParagraphs(translationText);
@@ -285,6 +286,7 @@ export default function WorkbenchView({
       aria-label="Workbench"
       className="workbench-view"
       data-expanded-pane={expandedPane ?? 'none'}
+      data-mobile-editor-mode={mobileEditorMode}
       data-mobile-section={mobileSection}
       data-translation-hidden={translationHidden ? 'true' : 'false'}
       data-view-mode={viewMode}
@@ -349,7 +351,7 @@ export default function WorkbenchView({
             role="tab"
             type="button"
           >
-            Editor
+            Nội dung
           </button>
           <button
             aria-selected={mobileSection === 'assist'}
@@ -374,6 +376,32 @@ export default function WorkbenchView({
         </article>
       ) : (
         <div className="workbench-body">
+          <div aria-label="Chế độ bàn dịch di động" className="workbench-editor-mode-tabs" role="tablist">
+            <button
+              aria-selected={mobileEditorMode === 'source'}
+              onClick={() => setMobileEditorMode('source')}
+              role="tab"
+              type="button"
+            >
+              Bản gốc
+            </button>
+            <button
+              aria-selected={mobileEditorMode === 'translation'}
+              onClick={() => setMobileEditorMode('translation')}
+              role="tab"
+              type="button"
+            >
+              Bản dịch
+            </button>
+            <button
+              aria-selected={mobileEditorMode === 'parallel'}
+              onClick={() => setMobileEditorMode('parallel')}
+              role="tab"
+              type="button"
+            >
+              Song song
+            </button>
+          </div>
           <div className="editor-grid-v2">
             <section className="editor-pane" aria-labelledby="workbench-source-title">
               <header className="editor-pane-header">

@@ -14,6 +14,7 @@ describe('App', () => {
     cleanup();
     clearToken();
     window.localStorage.removeItem('novel-pwa-install-dismissed-v1');
+    window.sessionStorage.removeItem('novel-pwa-install-later-session-v1');
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -48,9 +49,9 @@ describe('App', () => {
       { timeout: 2500 },
     );
     expect(preventDefault).toHaveBeenCalled();
-    expect(within(promptRegion).getByText(/Cài Novel-TNN lên Android Chrome hoặc desktop/)).toBeInTheDocument();
+    expect(within(promptRegion).getByText(/đọc các chương đã lưu khi mất mạng/)).toBeInTheDocument();
 
-    await userEvent.click(within(promptRegion).getByRole('button', { name: 'Cài app' }));
+    await userEvent.click(within(promptRegion).getByRole('button', { name: 'Cài đặt ngay' }));
 
     expect(prompt).toHaveBeenCalledTimes(1);
   });
@@ -69,15 +70,16 @@ describe('App', () => {
     await userEvent.click(within(promptRegion).getByRole('button', { name: 'Để sau' }));
 
     expect(screen.queryByRole('region', { name: 'Cài đặt Novel-TNN như app' })).not.toBeInTheDocument();
-    expect(window.localStorage.getItem('novel-pwa-install-dismissed-v1')).toBe('1');
+    expect(window.sessionStorage.getItem('novel-pwa-install-later-session-v1')).toBe('1');
+    expect(window.localStorage.getItem('novel-pwa-install-dismissed-v1')).toBeNull();
   });
 
   it('shows manual PWA install guidance when the browser does not emit installprompt', async () => {
     render(<App />);
 
     const promptRegion = await screen.findByRole('region', { name: 'Cài đặt Novel-TNN như app' });
-    expect(within(promptRegion).getByText(/Add to Home screen|Install app/)).toBeInTheDocument();
-    expect(within(promptRegion).queryByRole('button', { name: 'Cài app' })).not.toBeInTheDocument();
+    expect(within(promptRegion).getByText(/Thêm vào màn hình chính/)).toBeInTheDocument();
+    expect(within(promptRegion).queryByRole('button', { name: 'Cài đặt ngay' })).not.toBeInTheDocument();
   });
 
   it('shows a safe offline indicator without exposing private cached API data', () => {

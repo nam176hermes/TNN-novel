@@ -236,7 +236,8 @@ describe('ReaderTextSurface', () => {
         })}
       />,
     );
-    expect(screen.getByText('Đang tải bản đọc...')).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: 'Đang tải nội dung chương' })).toBeInTheDocument();
+    expect(screen.getByText('Đang tải nội dung chương…')).toBeInTheDocument();
 
     rerender(
       <ReaderTextSurface

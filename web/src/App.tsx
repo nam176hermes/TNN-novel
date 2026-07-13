@@ -1944,6 +1944,7 @@ function AuthenticatedApp() {
               )}
               status={systemStatus.data}
             />
+            <PwaInstallPrompt />
           </>
         );
       case 'export':
@@ -1981,7 +1982,6 @@ function AuthenticatedApp() {
 
   return (
     <>
-      {activeView !== 'reader' ? <PwaInstallPrompt /> : null}
       <PwaNetworkStatus />
       <WorkflowShell
         activeView={activeView}

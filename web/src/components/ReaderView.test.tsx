@@ -388,7 +388,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cài đặt chữ' }));
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     await userEvent.click(within(sheet).getByRole('button', { name: 'Sans' }));
     fireEvent.change(within(sheet).getByLabelText('Cỡ chữ'), { target: { value: '20' } });
     fireEvent.change(within(sheet).getByLabelText('Giãn dòng'), { target: { value: '2' } });
@@ -4491,7 +4491,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Mục lục' }));
     const drawer = screen.getByRole('dialog', { name: 'Mục lục' });
 
-    expect(within(drawer).getAllByRole('button')).toHaveLength(4);
+    expect(within(drawer).getAllByRole('button', { name: /^Ch\. \d/ })).toHaveLength(3);
     const currentChapterButton = within(drawer).getByRole('button', { name: 'Ch. 2 Thanh Ngưu trấn' });
     expect(currentChapterButton).toHaveAttribute('aria-current', 'true');
     expect(within(currentChapterButton).getByText('11 từ')).toBeInTheDocument();
@@ -4637,7 +4637,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cài đặt chữ' }));
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     expect(article).toHaveAttribute('data-theme', 'dark');
 
     fireEvent.change(within(sheet).getByLabelText('Cỡ chữ'), { target: { value: '20' } });

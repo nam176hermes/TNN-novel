@@ -126,7 +126,7 @@ async function openTranslatedWorkbench(bookTitle = 'Live Book'): Promise<void> {
   await userEvent.click(
     within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }),
   );
-  expect(await screen.findByRole('heading', { name: 'Thư viện đã dịch' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
 
   const bookHeading = await screen.findByRole('heading', { name: bookTitle });
   const row = bookHeading.closest('article');
@@ -699,12 +699,12 @@ describe('App live data wiring', () => {
     expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
 
-    expect(await screen.findByRole('heading', { name: 'Thư viện đã dịch' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
     expect(screen.getByText('1/1 chương đã dịch')).toBeVisible();
     expect(translatedLibraryRequests).toBe(1);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
 
     await expectReaderPage();
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Hắn bước vào động phủ.');
@@ -801,7 +801,7 @@ describe('App live data wiring', () => {
 
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
 
     await expectReaderPage();
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Chương hai từ local progress.');
@@ -879,7 +879,7 @@ describe('App live data wiring', () => {
       'http://127.0.0.1:7860/api/books/42',
       expect.objectContaining({ method: 'DELETE' }),
     ));
-    expect(await screen.findByText('Chưa có truyện đã dịch.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện trống' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Live Book' })).not.toBeInTheDocument();
     await expectNoGlobalAlert();
   });
