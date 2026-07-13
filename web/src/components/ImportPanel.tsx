@@ -259,7 +259,10 @@ function ebookSplitMethodLabel(preview: EbookPreview): string {
 
 function ebookDuplicateStrategySummary(dryRun: NonNullable<EbookPreview['dry_run']>): string {
   if (dryRun.duplicate_strategy === 'error') {
-    return `Chiến lược đã chọn: Dừng khi trùng. Sẽ dừng vì ${dryRun.would_error.toLocaleString('vi-VN')} chương trùng; chưa import chương nào.`;
+    if (dryRun.would_error === 0) {
+      return `Chiến lược đã chọn: Dừng khi trùng. Không có chương trùng; sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương mới.`;
+    }
+    return `Chiến lược đã chọn: Dừng khi trùng. Có ${dryRun.would_import.toLocaleString('vi-VN')} chương mới và ${dryRun.would_error.toLocaleString('vi-VN')} chương trùng. Import sẽ dừng khi gặp chương trùng; các chương đứng trước đó có thể đã được import.`;
   }
   if (dryRun.duplicate_strategy === 'overwrite') {
     return `Chiến lược đã chọn: Ghi đè chương trùng. Sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương, gồm ghi đè ${dryRun.would_overwrite.toLocaleString('vi-VN')} chương trùng.`;

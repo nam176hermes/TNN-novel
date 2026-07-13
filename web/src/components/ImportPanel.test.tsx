@@ -970,10 +970,6 @@ describe('ImportPanel', () => {
       expected: 'Chiến lược đã chọn: Bỏ qua chương trùng. Sẽ import 43 chương mới và bỏ qua 2 chương trùng.',
     },
     {
-      duplicateStrategy: 'error' as const,
-      expected: 'Chiến lược đã chọn: Dừng khi trùng. Sẽ dừng vì 2 chương trùng; chưa import chương nào.',
-    },
-    {
       duplicateStrategy: 'overwrite' as const,
       expected: 'Chiến lược đã chọn: Ghi đè chương trùng. Sẽ import 45 chương, gồm ghi đè 2 chương trùng.',
     },
@@ -990,9 +986,7 @@ describe('ImportPanel', () => {
     );
 
     await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
-    if (duplicateStrategy === 'error') {
-      await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
-    } else if (duplicateStrategy === 'overwrite') {
+    if (duplicateStrategy === 'overwrite') {
       await userEvent.click(screen.getByRole('radio', { name: 'Ghi đè chương trùng' }));
     }
     await userEvent.upload(
@@ -1001,6 +995,67 @@ describe('ImportPanel', () => {
     );
 
     expect(await screen.findByRole('alert')).toHaveTextContent(expected);
+  });
+
+  it('says error strategy imports every new chapter when there are no conflicts', async () => {
+    const onPreviewTranslatedEbook = vi.fn().mockResolvedValue(existingBookPreview({
+      duplicateChapters: 0,
+      duplicateStrategy: 'error',
+      newChapters: 45,
+    }));
+
+    render(
+      <ImportPanel
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={() => undefined}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
+    await userEvent.upload(
+      screen.getByLabelText('Ebook file'),
+      new File(['ebook'], 'all-new.epub', { type: 'application/epub+zip' }),
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Chiến lược đã chọn: Dừng khi trùng. Không có chương trùng; sẽ import 45 chương mới.',
+    );
+  });
+
+  it('says mixed error strategy stops at a duplicate without promising zero earlier imports', async () => {
+    const onPreviewTranslatedEbook = vi.fn().mockResolvedValue(existingBookPreview({
+      duplicateChapters: 2,
+      duplicateStrategy: 'error',
+      newChapters: 43,
+    }));
+
+    render(
+      <ImportPanel
+        onCancel={() => undefined}
+        onImportPaste={() => undefined}
+        onImportTranslatedEbook={() => undefined}
+        onPreviewTranslatedEbook={onPreviewTranslatedEbook}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Dừng khi trùng' }));
+    await userEvent.upload(
+      screen.getByLabelText('Ebook file'),
+      new File(['ebook'], 'mixed.epub', { type: 'application/epub+zip' }),
+    );
+
+    const warning = await screen.findByRole('alert');
+    expect(warning).toHaveTextContent(
+      'Chiến lược đã chọn: Dừng khi trùng. Có 43 chương mới và 2 chương trùng.',
+    );
+    expect(warning).toHaveTextContent(
+      'Import sẽ dừng khi gặp chương trùng; các chương đứng trước đó có thể đã được import.',
+    );
+    expect(warning).not.toHaveTextContent('chưa import chương nào');
   });
 
   it('blocks translated ebook import when preview has no readable chapter body', async () => {
