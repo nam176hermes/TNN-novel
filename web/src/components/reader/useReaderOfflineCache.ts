@@ -134,6 +134,8 @@ export function useReaderOfflineCache({
   const suppressedChapterIdentitiesRef = useRef(new Set<string>());
   const suppressedBookIdsRef = useRef(new Set<number>());
   const explicitlyAllowedAudioIdentitiesRef = useRef(new Set<string>());
+  const audioCacheEpochByIdentityRef = useRef(new Map<string, number>());
+  const pendingAudioCleanupByIdentityRef = useRef(new Map<string, Promise<void>>());
 
   const identity = `${bookId ?? ''}:${selectedChapterId ?? ''}`;
 
@@ -307,28 +309,54 @@ export function useReaderOfflineCache({
     setRefreshVersion((current) => current + 1);
   }, []);
 
-  const allowExplicitChapterCache = useCallback((targetBookId: number, targetChapterId: number) => {
+  const prepareExplicitChapterCache = useCallback((targetBookId: number, targetChapterId: number) => {
     const targetIdentity = `${targetBookId}:${targetChapterId}`;
     suppressedChapterIdentitiesRef.current.delete(targetIdentity);
     if (suppressedBookIdsRef.current.has(targetBookId)) {
       explicitlyAllowedAudioIdentitiesRef.current.add(targetIdentity);
     }
+    audioCacheEpochByIdentityRef.current.set(
+      targetIdentity,
+      (audioCacheEpochByIdentityRef.current.get(targetIdentity) ?? 0) + 1,
+    );
+    const pendingCleanup = pendingAudioCleanupByIdentityRef.current.get(targetIdentity);
     setSuppressionVersion((current) => current + 1);
+    return pendingCleanup ?? null;
   }, []);
 
-  const allowExplicitBookCache = useCallback((targetBookId: number) => {
+  const prepareExplicitBookCache = useCallback((targetBookId: number, chapterIds: number[]) => {
+    const targetPrefix = `${targetBookId}:`;
     suppressedBookIdsRef.current.delete(targetBookId);
     for (const targetIdentity of suppressedChapterIdentitiesRef.current) {
-      if (targetIdentity.startsWith(`${targetBookId}:`)) {
+      if (targetIdentity.startsWith(targetPrefix)) {
         suppressedChapterIdentitiesRef.current.delete(targetIdentity);
       }
     }
     for (const allowedIdentity of explicitlyAllowedAudioIdentitiesRef.current) {
-      if (allowedIdentity.startsWith(`${targetBookId}:`)) {
+      if (allowedIdentity.startsWith(targetPrefix)) {
         explicitlyAllowedAudioIdentitiesRef.current.delete(allowedIdentity);
       }
     }
+    const targetIdentities = new Set(chapterIds.map((chapterId) => `${targetBookId}:${chapterId}`));
+    for (const targetIdentity of audioCacheEpochByIdentityRef.current.keys()) {
+      if (targetIdentity.startsWith(targetPrefix)) targetIdentities.add(targetIdentity);
+    }
+    for (const targetIdentity of pendingAudioCleanupByIdentityRef.current.keys()) {
+      if (targetIdentity.startsWith(targetPrefix)) targetIdentities.add(targetIdentity);
+    }
+    const pendingCleanups: Promise<void>[] = [];
+    for (const targetIdentity of targetIdentities) {
+      audioCacheEpochByIdentityRef.current.set(
+        targetIdentity,
+        (audioCacheEpochByIdentityRef.current.get(targetIdentity) ?? 0) + 1,
+      );
+      const pendingCleanup = pendingAudioCleanupByIdentityRef.current.get(targetIdentity);
+      if (pendingCleanup) pendingCleanups.push(pendingCleanup);
+    }
     setSuppressionVersion((current) => current + 1);
+    return pendingCleanups.length > 0
+      ? Promise.all(pendingCleanups).then(() => undefined)
+      : null;
   }, []);
 
   const suppressChapterAutomaticAudio = useCallback((targetBookId: number, targetChapterId: number) => {
@@ -350,26 +378,52 @@ export function useReaderOfflineCache({
     setSuppressionVersion((current) => current + 1);
   }, []);
 
+  const reconcileLateAutomaticAudioWrite = useCallback(async (
+    targetBookId: number,
+    targetChapterId: number,
+    expectedEpoch: number,
+  ): Promise<boolean> => {
+    const targetIdentity = `${targetBookId}:${targetChapterId}`;
+    const existingCleanup = pendingAudioCleanupByIdentityRef.current.get(targetIdentity);
+    if (existingCleanup) {
+      await existingCleanup;
+      return true;
+    }
+    if (
+      (audioCacheEpochByIdentityRef.current.get(targetIdentity) ?? 0) !== expectedEpoch
+      || automaticAudioCacheAllowedFor(targetBookId, targetChapterId)
+    ) {
+      return false;
+    }
+
+    let cleanup!: Promise<void>;
+    cleanup = Promise.resolve()
+      .then(async () => {
+        await dependencies.removeChapter(targetBookId, targetChapterId);
+        dependencies.removeManifestChapter(targetBookId, targetChapterId);
+      })
+      .finally(() => {
+        if (pendingAudioCleanupByIdentityRef.current.get(targetIdentity) === cleanup) {
+          pendingAudioCleanupByIdentityRef.current.delete(targetIdentity);
+        }
+      });
+    pendingAudioCleanupByIdentityRef.current.set(targetIdentity, cleanup);
+    await cleanup;
+    refresh();
+    return true;
+  }, [automaticAudioCacheAllowedFor, dependencies, refresh]);
+
   const cacheAudio = useCallback(async (
     targetBookId: number,
     targetChapterId: number,
     url: string,
   ) => {
+    const targetIdentity = `${targetBookId}:${targetChapterId}`;
+    const audioCacheEpoch = audioCacheEpochByIdentityRef.current.get(targetIdentity) ?? 0;
+    audioCacheEpochByIdentityRef.current.set(targetIdentity, audioCacheEpoch);
     const result = await dependencies.cacheAudio(targetBookId, targetChapterId, url);
     if (!result.cached) return result;
-    if (!automaticAudioCacheAllowedFor(targetBookId, targetChapterId)) {
-      const targetIdentity = `${targetBookId}:${targetChapterId}`;
-      if (
-        suppressedBookIdsRef.current.has(targetBookId)
-        && !explicitlyAllowedAudioIdentitiesRef.current.has(targetIdentity)
-      ) {
-        await dependencies.removeBook(targetBookId);
-        dependencies.removeManifest(targetBookId);
-      } else {
-        await dependencies.removeChapter(targetBookId, targetChapterId);
-        dependencies.removeManifestChapter(targetBookId, targetChapterId);
-      }
-      refresh();
+    if (await reconcileLateAutomaticAudioWrite(targetBookId, targetChapterId, audioCacheEpoch)) {
       return { ...result, cached: false };
     }
     const nextCachedUrl = await dependencies.getCachedAudioUrl(targetBookId, targetChapterId, url);
@@ -381,7 +435,7 @@ export function useReaderOfflineCache({
       refresh();
     }
     return result;
-  }, [automaticAudioCacheAllowedFor, dependencies, refresh]);
+  }, [dependencies, reconcileLateAutomaticAudioWrite, refresh]);
 
   const cacheCurrentChapter = useCallback(async (audioUrlOverride = audioUrl): Promise<void> => {
     if (!apiClient || !bookId || !selectedChapter) {
@@ -393,11 +447,12 @@ export function useReaderOfflineCache({
       return;
     }
 
-    allowExplicitChapterCache(bookId, selectedChapter.id);
+    const pendingAudioCleanup = prepareExplicitChapterCache(bookId, selectedChapter.id);
 
     const operation = beginOperation();
     setMessage(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
     try {
+      if (pendingAudioCleanup) await pendingAudioCleanup;
       const summary = await dependencies.cacheChapter({
         audioUrl: audioUrlOverride,
         bookId,
@@ -421,7 +476,6 @@ export function useReaderOfflineCache({
     }
   }, [
     apiClient,
-    allowExplicitChapterCache,
     audioUrl,
     beginOperation,
     bookId,
@@ -429,6 +483,7 @@ export function useReaderOfflineCache({
     finishOperation,
     onError,
     operationIsCurrent,
+    prepareExplicitChapterCache,
     refresh,
     selectedChapter,
   ]);
@@ -482,11 +537,15 @@ export function useReaderOfflineCache({
       return;
     }
 
-    allowExplicitBookCache(bookId);
+    const pendingAudioCleanups = prepareExplicitBookCache(
+      bookId,
+      translatedChapters.map((chapter) => chapter.id),
+    );
 
     const operation = beginOperation();
     setMessage(`Đang cache offline 0/${translatedChapters.length} chương...`);
     try {
+      if (pendingAudioCleanups) await pendingAudioCleanups;
       const summary = await dependencies.cacheBook({
         bookId,
         chapters: translatedChapters,
@@ -515,7 +574,6 @@ export function useReaderOfflineCache({
     }
   }, [
     apiClient,
-    allowExplicitBookCache,
     beginOperation,
     bookId,
     coverUrl,
@@ -523,6 +581,7 @@ export function useReaderOfflineCache({
     finishOperation,
     onError,
     operationIsCurrent,
+    prepareExplicitBookCache,
     refresh,
     translatedChapters,
   ]);

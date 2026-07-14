@@ -374,6 +374,137 @@ describe('useReaderOfflineCache', () => {
     expect(deps.removeManifestChapter).toHaveBeenCalledWith(42, 102);
   });
 
+  it('reconciles a late book-suppressed audio write without removing newer explicit chapter cache', async () => {
+    const pendingAudio = deferred<{ cached: boolean; failed: boolean; sizeBytes: number; url: string }>();
+    const removeBook = vi.fn().mockResolvedValue(undefined);
+    const removeChapter = vi.fn().mockResolvedValue(undefined);
+    const cacheChapter = vi.fn().mockResolvedValue({
+      assetsCached: 0,
+      assetsFailed: 0,
+      assetsTotal: 0,
+      audioCached: 1,
+      audioFailed: 0,
+      audioTotal: 1,
+    });
+    const deps = dependencies({
+      cacheAudio: vi.fn().mockReturnValue(pendingAudio.promise),
+      cacheChapter,
+      getCachedAudioUrl: vi.fn().mockResolvedValue(''),
+      removeBook,
+      removeChapter,
+    });
+    const { result, rerender } = renderHook(
+      ({ selectedChapter, selectedChapterId }) => useReaderOfflineCache(options(deps, {
+        audioUrl: `/api/books/42/chapters/${selectedChapterId}/audio`,
+        selectedChapter,
+        selectedChapterId,
+      })),
+      { initialProps: { selectedChapter: chapters[1], selectedChapterId: 102 } },
+    );
+    await waitFor(() => expect(result.current.metadataLoading).toBe(false));
+
+    let automaticCache!: Promise<unknown>;
+    act(() => {
+      automaticCache = result.current.cacheAudio(42, 102, '/live-audio-102');
+    });
+    await act(async () => result.current.removeCurrentBook());
+    expect(removeBook).toHaveBeenCalledTimes(1);
+
+    rerender({ selectedChapter: chapters[2], selectedChapterId: 103 });
+    await act(async () => result.current.cacheCurrentChapter('/live-audio-103'));
+    expect(cacheChapter).toHaveBeenCalledWith(expect.objectContaining({
+      audioUrl: '/live-audio-103',
+      chapter: chapters[2],
+    }));
+
+    await act(async () => {
+      pendingAudio.resolve({ cached: true, failed: false, sizeBytes: 10, url: '/live-audio-102' });
+      await automaticCache;
+    });
+
+    expect(removeChapter).toHaveBeenCalledWith(42, 102);
+    expect(removeChapter).not.toHaveBeenCalledWith(42, 103);
+    expect(removeBook).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for same-chapter late cleanup before writing an explicit cache', async () => {
+    const pendingAudio = deferred<{ cached: boolean; failed: boolean; sizeBytes: number; url: string }>();
+    const pendingCleanup = deferred<void>();
+    const removeChapter = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(pendingCleanup.promise);
+    const cacheChapter = vi.fn().mockResolvedValue({
+      assetsCached: 0,
+      assetsFailed: 0,
+      assetsTotal: 0,
+      audioCached: 1,
+      audioFailed: 0,
+      audioTotal: 1,
+    });
+    const deps = dependencies({
+      cacheAudio: vi.fn().mockReturnValue(pendingAudio.promise),
+      cacheChapter,
+      getCachedAudioUrl: vi.fn().mockResolvedValue(''),
+      removeChapter,
+    });
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps)));
+    await waitFor(() => expect(result.current.metadataLoading).toBe(false));
+
+    let automaticCache!: Promise<unknown>;
+    act(() => {
+      automaticCache = result.current.cacheAudio(42, 102, '/live-audio');
+    });
+    await act(async () => result.current.removeCurrentChapter());
+
+    act(() => pendingAudio.resolve({ cached: true, failed: false, sizeBytes: 10, url: '/live-audio' }));
+    await waitFor(() => expect(removeChapter).toHaveBeenCalledTimes(2));
+
+    let explicitCache!: Promise<void>;
+    act(() => {
+      explicitCache = result.current.cacheCurrentChapter('/live-audio');
+    });
+    await act(async () => Promise.resolve());
+    expect(cacheChapter).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingCleanup.resolve();
+      await Promise.all([automaticCache, explicitCache]);
+    });
+
+    expect(cacheChapter).toHaveBeenCalledTimes(1);
+    expect(removeChapter.mock.invocationCallOrder[1]).toBeLessThan(cacheChapter.mock.invocationCallOrder[0]);
+    expect(result.current.allowAutomaticAudioCache).toBe(true);
+    expect(deps.removeBook).not.toHaveBeenCalled();
+  });
+
+  it('does not clean a late automatic write when explicit caching starts before it completes', async () => {
+    const pendingAudio = deferred<{ cached: boolean; failed: boolean; sizeBytes: number; url: string }>();
+    const removeChapter = vi.fn().mockResolvedValue(undefined);
+    const deps = dependencies({
+      cacheAudio: vi.fn().mockReturnValue(pendingAudio.promise),
+      getCachedAudioUrl: vi.fn().mockResolvedValue('blob:explicit-audio'),
+      removeChapter,
+    });
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps)));
+    await waitFor(() => expect(result.current.metadataLoading).toBe(false));
+
+    let automaticCache!: Promise<unknown>;
+    act(() => {
+      automaticCache = result.current.cacheAudio(42, 102, '/live-audio');
+    });
+    await act(async () => result.current.removeCurrentChapter());
+    await act(async () => result.current.cacheCurrentChapter('/live-audio'));
+
+    await act(async () => {
+      pendingAudio.resolve({ cached: true, failed: false, sizeBytes: 10, url: '/live-audio' });
+      await automaticCache;
+    });
+
+    expect(removeChapter).toHaveBeenCalledTimes(1);
+    expect(deps.removeBook).not.toHaveBeenCalled();
+    expect(result.current.allowAutomaticAudioCache).toBe(true);
+  });
+
   it('suppresses every chapter in a removed book until leaving that book or caching explicitly', async () => {
     const deps = dependencies({ getCachedAudioUrl: vi.fn().mockResolvedValue('') });
     const { result, rerender } = renderHook(
