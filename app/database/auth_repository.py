@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.database.connection import get_connection
+from app.database.operations_repository import RetentionPolicy
 
 
 def _utcnow_text() -> str:
@@ -215,3 +216,154 @@ def clear_auth_login_failures(db_path: Path, *, rate_limit_key: str) -> None:
     with get_connection(db_path) as conn:
         conn.execute("DELETE FROM auth_login_failures WHERE rate_limit_key = ?", (rate_limit_key,))
         conn.commit()
+
+
+_SESSION_RETENTION_TIME = (
+    "CASE WHEN COALESCE(revoked_at, '') <> '' THEN revoked_at ELSE expires_at END"
+)
+_SESSION_RETENTION_ELIGIBLE = (
+    "(COALESCE(revoked_at, '') <> '' OR julianday(expires_at) <= julianday(?))"
+)
+
+
+def _delete_primary_keys(
+    conn: Any,
+    *,
+    table: str,
+    primary_key: str,
+    keys: list[object],
+) -> int:
+    if not keys:
+        return 0
+    placeholders = ", ".join("?" for _ in keys)
+    cur = conn.execute(
+        f"DELETE FROM {table} WHERE {primary_key} IN ({placeholders})",
+        keys,
+    )
+    return int(cur.rowcount)
+
+
+def prune_auth_records(
+    db_path: Path,
+    *,
+    session_policy: RetentionPolicy,
+    login_failure_policy: RetentionPolicy,
+    batch_size: int,
+    now: str | None = None,
+) -> dict[str, int]:
+    """Delete one shared, deterministic, age-first batch of inactive auth data."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    comparison_time = now or _utcnow_text()
+    session_age_modifier = f"-{session_policy.max_age_days} days"
+    failure_age_modifier = f"-{login_failure_policy.max_age_days} days"
+    deleted = {"auth_sessions": 0, "auth_login_failures": 0}
+
+    with get_connection(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            session_age_rows = conn.execute(
+                f"""
+                SELECT session_id
+                FROM auth_sessions
+                WHERE {_SESSION_RETENTION_ELIGIBLE}
+                  AND julianday({_SESSION_RETENTION_TIME}) < julianday(?, ?)
+                ORDER BY julianday({_SESSION_RETENTION_TIME}) ASC, session_id ASC
+                LIMIT ?
+                """,
+                (comparison_time, comparison_time, session_age_modifier, batch_size),
+            ).fetchall()
+            deleted["auth_sessions"] += _delete_primary_keys(
+                conn,
+                table="auth_sessions",
+                primary_key="session_id",
+                keys=[str(row["session_id"]) for row in session_age_rows],
+            )
+
+            remaining = batch_size - sum(deleted.values())
+            if remaining > 0:
+                failure_age_rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM auth_login_failures
+                    WHERE julianday(failed_at) < julianday(?, ?)
+                    ORDER BY julianday(failed_at) ASC, id ASC
+                    LIMIT ?
+                    """,
+                    (comparison_time, failure_age_modifier, remaining),
+                ).fetchall()
+                deleted["auth_login_failures"] += _delete_primary_keys(
+                    conn,
+                    table="auth_login_failures",
+                    primary_key="id",
+                    keys=[int(row["id"]) for row in failure_age_rows],
+                )
+
+            remaining = batch_size - sum(deleted.values())
+            if remaining > 0:
+                session_count_row = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS row_count
+                    FROM auth_sessions
+                    WHERE {_SESSION_RETENTION_ELIGIBLE}
+                    """,
+                    (comparison_time,),
+                ).fetchone()
+                session_overflow = max(
+                    0,
+                    int(session_count_row["row_count"] if session_count_row else 0)
+                    - session_policy.max_rows,
+                )
+                if session_overflow:
+                    session_count_rows = conn.execute(
+                        f"""
+                        SELECT session_id
+                        FROM auth_sessions
+                        WHERE {_SESSION_RETENTION_ELIGIBLE}
+                        ORDER BY julianday({_SESSION_RETENTION_TIME}) ASC, session_id ASC
+                        LIMIT ?
+                        """,
+                        (comparison_time, min(remaining, session_overflow)),
+                    ).fetchall()
+                    deleted["auth_sessions"] += _delete_primary_keys(
+                        conn,
+                        table="auth_sessions",
+                        primary_key="session_id",
+                        keys=[str(row["session_id"]) for row in session_count_rows],
+                    )
+
+            remaining = batch_size - sum(deleted.values())
+            if remaining > 0:
+                failure_count_row = conn.execute(
+                    "SELECT COUNT(*) AS row_count FROM auth_login_failures"
+                ).fetchone()
+                failure_overflow = max(
+                    0,
+                    int(failure_count_row["row_count"] if failure_count_row else 0)
+                    - login_failure_policy.max_rows,
+                )
+                if failure_overflow:
+                    failure_count_rows = conn.execute(
+                        """
+                        SELECT id
+                        FROM auth_login_failures
+                        ORDER BY julianday(failed_at) ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (min(remaining, failure_overflow),),
+                    ).fetchall()
+                    deleted["auth_login_failures"] += _delete_primary_keys(
+                        conn,
+                        table="auth_login_failures",
+                        primary_key="id",
+                        keys=[int(row["id"]) for row in failure_count_rows],
+                    )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    return deleted

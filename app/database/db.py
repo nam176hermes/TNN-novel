@@ -10,25 +10,30 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from app.database.auth_repository import (
-    _utcnow_text,
-    auth_session_is_active,
-    clear_auth_login_failures,
-    count_auth_login_failures,
-    create_auth_session,
-    get_auth_session,
-    record_auth_login_failure,
-    revoke_auth_session,
-    revoke_auth_sessions_for_username,
-    rotate_auth_session_refresh,
-    touch_auth_session,
-)
+from app.database import auth_repository as _auth_repository
+from app.database import operations_repository as _operations_repository
 from app.database.connection import get_connection
 from app.database.schema import SCHEMA
 from app.database.glossary_history import log_glossary_change
 from app.mobile_api.job_states import normalize_job_state
 from app.mobile_api.services.import_metadata import normalize_book_key
 from app.translation.styleguide_config import get_locked_terms
+
+
+_utcnow_text = _auth_repository._utcnow_text
+auth_session_is_active = _auth_repository.auth_session_is_active
+clear_auth_login_failures = _auth_repository.clear_auth_login_failures
+count_auth_login_failures = _auth_repository.count_auth_login_failures
+create_auth_session = _auth_repository.create_auth_session
+get_auth_session = _auth_repository.get_auth_session
+record_auth_login_failure = _auth_repository.record_auth_login_failure
+revoke_auth_session = _auth_repository.revoke_auth_session
+revoke_auth_sessions_for_username = _auth_repository.revoke_auth_sessions_for_username
+rotate_auth_session_refresh = _auth_repository.rotate_auth_session_refresh
+touch_auth_session = _auth_repository.touch_auth_session
+
+list_operational_events = _operations_repository.list_operational_events
+record_operational_event = _operations_repository.record_operational_event
 
 
 CURRENT_SCHEMA_VERSION = "2026-07-09-source-catalog-phase8"
@@ -2429,118 +2434,6 @@ def get_job_logs(db_path: Path, job_id: str, limit: int = 100, offset: int = 0) 
         item["details"] = _decode_json_field(item.pop("details_json", None), {})
         logs.append(item)
     return logs
-
-
-_OPERATIONAL_SENSITIVE_MARKERS = (
-    "\n",
-    "traceback",
-    "secret",
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer ",
-    "token",
-    "/tmp/",
-    "/home/",
-    "\\users\\",
-    "sk-",
-)
-
-
-def _operational_value_has_sensitive_marker(value: object) -> bool:
-    return any(marker in str(value).lower() for marker in _OPERATIONAL_SENSITIVE_MARKERS)
-
-
-def _sanitize_operational_message(message: str) -> str:
-    if _operational_value_has_sensitive_marker(message):
-        return "Operational event recorded. Check server logs."
-    return message
-
-
-def _sanitize_operational_details(details: dict[str, Any] | None) -> dict[str, Any]:
-    safe_details: dict[str, Any] = {}
-    for key, value in (details or {}).items():
-        key_text = str(key)
-        lowered_key = key_text.lower()
-        if any(marker in lowered_key for marker in ("secret", "key", "token", "password", "authorization")):
-            safe_details[key_text] = "[redacted]"
-        elif _operational_value_has_sensitive_marker(value):
-            safe_details[key_text] = "[redacted]"
-        else:
-            safe_details[key_text] = value
-    return safe_details
-
-
-def record_operational_event(
-    db_path: Path,
-    *,
-    event_type: str,
-    severity: str = "info",
-    source: str = "",
-    message: str = "",
-    job_id: str = "",
-    details: dict[str, Any] | None = None,
-    actor_user_id: str = "",
-    owner_user_id: str = "",
-) -> int:
-    safe_message = _sanitize_operational_message(message)
-    safe_details = _sanitize_operational_details(details)
-    safe_actor_user_id = "" if _operational_value_has_sensitive_marker(actor_user_id) else actor_user_id
-    safe_owner_user_id = "" if _operational_value_has_sensitive_marker(owner_user_id) else owner_user_id
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO operational_events
-            (
-                event_type, severity, source, message,
-                actor_user_id, owner_user_id, details_json, job_id
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_type,
-                severity,
-                source,
-                safe_message,
-                safe_actor_user_id,
-                safe_owner_user_id,
-                json.dumps(safe_details, ensure_ascii=False),
-                job_id,
-            ),
-        )
-        conn.commit()
-        return cur.lastrowid
-
-
-def list_operational_events(
-    db_path: Path,
-    *,
-    limit: int = 20,
-    severities: tuple[str, ...] = ("error", "warning"),
-) -> list[dict[str, Any]]:
-    params: list[object] = []
-    where = ""
-    if severities:
-        placeholders = ", ".join("?" for _ in severities)
-        where = f"WHERE severity IN ({placeholders})"
-        params.extend(severities)
-    params.append(max(0, limit))
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT * FROM operational_events
-            {where}
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-    events: list[dict[str, Any]] = []
-    for row in rows:
-        event = dict(row)
-        event["details"] = _decode_json_field(event.pop("details_json", None), {})
-        events.append(event)
-    return events
 
 
 # ── Source Catalog ─────────────────────────────────────────────────────────────

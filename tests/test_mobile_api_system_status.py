@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.database.db import init_db
+from app.database import db, operations_repository
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.routers import auth as auth_router
@@ -15,6 +16,11 @@ from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api import dependencies as mobile_dependencies
 from app.mobile_api.routers import health as health_router
 from app.mobile_api.services.job_service import JobTracker
+
+
+def test_db_operational_event_exports_are_repository_function_objects() -> None:
+    assert db.record_operational_event is operations_repository.record_operational_event
+    assert db.list_operational_events is operations_repository.list_operational_events
 
 
 def test_data_size_snapshot_does_not_block_on_slow_filesystem_scan(
