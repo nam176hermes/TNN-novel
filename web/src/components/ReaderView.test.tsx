@@ -3,7 +3,12 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ReaderAnnotation } from '../api/types';
 import type { Chapter, TranslatedBookSummary } from '../api/types';
-import { cacheReaderAudio, getCachedChapterAsync, putCachedChapter } from '../state/readerCache';
+import {
+  cacheReaderAudio,
+  getCachedChapterAsync,
+  putCachedChapter,
+  removeCachedChapterAsync,
+} from '../state/readerCache';
 import { saveCachedReaderDictionaryResult } from '../state/readerDictionaryCache';
 import { chapterMarksKey, loadReaderMarks, saveReaderMarks } from '../state/readerMarks';
 import { loadReaderProgressSnapshot, saveReaderProgressSnapshot } from '../state/readerProgress';
@@ -2202,6 +2207,52 @@ describe('ReaderView', () => {
     expect(window.localStorage.getItem('novel-reader-offline-manifest-v1')).toContain('"chapterIds":[103]');
     expect(window.localStorage.getItem('novel-reader-cache-v1')).toContain('"chapterId":103');
     expect(window.localStorage.getItem('novel-reader-cache-v1')).not.toContain('"chapterId":102');
+  });
+
+  it('does not automatically recreate chapter audio after the user removes its cache', async () => {
+    const originalCreateObjectUrl = URL.createObjectURL;
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:reader-audio-before-remove'),
+    });
+    const seedFetcher = vi.fn().mockResolvedValue({
+      blob: async () => new Blob(['seed-audio'], { type: 'audio/mpeg' }),
+      headers: new Headers({ 'content-type': 'audio/mpeg' }),
+      ok: true,
+    }) as unknown as typeof fetch;
+    const automaticFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      blob: async () => new Blob(['unexpected-audio'], { type: 'audio/mpeg' }),
+      headers: new Headers({ 'content-type': 'audio/mpeg' }),
+      ok: true,
+    } as Response);
+
+    try {
+      await cacheReaderAudio(42, 102, 'http://test/api/books/42/chapters/102/audio', seedFetcher);
+      putCachedChapter({
+        bookId: 42,
+        chapterId: 102,
+        html: '',
+        sourceText: '',
+        text: 'Hàn Lập khẽ gật đầu.',
+      });
+      const audioChapters = chapters.map((chapter) => (
+        chapter.id === 102 ? { ...chapter, audio_path: '/tmp/chapter-102.mp3' } : chapter
+      ));
+      renderReader({ chapters: audioChapters, selectedChapter: audioChapters[1] });
+
+      await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled());
+      await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+      const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+      await waitFor(() => expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument());
+      await userEvent.click(within(menu).getByRole('button', { name: 'Xóa cache chương hiện tại' }));
+
+      expect(await within(menu).findByText('Đã xóa cache offline Chương 2.')).toBeInTheDocument();
+      await act(async () => Promise.resolve());
+      expect(automaticFetch).not.toHaveBeenCalled();
+    } finally {
+      await removeCachedChapterAsync(42, 102);
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateObjectUrl });
+    }
   });
 
   it('uploads an offline reader dictionary from the more menu', async () => {

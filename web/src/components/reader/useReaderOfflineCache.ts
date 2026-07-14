@@ -126,14 +126,39 @@ export function useReaderOfflineCache({
   const [message, setMessage] = useState('');
   const [online, setOnline] = useState(onlineNow);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [, setSuppressionVersion] = useState(0);
   const mountedRef = useRef(true);
   const identityRef = useRef(`${bookId ?? ''}:${selectedChapterId ?? ''}`);
   const operationGenerationRef = useRef(0);
   const activeOperationRef = useRef(0);
+  const suppressedChapterIdentitiesRef = useRef(new Set<string>());
+  const suppressedBookIdsRef = useRef(new Set<number>());
+  const explicitlyAllowedAudioIdentitiesRef = useRef(new Set<string>());
 
   const identity = `${bookId ?? ''}:${selectedChapterId ?? ''}`;
 
+  const automaticAudioCacheAllowedFor = useCallback((targetBookId: number, targetChapterId: number) => {
+    const targetIdentity = `${targetBookId}:${targetChapterId}`;
+    if (suppressedChapterIdentitiesRef.current.has(targetIdentity)) return false;
+    return !suppressedBookIdsRef.current.has(targetBookId)
+      || explicitlyAllowedAudioIdentitiesRef.current.has(targetIdentity);
+  }, []);
+
   useEffect(() => {
+    const previousIdentity = identityRef.current;
+    const previousBookId = Number(previousIdentity.split(':', 1)[0]);
+    if (previousIdentity !== identity) {
+      suppressedChapterIdentitiesRef.current.delete(previousIdentity);
+      explicitlyAllowedAudioIdentitiesRef.current.delete(previousIdentity);
+      if (Number.isFinite(previousBookId) && previousBookId !== bookId) {
+        suppressedBookIdsRef.current.delete(previousBookId);
+        for (const allowedIdentity of explicitlyAllowedAudioIdentitiesRef.current) {
+          if (allowedIdentity.startsWith(`${previousBookId}:`)) {
+            explicitlyAllowedAudioIdentitiesRef.current.delete(allowedIdentity);
+          }
+        }
+      }
+    }
     identityRef.current = identity;
     operationGenerationRef.current += 1;
     activeOperationRef.current = 0;
@@ -217,7 +242,9 @@ export function useReaderOfflineCache({
         if (cancelled) return;
         setCacheStatus(nextStatus);
         setCachedChapter(nextCachedChapter);
-        setCachedAudioUrl(nextCachedAudioUrl);
+        setCachedAudioUrl(
+          automaticAudioCacheAllowedFor(bookId, selectedChapterId) ? nextCachedAudioUrl : '',
+        );
         setResolvedCoverUrl(nextCachedCoverUrl || liveCoverUrl);
       })
       .finally(() => {
@@ -229,6 +256,7 @@ export function useReaderOfflineCache({
     };
   }, [
     audioUrl,
+    automaticAudioCacheAllowedFor,
     bookId,
     coverUrl,
     dependencies,
@@ -279,6 +307,49 @@ export function useReaderOfflineCache({
     setRefreshVersion((current) => current + 1);
   }, []);
 
+  const allowExplicitChapterCache = useCallback((targetBookId: number, targetChapterId: number) => {
+    const targetIdentity = `${targetBookId}:${targetChapterId}`;
+    suppressedChapterIdentitiesRef.current.delete(targetIdentity);
+    if (suppressedBookIdsRef.current.has(targetBookId)) {
+      explicitlyAllowedAudioIdentitiesRef.current.add(targetIdentity);
+    }
+    setSuppressionVersion((current) => current + 1);
+  }, []);
+
+  const allowExplicitBookCache = useCallback((targetBookId: number) => {
+    suppressedBookIdsRef.current.delete(targetBookId);
+    for (const targetIdentity of suppressedChapterIdentitiesRef.current) {
+      if (targetIdentity.startsWith(`${targetBookId}:`)) {
+        suppressedChapterIdentitiesRef.current.delete(targetIdentity);
+      }
+    }
+    for (const allowedIdentity of explicitlyAllowedAudioIdentitiesRef.current) {
+      if (allowedIdentity.startsWith(`${targetBookId}:`)) {
+        explicitlyAllowedAudioIdentitiesRef.current.delete(allowedIdentity);
+      }
+    }
+    setSuppressionVersion((current) => current + 1);
+  }, []);
+
+  const suppressChapterAutomaticAudio = useCallback((targetBookId: number, targetChapterId: number) => {
+    const targetIdentity = `${targetBookId}:${targetChapterId}`;
+    suppressedChapterIdentitiesRef.current.add(targetIdentity);
+    explicitlyAllowedAudioIdentitiesRef.current.delete(targetIdentity);
+    setCachedAudioUrl('');
+    setSuppressionVersion((current) => current + 1);
+  }, []);
+
+  const suppressBookAutomaticAudio = useCallback((targetBookId: number) => {
+    suppressedBookIdsRef.current.add(targetBookId);
+    for (const allowedIdentity of explicitlyAllowedAudioIdentitiesRef.current) {
+      if (allowedIdentity.startsWith(`${targetBookId}:`)) {
+        explicitlyAllowedAudioIdentitiesRef.current.delete(allowedIdentity);
+      }
+    }
+    setCachedAudioUrl('');
+    setSuppressionVersion((current) => current + 1);
+  }, []);
+
   const cacheAudio = useCallback(async (
     targetBookId: number,
     targetChapterId: number,
@@ -286,6 +357,21 @@ export function useReaderOfflineCache({
   ) => {
     const result = await dependencies.cacheAudio(targetBookId, targetChapterId, url);
     if (!result.cached) return result;
+    if (!automaticAudioCacheAllowedFor(targetBookId, targetChapterId)) {
+      const targetIdentity = `${targetBookId}:${targetChapterId}`;
+      if (
+        suppressedBookIdsRef.current.has(targetBookId)
+        && !explicitlyAllowedAudioIdentitiesRef.current.has(targetIdentity)
+      ) {
+        await dependencies.removeBook(targetBookId);
+        dependencies.removeManifest(targetBookId);
+      } else {
+        await dependencies.removeChapter(targetBookId, targetChapterId);
+        dependencies.removeManifestChapter(targetBookId, targetChapterId);
+      }
+      refresh();
+      return { ...result, cached: false };
+    }
     const nextCachedUrl = await dependencies.getCachedAudioUrl(targetBookId, targetChapterId, url);
     if (
       mountedRef.current
@@ -295,7 +381,7 @@ export function useReaderOfflineCache({
       refresh();
     }
     return result;
-  }, [dependencies, refresh]);
+  }, [automaticAudioCacheAllowedFor, dependencies, refresh]);
 
   const cacheCurrentChapter = useCallback(async (audioUrlOverride = audioUrl): Promise<void> => {
     if (!apiClient || !bookId || !selectedChapter) {
@@ -306,6 +392,8 @@ export function useReaderOfflineCache({
       setMessage('Chỉ cache offline được chương đã có bản dịch.');
       return;
     }
+
+    allowExplicitChapterCache(bookId, selectedChapter.id);
 
     const operation = beginOperation();
     setMessage(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
@@ -333,6 +421,7 @@ export function useReaderOfflineCache({
     }
   }, [
     apiClient,
+    allowExplicitChapterCache,
     audioUrl,
     beginOperation,
     bookId,
@@ -349,6 +438,8 @@ export function useReaderOfflineCache({
       setMessage('Không thể xóa cache chương: chưa chọn chương.');
       return;
     }
+
+    suppressChapterAutomaticAudio(bookId, selectedChapterId);
 
     const operation = beginOperation();
     setMessage(`Đang xóa cache Chương ${selectedChapter.chapter_number}...`);
@@ -377,6 +468,7 @@ export function useReaderOfflineCache({
     refresh,
     selectedChapter,
     selectedChapterId,
+    suppressChapterAutomaticAudio,
   ]);
 
   const translatedChapters = useMemo(
@@ -389,6 +481,8 @@ export function useReaderOfflineCache({
       setMessage('Không thể cache offline: thiếu kết nối API hoặc truyện đang đọc.');
       return;
     }
+
+    allowExplicitBookCache(bookId);
 
     const operation = beginOperation();
     setMessage(`Đang cache offline 0/${translatedChapters.length} chương...`);
@@ -421,6 +515,7 @@ export function useReaderOfflineCache({
     }
   }, [
     apiClient,
+    allowExplicitBookCache,
     beginOperation,
     bookId,
     coverUrl,
@@ -437,6 +532,8 @@ export function useReaderOfflineCache({
       setMessage('Không thể xóa cache offline: chưa chọn truyện.');
       return;
     }
+
+    suppressBookAutomaticAudio(bookId);
 
     const operation = beginOperation();
     setMessage('Đang xóa cache offline...');
@@ -463,10 +560,18 @@ export function useReaderOfflineCache({
     onError,
     operationIsCurrent,
     refresh,
+    suppressBookAutomaticAudio,
   ]);
+
+  const allowAutomaticAudioCache = Boolean(
+    bookId
+    && selectedChapterId
+    && automaticAudioCacheAllowedFor(bookId, selectedChapterId),
+  );
 
   return {
     cacheStatus,
+    allowAutomaticAudioCache,
     cacheAudio,
     cachedAudioUrl,
     cachedChapter,

@@ -1661,6 +1661,7 @@ export default function ReaderView({
   }, [onSelectChapter]);
   const readerAudio = useReaderAudio({
     activeBookId,
+    allowAutomaticAudioCache: readerOfflineCache.allowAutomaticAudioCache,
     apiClient,
     cachedAudioLoading: readerOfflineCache.metadataLoading,
     cachedAudioUrl: readerOfflineCache.cachedAudioUrl,

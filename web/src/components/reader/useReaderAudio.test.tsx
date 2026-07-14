@@ -35,6 +35,7 @@ function api(overrides: Partial<ReaderAudioApiClient> = {}): ReaderAudioApiClien
 function options(overrides: Record<string, unknown> = {}) {
   return {
     activeBookId: 42,
+    allowAutomaticAudioCache: true,
     apiClient: api(),
     cacheAudio: vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' }),
     cachedAudioLoading: false,
@@ -89,6 +90,20 @@ describe('useReaderAudio', () => {
   it('waits for the offline controller metadata lookup before caching live audio', async () => {
     const cacheAudio = vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' });
     const hookOptions = options({ cacheAudio, cachedAudioLoading: true, cachedAudioUrl: '' });
+    renderHook(() => useReaderAudio(hookOptions));
+
+    await waitFor(() => expect(hookOptions.apiClient.getBookAudioPlaylist).toHaveBeenCalledTimes(1));
+    expect(cacheAudio).not.toHaveBeenCalled();
+  });
+
+  it('does not cache live audio while the offline controller suppresses automatic writes', async () => {
+    const cacheAudio = vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' });
+    const hookOptions = options({
+      allowAutomaticAudioCache: false,
+      cacheAudio,
+      cachedAudioLoading: false,
+      cachedAudioUrl: '',
+    });
     renderHook(() => useReaderAudio(hookOptions));
 
     await waitFor(() => expect(hookOptions.apiClient.getBookAudioPlaylist).toHaveBeenCalledTimes(1));
