@@ -3450,6 +3450,13 @@ describe('ReaderView', () => {
     expect(within(panel).getByRole('button', { name: 'Tạo audio chương' })).toBeDisabled();
   });
 
+  it('disables compact chapter TTS when the API connection is unavailable', () => {
+    renderReader({ apiClient: undefined });
+
+    const panel = screen.getByRole('region', { name: 'Audio và TTS chương' });
+    expect(within(panel).getByRole('button', { name: 'Tạo audio chương' })).toBeDisabled();
+  });
+
   it('shows TTS progress, failed chunks, friendly errors, and retry without leaking secrets', async () => {
     const apiClient = mockReaderApiClient({
       startTtsJob: vi.fn().mockResolvedValue({

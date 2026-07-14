@@ -42,7 +42,7 @@ export default function ReaderAudioSummary({ audio, visible }: ReaderAudioSummar
           ) : (
             <button
               className="reader-menu-action"
-              disabled={state.jobLoading || state.generationBlocked}
+              disabled={!state.canStartChapterJob}
               onClick={() => { void actions.startChapterJob(); }}
               type="button"
             >
@@ -62,7 +62,7 @@ export default function ReaderAudioSummary({ audio, visible }: ReaderAudioSummar
           <summary>Advanced</summary>
           <button
             className="reader-menu-action"
-            disabled={state.jobLoading || state.generationBlocked}
+            disabled={!state.canStartChapterJob}
             onClick={() => { void actions.startChapterJob(); }}
             type="button"
           >

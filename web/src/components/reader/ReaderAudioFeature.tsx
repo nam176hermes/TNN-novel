@@ -59,7 +59,7 @@ export default function ReaderAudioFeature({ audio }: ReaderAudioFeatureProps) {
               </button>
               <button
                 className="primary-action"
-                disabled={state.translatedChapterCount === 0 || state.jobLoading}
+                disabled={!state.canStartBookJob}
                 onClick={() => { void actions.confirmBookJob(); }}
                 type="button"
               >

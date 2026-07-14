@@ -155,8 +155,11 @@ export function useReaderAudio({
   const [playlist, setPlaylist] = useState<BookAudioPlaylistItem[]>([]);
   const [playlistError, setPlaylistError] = useState('');
   const [cachedUrl, setCachedUrl] = useState('');
+  const activeJobGenerationRef = useRef(0);
+  const activeJobIdRef = useRef('');
   const playlistRequestRef = useRef(0);
   const playlistRefreshJobRef = useRef('');
+  const refreshInFlightRef = useRef(new Map<number, Promise<void>>());
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -243,23 +246,47 @@ export function useReaderAudio({
     return () => { cancelled = true; };
   }, [activeBookId, cacheAudio, canPlay, getCachedAudioUrl, selectedChapterId, streamUrl]);
 
-  const refreshJob = useCallback(async (requestedJobId = jobId) => {
-    if (!apiClient || !requestedJobId) return;
+  const activateJob = useCallback((nextJobId: string) => {
+    activeJobGenerationRef.current += 1;
+    activeJobIdRef.current = nextJobId;
+    setJobId(nextJobId);
+  }, []);
+
+  const refreshJob = useCallback((requestedJobId = activeJobIdRef.current): Promise<void> => {
+    if (!apiClient || !requestedJobId || requestedJobId !== activeJobIdRef.current) return Promise.resolve();
+    const generation = activeJobGenerationRef.current;
+    const existingRefresh = refreshInFlightRef.current.get(generation);
+    if (existingRefresh) return existingRefresh;
     setJobRefreshing(true);
-    const [jobResult, ttsResult] = await Promise.allSettled([
+    const refreshPromise = Promise.allSettled([
       apiClient.getJobStatus(requestedJobId),
       apiClient.getTtsJob(requestedJobId),
-    ]);
-    if (!mountedRef.current) return;
-    if (jobResult.status === 'fulfilled') setJobSnapshot(jobResult.value);
-    if (ttsResult.status === 'fulfilled') setTtsSnapshot(ttsResult.value);
-    if (jobResult.status === 'rejected' && ttsResult.status === 'rejected') {
-      setError(audioErrorFromUnknown(jobResult.reason, 'Không đọc được trạng thái job audio. Mở trang Tác vụ để kiểm tra.'));
-    } else {
-      setError('');
-    }
-    setJobRefreshing(false);
-  }, [apiClient, jobId]);
+    ]).then(([jobResult, ttsResult]) => {
+      if (
+        !mountedRef.current
+        || activeJobGenerationRef.current !== generation
+        || activeJobIdRef.current !== requestedJobId
+      ) return;
+      setJobSnapshot(jobResult.status === 'fulfilled' ? jobResult.value : null);
+      setTtsSnapshot(ttsResult.status === 'fulfilled' ? ttsResult.value : null);
+      if (jobResult.status === 'rejected' && ttsResult.status === 'rejected') {
+        setError(audioErrorFromUnknown(jobResult.reason, 'Không đọc được trạng thái job audio. Mở trang Tác vụ để kiểm tra.'));
+      } else {
+        setError('');
+      }
+    }).finally(() => {
+      if (refreshInFlightRef.current.get(generation) === refreshPromise) {
+        refreshInFlightRef.current.delete(generation);
+      }
+      if (
+        mountedRef.current
+        && activeJobGenerationRef.current === generation
+        && activeJobIdRef.current === requestedJobId
+      ) setJobRefreshing(false);
+    });
+    refreshInFlightRef.current.set(generation, refreshPromise);
+    return refreshPromise;
+  }, [apiClient]);
 
   const statusValue = ttsSnapshot?.status || jobSnapshot?.status || (jobId ? 'queued' : '');
 
@@ -298,7 +325,7 @@ export function useReaderAudio({
     setStatus('Đang gửi job tạo audio...');
     try {
       const job = await apiClient.startTtsJob(activeBookId, [selectedChapterId]);
-      setJobId(job.job_id);
+      activateJob(job.job_id);
       setJobKind('audio');
       setStatus(`Đã tạo job audio ${shortJobId(job.job_id)}. Mở Jobs để theo dõi.`);
       onError('');
@@ -309,7 +336,7 @@ export function useReaderAudio({
     } finally {
       setJobLoading(false);
     }
-  }, [activeBookId, apiClient, onError, refreshJob, reportError, selectedChapter, selectedChapterId, translationText]);
+  }, [activateJob, activeBookId, apiClient, onError, refreshJob, reportError, selectedChapter, selectedChapterId, translationText]);
 
   const confirmBookJob = useCallback(async () => {
     setBulkConfirmOpen(false);
@@ -324,7 +351,7 @@ export function useReaderAudio({
     setStatus('Đang gửi job tạo audiobook...');
     try {
       const job = await apiClient.startBookTtsJob(activeBookId, { limit: 200 });
-      setJobId(job.job_id);
+      activateJob(job.job_id);
       setJobKind('audiobook');
       setStatus(`Đã tạo job audiobook ${shortJobId(job.job_id)}. Mở Jobs để theo dõi.`);
       onError('');
@@ -335,7 +362,7 @@ export function useReaderAudio({
     } finally {
       setJobLoading(false);
     }
-  }, [activeBookId, apiClient, onError, refreshJob, reportError]);
+  }, [activateJob, activeBookId, apiClient, onError, refreshJob, reportError]);
 
   const cancelJob = useCallback(async () => {
     if (!apiClient || !jobId) {
@@ -368,7 +395,7 @@ export function useReaderAudio({
     setStatus('Đang gửi retry TTS...');
     try {
       const job = await apiClient.retryTtsJob(jobId);
-      setJobId(job.job_id);
+      activateJob(job.job_id);
       setJobKind('audio');
       setStatus(`Đã gửi retry TTS ${shortJobId(job.job_id)}. Mở Jobs để theo dõi.`);
       setJobSnapshot(null);
@@ -381,7 +408,7 @@ export function useReaderAudio({
     } finally {
       setJobLoading(false);
     }
-  }, [apiClient, jobId, onError, refreshJob, reportError]);
+  }, [activateJob, apiClient, jobId, onError, refreshJob, reportError]);
 
   const downloadAudiobook = useCallback(async () => {
     if (!apiClient || !activeBookId) {
@@ -415,6 +442,12 @@ export function useReaderAudio({
     (chapter) => Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id),
   ).length;
   const generationBlocked = !(selectedChapter?.has_translation && translationText.trim());
+  const canStartChapterJob = Boolean(
+    apiClient && activeBookId && selectedChapterId && !jobLoading && !generationBlocked,
+  );
+  const canStartBookJob = Boolean(
+    apiClient && activeBookId && translatedChapters.length > 0 && !jobLoading,
+  );
   const qaOverallStatus = String(qaReport?.overall_status ?? '').toUpperCase();
   const chineseLeakageCount = Math.max(0, Math.round(qaReport?.chinese_leakage_count ?? 0));
   const readinessWarnings = [
@@ -431,6 +464,8 @@ export function useReaderAudio({
       canCancelJob: Boolean(apiClient && jobId && CANCELABLE_JOB_STATUSES.has(statusValue.toLowerCase())),
       canPlay,
       canRetryChunks: Boolean(apiClient && jobId && (failedChunks > 0 || statusValue.toLowerCase() === 'failed')),
+      canStartBookJob,
+      canStartChapterJob,
       completedChunks,
       error,
       failedChunks,

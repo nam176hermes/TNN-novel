@@ -3770,7 +3770,7 @@ export default function ReaderView({
             <button
               aria-label="Tạo audio chương từ tùy chọn"
               className="reader-menu-action"
-              disabled={!apiClient || !activeBookId || !selectedChapterId || readerAudio.state.jobLoading || readerAudio.state.generationBlocked}
+              disabled={!readerAudio.state.canStartChapterJob}
               onClick={() => { void readerAudio.actions.startChapterJob(); }}
               type="button"
             >
@@ -3780,7 +3780,7 @@ export default function ReaderView({
           ) : null}
           <button
             className="reader-menu-action"
-            disabled={!apiClient || !activeBookId || readerAudio.state.jobLoading}
+            disabled={!readerAudio.state.canStartBookJob}
             onClick={() => {
               readerAudio.actions.requestBookJob();
               setMoreOpen(false);

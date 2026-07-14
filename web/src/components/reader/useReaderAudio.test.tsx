@@ -50,6 +50,14 @@ function options(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 describe('useReaderAudio', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -150,6 +158,145 @@ describe('useReaderAudio', () => {
 
     expect(result.current.state.jobSnapshot?.status).toBe('completed');
     expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(2);
+  });
+
+  it('serializes overlapping refreshes for the same audio job', async () => {
+    const pendingJob = deferred<JobStatus>();
+    const pendingTts = deferred<TtsJobStatus>();
+    const runningJob: JobStatus = {
+      job_id: 'tts-job-123456', job_type: 'tts', status: 'running', progress: 1, total: 4, message: 'running',
+    };
+    const runningTts: TtsJobStatus = {
+      job_id: 'tts-job-123456', status: 'running', progress: 25, chunks: [],
+    };
+    const client = api({
+      getJobStatus: vi.fn()
+        .mockResolvedValueOnce(runningJob)
+        .mockReturnValueOnce(pendingJob.promise)
+        .mockResolvedValue(runningJob),
+      getTtsJob: vi.fn()
+        .mockResolvedValueOnce(runningTts)
+        .mockReturnValueOnce(pendingTts.promise)
+        .mockResolvedValue(runningTts),
+    });
+    const hookOptions = options({ apiClient: client });
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
+
+    await act(async () => result.current.actions.startChapterJob());
+    let firstRefresh!: Promise<void>;
+    let overlappingRefresh!: Promise<void>;
+    act(() => {
+      firstRefresh = result.current.actions.refreshJob();
+      overlappingRefresh = result.current.actions.refreshJob();
+    });
+
+    expect(client.getJobStatus).toHaveBeenCalledTimes(2);
+    expect(client.getTtsJob).toHaveBeenCalledTimes(2);
+
+    pendingJob.resolve(runningJob);
+    pendingTts.resolve(runningTts);
+    await act(async () => Promise.all([firstRefresh, overlappingRefresh]));
+  });
+
+  it('ignores a completed refresh from the previous job after a new job starts', async () => {
+    const oldJob = deferred<JobStatus>();
+    const oldTts = deferred<TtsJobStatus>();
+    const newJob: JobStatus = {
+      job_id: 'tts-new-123456', job_type: 'tts', status: 'running', progress: 1, total: 2, message: 'new',
+    };
+    const newTts: TtsJobStatus = {
+      job_id: 'tts-new-123456', status: 'running', progress: 50, chunks: [],
+    };
+    const client = api({
+      startTtsJob: vi.fn()
+        .mockResolvedValueOnce({ job_id: 'tts-old-123456', status: 'queued', message: 'old' })
+        .mockResolvedValueOnce({ job_id: 'tts-new-123456', status: 'queued', message: 'new' }),
+      getJobStatus: vi.fn((requestedJobId: string) => (
+        requestedJobId === 'tts-old-123456' ? oldJob.promise : Promise.resolve(newJob)
+      )),
+      getTtsJob: vi.fn((requestedJobId: string) => (
+        requestedJobId === 'tts-old-123456' ? oldTts.promise : Promise.resolve(newTts)
+      )),
+    });
+    const hookOptions = options({ apiClient: client });
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
+
+    let oldStart!: Promise<void>;
+    act(() => { oldStart = result.current.actions.startChapterJob(); });
+    await waitFor(() => expect(result.current.state.jobId).toBe('tts-old-123456'));
+
+    await act(async () => result.current.actions.startChapterJob());
+    expect(result.current.state.jobId).toBe('tts-new-123456');
+    expect(result.current.state.jobSnapshot?.job_id).toBe('tts-new-123456');
+    expect(result.current.state.ttsSnapshot?.job_id).toBe('tts-new-123456');
+
+    oldJob.resolve({
+      job_id: 'tts-old-123456', job_type: 'tts', status: 'completed', progress: 1, total: 1, message: 'old done',
+    });
+    oldTts.resolve({ job_id: 'tts-old-123456', status: 'completed', progress: 100, chunks: [] });
+    await act(async () => oldStart);
+
+    expect(result.current.state.jobId).toBe('tts-new-123456');
+    expect(result.current.state.jobSnapshot?.job_id).toBe('tts-new-123456');
+    expect(result.current.state.ttsSnapshot?.job_id).toBe('tts-new-123456');
+  });
+
+  it('clears a rejected TTS snapshot so current job completion stops polling and refreshes the playlist', async () => {
+    vi.useFakeTimers();
+    const runningJob: JobStatus = {
+      job_id: 'tts-job-123456', job_type: 'tts', status: 'running', progress: 1, total: 2, message: 'running',
+    };
+    const completedJob: JobStatus = {
+      ...runningJob, status: 'completed', progress: 2, message: 'done',
+    };
+    const runningTts: TtsJobStatus = {
+      job_id: 'tts-job-123456', status: 'running', progress: 50, chunks: [],
+    };
+    const client = api({
+      getJobStatus: vi.fn()
+        .mockResolvedValueOnce(runningJob)
+        .mockResolvedValueOnce(completedJob)
+        .mockResolvedValue(runningJob),
+      getTtsJob: vi.fn()
+        .mockResolvedValueOnce(runningTts)
+        .mockRejectedValueOnce(new Error('TTS detail endpoint unavailable'))
+        .mockResolvedValue(runningTts),
+    });
+    const hookOptions = options({ apiClient: client });
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
+
+    await act(async () => result.current.actions.startChapterJob());
+    expect(result.current.state.ttsSnapshot?.status).toBe('running');
+
+    await act(async () => result.current.actions.refreshJob());
+    expect(result.current.state.jobSnapshot?.status).toBe('completed');
+    expect(result.current.state.ttsSnapshot).toBeNull();
+    expect(result.current.state.statusValue).toBe('completed');
+    await act(async () => Promise.resolve());
+    expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(2);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(client.getJobStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('exposes explicit chapter and book start guards for missing runtime prerequisites', () => {
+    const valid = options();
+    const noApi = renderHook(() => useReaderAudio({ ...valid, apiClient: undefined }));
+    const noBook = renderHook(() => useReaderAudio({ ...valid, activeBookId: null }));
+    const noChapter = renderHook(() => useReaderAudio({
+      ...valid,
+      selectedChapter: null,
+      selectedChapterId: null,
+    }));
+    const ready = renderHook(() => useReaderAudio(valid));
+
+    expect(noApi.result.current.state.canStartChapterJob).toBe(false);
+    expect(noApi.result.current.state.canStartBookJob).toBe(false);
+    expect(noBook.result.current.state.canStartChapterJob).toBe(false);
+    expect(noBook.result.current.state.canStartBookJob).toBe(false);
+    expect(noChapter.result.current.state.canStartChapterJob).toBe(false);
+    expect(ready.result.current.state.canStartChapterJob).toBe(true);
+    expect(ready.result.current.state.canStartBookJob).toBe(true);
   });
 
   it('sanitizes job errors and never exposes secrets or absolute paths', async () => {
