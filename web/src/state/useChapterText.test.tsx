@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { ApiClient } from '../api/client';
 import { fixtureChapter } from '../test/fixtures';
+import * as readerCacheModule from './readerCache';
 import { hasCachedChapter, putCachedChapter } from './readerCache';
 import { useChapterText } from './useChapterText';
 
@@ -88,7 +89,7 @@ describe('useChapterText', () => {
     }
   });
 
-  it('shows cached chapter text immediately while refreshing from the API', async () => {
+  it('leaves cached fallback reads to the offline controller while refreshing from the API', async () => {
     putCachedChapter({
       bookId: 42,
       chapterId: 4201,
@@ -98,6 +99,7 @@ describe('useChapterText', () => {
     });
     const source = deferred<string>();
     const translation = deferred<string | null>();
+    const getCachedChapter = vi.spyOn(readerCacheModule, 'getCachedChapterAsync');
     const client = {
       getChapterSource: vi.fn().mockReturnValue(source.promise),
       getChapterTranslation: vi.fn().mockReturnValue(translation.promise),
@@ -109,9 +111,10 @@ describe('useChapterText', () => {
       useChapterText(client, true, { ...fixtureChapter, audio_path: '' }),
     );
 
-    await waitFor(() => expect(result.current.translationText).toBe('Bản dịch cache'));
-    expect(result.current.sourceText).toBe('舊原文');
-    expect(result.current.state).toBe('ready');
+    await waitFor(() => expect(client.getChapterSource).toHaveBeenCalledTimes(1));
+    expect(getCachedChapter).not.toHaveBeenCalled();
+    expect(result.current.translationText).toBe('');
+    expect(result.current.state).toBe('loading');
 
     source.resolve('新原文');
     translation.resolve('Bản dịch mới');

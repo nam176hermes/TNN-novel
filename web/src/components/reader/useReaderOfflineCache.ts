@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Chapter } from '../../api/types';
 import {
   READER_CACHE_UPDATED_EVENT,
+  cacheReaderAudio,
   getCachedChapterAsync,
   getCachedReaderAssetUrl,
   getCachedReaderAudioUrl,
@@ -28,6 +29,12 @@ export type ReaderOfflineState = 'online' | 'offline-with-cache' | 'offline-with
 
 export type ReaderOfflineCacheDependencies = {
   cacheBook(options: CacheBookForOfflineOptions): Promise<ReaderOfflineCacheSummary>;
+  cacheAudio(bookId: number, chapterId: number, url: string): Promise<{
+    cached: boolean;
+    failed: boolean;
+    sizeBytes: number;
+    url: string;
+  }>;
   cacheChapter(options: CacheChapterForOfflineOptions): Promise<ReaderOfflineCacheSummary>;
   getCachedAudioUrl(bookId: number, chapterId: number, url: string): Promise<string>;
   getCachedChapter(bookId: number, chapterId: number): Promise<ReaderCachedChapter | null>;
@@ -59,6 +66,7 @@ export type UseReaderOfflineCacheOptions = {
 };
 
 const defaultDependencies: ReaderOfflineCacheDependencies = {
+  cacheAudio: cacheReaderAudio,
   cacheBook: cacheBookForOffline,
   cacheChapter: cacheChapterForOffline,
   getCachedAudioUrl: getCachedReaderAudioUrl,
@@ -167,9 +175,11 @@ export function useReaderOfflineCache({
       nextChapterId,
     }).catch(() => null);
     const chapterRequest = dependencies.getCachedChapter(bookId, selectedChapterId).catch(() => null);
-    const audioRequest = normalizedAudioUrl
-      ? dependencies.getCachedAudioUrl(bookId, selectedChapterId, normalizedAudioUrl).catch(() => '')
-      : Promise.resolve('');
+    const audioRequest = dependencies.getCachedAudioUrl(
+      bookId,
+      selectedChapterId,
+      normalizedAudioUrl,
+    ).catch(() => '');
     const coverRequest = normalizedCoverUrl
       ? dependencies.getCachedCoverUrl(bookId, 0, normalizedCoverUrl).catch(() => '')
       : Promise.resolve('');
@@ -200,10 +210,15 @@ export function useReaderOfflineCache({
     selectedChapterId,
   ]);
 
+  const manifestChapterAvailable = Boolean(manifest?.chapters.some((chapter) => (
+    chapter.id === selectedChapterId
+    && chapter.cached
+    && !chapter.failed
+  )));
   const currentAvailable = Boolean(
     cacheStatus?.currentCached
     || cachedChapter
-    || (selectedChapterId && manifest?.chapterIds.includes(selectedChapterId)),
+    || manifestChapterAvailable,
   );
   const offlineState: ReaderOfflineState = online
     ? 'online'
@@ -235,7 +250,25 @@ export function useReaderOfflineCache({
     setRefreshVersion((current) => current + 1);
   }, []);
 
-  const cacheCurrentChapter = useCallback(async (): Promise<void> => {
+  const cacheAudio = useCallback(async (
+    targetBookId: number,
+    targetChapterId: number,
+    url: string,
+  ) => {
+    const result = await dependencies.cacheAudio(targetBookId, targetChapterId, url);
+    if (!result.cached) return result;
+    const nextCachedUrl = await dependencies.getCachedAudioUrl(targetBookId, targetChapterId, url);
+    if (
+      mountedRef.current
+      && identityRef.current === `${targetBookId}:${targetChapterId}`
+    ) {
+      setCachedAudioUrl(nextCachedUrl);
+      refresh();
+    }
+    return result;
+  }, [dependencies, refresh]);
+
+  const cacheCurrentChapter = useCallback(async (audioUrlOverride = audioUrl): Promise<void> => {
     if (!apiClient || !bookId || !selectedChapter) {
       setMessage('Không thể cache chương: thiếu kết nối API hoặc chương đang đọc.');
       return;
@@ -249,7 +282,7 @@ export function useReaderOfflineCache({
     setMessage(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
     try {
       const summary = await dependencies.cacheChapter({
-        audioUrl,
+        audioUrl: audioUrlOverride,
         bookId,
         chapter: selectedChapter,
         client: apiClient,
@@ -405,6 +438,7 @@ export function useReaderOfflineCache({
 
   return {
     cacheStatus,
+    cacheAudio,
     cachedAudioUrl,
     cachedChapter,
     coverUrl: resolvedCoverUrl,

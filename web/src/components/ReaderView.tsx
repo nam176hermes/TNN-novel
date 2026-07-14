@@ -69,10 +69,6 @@ import {
 } from '../state/readerMarks';
 import { formatError, type LoadState } from '../state/types';
 import {
-  cacheReaderAudio,
-  getCachedReaderAudioUrl,
-} from '../state/readerCache';
-import {
   loadCachedReaderDictionaryResult,
   lookupCachedReaderDictionaryPack,
   saveCachedReaderDictionaryPack,
@@ -1605,6 +1601,54 @@ export default function ReaderView({
   const [readerQaReport, setReaderQaReport] = useState<QaReport | null>(null);
   const [readerQaState, setReaderQaState] = useState<LoadState>('idle');
   const [readerQaError, setReaderQaError] = useState('');
+  const translatedChapters = useMemo(
+    () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
+    [chapters],
+  );
+  const chapterIndexes = useMemo(
+    () => new Map(translatedChapters.map((chapter, index) => [chapter.id, index])),
+    [translatedChapters],
+  );
+  const selectedBook = books.find((book) => book.id === activeBookId);
+  const selectedIndex = translatedChapters.findIndex((chapter) => chapter.id === selectedChapterId);
+  const currentPosition = selectedIndex >= 0 ? selectedIndex + 1 : 0;
+  const previousChapter = selectedIndex > 0 ? translatedChapters[selectedIndex - 1] : null;
+  const nextChapter = selectedIndex >= 0 && selectedIndex < translatedChapters.length - 1
+    ? translatedChapters[selectedIndex + 1]
+    : null;
+  const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
+  const fallbackCoverUrl = fallbackReaderCover(selectedBook);
+  const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
+  const readerOfflineCache = useReaderOfflineCache({
+    apiClient,
+    bookId: activeBookId,
+    chapters: translatedChapters,
+    coverUrl: fallbackCoverUrl ? '' : backendCoverUrl,
+    liveCoverUrl,
+    nextChapterId: nextChapter?.id ?? null,
+    onError: setMarksError,
+    selectedChapter,
+    selectedChapterId,
+  });
+  const currentCachedChapter = readerOfflineCache.cachedChapter?.bookId === activeBookId
+    && readerOfflineCache.cachedChapter.chapterId === selectedChapterId
+    ? readerOfflineCache.cachedChapter
+    : null;
+  const useCachedChapterContent = Boolean(
+    currentCachedChapter
+    && (textState === 'loading' || textState === 'error'),
+  );
+  const readerTranslationText = useCachedChapterContent
+    ? currentCachedChapter?.text ?? ''
+    : translationText;
+  const readerContentHtml = useCachedChapterContent
+    ? currentCachedChapter?.html ?? ''
+    : contentHtml;
+  const readerSourceText = useCachedChapterContent
+    ? currentCachedChapter?.sourceText ?? ''
+    : '';
+  const readerTextState: LoadState = useCachedChapterContent ? 'ready' : textState;
+  const readerTextError = useCachedChapterContent ? '' : textError;
   const selectAudioChapter = useCallback((chapterId: number) => {
     onSelectChapter(chapterId);
     setTocOpen(false);
@@ -1618,16 +1662,16 @@ export default function ReaderView({
   const readerAudio = useReaderAudio({
     activeBookId,
     apiClient,
-    cacheAudio: cacheReaderAudio,
+    cachedAudioUrl: readerOfflineCache.cachedAudioUrl,
+    cacheAudio: readerOfflineCache.cacheAudio,
     chapters,
-    getCachedAudioUrl: getCachedReaderAudioUrl,
     onDownload: triggerBrowserDownload,
     onError: setMarksError,
     onSelectChapter: selectAudioChapter,
     qaReport: readerQaReport,
     selectedChapter,
     selectedChapterId,
-    translationText,
+    translationText: readerTranslationText,
   });
   const exitReader = useCallback(() => {
     const state = window.history.state as Record<string, unknown> | null;
@@ -1679,36 +1723,6 @@ export default function ReaderView({
     setReaderTextModeState(mode);
     saveReaderTextMode(mode);
   }, []);
-  const translatedChapters = useMemo(
-    () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
-    [chapters],
-  );
-  const chapterIndexes = useMemo(
-    () => new Map(translatedChapters.map((chapter, index) => [chapter.id, index])),
-    [translatedChapters],
-  );
-  const selectedBook = books.find((book) => book.id === activeBookId);
-  const selectedIndex = translatedChapters.findIndex((chapter) => chapter.id === selectedChapterId);
-  const currentPosition = selectedIndex >= 0 ? selectedIndex + 1 : 0;
-  const previousChapter = selectedIndex > 0 ? translatedChapters[selectedIndex - 1] : null;
-  const nextChapter = selectedIndex >= 0 && selectedIndex < translatedChapters.length - 1
-    ? translatedChapters[selectedIndex + 1]
-    : null;
-  const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
-  const fallbackCoverUrl = fallbackReaderCover(selectedBook);
-  const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
-  const readerOfflineCache = useReaderOfflineCache({
-    apiClient,
-    audioUrl: readerAudio.playback.streamUrl,
-    bookId: activeBookId,
-    chapters: translatedChapters,
-    coverUrl: fallbackCoverUrl ? '' : backendCoverUrl,
-    liveCoverUrl,
-    nextChapterId: nextChapter?.id ?? null,
-    onError: setMarksError,
-    selectedChapter,
-    selectedChapterId,
-  });
   const {
     cacheStatus,
     currentAvailable: currentChapterAvailableOffline,
@@ -1716,21 +1730,25 @@ export default function ReaderView({
     manifest: offlineManifest,
     message: offlineCacheStatus,
     cacheCurrentBook: cacheCurrentBookOffline,
-    cacheCurrentChapter: cacheCurrentChapterOffline,
+    cacheCurrentChapter,
     removeCurrentBook: clearCurrentBookOfflineCache,
     removeCurrentChapter: clearCurrentChapterOfflineCache,
   } = readerOfflineCache;
+  const cacheCurrentChapterOffline = () => cacheCurrentChapter(readerAudio.playback.streamUrl);
   const readerCoverUrl = readerOfflineCache.coverUrl;
-  const paragraphs = useMemo(() => splitParagraphs(translationText), [translationText]);
-  const rawText = useMemo(() => htmlTextContent(contentHtml), [contentHtml]);
-  const richBlocks = useMemo(() => extractReaderRichBlocks(contentHtml), [contentHtml]);
+  const paragraphs = useMemo(() => splitParagraphs(readerTranslationText), [readerTranslationText]);
+  const rawText = useMemo(
+    () => htmlTextContent(readerContentHtml) || readerSourceText,
+    [readerContentHtml, readerSourceText],
+  );
+  const richBlocks = useMemo(() => extractReaderRichBlocks(readerContentHtml), [readerContentHtml]);
   const rawParagraphs = useMemo(() => {
     const blockTexts = richBlocks.map((block) => block.text.trim()).filter(Boolean);
     return blockTexts.length > 0 ? blockTexts : splitParagraphs(rawText);
   }, [rawText, richBlocks]);
   const rawContentAvailable = rawParagraphs.length > 0;
-  const richContentAvailable = contentHtml.trim().length > 0;
-  const contentHtmlLooksRawSource = translationText.trim().length > 0 && containsHanText(rawText);
+  const richContentAvailable = readerContentHtml.trim().length > 0;
+  const contentHtmlLooksRawSource = readerTranslationText.trim().length > 0 && containsHanText(rawText);
   const hasRichContent = richContentAvailable && !contentHtmlLooksRawSource;
   const progressTextBlocks = useMemo(
     () => (hasRichContent ? richBlocks.map((block) => block.text) : paragraphs),
@@ -1799,11 +1817,11 @@ export default function ReaderView({
       };
     });
   const hasReadableRichText = rawText.length > 0;
-  const selectedChapterStatText = translationText.trim() || rawText;
+  const selectedChapterStatText = readerTranslationText.trim() || rawText;
   const hasReadableChapterContent = paragraphs.length > 0 || hasRichContent;
   const hasTitleOnlyImportContent = Boolean(
     selectedChapter
-      && translationLooksTitleOnly(translationText, selectedChapter)
+      && translationLooksTitleOnly(readerTranslationText, selectedChapter)
       && (!hasRichContent || !hasReadableRichText),
   );
   useEffect(() => {
@@ -2058,7 +2076,7 @@ export default function ReaderView({
   }, [
     isPaginatedMode,
     canMeasureViewportPages,
-    contentHtml,
+    readerContentHtml,
     measureViewportPagesNow,
     paginatedBlockCount,
     readerSettings.characterSpacing,
@@ -2070,12 +2088,12 @@ export default function ReaderView({
     readerSettings.marginScale,
     readerSettings.paragraphSpacing,
     readerSettings.width,
-    translationText,
+    readerTranslationText,
   ]);
 
   useEffect(() => {
     setRenderedParagraphLimit(INITIAL_SCROLL_PARAGRAPH_LIMIT);
-  }, [contentHtml, readerSettings.readingMode, selectedChapterId, translationText]);
+  }, [readerContentHtml, readerSettings.readingMode, selectedChapterId, readerTranslationText]);
 
   useEffect(() => {
     if (!hasMoreScrollParagraphs) return;
@@ -2337,14 +2355,14 @@ export default function ReaderView({
   }, [
     activeBookId,
     activeViewportPages,
-    contentHtml,
+    readerContentHtml,
     expandRenderedParagraphs,
     isPaginatedMode,
     pageCount,
     progressTextBlocks,
     readerSettings.readingMode,
     selectedChapterId,
-    translationText,
+    readerTranslationText,
     updateScrollProgress,
     visibleScrollParagraphLimit,
   ]);
@@ -2539,7 +2557,7 @@ export default function ReaderView({
     });
   }, [
     activeViewportPages,
-    contentHtml,
+    readerContentHtml,
     currentPage,
     expandRenderedParagraphs,
     isPaginatedMode,
@@ -2547,7 +2565,7 @@ export default function ReaderView({
     pendingParagraphJump,
     progressTextBlocks,
     selectedChapterId,
-    translationText,
+    readerTranslationText,
     updateScrollProgress,
     visibleParagraphs.length,
     visibleScrollParagraphLimit,
@@ -3957,8 +3975,8 @@ export default function ReaderView({
             readerStyle={readerStyle}
             richBlocks={richBlocks}
             selectedChapter={selectedChapter}
-            textError={textError}
-            textState={textState}
+            textError={readerTextError}
+            textState={readerTextState}
             theme={readerSettings.theme}
             visibleParagraphs={visibleParagraphs}
             visibleRichBlocks={visibleRichBlocks}
@@ -3976,8 +3994,8 @@ export default function ReaderView({
             paragraphs={rawParagraphs}
             readerStyle={readerStyle}
             selectedChapter={selectedChapter}
-            textError={textError}
-            textState={textState}
+            textError={readerTextError}
+            textState={readerTextState}
             theme={readerSettings.theme}
             width={readerSettings.width}
             onToggleChrome={() => setChromeVisible((current) => !current)}
@@ -3990,8 +4008,8 @@ export default function ReaderView({
               paragraphs={rawParagraphs}
               readerStyle={readerStyle}
               selectedChapter={selectedChapter}
-              textError={textError}
-              textState={textState}
+              textError={readerTextError}
+              textState={readerTextState}
               theme={readerSettings.theme}
               width={readerSettings.width}
               onToggleChrome={() => setChromeVisible((current) => !current)}
@@ -4009,8 +4027,8 @@ export default function ReaderView({
               readerStyle={readerStyle}
               richBlocks={richBlocks}
               selectedChapter={selectedChapter}
-              textError={textError}
-              textState={textState}
+              textError={readerTextError}
+              textState={readerTextState}
               theme={readerSettings.theme}
               visibleParagraphs={paragraphs.map((paragraph, index) => ({ index, paragraph }))}
               visibleRichBlocks={richBlocks}
@@ -4029,8 +4047,8 @@ export default function ReaderView({
             rawParagraphs={rawParagraphs}
             readerStyle={readerStyle}
             selectedChapter={selectedChapter}
-            textError={textError}
-            textState={textState}
+            textError={readerTextError}
+            textState={readerTextState}
             theme={readerSettings.theme}
             translatedParagraphs={paragraphs}
             width={readerSettings.width}
@@ -4059,8 +4077,8 @@ export default function ReaderView({
               richBlocks={richBlocks}
               selectedChapter={selectedChapter}
               showQaOverlay
-              textError={textError}
-              textState={textState}
+              textError={readerTextError}
+              textState={readerTextState}
               theme={readerSettings.theme}
               visibleParagraphs={paragraphs.map((paragraph, index) => ({ index, paragraph }))}
               visibleRichBlocks={richBlocks}

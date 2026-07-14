@@ -74,6 +74,12 @@ function cachedChapter(bookId = 42, chapterId = 102): ReaderCachedChapter {
 
 function dependencies(overrides: Partial<ReaderOfflineCacheDependencies> = {}): ReaderOfflineCacheDependencies {
   return {
+    cacheAudio: vi.fn().mockResolvedValue({
+      cached: true,
+      failed: false,
+      sizeBytes: 10,
+      url: '/api/books/42/chapters/102/audio',
+    }),
     cacheBook: vi.fn().mockResolvedValue({
       assetsCached: 1,
       assetsFailed: 0,
@@ -171,6 +177,8 @@ describe('useReaderOfflineCache', () => {
 
     await waitFor(() => expect(deps.readStatus).toHaveBeenCalledTimes(2));
     expect(deps.loadManifest).toHaveBeenCalledTimes(2);
+    expect(deps.getCachedChapter).toHaveBeenCalledTimes(2);
+    expect(deps.getCachedAudioUrl).toHaveBeenCalledTimes(2);
   });
 
   it('caches and removes the current chapter while preserving manifest ownership', async () => {
@@ -199,11 +207,15 @@ describe('useReaderOfflineCache', () => {
   });
 
   it('caches and removes the translated book with progress and summary messages', async () => {
-    const deps = dependencies();
+    const pendingCache = deferred<ReaderOfflineCacheSummary>();
+    const deps = dependencies({ cacheBook: vi.fn().mockReturnValue(pendingCache.promise) });
     const { result } = renderHook(() => useReaderOfflineCache(options(deps)));
     await waitFor(() => expect(result.current.cacheStatus).toEqual(cacheStatus));
 
-    await act(async () => result.current.cacheCurrentBook());
+    let cachePromise!: Promise<void>;
+    act(() => {
+      cachePromise = result.current.cacheCurrentBook();
+    });
     const cacheBookOptions = vi.mocked(deps.cacheBook).mock.calls[0][0];
     act(() => cacheBookOptions.onProgress?.({
       assetsCached: 0,
@@ -218,6 +230,23 @@ describe('useReaderOfflineCache', () => {
       currentChapterId: 102,
       dictionaryCached: false,
     }));
+    expect(result.current.message).toBe('Đang cache offline 2/3 chương...');
+
+    await act(async () => {
+      pendingCache.resolve({
+        assetsCached: 1,
+        assetsFailed: 0,
+        assetsTotal: 1,
+        audioCached: 1,
+        audioFailed: 0,
+        audioTotal: 1,
+        chaptersCached: 3,
+        chaptersFailed: 0,
+        chaptersTotal: 3,
+        dictionaryCached: true,
+      });
+      await cachePromise;
+    });
     expect(deps.cacheBook).toHaveBeenCalledWith(expect.objectContaining({ bookId: 42, chapters }));
     expect(result.current.message).toBe('Đã cache offline 3/3 chương · 1/1 asset · 1/1 audio · đã cache từ điển');
 
@@ -244,6 +273,34 @@ describe('useReaderOfflineCache', () => {
 
     act(() => window.dispatchEvent(new Event('online')));
     expect(second.result.current.offlineState).toBe('online');
+  });
+
+  it('does not treat a failed manifest chapter entry as available offline', async () => {
+    Object.defineProperty(window.navigator, 'onLine', { configurable: true, value: false });
+    const failedManifest = manifest();
+    failedManifest.chapters = [{
+      cached: false,
+      failed: true,
+      htmlCached: false,
+      id: 102,
+      textCached: false,
+    }];
+    failedManifest.summary = {
+      ...failedManifest.summary,
+      chaptersCached: 0,
+      chaptersFailed: 1,
+    };
+    const deps = dependencies({
+      getCachedChapter: vi.fn().mockResolvedValue(null),
+      loadManifest: vi.fn().mockReturnValue(failedManifest),
+      readStatus: vi.fn().mockResolvedValue({ ...cacheStatus, currentCached: false }),
+    });
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps)));
+
+    await waitFor(() => expect(result.current.metadataLoading).toBe(false));
+
+    expect(result.current.currentAvailable).toBe(false);
+    expect(result.current.offlineState).toBe('offline-without-cache');
   });
 
   it('removes cache and connectivity listeners on unmount', async () => {

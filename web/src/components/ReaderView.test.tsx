@@ -39,6 +39,35 @@ const chapters: Chapter[] = [
   { id: 104, book_id: 42, chapter_number: 4, title: 'Chưa dịch', status: 'cleaned', audio_path: null, has_translation: false },
 ];
 
+const manifestFixtureForReaderTest = {
+  assets: [],
+  audio: [],
+  cachedAt: '2026-07-14T00:00:00Z',
+  checksum: 'failed-entry',
+  cover: null,
+  dictionary: {
+    cached: false,
+    chapterPacks: [],
+    counts: { builtin: 0, glossary: 0, offline_dictionary: 0, xray: 0 },
+    files: [],
+    generatedAt: '',
+    sourceCount: 0,
+  },
+  summary: {
+    assetsCached: 0,
+    assetsFailed: 0,
+    assetsTotal: 0,
+    audioCached: 0,
+    audioFailed: 0,
+    audioTotal: 0,
+    chaptersCached: 0,
+    chaptersFailed: 0,
+    chaptersTotal: 0,
+    dictionaryCached: false,
+  },
+  version: 3,
+};
+
 const remoteHighlight: ReaderAnnotation = {
   id: 700,
   book_id: 42,
@@ -1959,6 +1988,50 @@ describe('ReaderView', () => {
 
     expect(await screen.findByLabelText('Có sẵn offline')).toBeInTheDocument();
     expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument();
+  });
+
+  it('renders cached chapter content supplied by the offline controller while live text loads', async () => {
+    putCachedChapter({
+      bookId: 42,
+      chapterId: 102,
+      html: '',
+      sourceText: '舊原文',
+      text: 'Bản dịch cache từ controller.',
+    });
+
+    renderReader({
+      contentHtml: '',
+      textError: '',
+      textState: 'loading',
+      translationText: '',
+    });
+
+    expect(await screen.findByText('Bản dịch cache từ controller.')).toBeInTheDocument();
+    expect(screen.queryByText('Đang tải bản đọc...')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Có sẵn offline')).toBeInTheDocument();
+  });
+
+  it('does not show the offline badge for a failed manifest entry without cached content', async () => {
+    window.localStorage.setItem('novel-reader-offline-manifest-v1', JSON.stringify({
+      42: {
+        ...manifestFixtureForReaderTest,
+        bookId: 42,
+        chapterIds: [102],
+        chapters: [{ cached: false, failed: true, htmlCached: false, id: 102, textCached: false }],
+        summary: {
+          ...manifestFixtureForReaderTest.summary,
+          chaptersCached: 0,
+          chaptersFailed: 1,
+          chaptersTotal: 1,
+        },
+      },
+    }));
+
+    renderReader({ contentHtml: '', textError: '', textState: 'ready', translationText: '' });
+    await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    await waitFor(() => expect(within(menu).getByText('Chương hiện tại chưa cache')).toBeInTheDocument());
+    expect(screen.queryByLabelText('Có sẵn offline')).not.toBeInTheDocument();
   });
 
   it('caches the whole translated book for offline reading from the more menu', async () => {

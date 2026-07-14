@@ -46,9 +46,9 @@ type ReaderAudioRefreshOutcome =
 export type UseReaderAudioOptions = {
   activeBookId: number | null;
   apiClient?: ReaderAudioApiClient;
+  cachedAudioUrl: string;
   cacheAudio(bookId: number, chapterId: number, url: string): Promise<CacheAudioResult>;
   chapters: Chapter[];
-  getCachedAudioUrl(bookId: number, chapterId: number, url: string): Promise<string>;
   onDownload(blob: Blob, filename: string): void;
   onError(message: string): void;
   onSelectChapter(chapterId: number): void;
@@ -138,9 +138,9 @@ function audioJobFailureReason(job: JobStatus | null, ttsJob: TtsJobStatus | nul
 export function useReaderAudio({
   activeBookId,
   apiClient,
+  cachedAudioUrl,
   cacheAudio,
   chapters,
-  getCachedAudioUrl,
   onDownload,
   onError,
   onSelectChapter,
@@ -162,7 +162,6 @@ export function useReaderAudio({
   const [jobRefreshing, setJobRefreshing] = useState(false);
   const [playlist, setPlaylist] = useState<BookAudioPlaylistItem[]>([]);
   const [playlistError, setPlaylistError] = useState('');
-  const [cachedUrl, setCachedUrl] = useState('');
   const activeJobGenerationRef = useRef(0);
   const activeJobIdRef = useRef('');
   const playlistRequestRef = useRef(0);
@@ -195,7 +194,12 @@ export function useReaderAudio({
       .find((chapter) => Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id)) ?? null
     : null;
   const playlistItem = selectedChapterId ? playlistByChapterId.get(selectedChapterId) ?? null : null;
-  const canPlay = Boolean(apiClient && activeBookId && selectedChapterId && (selectedChapter?.audio_path || playlistItem));
+  const canPlay = Boolean(
+    apiClient
+    && activeBookId
+    && selectedChapterId
+    && (selectedChapter?.audio_path || playlistItem || cachedAudioUrl),
+  );
   const streamUrl = canPlay && apiClient && activeBookId && selectedChapterId
     ? selectedChapter?.audio_path
       ? apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
@@ -236,27 +240,9 @@ export function useReaderAudio({
   }, [loadPlaylist]);
 
   useEffect(() => {
-    if (!canPlay || !activeBookId || !selectedChapterId || !streamUrl) {
-      setCachedUrl('');
-      return;
-    }
-    let cancelled = false;
-    setCachedUrl('');
-    void getCachedAudioUrl(activeBookId, selectedChapterId, streamUrl)
-      .then(async (url) => {
-        if (cancelled) return;
-        if (url) {
-          setCachedUrl(url);
-          return;
-        }
-        const result = await cacheAudio(activeBookId, selectedChapterId, streamUrl);
-        if (!result.cached || cancelled) return;
-        const nextUrl = await getCachedAudioUrl(activeBookId, selectedChapterId, streamUrl);
-        if (!cancelled) setCachedUrl(nextUrl);
-      })
-      .catch(() => { if (!cancelled) setCachedUrl(''); });
-    return () => { cancelled = true; };
-  }, [activeBookId, cacheAudio, canPlay, getCachedAudioUrl, selectedChapterId, streamUrl]);
+    if (!canPlay || !activeBookId || !selectedChapterId || !streamUrl || cachedAudioUrl) return;
+    void cacheAudio(activeBookId, selectedChapterId, streamUrl).catch(() => {});
+  }, [activeBookId, cacheAudio, cachedAudioUrl, canPlay, selectedChapterId, streamUrl]);
 
   const activateJob = useCallback((nextJobId: string) => {
     activeJobGenerationRef.current += 1;
@@ -560,7 +546,7 @@ export function useReaderAudio({
       nextChapterId: nextChapter?.id ?? null,
       resumeOnSourceChange: autoNext,
       streamUrl,
-      url: cachedUrl || streamUrl,
+      url: cachedAudioUrl || streamUrl,
     },
   };
 }

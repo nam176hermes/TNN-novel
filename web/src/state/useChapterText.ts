@@ -3,7 +3,6 @@ import { ApiError, type ApiClient } from '../api/client';
 import type { Chapter } from '../api/types';
 import {
   cacheReaderAssetsFromHtml,
-  getCachedChapterAsync,
   hasCachedChapterAsync,
   hydrateCachedReaderAssetUrls,
   putCachedChapterAsync,
@@ -83,32 +82,11 @@ export function useChapterText(
 
       const requestId = loadRequestIdRef.current + 1;
       loadRequestIdRef.current = requestId;
-      const cachedChapter = await getCachedChapterAsync(nextChapter.book_id, nextChapter.id);
-      if (requestId !== loadRequestIdRef.current) return;
-      if (cachedChapter) {
-        setSourceText(cachedChapter.sourceText);
-        setTranslationText(cachedChapter.text);
-        setSavedTranslationText(cachedChapter.text);
-        setContentHtml(cachedChapter.html);
-        setState('ready');
-        if (cachedChapter.html.trim()) {
-          const assetBase = readerHtmlAssetBase(nextChapter.content_html_path);
-          void hydrateCachedReaderAssetUrls(
-            nextChapter.book_id,
-            nextChapter.id,
-            cachedChapter.html,
-            assetBase,
-          ).then((hydratedHtml) => {
-            if (requestId === loadRequestIdRef.current) setContentHtml(hydratedHtml);
-          });
-        }
-      } else {
-        setSourceText('');
-        setTranslationText('');
-        setSavedTranslationText('');
-        setContentHtml('');
-        setState('loading');
-      }
+      setSourceText('');
+      setTranslationText('');
+      setSavedTranslationText('');
+      setContentHtml('');
+      setState('loading');
       setError('');
 
       try {
@@ -149,10 +127,6 @@ export function useChapterText(
           setError(formatError(nextError));
           setState('error');
           throw nextError;
-        }
-        if (cachedChapter) {
-          setState('ready');
-          return;
         }
         reset();
         setError(formatError(nextError));
