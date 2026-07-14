@@ -297,7 +297,10 @@ builds and encrypts entirely below private mode-`0700` staging, validates READY
 metadata, then publishes the sidecar before the completed encrypted artifact.
 An owned hidden reservation suppresses sidecar-only process-crash residue.
 Normal exceptions record each final hardlink immediately and roll back every
-owned link if any later source cleanup or publication step fails.
+owned link if any later source cleanup or publication step fails. Cleanup of
+process-owned hidden staging is best-effort: a cleanup error cannot change a
+completed READY result or mask the primary encryption/publication failure, and
+any residue remains outside normal list/download paths.
 
 ## P2C rollback boundaries
 
@@ -306,7 +309,7 @@ without changing archive/restore format:
 
 - backup API/jobs: `b77fa38` through `04ad491`, plus terminal-audit commits
   `9d04ffe`/`de94de7` and encrypt-before-publish commits
-  `3f3b83d`/`a4eac8c`;
+  `3f3b83d`/`a4eac8c`/`f744b25`;
 - retention and repository foundations: `38156ce` through `56534d9`;
 - Reader feature ownership: `31093ba` through `987aea0`;
 - CSS layers/features: `46759eb` through `2a77755`;

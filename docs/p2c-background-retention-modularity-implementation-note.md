@@ -6,7 +6,7 @@
 
 **Original verification baseline:** `9f47a41` (`refactor(services): extract reader content seams`)
 
-**Closure code baseline:** `a4eac8c` (`fix(backups): roll back partial publication links`)
+**Closure code baseline:** `f744b25` (`fix(backups): isolate staging cleanup failures`)
 
 **Scope:** P2C only; no operator data migration, restore, retention apply, paid
 provider call, schema redesign, or Reader redesign was performed.
@@ -32,8 +32,10 @@ describe the script itself as passing.
 **Phase status: COMPLETE.** The completion audit closed the dedicated terminal
 backup-event gap in `9d04ffe`/`de94de7`. Final whole-branch review then found
 that secret-bearing background backups briefly published plaintext before
-encryption. `3f3b83d` moved that work into private staging and `a4eac8c` made
-partial final-link rollback reliable; independent re-review approved the fix.
+encryption. `3f3b83d` moved that work into private staging, `a4eac8c` made
+partial final-link rollback reliable, and `f744b25` prevented best-effort
+staging cleanup from overturning READY success or masking the primary failure;
+independent re-review approved the fixes.
 The documented bounded verification equivalent passes; `scripts/verify.sh`
 itself still returned RC 1 and is not described as passing.
 
@@ -161,7 +163,7 @@ translation provider, or TTS provider was invoked against live data.
 | Task 16 focused terminal-event suite | RC 0; 22 tests passed |
 | Task 16 five-file regression suite | RC 0; 98 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
 | Task 16 compile/lint checks | `compileall` RC 0; Python lint and frontend `tsc --noEmit` RC 0 |
-| Task 18 backup/ops/job suite | RC 0; 84 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
+| Task 18 backup/ops/job suite | RC 0; 88 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
 | Task 18 real encryption/restore compatibility | RC 0; temp-only OpenSSL `create_encrypted_backup` to `restore_drill` smoke passed |
 | Task 18 static checks | `scripts/lint.sh` and `git diff --check` RC 0 |
 
@@ -187,7 +189,7 @@ would remain for runtime resolution. It did not fail the build.
 | Backup POST returns 202 and archive creation runs through a tracked background job | PASS | `routers/backups.py`, `backup_job_service.py`; focused backend and full backend suites |
 | No backup passphrase is persisted or exposed | PASS | secret-store/coordinator tests; safe API schema and job params |
 | Cancellation before publication leaves no final archive/sidecar | PASS | ops cancellation/failure-window tests; focused backend suite |
-| Secrets-included background backups never expose plaintext through live list/download | PASS | `3f3b83d`, `a4eac8c`; concurrent encryption, crash-residue, malformed-sidecar, collision, and post-link failure-injection tests |
+| Secrets-included background backups never expose plaintext through live list/download | PASS | `3f3b83d`, `a4eac8c`, `f744b25`; concurrent encryption, crash-residue, malformed-sidecar, collision, post-link, and cleanup failure-injection tests |
 | Completed archives remain restore-compatible and list through sidecars | PASS | ops restore/list tests and backup API tests; archive format unchanged; no live restore was run |
 | Retention enforces age/count bounds without deleting active sessions or mass-deleting in requests | PASS | retention repository/service/lifespan tests; full backend suite |
 | ReaderView delegates TOC, controls, audio, and offline-cache ownership | PASS | direct feature tests plus ReaderView regression suite |
@@ -243,6 +245,11 @@ authenticated list/download requests.
 - `a4eac8c` records ownership immediately after each successful hardlink, before
   unlinking its staging source. Injected sidecar-source and archive-source unlink
   failures both roll back every owned live link.
+- `f744b25` makes cleanup of process-owned hidden staging best-effort. Injected
+  cleanup failures at both inner and outer boundaries preserve READY success;
+  cleanup failure also cannot mask a primary encryption/publication error.
+  Any residue keeps its hidden unsupported name and remains outside normal
+  list/download paths.
 - A temp-only real OpenSSL encrypted-backup restore drill passed. The archive,
   internal manifest, sidecar, and restore formats did not change.
 
@@ -251,7 +258,7 @@ authenticated list/download requests.
 For the affected seam, run `git revert <commit>` once per commit, newest first,
 then run that seam's focused tests. The boundaries below are inclusive:
 
-- backup jobs/publication/terminal audit: revert `a4eac8c`, then `3f3b83d`,
+- backup jobs/publication/terminal audit: revert `f744b25`, then `a4eac8c`, then `3f3b83d`,
   then `de94de7`, then `9d04ffe`,
   then every backup-seam commit from `04ad491` backward through and including
   `b77fa38`;

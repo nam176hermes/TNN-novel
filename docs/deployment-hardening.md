@@ -308,6 +308,8 @@ Rules:
 - secrets backup requires encryption passphrase
 - secrets-included API backups keep plaintext below private mode-`0700`
   staging and publish only the encrypted READY artifact pair
+- cleanup failure for process-owned hidden staging does not overturn READY
+  success or mask a primary encryption/publication failure
 - protected download requires a supported final filename, regular non-symlink
   artifact, and valid matching sidecar
 - restore stays a documented CLI workflow, not a one-click public UI action

@@ -157,7 +157,8 @@ Each extraction must preserve API contracts, full verification, E2E library-to-R
 For the affected seam, run `git revert <commit>` once per commit, newest first.
 These boundaries are inclusive:
 
-- backup jobs/publication/terminal audit: revert `de94de7`, then `9d04ffe`,
+- backup jobs/publication/terminal audit: revert `f744b25`, then `a4eac8c`,
+  then `3f3b83d`, then `de94de7`, then `9d04ffe`,
   then every backup-seam commit from `04ad491` backward through and including
   `b77fa38`;
 - retention/repository foundation: revert every affected commit from `56534d9`
