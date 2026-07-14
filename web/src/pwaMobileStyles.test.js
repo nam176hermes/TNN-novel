@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readStyleSources } from './test/readStyleSources';
 
-const styles = readFileSync(resolve(__dirname, 'styles.css'), 'utf-8');
+const styles = readStyleSources(resolve(__dirname, 'styles.css'));
 
 describe('mobile PWA prompt styles', () => {
   it('keeps the install prompt above the fixed mobile navigation', () => {

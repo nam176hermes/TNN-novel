@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { readStyleSources } from '../test/readStyleSources';
 
-const readerStyles = readFileSync(resolve(__dirname, '../styles.css'), 'utf-8');
+const readerStyles = readStyleSources(resolve(__dirname, '../styles.css'));
 
 describe('reader paginated rich media styles', () => {
   it('constrains rich images and complex EPUB blocks to the paginated viewport', () => {
