@@ -670,12 +670,6 @@
   padding: 0;
 }
 
-.login-panel .primary-action {
-  justify-content: center;
-  min-height: 48px;
-  width: 100%;
-}
-
 .login-divider {
   align-items: center;
   color: var(--text-soft);
@@ -1186,59 +1180,6 @@
     grid-template-columns: 1fr;
   }
 }
-@media (min-width: 821px) {
-  .workflow-management-view .providers-management-table {
-    font-size: 11.5px;
-    min-width: 660px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(1),
-.workflow-management-view .providers-management-table td:nth-child(1) {
-    width: 78px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(2),
-.workflow-management-view .providers-management-table td:nth-child(2) {
-    width: 96px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(3),
-.workflow-management-view .providers-management-table td:nth-child(3) {
-    width: 145px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(4),
-.workflow-management-view .providers-management-table td:nth-child(4) {
-    width: 108px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(5),
-.workflow-management-view .providers-management-table td:nth-child(5) {
-    width: 110px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(6),
-.workflow-management-view .providers-management-table td:nth-child(6) {
-    width: 78px;
-  }
-
-  .workflow-management-view .providers-management-table th:nth-child(7),
-.workflow-management-view .providers-management-table td:nth-child(7) {
-    width: 31px;
-  }
-
-  .workflow-management-view .providers-management-table code {
-    display: inline-block;
-    font-size: 9px;
-    line-height: 1.25;
-    max-width: 100%;
-    overflow: hidden;
-    overflow-wrap: normal;
-    text-overflow: clip;
-    white-space: nowrap;
-  }
-}
-
 @media (min-width: 641px) and (max-width: 820px) {
   .workflow-shell:not([data-active-view="reader"]) {
     grid-template-columns: 176px minmax(0, 1fr);

@@ -281,6 +281,7 @@ async function signIn(page: Page, state: MockState) {
   await installApiMock(page, state);
   await page.goto('/');
   await page.getByLabel('Password').fill('correct horse battery staple');
+  await expect(page.getByRole('button', { name: 'Login' })).toHaveCSS('min-height', '48px');
   await page.getByRole('button', { name: 'Login' }).click();
   await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeVisible();
 }
@@ -311,6 +312,17 @@ test('login works and protected shell is blocked without a token', async ({ page
 
   await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Chưa chọn chương' })).toBeVisible();
+});
+
+test('desktop provider table keeps the compact reference sizing', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await authenticatedPage(page, state);
+
+  await page.getByRole('navigation', { name: 'Quy trình' }).getByRole('button', { name: 'Model API' }).click();
+  const providerTable = page.getByRole('table');
+  await expect(providerTable).toBeVisible();
+  await expect(providerTable).toHaveCSS('min-width', '660px');
+  await expect(providerTable).toHaveCSS('font-size', '11.5px');
 });
 
 test('import wizard loads the current paste flow with mocked backend data', async ({ page }) => {

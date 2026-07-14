@@ -453,6 +453,12 @@
   color: var(--accent-strong);
 }
 
+.login-panel .primary-action {
+  justify-content: center;
+  min-height: 48px;
+  width: 100%;
+}
+
 .panel {
   background: rgb(17 20 15 / 76%);
   border: 1px solid rgb(255 255 255 / 8%);

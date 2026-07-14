@@ -10,6 +10,9 @@ declare const __dirname: string;
 
 const entryPath = resolve(__dirname, 'styles.css');
 const entry = readFileSync(entryPath, 'utf-8');
+const componentStyles = readFileSync(resolve(__dirname, 'styles/components.css'), 'utf-8');
+const featureStyles = readFileSync(resolve(__dirname, 'styles/features.css'), 'utf-8');
+const shellStyles = readFileSync(resolve(__dirname, 'styles/shell.css'), 'utf-8');
 const expectedImports = [
   './styles/tokens.css',
   './styles/base.css',
@@ -56,5 +59,27 @@ describe('ordered stylesheet layers', () => {
     expect(sources).toContain('--accent: #078b5b;');
     expect(sources).toContain('.workflow-shell[data-active-view="reader"] .reader-text-mode-switcher {');
     expect(sources).toContain('max-height: min(58dvh, calc(100dvh - 240px), 620px);');
+  });
+
+  it('keeps the login CTA override after the generic action owner', () => {
+    const genericMinimum = componentStyles.indexOf('min-height: 38px;');
+    const loginOverride = componentStyles.indexOf('.login-panel .primary-action {');
+
+    expect(genericMinimum).toBeGreaterThan(-1);
+    expect(loginOverride).toBeGreaterThan(genericMinimum);
+    expect(componentStyles.slice(loginOverride, loginOverride + 120)).toContain('min-height: 48px;');
+    expect(shellStyles).not.toContain('.login-panel .primary-action {');
+  });
+
+  it('keeps desktop provider table sizing with the feature owner after its base sizing', () => {
+    const baseTable = featureStyles.indexOf('.providers-management-table {\n  font-size: 12px;\n  min-width: 800px;');
+    const desktopTable = featureStyles.indexOf(
+      '.workflow-management-view .providers-management-table {\n    font-size: 11.5px;\n    min-width: 660px;',
+    );
+
+    expect(baseTable).toBeGreaterThan(-1);
+    expect(desktopTable).toBeGreaterThan(baseTable);
+    expect(featureStyles.lastIndexOf('@media (min-width: 821px) {', desktopTable)).toBeGreaterThan(baseTable);
+    expect(shellStyles).not.toContain('.workflow-management-view .providers-management-table {');
   });
 });
