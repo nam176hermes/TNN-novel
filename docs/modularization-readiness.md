@@ -4,6 +4,9 @@
 
 Further division is justified, but only after the measured P1 correctness/performance fixes and a new green commit. Line count alone is not the reason; measured change risk, optional feature loading, duplicate requests, and transaction behavior are.
 
+P2C has now established the approved first boundaries. This document remains a
+readiness guide for subsequent work, not permission for a one-shot split.
+
 ## ReaderView
 
 - Current: 5,251 lines and 181.73 KB route chunk.
@@ -12,6 +15,13 @@ Further division is justified, but only after the measured P1 correctness/perfor
 - Dependency direction: controller -> data hooks and presentational feature modules; optional panels depend on narrow client interfaces, never on the controller.
 - Sequence: fix request ownership and raw contract, add integration/performance tests, extract pure mode/QA logic, then lazy-load panels.
 - Risk: high. Do after P1 fixes, not during this audit.
+
+P2C result: TOC ownership is in `ReaderTocSheet`/`useReaderToc`; presentational
+chrome and settings composition are in `ReaderChrome`/`ReaderQuickControls`;
+audio state is in `useReaderAudio` with lazy `ReaderAudioFeature`; offline cache
+state is in `useReaderOfflineCache`. `ReaderView` still owns selected
+book/chapter, fetching, progress, rendering, annotations, AI/X-Ray, and opening
+feature surfaces. Further optional-panel work remains recommendation-only.
 
 ## ImportPanel
 
@@ -29,6 +39,12 @@ Further division is justified, but only after the measured P1 correctness/perfor
 - Sequence: add query-count/transaction tests, implement aggregate library query, make migrations startup-scoped, extract one repository at a time, retain service APIs.
 - Risk: high. Performance fixes should establish seams before broad extraction.
 
+P2C result: `connection`, `auth_repository`, `operations_repository`, and
+`reader_repository` are authoritative behind `db.py` compatibility exports.
+`ContentFileService` and `ReaderService` are composed by `PipelineService`, and
+the QA runtime cycle is replaced by `ChapterContentReader`. Book/import and the
+other repository domains remain intentionally in place.
+
 ## CSS
 
 - Current: 12,236 lines and 188.78 KB global payload.
@@ -37,6 +53,21 @@ Further division is justified, but only after the measured P1 correctness/perfor
 - Sequence: add screenshot/interaction regressions, consolidate mobile cascade conflicts, then split without visual changes.
 - Risk: medium-high due cascade order.
 
+P2C result: `styles.css` declares the fixed cascade order and imports tokens,
+base, shell, shared components/features, Reader, Library, Import, Operations,
+and utilities. Feature media queries are colocated with their owning feature
+file. Selector names were preserved; no route-lazy CSS or redesign was added.
+
 ## Keep Unchanged Now
 
 - Existing reader state modules, API client method boundaries, TTS chunker/normalizer/audio QA modules, authentication/session design, protected file routes, and source policy modules already have useful domain boundaries.
+
+## Remaining limits
+
+- The backup runner and retention scheduler are process-local, not a durable
+  multi-node worker system.
+- App shell and ImportPanel remain large surfaces.
+- `db.py` and `PipelineService` remain compatibility facades and still contain
+  domains outside the P2C scope.
+- Reader annotations/AI/X-Ray/rendering remain in the route controller.
+- CSS is layered but still eagerly loaded as one deterministic manifest.

@@ -26,6 +26,10 @@ Normal `get_connection(db_path)` work:
 
 Normal connections do not run schema checks, migrations, backfills, default seeding, index creation, WAL negotiation, or commits merely because a connection was opened.
 
+`app/database/connection.py` is the authoritative connection primitive.
+`app/database/db.py` keeps a compatibility re-export so existing callers retain
+the same object identity while imports migrate.
+
 ## Startup Ordering
 
 Initialization configures WAL, creates the migration registry, runs the additive legacy migration once, applies the canonical schema, seeds required defaults, backfills ownership, records the current schema version, and commits.
@@ -47,6 +51,41 @@ Retention is not a request-path fallback. It snapshots an initial row-count budg
 The default bounds are 30 days/5,000 rows for revoked or expired auth sessions, 30 days/5,000 rows for login failures, and 90 days/50,000 rows for operational events. All eight retention settings are positive validated environment integers; zero and negative values are rejected.
 
 Concurrent processes may attempt the same idempotent cleanup. A SQLite busy or locked result skips the run safely and retries on the next interval without blocking API startup. Committed deletion counts whose audit insert is interrupted remain pending in the process-local service and are finalized exactly once on a later run. Event pruning reserves one configured row for that count-only audit, so inserting it does not exceed the operational-event cap; a zero-delete run produces no event. Authenticated status performs count queries only and exposes no paths, SQL, row values, exception text, or secrets.
+
+Environment controls and approved defaults:
+
+| Setting | Default |
+| --- | ---: |
+| `AUTH_SESSION_RETENTION_DAYS` | 30 |
+| `AUTH_SESSION_RETENTION_MAX_ROWS` | 5,000 |
+| `AUTH_LOGIN_FAILURE_RETENTION_DAYS` | 30 |
+| `AUTH_LOGIN_FAILURE_RETENTION_MAX_ROWS` | 5,000 |
+| `OPERATIONAL_EVENT_RETENTION_DAYS` | 90 |
+| `OPERATIONAL_EVENT_RETENTION_MAX_ROWS` | 50,000 |
+| `OPERATIONAL_RETENTION_BATCH_SIZE` | 500 |
+| `OPERATIONAL_RETENTION_INTERVAL_SECONDS` | 21,600 |
+
+All are positive validated integers. Retention runs once after startup and then
+at the configured interval. It never runs as a login, list, status, or other
+request side effect. A run that deletes rows records one sanitized
+`operational_retention` event containing counts only; zero-delete runs do not
+create an event.
+
+Do not point tests or ad-hoc retention commands at the operator database.
+Operator apply is a separate maintenance action requiring a fresh safety
+snapshot, reviewed configuration, and rollback backup.
+
+## Repository ownership
+
+- `connection.py`: connection creation and per-connection pragmas;
+- `auth_repository.py`: auth sessions and login failures;
+- `operations_repository.py`: operational events and bounded retention SQL;
+- `reader_repository.py`: Reader progress, annotations, AI/dictionary cache,
+  X-Ray entities/mentions, and timeline queries.
+
+`db.py` remains the compatibility facade. Schema initialization, books,
+chapters, glossary, sources, TTS, and import transaction ownership remain in
+their existing seams; P2C did not rename/split tables or introduce an ORM.
 
 ## Entry Points
 

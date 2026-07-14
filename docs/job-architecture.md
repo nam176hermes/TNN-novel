@@ -6,6 +6,8 @@ single operator and avoids external queue dependencies.
 ## Current Architecture
 
 - FastAPI request handlers create job rows in `mobile_jobs`.
+- System-backup creation returns `202 Accepted` after creating a `backup` job;
+  archive work does not run in the request handler.
 - `JobTracker.start_background_task()` claims a queued job with a SQLite lease.
 - The claimed coroutine runs in the current API process.
 - Long blocking work is offloaded with `asyncio.to_thread()` where practical.
@@ -49,6 +51,11 @@ frontend code:
 - `SAVING_CHAPTER`
 - `GENERATING_TTS`
 - `EXPORTING`
+- `PREPARING_BACKUP`
+- `WRITING_BACKUP`
+- `VALIDATING_BACKUP`
+- `ENCRYPTING_BACKUP`
+- `PUBLISHING_BACKUP`
 - `COMPLETED`
 - `FAILED`
 - `CANCELED`
@@ -115,6 +122,13 @@ cancel-check callbacks into their chunk loops where supported. If the in-process
 task still exists, the tracker also cancels it so the job can stop promptly.
 Partial outputs are left in place and the job moves to `cancelled` / `CANCELED`.
 
+Backup cancellation is stricter than the generic partial-output rule. The
+archive builder checks cancellation between bounded member operations and
+keeps partial names in a private staging directory. Cancellation before final
+publication leaves no final archive or sidecar. If cancellation arrives while
+a blocking worker thread is active, the coordinator drains that worker before
+releasing the per-backup-directory lock or discarding its in-memory secret.
+
 Cancel is cooperative. A provider HTTP call or other blocking function already
 running in a worker thread may finish its current call before noticing cancel.
 The worker preserves `CANCELED` if the cancel flag was already set.
@@ -131,6 +145,25 @@ chapter has a translated-like status. TTS failed-chunk retry only resets failed
 or QA-failed chunks; completed chunk files are reused. Export is still a
 request/download service rather than a durable export job, so partial export
 retry is limited to regenerating the file through the export endpoint.
+
+Backup jobs are not accepted by the translation retry endpoint. To retry a
+plain backup, submit a new authenticated `POST /api/system/backups`; the new
+job receives a collision-resistant filename and cannot overwrite a completed
+archive. To retry an encrypted/secrets backup, submit a new request and enter
+the passphrase again. The passphrase is intentionally unavailable after the
+original process or job ends.
+
+## Backup Credential Lifecycle
+
+Persisted backup job parameters contain only booleans for included modules and,
+after success, a safe archive filename. A backup passphrase is kept in a
+locked, process-local, take-once store with a short expiry. It is not written to
+SQLite, job logs, audit details, API responses, or error messages.
+
+Restarting the API loses that store by design. A queued/running encrypted
+backup is then interrupted or fails with a fixed safe credential-expired
+message. There is no automatic encrypted retry: the authenticated operator must
+queue a new backup and supply the passphrase again.
 
 ## Restart Recovery
 
@@ -171,6 +204,8 @@ replace the in-process runner with a queue that has built-in retention policy.
 ## Known Limitations
 
 - The runner is still in-process and single-operator oriented.
+- Process restart does not resume archive construction; encrypted backup
+  credentials are deliberately lost and must be resubmitted.
 - Exact translation chunk progress is estimated until the translation engine
   exposes chunk callbacks.
 - Cancel is cooperative and cannot kill an already-running provider request in a

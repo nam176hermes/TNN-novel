@@ -2,7 +2,11 @@
 
 ## Implementation Note
 
-Current reader code lives mainly in `web/src/components/ReaderView.tsx`, with supporting panels under `web/src/components/reader/`. The reader receives book/chapter state from the app shell, loads chapter translation/raw content through the existing API client, and stores local reader settings in `localStorage`.
+`web/src/components/ReaderView.tsx` remains the route-level controller. Focused
+modules under `web/src/components/reader/` now own TOC, chrome/settings, audio,
+and offline-cache state. The reader receives book/chapter state from the app
+shell, loads chapter translation/raw content through the existing API client,
+and stores local reader settings in `localStorage`.
 
 Existing reader behavior before this phase already included:
 
@@ -16,6 +20,30 @@ Existing reader behavior before this phase already included:
 - Reader dictionary, AI/X-Ray, audio controls, and offline cache controls.
 
 This phase keeps the data model and backend reader APIs intact. It adds reader UX/state around content modes and QA visibility only.
+
+## P2C feature ownership
+
+- `types.ts` and `readerSettings.ts`: shared Reader types and settings
+  persistence;
+- `ReaderTocSheet.tsx` and `useReaderToc.ts`: query, order, current-item focus,
+  first/latest navigation, and chapter selection UI;
+- `ReaderChrome.tsx`: labelled exit, title, immersive visibility, and
+  previous/current/next chapter navigation;
+- `ReaderQuickControls.tsx`: content-mode and settings composition plus local
+  panel UI state;
+- `useReaderAudio.ts` and lazy `ReaderAudioFeature.tsx`: job polling,
+  cancellation/error handling, playlist/cached URL selection, auto-next,
+  mini-player and audio-sheet presentation;
+- `useReaderOfflineCache.ts`: cache manifest/status, cache/remove operations,
+  cached chapter/audio URL lookup, service-worker messages, and cleanup.
+
+`ReaderView` still owns selected book/chapter, chapter/API loading, reading
+progress, core rendering, annotations and AI/X-Ray integration. Feature hooks do
+not fetch duplicate chapter content or introduce a second cache format.
+
+The audio feature uses `React.lazy`; importing/rendering ReaderView without
+opening audio does not eagerly load the feature module. Reader CSS remains in
+the fixed global layer manifest so cascade order is deterministic.
 
 ## Reader Modes
 
@@ -103,3 +131,7 @@ Parallel mode still stacks to one column on narrow screens through existing resp
 - QA badges are derived from available report fields. If a QA report lacks paragraph indexes/source terms, badges may attach to the first paragraph.
 - Dedicated translation issue reporting is postponed to avoid introducing a new backend workflow in this reader-focused phase.
 - Server-side reader preferences are not introduced; settings remain per browser/device.
+- ReaderView is smaller but remains a large controller; annotations, AI/X-Ray,
+  search, dictionary and text rendering were not redesigned in P2C.
+- Offline cache format/storage keys and best-effort paragraph alignment are
+  intentionally unchanged.

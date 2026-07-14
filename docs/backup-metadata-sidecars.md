@@ -92,6 +92,15 @@ Run the isolated benchmark on a Linux filesystem:
 
 The benchmark creates synthetic fixtures only. It reports directory time, sidecar-read time, total service time, bytes read, response size, and archive-open count. The acceptance gate is zero archive opens and a current warm list below 250 ms.
 
-## Compatibility and remaining work
+## Compatibility and background creation
 
-The internal `manifest.json`, backup archive format, authenticated download route, restore command, and restore drill are unchanged. System backup creation remains synchronous; moving creation to a durable job is `RECOMMENDATION_ONLY` for P2C and is outside P1A.
+The internal `manifest.json`, backup archive format, authenticated download
+route, restore command, and restore drill are unchanged. P2C moved API backup
+creation behind the existing SQLite-tracked in-process job runner: the POST
+returns `202`, final publication remains staged/atomic, and the listing contract
+continues to read only sidecar/stat metadata.
+
+The runner is not an external durable queue. Process loss interrupts current
+work rather than resuming it. Encrypted job passphrases are intentionally
+process-local and are lost on restart; the operator must submit a new request.
+This limitation does not affect sidecar compatibility or explicit repair.

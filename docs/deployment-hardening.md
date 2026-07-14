@@ -268,6 +268,17 @@ System backup routes are authenticated only:
 - `POST /api/system/backups`
 - `GET /api/system/backups/{filename}/download`
 
+Backup creation is job-backed. The POST returns `202 Accepted` with a safe job
+id and does not build an archive inside the request. The Status UI polls the
+existing authenticated job endpoint, offers cooperative cancel while the job
+is active, and reloads the sidecar-only list after completion.
+
+The encryption passphrase is process-local, take-once, and never persisted in
+job parameters or logs. Restarting the API deliberately loses it. An
+interrupted encrypted/secrets backup must be queued again with a newly entered
+passphrase; never attempt to recover it from SQLite or server logs. Plain retry
+also creates a new backup job and cannot overwrite an existing archive.
+
 Normal backup listing is metadata-only. It may read safe filename/stat data and a bounded adjacent sidecar, but must not open, decompress, decrypt, checksum, or walk an archive. Missing or invalid sidecars are entry-specific warnings and cannot block the core Status page or other backup entries. Only `READY` entries receive a protected download action.
 
 Rules:
@@ -277,10 +288,19 @@ Rules:
 - `.env` and provider secrets are excluded by default
 - secrets backup requires encryption passphrase
 - restore stays a documented CLI workflow, not a one-click public UI action
+- final archive names appear only after staged validation/publication; partial
+  and staging names remain unlistable and undownloadable
 
 Run restore drills regularly and keep backups outside any public static root.
 
 Legacy sidecar repair is never triggered by the browser. Rehearse and invoke the dry-run-first operator command documented in [`docs/backup-metadata-sidecars.md`](backup-metadata-sidecars.md). Do not supply passphrases on the command line, do not overwrite valid sidecars without explicit review, and verify archive hashes before and after repair.
+
+P2C rollback uses the commit boundaries in
+[`docs/backup-restore.md`](backup-restore.md#p2c-rollback-boundaries). Stop the
+app, take a verified rollback backup, revert only the newest affected seam, and
+rerun its focused tests before restart. P2C did not change the backup/restore
+format or database schema, so rollback must not delete archives or run downgrade
+SQL.
 
 ## Sessions, Refresh Tokens, and Password Changes
 
@@ -390,6 +410,12 @@ Job interrupted before completion
 This prevents jobs from staying permanently `running`. Failed or interrupted translation jobs can be retried from the Trạng thái page or by calling `POST /api/jobs/{job_id}/retry`. The retry creates a new attempt from the saved job targets/config and skips chapters that already have a completed readable translation.
 
 Known limitation: this is a SQLite lease around the existing in-process job runner, not a full durable queue. It improves duplicate protection and stale-job recovery for single-operator use, but it does not resume a partially executed coroutine after process death. A real worker queue is still required for production-grade multi-user reliability.
+
+The same limitation applies to system backups and scheduled metadata retention:
+both run in the API process. Retention retries SQLite busy/locked work at the
+next interval, and its pending count-only audit recovery is process-local; a
+hard process loss can therefore lose that pending audit summary even though
+already committed deletions remain committed.
 
 ## Operational Status
 

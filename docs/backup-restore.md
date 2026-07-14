@@ -262,3 +262,50 @@ These routes:
 - never expose raw absolute filesystem paths
 - exclude secrets by default
 - require an encryption passphrase when secrets are included
+
+`POST /api/system/backups` returns HTTP `202 Accepted` with a safe job payload:
+
+```json
+{"job_id":"...","status":"queued","message":"Backup queued"}
+```
+
+The request performs validation and scheduling only. The frontend follows the
+existing authenticated job-status stream, shows queued/running progress, and
+reloads the metadata-only backup list only after the job reaches `completed`.
+Cancel uses the normal authenticated job-cancel route. A failed, cancelled, or
+interrupted backup remains entry-specific and does not block system status or
+listing other backups.
+
+Retry always means queueing a new backup request. Plain backups may be queued
+again with the same options. Encrypted or secrets-included backups require the
+operator to enter the passphrase again; do not use the translation-job retry
+route. Backup names are reserved without overwrite, so a retry cannot replace
+an existing completed archive.
+
+The passphrase exists only in process memory, is taken once by the worker, and
+is discarded after the worker finishes. It is never part of persisted job
+parameters. A process restart deliberately loses it, so an interrupted
+encrypted backup cannot resume and must be submitted again.
+
+Publication remains same-filesystem and staged: validate the archive, publish
+the archive with no-clobber semantics, then publish the sidecar. Before archive
+publication, failure/cancel cleans owned staging files. If only sidecar
+publication fails after a valid archive is visible, keep the archive and repair
+its `METADATA_MISSING` state through the explicit dry-run-first tool.
+
+## P2C rollback boundaries
+
+P2C was delivered as narrow commits so an operator can revert the failing seam
+without changing archive/restore format:
+
+- backup API/jobs: `b77fa38` through `04ad491`;
+- retention and repository foundations: `38156ce` through `56534d9`;
+- Reader feature ownership: `31093ba` through `987aea0`;
+- CSS layers/features: `46759eb` through `2a77755`;
+- Reader database/content services: `6c2ba0a` and `9f47a41`.
+
+Use `git revert <commit>` from newest affected commit backward. Never delete
+published archives during rollback. Before deploying a rollback, stop the app,
+create and verify a fresh backup through the established operator workflow,
+then run the focused tests for that seam. Database schema and restore format did
+not change in P2C, so no data downgrade or restore-format conversion is needed.

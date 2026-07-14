@@ -4,7 +4,27 @@
 
 Yes, the code should be divided further, but only along measured responsibility and test boundaries. A rewrite or line-count-driven split is not justified. P2A and P2B proved that high-value performance fixes can be delivered through narrow seams while preserving the current architecture.
 
-## Evidence
+## P2C status
+
+P2C implemented the first approved seams without a broad rewrite:
+
+- database connection, auth, operations, and Reader repositories now have one
+  authoritative module each, with identity-compatible exports from `db.py`;
+- `ContentFileService` owns bounded artifact reads and `ReaderService` owns
+  Reader progress/annotation/content orchestration; `PipelineService` preserves
+  existing method signatures through delegates;
+- `QAService` consumes the narrow `ChapterContentReader` protocol and no longer
+  imports `PipelineService` at runtime;
+- Reader TOC, chrome/quick controls, lazy audio, and offline cache state live in
+  focused modules while `ReaderView` remains the route/data controller;
+- `styles.css` is an ordered layer/import manifest and feature rules, including
+  responsive rules, are owned by feature stylesheets.
+
+These are compatibility facades, not duplicate implementations. Books/import,
+glossary, sources, TTS, App-shell orchestration, and ImportPanel remain future
+seams and must not be moved only to reduce line count.
+
+## Baseline evidence before P2C
 
 | Module | Lines | Approx. functions | Why it matters |
 |---|---:|---:|---|
@@ -106,3 +126,17 @@ The local import graph also contains a direct circular dependency: `pipeline_ser
 ## Acceptance Rule
 
 Each extraction must preserve API contracts, full verification, E2E library-to-Reader/import workflows, security tests, and measured route performance. No phase should combine behavior changes with broad file movement.
+
+## P2C rollback map
+
+Revert only the affected seam, newest commit first:
+
+- backup: `b77fa38..04ad491`;
+- retention/repository foundation: `38156ce..56534d9`;
+- Reader modules: `31093ba..987aea0`;
+- CSS ownership: `46759eb..2a77755`;
+- Reader repository/services: `6c2ba0a..9f47a41`.
+
+All P2C extractions preserve the schema and public routes except the documented
+backup POST `202` contract. Rollback therefore uses `git revert`, focused tests,
+and a normal redeploy; it does not require database downgrade SQL.
