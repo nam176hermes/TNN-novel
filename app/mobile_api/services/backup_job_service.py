@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from app.database.db import record_operational_event
+from app.database.db import get_mobile_job, record_operational_event
 from app.mobile_api.services.backup_service import BackupService
 from app.mobile_api.services.job_service import JobTracker
 from scripts.ops import BackupCancelled
@@ -144,7 +144,8 @@ class BackupJobCoordinator:
         *,
         job_id: str,
         result: str,
-        include_secrets: bool,
+        encrypted: bool,
+        secrets_included: bool,
         started_at: float,
         backup_filename: str = "",
     ) -> None:
@@ -155,8 +156,8 @@ class BackupJobCoordinator:
         duration_ms = min(int(elapsed_seconds * 1000), BACKUP_DURATION_MAX_MS)
         details: dict[str, object] = {
             "result": result,
-            "encrypted": include_secrets,
-            "secrets_included": include_secrets,
+            "encrypted": encrypted,
+            "secrets_included": secrets_included,
             "duration_ms": duration_ms,
         }
         if backup_filename:
@@ -176,6 +177,16 @@ class BackupJobCoordinator:
         except Exception:
             logger.warning("Failed to record terminal backup event for job %s", job_id)
 
+    def _update_terminal_job(self, job_id: str, *, status: str, **changes: object) -> bool:
+        try:
+            return self.tracker.update_job(job_id, status=status, **changes)
+        except Exception:
+            persisted = get_mobile_job(self.tracker.db_path, job_id) if self.tracker.db_path else None
+            if not persisted or persisted.get("status") != status:
+                raise
+            logger.warning("Job %s terminal state persisted but auxiliary recording failed", job_id)
+            return True
+
     async def _run_backup_job(self, job_id: str) -> None:
         started_at = time.monotonic()
         directory = self.backup_service.backup_dir.resolve()
@@ -185,7 +196,7 @@ class BackupJobCoordinator:
                 job = self.tracker.get_job(job_id)
                 include_secrets = bool(job and job.params.get("include_secrets"))
                 if self._cancel_requested(job_id):
-                    self.tracker.update_job(
+                    self._update_terminal_job(
                         job_id,
                         status="cancelled",
                         message="Backup cancelled",
@@ -194,14 +205,17 @@ class BackupJobCoordinator:
                     self._record_terminal_event(
                         job_id=job_id,
                         result="cancelled",
-                        include_secrets=include_secrets,
+                        # Cancellation has no completed artifact metadata, so
+                        # request intent is the authoritative safe fallback.
+                        encrypted=include_secrets,
+                        secrets_included=include_secrets,
                         started_at=started_at,
                     )
                     return
 
                 credential = self.secret_store.take(job_id) if include_secrets else ""
                 if include_secrets and not credential:
-                    self.tracker.update_job(
+                    self._update_terminal_job(
                         job_id,
                         status="failed",
                         error=BACKUP_SECRET_EXPIRED_DETAIL,
@@ -210,7 +224,8 @@ class BackupJobCoordinator:
                     self._record_terminal_event(
                         job_id=job_id,
                         result="failed",
-                        include_secrets=True,
+                        encrypted=True,
+                        secrets_included=True,
                         started_at=started_at,
                     )
                     return
@@ -249,7 +264,7 @@ class BackupJobCoordinator:
                                 pass
                         raise BackupCancelled("Backup cancelled") from None
                 except BackupCancelled:
-                    self.tracker.update_job(
+                    self._update_terminal_job(
                         job_id,
                         status="cancelled",
                         message="Backup cancelled",
@@ -258,13 +273,14 @@ class BackupJobCoordinator:
                     self._record_terminal_event(
                         job_id=job_id,
                         result="cancelled",
-                        include_secrets=include_secrets,
+                        encrypted=include_secrets,
+                        secrets_included=include_secrets,
                         started_at=started_at,
                     )
                     return
                 except Exception:
                     logger.error("Backup job %s failed", job_id)
-                    self.tracker.update_job(
+                    self._update_terminal_job(
                         job_id,
                         status="failed",
                         error=BACKUP_FAILURE_DETAIL,
@@ -273,14 +289,17 @@ class BackupJobCoordinator:
                     self._record_terminal_event(
                         job_id=job_id,
                         result="failed",
-                        include_secrets=include_secrets,
+                        # Failure has no completed artifact metadata, so request
+                        # intent is the authoritative safe fallback.
+                        encrypted=include_secrets,
+                        secrets_included=include_secrets,
                         started_at=started_at,
                     )
                     return
 
                 filename = _backup_basename(item.get("filename"))
                 completed_params = {**params, "backup_filename": filename}
-                self.tracker.update_job(
+                self._update_terminal_job(
                     job_id,
                     status="completed",
                     progress=BACKUP_TOTAL_STEPS,
@@ -291,9 +310,26 @@ class BackupJobCoordinator:
                 self._record_terminal_event(
                     job_id=job_id,
                     result="completed",
-                    include_secrets=include_secrets,
+                    encrypted=bool(item.get("encrypted")),
+                    secrets_included=bool(item.get("secrets_included")),
                     started_at=started_at,
                     backup_filename=filename,
                 )
+        except asyncio.CancelledError:
+            job = self.tracker.get_job(job_id)
+            include_secrets = bool(job and job.params.get("include_secrets"))
+            self._update_terminal_job(
+                job_id,
+                status="cancelled",
+                message="Backup cancelled",
+                cancel_requested=True,
+            )
+            self._record_terminal_event(
+                job_id=job_id,
+                result="cancelled",
+                encrypted=include_secrets,
+                secrets_included=include_secrets,
+                started_at=started_at,
+            )
         finally:
             self.secret_store.discard(job_id)
