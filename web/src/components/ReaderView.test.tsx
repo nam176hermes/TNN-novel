@@ -3251,7 +3251,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
     await userEvent.click(screen.getByRole('button', { name: 'Nghe audio chương' }));
 
-    const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+    const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
     expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
       'src',
       'http://test/api/books/42/chapters/102/audio',
@@ -3307,7 +3307,7 @@ describe('ReaderView', () => {
     await waitFor(() => expect(apiClient.getBookAudioPlaylist).toHaveBeenCalledWith(42));
     await userEvent.click(await screen.findByRole('button', { name: 'Nghe audio chương' }));
 
-    const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+    const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
     expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
       'src',
       '/api/books/42/chapters/102/audio',
@@ -3344,7 +3344,7 @@ describe('ReaderView', () => {
       await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
       await userEvent.click(screen.getByRole('button', { name: 'Nghe audio chương' }));
 
-      const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+      const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
       await waitFor(() => expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
         'src',
         'blob:reader-audio-102',
@@ -3409,7 +3409,7 @@ describe('ReaderView', () => {
 
     await userEvent.click(within(panel).getByRole('button', { name: 'Nghe audio' }));
 
-    expect(screen.getByRole('region', { name: 'Audio chương' })).toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Audio chương' })).toBeInTheDocument();
   });
 
   it('warns about QA FAIL and Chinese leakage before starting reader TTS', async () => {

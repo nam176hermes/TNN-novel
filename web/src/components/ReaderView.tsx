@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   BookOpenText,
   Bookmark,
@@ -12,9 +12,7 @@ import {
 } from 'lucide-react';
 import type { ApiClient } from '../api/client';
 import type {
-  BookAudioPlaylistItem,
   Chapter,
-  JobStatus,
   QaReport,
   ReaderAnnotationExportFormat,
   ReaderAnnotationImportItem,
@@ -28,7 +26,6 @@ import type {
   ReaderSearchResult,
   ReaderXrayResponse,
   ReaderXraySpoilerMode,
-  TtsJobStatus,
   TranslatedBookSummary,
 } from '../api/types';
 import coverDocTu from '../assets/reference-ui/cover-doc-tu-clean.png';
@@ -114,7 +111,7 @@ import {
   type ReaderRichBlock,
 } from '../state/readerRichContent';
 import { searchCurrentChapter, type ReaderSearchOptions } from '../state/readerSearch';
-import ReaderAudioBar from './reader/ReaderAudioBar';
+import ReaderAudioSummary from './reader/ReaderAudioSummary';
 import ReaderDictionaryPanel from './reader/ReaderDictionaryPanel';
 import ReaderMarksPanel, { type ReaderMarkPanelItem } from './reader/ReaderMarksPanel';
 import ReaderAiPanel, { type ReaderAiPanelMode } from './reader/ReaderAiPanel';
@@ -137,6 +134,7 @@ import ReaderSelectionPopover, { type ReaderSelectionAction } from './reader/Rea
 import ReaderTocSheet, { type TocChapterPreview } from './reader/ReaderTocSheet';
 import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichBlock } from './reader/ReaderTextSurface';
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
+import { useReaderAudio } from './reader/useReaderAudio';
 import {
   loadReaderSettings,
   loadReaderTextMode,
@@ -150,6 +148,23 @@ import type {
   ReaderTheme,
   ReaderWidth,
 } from './reader/types';
+
+const ReaderAudioFeature = lazy(() => import('./reader/ReaderAudioFeature'));
+
+export function ReaderAudioFeatureBoundary({
+  active,
+  audio,
+}: {
+  active: boolean;
+  audio: ReturnType<typeof useReaderAudio>;
+}) {
+  if (!active) return null;
+  return (
+    <Suspense fallback={null}>
+      <ReaderAudioFeature audio={audio} />
+    </Suspense>
+  );
+}
 
 export type ReaderApiClient = Pick<
   ApiClient,
@@ -467,110 +482,6 @@ const readerAnnotationExportScopes: Array<{ kind: ReaderAnnotationKind | null; l
   { kind: 'highlight', label: 'Highlights' },
   { kind: 'note', label: 'Notes' },
 ];
-const FAILED_TTS_STATUSES = new Set(['failed', 'error', 'qa_failed']);
-const COMPLETE_TTS_STATUSES = new Set(['completed', 'done', 'success']);
-const CANCELABLE_JOB_STATUSES = new Set([
-  'queued',
-  'pending',
-  'claimed',
-  'running',
-  'retrying',
-  'generating_tts',
-  'loading_source',
-  'cleaning_text',
-  'splitting_chunks',
-  'translating',
-  'qa_checking',
-  'exporting',
-]);
-
-type ReaderAudioJobKind = 'audio' | 'audiobook';
-
-function shortJobId(jobId: string): string {
-  return jobId.trim().slice(0, 8);
-}
-
-function sanitizeAudioErrorText(value: string): string {
-  return value
-    .replace(/sk-[A-Za-z0-9_-]{6,}/gi, '[redacted]')
-    .replace(/\b[A-Z][A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\b/g, '[redacted]')
-    .replace(/\/(?:home|Users|mnt|tmp|var|srv|app|root)\/[^\s'",)<]+/gi, '[path]')
-    .replace(/[A-Za-z]:\\[^\s'",)<]+/g, '[path]');
-}
-
-function friendlyAudioError(message: string, fallback = 'TTS thất bại. Kiểm tra cấu hình audio và log server.'): string {
-  const cleaned = sanitizeAudioErrorText(message).toLowerCase();
-  if (!cleaned.trim()) return fallback;
-  if (cleaned.includes('ffmpeg')) {
-    return 'Thiếu ffmpeg hoặc ffmpeg không chạy được. Cài ffmpeg rồi chạy lại audio.';
-  }
-  if (
-    cleaned.includes('checkpoint')
-    || cleaned.includes('ckpt')
-    || cleaned.includes('vocab')
-    || cleaned.includes('model')
-    || cleaned.includes('hugging face')
-  ) {
-    return 'Thiếu model TTS hoặc file cấu hình. Kiểm tra TTS_CKPT_FILE/TTS_VOCAB_FILE trên server.';
-  }
-  if (cleaned.includes('cuda') || cleaned.includes('gpu') || cleaned.includes('out of memory')) {
-    return 'Thiết bị TTS không sẵn sàng. Kiểm tra CUDA/GPU hoặc chuyển TTS_DEVICE=cpu.';
-  }
-  if (cleaned.includes('already running') || cleaned.includes('job already')) {
-    return 'Đã có job audio đang chạy. Đợi job hiện tại xong hoặc mở trang Tác vụ để kiểm tra.';
-  }
-  if (cleaned.includes('artifact') || cleaned.includes('not found') || cleaned.includes('no audio')) {
-    return 'Chưa có file audio để nghe hoặc tải. Hãy tạo audio trước.';
-  }
-  if (cleaned.includes('provider') || cleaned.includes('unauthorized') || cleaned.includes('forbidden')) {
-    return 'Provider TTS không sẵn sàng. Kiểm tra cấu hình provider trên server.';
-  }
-  if (cleaned.includes('chunk')) {
-    return 'Một hoặc nhiều đoạn audio bị lỗi. Có thể chạy lại các chunk lỗi.';
-  }
-  return fallback;
-}
-
-function audioErrorFromUnknown(error: unknown, fallback: string): string {
-  if (error instanceof Error) return friendlyAudioError(error.message, fallback);
-  if (typeof error === 'string') return friendlyAudioError(error, fallback);
-  return fallback;
-}
-
-function failedTtsChunkCount(ttsJob: TtsJobStatus | null): number {
-  return (ttsJob?.chunks ?? []).filter((chunk) => (
-    FAILED_TTS_STATUSES.has(chunk.status.toLowerCase())
-    || (chunk.qa_status ? FAILED_TTS_STATUSES.has(chunk.qa_status.toLowerCase()) : false)
-  )).length;
-}
-
-function completedTtsChunkCount(ttsJob: TtsJobStatus | null): number {
-  return (ttsJob?.chunks ?? []).filter((chunk) => (
-    COMPLETE_TTS_STATUSES.has(chunk.status.toLowerCase())
-  )).length;
-}
-
-function audioJobProgressPercent(job: JobStatus | null, ttsJob: TtsJobStatus | null): number | null {
-  if (typeof ttsJob?.progress === 'number' && Number.isFinite(ttsJob.progress)) {
-    return Math.max(0, Math.min(100, Math.round(ttsJob.progress)));
-  }
-  if (job && Number.isFinite(job.progress) && Number.isFinite(job.total) && job.total > 0) {
-    return Math.max(0, Math.min(100, Math.round((job.progress / job.total) * 100)));
-  }
-  return null;
-}
-
-function audioJobFailureReason(job: JobStatus | null, ttsJob: TtsJobStatus | null): string {
-  if (ttsJob?.error_message) return ttsJob.error_message;
-  const failedChunk = (ttsJob?.chunks ?? []).find((chunk) => (
-    FAILED_TTS_STATUSES.has(chunk.status.toLowerCase()) && Boolean(chunk.error_message)
-  ));
-  if (failedChunk?.error_message) return failedChunk.error_message;
-  if (job?.error) return job.error;
-  if (job?.status.toLowerCase() === 'failed') return job.message;
-  return '';
-}
-
 function readerProgressSnapshotToSyncProgress(snapshot: ReaderProgressSnapshot): ReaderSyncProgress {
   const progress: ReaderSyncProgress = {
     chapter_id: snapshot.chapterId,
@@ -1688,20 +1599,6 @@ export default function ReaderView({
   const [dictionaryDeletingFilename, setDictionaryDeletingFilename] = useState('');
   const [dictionaryUploadLoading, setDictionaryUploadLoading] = useState(false);
   const [dictionaryUploadStatus, setDictionaryUploadStatus] = useState('');
-  const [audioOpen, setAudioOpen] = useState(false);
-  const [audioAutoNext, setAudioAutoNext] = useState(false);
-  const [audioJobLoading, setAudioJobLoading] = useState(false);
-  const [audioJobStatus, setAudioJobStatus] = useState('');
-  const [audioJobError, setAudioJobError] = useState('');
-  const [audioJobId, setAudioJobId] = useState('');
-  const [audioJobKind, setAudioJobKind] = useState<ReaderAudioJobKind>('audio');
-  const [audioBulkConfirmOpen, setAudioBulkConfirmOpen] = useState(false);
-  const [audioJobSnapshot, setAudioJobSnapshot] = useState<JobStatus | null>(null);
-  const [audioTtsSnapshot, setAudioTtsSnapshot] = useState<TtsJobStatus | null>(null);
-  const [audioJobRefreshing, setAudioJobRefreshing] = useState(false);
-  const [audioPlaylist, setAudioPlaylist] = useState<BookAudioPlaylistItem[]>([]);
-  const [audioPlaylistError, setAudioPlaylistError] = useState('');
-  const [cachedAudioUrl, setCachedAudioUrl] = useState('');
   const [readerCoverUrl, setReaderCoverUrl] = useState('');
   const [offlineCacheLoading, setOfflineCacheLoading] = useState(false);
   const [offlineCacheStatus, setOfflineCacheStatus] = useState('');
@@ -1726,6 +1623,30 @@ export default function ReaderView({
   const [readerQaReport, setReaderQaReport] = useState<QaReport | null>(null);
   const [readerQaState, setReaderQaState] = useState<LoadState>('idle');
   const [readerQaError, setReaderQaError] = useState('');
+  const selectAudioChapter = useCallback((chapterId: number) => {
+    onSelectChapter(chapterId);
+    setTocOpen(false);
+    setReaderSearchOpen(false);
+    setMoreOpen(false);
+    setMarksPanelOpen(false);
+    setReaderSelection(null);
+    setDictionaryOpen(false);
+    setXrayOpen(false);
+  }, [onSelectChapter]);
+  const readerAudio = useReaderAudio({
+    activeBookId,
+    apiClient,
+    cacheAudio: cacheReaderAudio,
+    chapters,
+    getCachedAudioUrl: getCachedReaderAudioUrl,
+    onDownload: triggerBrowserDownload,
+    onError: setMarksError,
+    onSelectChapter: selectAudioChapter,
+    qaReport: readerQaReport,
+    selectedChapter,
+    selectedChapterId,
+    translationText,
+  });
   const exitReader = useCallback(() => {
     const state = window.history.state as Record<string, unknown> | null;
     if (state?.novelTnnReader === true) {
@@ -1785,10 +1706,6 @@ export default function ReaderView({
     [translatedChapters],
   );
   const selectedBook = books.find((book) => book.id === activeBookId);
-  const audioPlaylistByChapterId = useMemo(
-    () => new Map(audioPlaylist.map((item) => [item.chapter_id, item])),
-    [audioPlaylist],
-  );
   const selectedIndex = translatedChapters.findIndex((chapter) => chapter.id === selectedChapterId);
   const currentPosition = selectedIndex >= 0 ? selectedIndex + 1 : 0;
   const previousChapter = selectedIndex > 0 ? translatedChapters[selectedIndex - 1] : null;
@@ -1799,11 +1716,6 @@ export default function ReaderView({
     selectedChapterId && offlineManifest?.chapterIds.includes(selectedChapterId),
   );
   const currentChapterAvailableOffline = Boolean(cacheStatus?.currentCached || currentChapterInOfflineManifest);
-  const nextAudioChapter = selectedIndex >= 0
-    ? translatedChapters
-      .slice(selectedIndex + 1)
-      .find((chapter) => Boolean(chapter.audio_path) || audioPlaylistByChapterId.has(chapter.id)) ?? null
-    : null;
   const paragraphs = useMemo(() => splitParagraphs(translationText), [translationText]);
   const rawText = useMemo(() => htmlTextContent(contentHtml), [contentHtml]);
   const richBlocks = useMemo(() => extractReaderRichBlocks(contentHtml), [contentHtml]);
@@ -2040,71 +1952,6 @@ export default function ReaderView({
   const activeChapterTitle = selectedChapter
     ? `Chương ${selectedChapter.chapter_number} · ${selectedChapter.title}`
     : 'Chưa chọn chương';
-  const selectedAudioPlaylistItem = selectedChapterId
-    ? audioPlaylistByChapterId.get(selectedChapterId) ?? null
-    : null;
-  const canPlayAudio = Boolean(
-    apiClient
-    && activeBookId
-    && selectedChapterId
-    && (selectedChapter?.audio_path || selectedAudioPlaylistItem),
-  );
-  const audioStreamUrl = canPlayAudio && apiClient && activeBookId && selectedChapterId
-    ? selectedChapter?.audio_path
-      ? apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
-      : selectedAudioPlaylistItem?.stream_url || apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
-    : '';
-  const audioDownloadUrl = canPlayAudio && apiClient && activeBookId && selectedChapterId
-    ? selectedChapter?.audio_path
-      ? apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId)
-      : selectedAudioPlaylistItem?.download_url || apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId)
-    : '';
-  const audioPlaybackUrl = cachedAudioUrl || audioStreamUrl;
-  const audioStatusValue = audioTtsSnapshot?.status || audioJobSnapshot?.status || (audioJobId ? 'queued' : '');
-  const audioProgressPercent = audioJobProgressPercent(audioJobSnapshot, audioTtsSnapshot);
-  const audioFailedChunks = failedTtsChunkCount(audioTtsSnapshot);
-  const audioCompletedChunks = completedTtsChunkCount(audioTtsSnapshot);
-  const audioTotalChunks = audioTtsSnapshot?.chunks.length ?? 0;
-  const audioOperationalWarnings = Array.from(
-    new Set(
-      (audioTtsSnapshot?.audio_summary?.warnings ?? []).filter(
-        (warning): warning is string => typeof warning === 'string' && warning.trim().length > 0,
-      ),
-    ),
-  );
-  const audioFailureMessage = audioJobError || friendlyAudioError(
-    audioJobFailureReason(audioJobSnapshot, audioTtsSnapshot),
-    '',
-  );
-  const canRetryAudioChunks = Boolean(
-    apiClient
-    && audioJobId
-    && (audioFailedChunks > 0 || audioStatusValue.toLowerCase() === 'failed'),
-  );
-  const chapterHasVietnameseTranslation = Boolean(
-    selectedChapter?.has_translation && translationText.trim().length > 0,
-  );
-  const audioGenerationBlocked = !chapterHasVietnameseTranslation;
-  const qaOverallStatus = String(readerQaReport?.overall_status ?? '').toUpperCase();
-  const qaFailsBeforeAudio = qaOverallStatus === 'FAIL';
-  const audioChineseLeakageCount = Math.max(0, Math.round(readerQaReport?.chinese_leakage_count ?? 0));
-  const translatedChapterIdsWithAudio = new Set<number>();
-  for (const chapter of translatedChapters) {
-    if (chapter.audio_path || audioPlaylistByChapterId.has(chapter.id)) {
-      translatedChapterIdsWithAudio.add(chapter.id);
-    }
-  }
-  const translatedAudioChapterCount = translatedChapterIdsWithAudio.size;
-  const missingTranslationChapterCount = chapters.filter((chapter) => !chapter.has_translation).length;
-  const missingAudioTranslatedChapterCount = Math.max(0, translatedChapters.length - translatedAudioChapterCount);
-  const m4bReadinessWarning = missingAudioTranslatedChapterCount > 0
-    ? `M4B chưa sẵn: còn ${missingAudioTranslatedChapterCount.toLocaleString('vi-VN')} chương đã dịch chưa có audio.`
-    : '';
-  const canCancelAudioJob = Boolean(
-    apiClient
-    && audioJobId
-    && CANCELABLE_JOB_STATUSES.has(audioStatusValue.toLowerCase()),
-  );
   const canGoPrevious = isPaginatedMode
     ? currentPage > 0 || Boolean(previousChapter)
     : Boolean(previousChapter);
@@ -2207,64 +2054,6 @@ export default function ReaderView({
       cancelled = true;
     };
   }, [activeBookId, readerCacheVersion, selectedBook]);
-
-  useEffect(() => {
-    if (!apiClient || !activeBookId) {
-      setAudioPlaylist([]);
-      setAudioPlaylistError('');
-      return;
-    }
-
-    let cancelled = false;
-    setAudioPlaylistError('');
-    void apiClient.getBookAudioPlaylist(activeBookId)
-      .then((playlist) => {
-        if (cancelled) return;
-        setAudioPlaylist(playlist.chapters);
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setAudioPlaylist([]);
-        setAudioPlaylistError(error instanceof Error ? error.message : 'Failed to load audiobook playlist');
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, apiClient]);
-
-  useEffect(() => {
-    if (!canPlayAudio || !activeBookId || !selectedChapterId || !audioStreamUrl) {
-      setCachedAudioUrl('');
-      return;
-    }
-
-    let cancelled = false;
-    setCachedAudioUrl('');
-    void getCachedReaderAudioUrl(activeBookId, selectedChapterId, audioStreamUrl)
-      .then((url) => {
-        if (!cancelled && url) setCachedAudioUrl(url);
-        return url;
-      })
-      .then((url) => {
-        if (url || cancelled) return undefined;
-        return cacheReaderAudio(activeBookId, selectedChapterId, audioStreamUrl)
-          .then((result) => {
-            if (!result.cached || cancelled) return;
-            return getCachedReaderAudioUrl(activeBookId, selectedChapterId, audioStreamUrl)
-              .then((cachedUrl) => {
-                if (!cancelled) setCachedAudioUrl(cachedUrl);
-              });
-          });
-      })
-      .catch(() => {
-        if (!cancelled) setCachedAudioUrl('');
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, audioStreamUrl, canPlayAudio, selectedChapterId]);
 
   useEffect(() => {
     if (!apiClient || !activeBookId) return;
@@ -2889,7 +2678,7 @@ export default function ReaderView({
     setReaderSelection(null);
     setDictionaryOpen(false);
     if (!options.keepAudioOpen) {
-      setAudioOpen(false);
+      readerAudio.actions.close();
     }
     setXrayOpen(false);
   }
@@ -3446,176 +3235,6 @@ export default function ReaderView({
       .finally(() => setAnnotationImportLoading(false));
   }
 
-  function refreshReaderAudioJobStatus(jobId = audioJobId): void {
-    if (!apiClient || !jobId) return;
-
-    setAudioJobRefreshing(true);
-    void Promise.allSettled([
-      apiClient.getJobStatus(jobId),
-      apiClient.getTtsJob(jobId),
-    ])
-      .then(([jobResult, ttsResult]) => {
-        if (jobResult.status === 'fulfilled') {
-          setAudioJobSnapshot(jobResult.value);
-        }
-        if (ttsResult.status === 'fulfilled') {
-          setAudioTtsSnapshot(ttsResult.value);
-        }
-        if (jobResult.status === 'rejected' && ttsResult.status === 'rejected') {
-          setAudioJobError(audioErrorFromUnknown(
-            jobResult.reason,
-            'Không đọc được trạng thái job audio. Mở trang Tác vụ để kiểm tra.',
-          ));
-        } else {
-          setAudioJobError('');
-        }
-      })
-      .finally(() => setAudioJobRefreshing(false));
-  }
-
-  function startReaderAudioJob(): void {
-    if (!apiClient || !activeBookId || !selectedChapterId) {
-      setAudioJobStatus('Không thể tạo audio: thiếu kết nối API hoặc chương đang đọc.');
-      return;
-    }
-    if (audioGenerationBlocked) {
-      const message = 'Chưa có bản dịch tiếng Việt để tạo audio.';
-      setAudioJobStatus('');
-      setAudioJobError(message);
-      setMarksError(message);
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobSnapshot(null);
-    setAudioTtsSnapshot(null);
-    setAudioJobStatus('Đang gửi job tạo audio...');
-    void apiClient.startTtsJob(activeBookId, [selectedChapterId])
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audio');
-        setAudioJobStatus(`Đã tạo job audio ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tạo audio chương. Kiểm tra cấu hình TTS.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function startReaderBookAudioJob(): void {
-    if (!apiClient || !activeBookId) {
-      setAudioJobStatus('Không thể tạo audiobook: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobSnapshot(null);
-    setAudioTtsSnapshot(null);
-    setAudioJobStatus('Đang gửi job tạo audiobook...');
-    void apiClient.startBookTtsJob(activeBookId, { limit: 200 })
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audiobook');
-        setAudioJobStatus(`Đã tạo job audiobook ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tạo audiobook. Kiểm tra cấu hình TTS.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function requestReaderBookAudioJob(): void {
-    setAudioBulkConfirmOpen(true);
-    setMoreOpen(false);
-  }
-
-  function cancelReaderAudioJob(): void {
-    if (!apiClient || !audioJobId) {
-      setAudioJobError('Không thể hủy: chưa có job audio đang chạy.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobStatus('Đang yêu cầu hủy job audio...');
-    void apiClient.cancelJob(audioJobId)
-      .then(() => {
-        setAudioJobStatus(`Đã yêu cầu hủy job audio ${shortJobId(audioJobId)}.`);
-        setMarksError('');
-        refreshReaderAudioJobStatus(audioJobId);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể hủy job audio. Mở trang Tác vụ để kiểm tra.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function retryReaderAudioChunks(): void {
-    if (!apiClient || !audioJobId) {
-      setAudioJobError('Không thể retry: chưa có job audio để chạy lại.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobStatus('Đang gửi retry TTS...');
-    void apiClient.retryTtsJob(audioJobId)
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audio');
-        setAudioJobStatus(`Đã gửi retry TTS ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setAudioJobSnapshot(null);
-        setAudioTtsSnapshot(null);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể retry chunk lỗi. Mở trang Tác vụ để kiểm tra.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function downloadReaderAudiobookExport(): void {
-    if (!apiClient || !activeBookId) {
-      setAudioJobStatus('Không thể tải audiobook: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobStatus('Đang xuất audiobook M4B...');
-    void apiClient.downloadAudiobookExport(activeBookId, 'm4b')
-      .then((download) => {
-        triggerBrowserDownload(download.blob, download.filename);
-        setAudioJobStatus(`Đã tải ${download.filename}`);
-        setMarksError('');
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tải audiobook M4B. Hãy tạo audiobook trước.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
   function cacheCurrentChapterOffline(): void {
     if (!apiClient || !activeBookId || !selectedChapter) {
       setOfflineCacheStatus('Không thể cache chương: thiếu kết nối API hoặc chương đang đọc.');
@@ -3629,7 +3248,7 @@ export default function ReaderView({
     setOfflineCacheLoading(true);
     setOfflineCacheStatus(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
     void cacheChapterForOffline({
-      audioUrl: audioStreamUrl,
+      audioUrl: readerAudio.playback.streamUrl,
       bookId: activeBookId,
       chapter: selectedChapter,
       client: apiClient,
@@ -3967,12 +3586,6 @@ export default function ReaderView({
     if (nextChapter) handleSelectChapter(nextChapter.id);
   }
 
-  function handleAudioNextChapter(): void {
-    if (!nextAudioChapter) return;
-    setAudioOpen(true);
-    handleSelectChapter(nextAudioChapter.id, { keepAudioOpen: true });
-  }
-
   function handleJumpToMark(item: ReaderMarkPanelItem): void {
     setPendingParagraphJump({
       charOffset: item.charStart,
@@ -3998,82 +3611,6 @@ export default function ReaderView({
       handleSelectChapter(result.chapter_id);
     }
   }
-
-  const audioReadinessWarnings = [
-    audioGenerationBlocked ? 'Chưa có bản dịch tiếng Việt để tạo audio.' : '',
-    qaFailsBeforeAudio ? 'QA đang FAIL. Nên xem lại trước khi tạo audio.' : '',
-    audioChineseLeakageCount > 0
-      ? `Còn ${audioChineseLeakageCount.toLocaleString('vi-VN')} dấu hiệu rò chữ Trung trong bản dịch.`
-      : '',
-  ].filter(Boolean);
-
-  const audioJobStatusPanel = (audioJobId || audioJobStatus || audioJobError) ? (
-    <section aria-label="Trạng thái audio" className="reader-audio-job-status" role="status">
-      <div className="reader-audio-job-header">
-        <strong>{audioJobId ? `Job ${audioJobKind} ${shortJobId(audioJobId)}` : 'Audio job'}</strong>
-        {audioStatusValue ? <span>{audioStatusValue}</span> : null}
-      </div>
-      {audioProgressPercent !== null ? (
-        <div className="reader-audio-job-progress">
-          <progress aria-label="Tiến độ job audio" max="100" value={audioProgressPercent} />
-          <span>{audioProgressPercent}%</span>
-        </div>
-      ) : null}
-      {audioJobSnapshot?.provider || audioJobSnapshot?.model ? (
-        <div className="reader-audio-job-meta">
-          {audioJobSnapshot.provider ? <span>{audioJobSnapshot.provider}</span> : null}
-          {audioJobSnapshot.model ? <span>{audioJobSnapshot.model}</span> : null}
-        </div>
-      ) : null}
-      {audioJobStatus ? <p className="reader-export-status">{audioJobStatus}</p> : null}
-      {(audioTotalChunks > 0 || audioFailedChunks > 0) ? (
-        <div className="reader-audio-job-meta">
-          {audioTotalChunks > 0 ? <span>{audioCompletedChunks}/{audioTotalChunks} chunks</span> : null}
-          {audioFailedChunks > 0 ? <span>{audioFailedChunks} chunk lỗi</span> : null}
-        </div>
-      ) : null}
-      {audioOperationalWarnings.length > 0 ? (
-        <ul className="reader-audio-warning-list">
-          {audioOperationalWarnings.map((warning) => (
-            <li key={warning}>{warning}</li>
-          ))}
-        </ul>
-      ) : null}
-      {audioFailureMessage ? <p className="reader-export-status status-error">{audioFailureMessage}</p> : null}
-      {audioJobId ? (
-        <div className="reader-audio-job-actions">
-          <button
-            className="reader-menu-action"
-            disabled={audioJobRefreshing}
-            onClick={() => refreshReaderAudioJobStatus()}
-            type="button"
-          >
-            {audioJobRefreshing ? 'Đang làm mới...' : 'Làm mới audio job'}
-          </button>
-          {canCancelAudioJob ? (
-            <button
-              className="reader-menu-action"
-              disabled={audioJobLoading}
-              onClick={cancelReaderAudioJob}
-              type="button"
-            >
-              Hủy job audio
-            </button>
-          ) : null}
-          {canRetryAudioChunks ? (
-            <button
-              className="reader-menu-action"
-              disabled={audioJobLoading}
-              onClick={retryReaderAudioChunks}
-              type="button"
-            >
-              Chạy lại chunk lỗi
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-    </section>
-  ) : null;
 
   const chromeTitle: ReaderChromeTitle = {
     bookTitle: selectedBook?.title || 'Đọc truyện',
@@ -4118,18 +3655,18 @@ export default function ReaderView({
     onChange: setReaderTextMode,
   };
   const quickSettings: ReaderQuickSettingsControls = {
-    audioAvailable: canPlayAudio,
-    audioBusy: audioJobLoading,
+    audioAvailable: readerAudio.state.canPlay,
+    audioBusy: readerAudio.state.jobLoading,
     autoScrollEnabled,
     canAutoScroll: hasReadableChapterContent,
     open: settingsOpen,
     value: readerSettings,
     onAudioAction: () => {
-      if (canPlayAudio) {
-        setAudioOpen(true);
+      if (readerAudio.state.canPlay) {
+        readerAudio.actions.open();
         return;
       }
-      startReaderAudioJob();
+      void readerAudio.actions.startChapterJob();
     },
     onAutoScrollChange: (enabled) => {
       if (enabled && readerSettings.readingMode !== 'scroll') {
@@ -4166,74 +3703,7 @@ export default function ReaderView({
 
       <ReaderTextModeSwitcher modes={quickModes} visible={chromeVisible} />
 
-      <section aria-label="Audio và TTS chương" className="reader-audio-panel" data-visible={chromeVisible}>
-        <div className="reader-audio-panel-main">
-          <div>
-            <span className={canPlayAudio ? 'reader-audio-state is-ready' : 'reader-audio-state'}>
-              {canPlayAudio ? 'Audio có sẵn' : 'Chưa có audio'}
-            </span>
-            <strong>{selectedChapter ? `Chương ${selectedChapter.chapter_number}` : 'Chưa chọn chương'}</strong>
-            <small>
-              {canPlayAudio
-                ? 'Có thể nghe hoặc tải MP3 qua route được bảo vệ.'
-                : 'Tạo audio từ bản dịch tiếng Việt của chương hiện tại.'}
-            </small>
-          </div>
-          <div className="reader-audio-panel-actions">
-            {canPlayAudio ? (
-              <>
-                <button
-                  className="reader-menu-action"
-                  onClick={() => setAudioOpen(true)}
-                  type="button"
-                >
-                  <Volume2 aria-hidden="true" size={16} />
-                  Nghe audio
-                </button>
-                <a className="reader-menu-action" href={audioDownloadUrl}>
-                  <Download aria-hidden="true" size={16} />
-                  Tải MP3
-                </a>
-              </>
-            ) : null}
-            {!canPlayAudio ? (
-              <button
-                className="reader-menu-action"
-                disabled={!apiClient || !activeBookId || !selectedChapterId || audioJobLoading || audioGenerationBlocked}
-                onClick={startReaderAudioJob}
-                type="button"
-              >
-                <Volume2 aria-hidden="true" size={16} />
-                {audioJobLoading ? 'Đang tạo...' : 'Tạo audio chương'}
-              </button>
-            ) : null}
-          </div>
-        </div>
-        {audioReadinessWarnings.length > 0 ? (
-          <ul className="reader-audio-warning-list">
-            {audioReadinessWarnings.map((warning) => (
-              <li key={warning}>{warning}</li>
-            ))}
-          </ul>
-        ) : null}
-        {canPlayAudio ? (
-          <details className="reader-audio-advanced">
-            <summary>Advanced</summary>
-            <button
-              className="reader-menu-action"
-              disabled={!apiClient || !activeBookId || !selectedChapterId || audioJobLoading || audioGenerationBlocked}
-              onClick={startReaderAudioJob}
-              type="button"
-            >
-              <Volume2 aria-hidden="true" size={16} />
-              {audioJobLoading ? 'Đang tạo lại...' : 'Tạo lại audio chương'}
-            </button>
-          </details>
-        ) : null}
-        {audioJobStatusPanel}
-        {audioPlaylistError ? <p className="reader-export-status status-error">{audioPlaylistError}</p> : null}
-        {m4bReadinessWarning ? <p className="reader-export-status">{m4bReadinessWarning}</p> : null}
-      </section>
+      <ReaderAudioSummary audio={readerAudio} visible={chromeVisible} />
 
       {moreOpen ? (
         <div aria-label="Tùy chọn đọc" className="reader-more-popover" role="dialog">
@@ -4280,47 +3750,50 @@ export default function ReaderView({
           </button>
           <button
             className="reader-menu-action"
-            disabled={!canPlayAudio}
+            disabled={!readerAudio.state.canPlay}
             onClick={() => {
-              setAudioOpen(true);
+              readerAudio.actions.open();
               setMoreOpen(false);
             }}
             type="button"
           >
             <Volume2 aria-hidden="true" size={16} />
-            {canPlayAudio ? 'Nghe audio chương' : 'Chưa có audio'}
+            {readerAudio.state.canPlay ? 'Nghe audio chương' : 'Chưa có audio'}
           </button>
-          {canPlayAudio ? (
-            <a className="reader-menu-action" href={audioDownloadUrl}>
+          {readerAudio.state.canPlay ? (
+            <a className="reader-menu-action" href={readerAudio.playback.downloadUrl}>
               <Download aria-hidden="true" size={16} />
               Tải MP3 chương
             </a>
           ) : null}
-          {!canPlayAudio ? (
+          {!readerAudio.state.canPlay ? (
             <button
               aria-label="Tạo audio chương từ tùy chọn"
               className="reader-menu-action"
-              disabled={!apiClient || !activeBookId || !selectedChapterId || audioJobLoading || audioGenerationBlocked}
-              onClick={startReaderAudioJob}
+              disabled={!apiClient || !activeBookId || !selectedChapterId || readerAudio.state.jobLoading || readerAudio.state.generationBlocked}
+              onClick={() => { void readerAudio.actions.startChapterJob(); }}
               type="button"
             >
               <Volume2 aria-hidden="true" size={16} />
-              {audioJobLoading ? 'Đang tạo audio...' : 'Tạo audio chương'}
+              {readerAudio.state.jobLoading ? 'Đang tạo audio...' : 'Tạo audio chương'}
             </button>
           ) : null}
           <button
             className="reader-menu-action"
-            disabled={!apiClient || !activeBookId || audioJobLoading}
-            onClick={requestReaderBookAudioJob}
+            disabled={!apiClient || !activeBookId || readerAudio.state.jobLoading}
+            onClick={() => {
+              readerAudio.actions.requestBookJob();
+              setMoreOpen(false);
+            }}
             type="button"
           >
             <Volume2 aria-hidden="true" size={16} />
-            {audioJobLoading ? 'Đang tạo audiobook...' : 'Tạo audiobook còn thiếu'}
+            {readerAudio.state.jobLoading ? 'Đang tạo audiobook...' : 'Tạo audiobook còn thiếu'}
           </button>
           <button
             className="reader-menu-action"
-            disabled={!apiClient || !activeBookId || audioJobLoading}
-            onClick={downloadReaderAudiobookExport}
+            disabled={!apiClient || !activeBookId || readerAudio.state.jobLoading}
+            onClick={() => { void readerAudio.actions.downloadAudiobook(); }}
             type="button"
           >
             <Download aria-hidden="true" size={16} />
@@ -4575,71 +4048,10 @@ export default function ReaderView({
         </div>
       ) : null}
 
-      {audioBulkConfirmOpen ? (
-        <div className="modal-backdrop">
-          <section
-            aria-label="Xác nhận tạo audiobook"
-            className="dialog confirm-dialog reader-audio-confirm-dialog"
-            role="dialog"
-          >
-            <div className="dialog-header">
-              <div>
-                <p className="section-label">Audiobook</p>
-                <h2>Xác nhận tạo audiobook</h2>
-              </div>
-              <button
-                aria-label="Đóng xác nhận tạo audiobook"
-                className="reader-icon-button"
-                onClick={() => setAudioBulkConfirmOpen(false)}
-                type="button"
-              >
-                <X aria-hidden="true" size={18} />
-              </button>
-            </div>
-            <p>
-              Job sẽ dùng pipeline TTS hiện có và bỏ qua chương đã có audio, trừ khi bạn tạo lại audio từng chương trong Advanced.
-            </p>
-            <div className="reader-audio-confirm-grid">
-              <span>
-                <strong>{translatedChapters.length.toLocaleString('vi-VN')} chương đã dịch</strong>
-                <small>Sẵn sàng đưa vào job audio</small>
-              </span>
-              <span>
-                <strong>{translatedAudioChapterCount.toLocaleString('vi-VN')} chương đã có audio</strong>
-                <small>Sẽ được backend bỏ qua nếu không cần tạo lại</small>
-              </span>
-              <span>
-                <strong>{missingTranslationChapterCount.toLocaleString('vi-VN')} chương thiếu bản dịch</strong>
-                <small>Không thể tạo TTS cho các chương này</small>
-              </span>
-              <span>
-                <strong>{missingAudioTranslatedChapterCount.toLocaleString('vi-VN')} chương cần tạo audio</strong>
-                <small>Ước lượng theo playlist/audio metadata hiện có</small>
-              </span>
-            </div>
-            <div className="dialog-actions">
-              <button
-                className="secondary-action"
-                onClick={() => setAudioBulkConfirmOpen(false)}
-                type="button"
-              >
-                Hủy
-              </button>
-              <button
-                className="primary-action"
-                disabled={!apiClient || !activeBookId || translatedChapters.length === 0 || audioJobLoading}
-                onClick={() => {
-                  setAudioBulkConfirmOpen(false);
-                  startReaderBookAudioJob();
-                }}
-                type="button"
-              >
-                Tạo audiobook
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
+      <ReaderAudioFeatureBoundary
+        active={readerAudio.state.open || readerAudio.state.bulkConfirmOpen}
+        audio={readerAudio}
+      />
 
       <main
         aria-label="Vùng đọc chính"
@@ -4843,19 +4255,6 @@ export default function ReaderView({
         settings={quickSettings}
         visible={chromeVisible}
         onOpenToc={chromeActions.onOpenToc}
-      />
-
-      <ReaderAudioBar
-        autoNext={audioAutoNext}
-        chapterTitle={activeChapterTitle}
-        downloadUrl={audioDownloadUrl}
-        hasNextChapter={Boolean(nextAudioChapter)}
-        open={audioOpen && Boolean(audioPlaybackUrl)}
-        resumeOnSourceChange={audioAutoNext}
-        streamUrl={audioPlaybackUrl}
-        onAutoNextChange={setAudioAutoNext}
-        onClose={() => setAudioOpen(false)}
-        onNextChapter={handleAudioNextChapter}
       />
 
       <ReaderTocSheet
