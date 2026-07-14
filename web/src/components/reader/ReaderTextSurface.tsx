@@ -3,7 +3,7 @@ import { Highlighter, StickyNote } from 'lucide-react';
 import type { Chapter } from '../../api/types';
 import { richBlockNeedsTextMirror, type ReaderRichBlock } from '../../state/readerRichContent';
 import type { LoadState } from '../../state/types';
-import type { ReaderFontFamily, ReaderTheme, ReaderWidth } from '../ReaderView';
+import type { ReaderFontFamily, ReaderTheme, ReaderWidth } from './types';
 
 export type ReaderVisibleRange = {
   charEnd?: number;

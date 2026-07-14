@@ -6,7 +6,7 @@ import type {
   ReaderTextMode,
   ReaderTheme,
   ReaderWidth,
-} from '../ReaderView';
+} from './types';
 
 export type ReaderSettingsSheetProps = {
   open: boolean;

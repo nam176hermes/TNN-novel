@@ -9,6 +9,7 @@ import { chapterMarksKey, loadReaderMarks, saveReaderMarks } from '../state/read
 import { loadReaderProgressSnapshot, saveReaderProgressSnapshot } from '../state/readerProgress';
 import { buildReaderProgressTextAnchor } from '../state/readerProgressAnchor';
 import ReaderView, { type ReaderApiClient } from './ReaderView';
+import { loadReaderSettings, loadReaderTextMode } from './reader/readerSettings';
 
 const books: TranslatedBookSummary[] = [
   {
@@ -411,7 +412,7 @@ describe('ReaderView', () => {
       '--reader-margin-scale': '1.2',
       '--reader-paragraph-spacing': '1.4em',
     });
-    expect(JSON.parse(window.localStorage.getItem('novel-reader-settings-v1') ?? '{}')).toMatchObject({
+    expect(loadReaderSettings(window.localStorage)).toMatchObject({
       characterSpacing: 0.35,
       fontFamily: 'sans',
       fontSize: 20,
@@ -455,7 +456,7 @@ describe('ReaderView', () => {
     });
 
     await userEvent.click(screen.getByRole('button', { name: 'Raw' }));
-    expect(window.localStorage.getItem('novel-reader-text-mode-v1')).toBe('raw');
+    expect(loadReaderTextMode(window.localStorage)).toBe('raw');
 
     cleanup();
     renderReader({

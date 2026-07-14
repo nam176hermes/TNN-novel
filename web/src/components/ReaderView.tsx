@@ -126,9 +126,23 @@ import ReaderAiPanel, { type ReaderAiPanelMode } from './reader/ReaderAiPanel';
 import ReaderProgressBar from './reader/ReaderProgressBar';
 import ReaderSearchPanel from './reader/ReaderSearchPanel';
 import ReaderSelectionPopover, { type ReaderSelectionAction } from './reader/ReaderSelectionPopover';
+import ReaderTocSheet, { type TocChapterPreview } from './reader/ReaderTocSheet';
 import ReaderSettingsSheet from './reader/ReaderSettingsSheet';
 import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichBlock } from './reader/ReaderTextSurface';
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
+import {
+  loadReaderSettings,
+  loadReaderTextMode,
+  saveReaderSettings,
+  saveReaderTextMode,
+} from './reader/readerSettings';
+import type {
+  ReaderFontFamily,
+  ReaderSettings,
+  ReaderTextMode,
+  ReaderTheme,
+  ReaderWidth,
+} from './reader/types';
 
 export type ReaderApiClient = Pick<
   ApiClient,
@@ -389,27 +403,6 @@ function offlineManifestResourcesLabel(manifest: ReaderOfflineManifest): string 
   ].join(' · ');
 }
 
-export type ReaderTheme = 'light' | 'dark' | 'sepia' | 'eink';
-export type ReaderWidth = 'narrow' | 'medium' | 'wide';
-export type ReaderFontFamily = 'serif' | 'sans';
-export type ReaderMode = 'scroll' | 'paginated';
-export type ReaderTextMode = 'translation' | 'raw' | 'split' | 'raw-collapsed' | 'qa-overlay';
-
-export type ReaderSettings = {
-  characterSpacing: number;
-  fontFamily: ReaderFontFamily;
-  fontSize: number;
-  fontWeight: number;
-  fullscreen: boolean;
-  lineHeight: number;
-  marginScale: number;
-  paragraphSpacing: number;
-  readingMode: ReaderMode;
-  instantMode: boolean;
-  theme: ReaderTheme;
-  width: ReaderWidth;
-};
-
 type ReaderScrollProgress = {
   canScroll: boolean;
   location: number;
@@ -425,13 +418,6 @@ type ReaderTextProgress = {
   totalChars: number;
 };
 
-type TocChapterPreview = {
-  readingState: 'read' | 'reading' | 'unread';
-  stateLabel: string;
-  timeLabel: string;
-  wordLabel: string;
-};
-
 type ReaderSelectionState = {
   anchor: { left: number; top: number };
   charEnd: number;
@@ -442,8 +428,6 @@ type ReaderSelectionState = {
   text: string;
 };
 
-const READER_SETTINGS_STORAGE_KEY = 'novel-reader-settings-v1';
-const READER_TEXT_MODE_STORAGE_KEY = 'novel-reader-text-mode-v1';
 const RAW_READER_TEXT_MODES = new Set<ReaderTextMode>(['raw', 'split', 'raw-collapsed']);
 const FALLBACK_PARAGRAPHS_PER_PAGE = 4;
 const LONG_CHAPTER_PARAGRAPH_THRESHOLD = 120;
@@ -578,124 +562,6 @@ function audioJobFailureReason(job: JobStatus | null, ttsJob: TtsJobStatus | nul
   if (job?.error) return job.error;
   if (job?.status.toLowerCase() === 'failed') return job.message;
   return '';
-}
-
-const defaultReaderSettings: ReaderSettings = {
-  characterSpacing: 0,
-  fontFamily: 'serif',
-  fontSize: 18,
-  fontWeight: 400,
-  fullscreen: false,
-  instantMode: false,
-  lineHeight: 1.9,
-  marginScale: 1,
-  paragraphSpacing: 1.05,
-  readingMode: 'scroll',
-  theme: 'light',
-  width: 'medium',
-};
-
-function getBrowserStorage(): Storage | null {
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
-}
-
-function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
-  const numberValue = Number(value);
-  if (!Number.isFinite(numberValue)) return fallback;
-  return Math.min(max, Math.max(min, numberValue));
-}
-
-function normalizeReaderTheme(value: unknown): ReaderTheme | null {
-  if (value === 'light' || value === 'dark' || value === 'sepia' || value === 'eink') return value;
-  if (value === 'paper') return 'light';
-  if (value === 'night') return 'dark';
-  if (value === 'oled') return 'eink';
-  return null;
-}
-
-function isReaderWidth(value: unknown): value is ReaderWidth {
-  return value === 'narrow' || value === 'medium' || value === 'wide';
-}
-
-function isReaderFontFamily(value: unknown): value is ReaderFontFamily {
-  return value === 'serif' || value === 'sans';
-}
-
-function isReaderMode(value: unknown): value is ReaderMode {
-  return value === 'scroll' || value === 'paginated';
-}
-
-function isReaderTextMode(value: unknown): value is ReaderTextMode {
-  return value === 'translation'
-    || value === 'raw'
-    || value === 'split'
-    || value === 'raw-collapsed'
-    || value === 'qa-overlay';
-}
-
-function loadReaderSettings(storage: Storage | null = getBrowserStorage()): ReaderSettings {
-  if (!storage) return defaultReaderSettings;
-  try {
-    const parsed = JSON.parse(storage.getItem(READER_SETTINGS_STORAGE_KEY) ?? '{}') as Partial<ReaderSettings>;
-    return {
-      characterSpacing: clampNumber(
-        parsed.characterSpacing,
-        defaultReaderSettings.characterSpacing,
-        0,
-        1.5,
-      ),
-      fontFamily: isReaderFontFamily(parsed.fontFamily) ? parsed.fontFamily : defaultReaderSettings.fontFamily,
-      fontSize: clampNumber(parsed.fontSize, defaultReaderSettings.fontSize, 16, 24),
-      fontWeight: clampNumber(parsed.fontWeight, defaultReaderSettings.fontWeight, 350, 800),
-      fullscreen: typeof parsed.fullscreen === 'boolean' ? parsed.fullscreen : defaultReaderSettings.fullscreen,
-      instantMode: typeof parsed.instantMode === 'boolean' ? parsed.instantMode : defaultReaderSettings.instantMode,
-      lineHeight: clampNumber(parsed.lineHeight, defaultReaderSettings.lineHeight, 1.5, 2.2),
-      marginScale: clampNumber(parsed.marginScale, defaultReaderSettings.marginScale, 0.75, 1.5),
-      paragraphSpacing: clampNumber(
-        parsed.paragraphSpacing,
-        defaultReaderSettings.paragraphSpacing,
-        0.6,
-        2.4,
-      ),
-      readingMode: isReaderMode(parsed.readingMode) ? parsed.readingMode : defaultReaderSettings.readingMode,
-      theme: normalizeReaderTheme(parsed.theme) ?? defaultReaderSettings.theme,
-      width: isReaderWidth(parsed.width) ? parsed.width : defaultReaderSettings.width,
-    };
-  } catch {
-    return defaultReaderSettings;
-  }
-}
-
-function saveReaderSettings(settings: ReaderSettings, storage: Storage | null = getBrowserStorage()): void {
-  if (!storage) return;
-  try {
-    storage.setItem(READER_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Reading should still work when browser storage is unavailable.
-  }
-}
-
-function loadReaderTextMode(storage: Storage | null = getBrowserStorage()): ReaderTextMode {
-  if (!storage) return 'translation';
-  try {
-    const stored = storage.getItem(READER_TEXT_MODE_STORAGE_KEY);
-    return isReaderTextMode(stored) ? stored : 'translation';
-  } catch {
-    return 'translation';
-  }
-}
-
-function saveReaderTextMode(mode: ReaderTextMode, storage: Storage | null = getBrowserStorage()): void {
-  if (!storage) return;
-  try {
-    storage.setItem(READER_TEXT_MODE_STORAGE_KEY, mode);
-  } catch {
-    // Reading should remain usable when storage is unavailable.
-  }
 }
 
 function readerProgressSnapshotToSyncProgress(snapshot: ReaderProgressSnapshot): ReaderSyncProgress {
@@ -1763,9 +1629,7 @@ export default function ReaderView({
   const [scrollTextProgress, setScrollTextProgress] = useState<ReaderTextProgress | null>(null);
   const [chromeVisible, setChromeVisible] = useState(true);
   const [tocOpen, setTocOpen] = useState(false);
-  const [tocOrder, setTocOrder] = useState<'asc' | 'desc'>('asc');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
   const [readerSearchOpen, setReaderSearchOpen] = useState(false);
   const [readerSearchQuery, setReaderSearchQuery] = useState('');
   const [readerSearchOptions, setReaderSearchOptions] = useState<ReaderSearchOptions>({
@@ -1905,7 +1769,6 @@ export default function ReaderView({
     setReaderTextModeState(mode);
     saveReaderTextMode(mode);
   }, []);
-  const [chapterQuery, setChapterQuery] = useState('');
   const translatedChapters = useMemo(
     () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
     [chapters],
@@ -1913,19 +1776,6 @@ export default function ReaderView({
   const chapterIndexes = useMemo(
     () => new Map(translatedChapters.map((chapter, index) => [chapter.id, index])),
     [translatedChapters],
-  );
-  const normalizedChapterQuery = chapterQuery.trim().toLowerCase();
-  const visibleChapters = useMemo(
-    () => {
-      const filtered = normalizedChapterQuery
-      ? translatedChapters.filter((chapter) => (
-        String(chapter.chapter_number).includes(normalizedChapterQuery)
-        || chapter.title.toLowerCase().includes(normalizedChapterQuery)
-      ))
-      : translatedChapters;
-      return tocOrder === 'desc' ? [...filtered].reverse() : filtered;
-    },
-    [normalizedChapterQuery, tocOrder, translatedChapters],
   );
   const selectedBook = books.find((book) => book.id === activeBookId);
   const audioPlaylistByChapterId = useMemo(
@@ -2096,9 +1946,7 @@ export default function ReaderView({
     }),
     [chapterMarks, progressTextBlocks, readerSearchOptions, readerSearchQuery, selectedChapter],
   );
-  const chapterCountLabel = normalizedChapterQuery
-    ? `${visibleChapters.length.toLocaleString()}/${translatedChapters.length.toLocaleString()} chương`
-    : `${translatedChapters.length.toLocaleString()} chương đã dịch`;
+  const chapterCountLabel = `${translatedChapters.length.toLocaleString()} chương đã dịch`;
   const totalProgressChars = totalTextLength(progressTextBlocks);
   const currentPageStartCharOffset = isPaginatedMode ? currentViewportPage.startChar ?? 0 : 0;
   const currentPageStartAbsoluteCharOffset = isPaginatedMode
@@ -3029,7 +2877,6 @@ export default function ReaderView({
   function handleSelectChapter(chapterId: number, options: { keepAudioOpen?: boolean } = {}): void {
     onSelectChapter(chapterId);
     setTocOpen(false);
-    setSearchOpen(false);
     setReaderSearchOpen(false);
     setMoreOpen(false);
     setMarksPanelOpen(false);
@@ -5114,108 +4961,17 @@ export default function ReaderView({
         onNextChapter={handleAudioNextChapter}
       />
 
-      {tocOpen ? (
-        <div className="reader-drawer-backdrop">
-          <aside aria-label="Mục lục" className="reader-toc-drawer" role="dialog">
-            <header className="reader-drawer-header">
-              <div>
-                <p className="section-label">Mục lục</p>
-                <h2>{selectedBook?.title || 'Truyện đã dịch'}</h2>
-                {selectedBook?.author ? <span>{selectedBook.author}</span> : null}
-                <span>{chapterCountLabel}</span>
-              </div>
-              <button
-                aria-label="Đóng mục lục"
-                className="reader-icon-button"
-                onClick={() => setTocOpen(false)}
-                title="Đóng mục lục"
-                type="button"
-              >
-                <X aria-hidden="true" size={22} />
-              </button>
-            </header>
-
-            <label className="reader-drawer-search">
-              <span>{searchOpen ? 'Tìm trong mục lục' : 'Tìm trong mục lục'}</span>
-              <input
-                aria-label="Tìm trong mục lục"
-                autoFocus={searchOpen}
-                onChange={(event) => setChapterQuery(event.target.value)}
-                placeholder="Số chương hoặc tên chương"
-                type="search"
-                value={chapterQuery}
-              />
-            </label>
-
-            <div aria-label="Thứ tự chương" className="reader-toc-order" role="group">
-              <button
-                aria-pressed={tocOrder === 'asc'}
-                onClick={() => setTocOrder('asc')}
-                type="button"
-              >
-                Đầu → cuối
-              </button>
-              <button
-                aria-pressed={tocOrder === 'desc'}
-                onClick={() => setTocOrder('desc')}
-                type="button"
-              >
-                Cuối → đầu
-              </button>
-            </div>
-
-            <div className="reader-toc-shortcuts">
-              <button
-                disabled={translatedChapters.length === 0}
-                onClick={() => {
-                  const firstChapter = translatedChapters[0];
-                  if (firstChapter) handleSelectChapter(firstChapter.id);
-                }}
-                type="button"
-              >
-                Về chương đầu
-              </button>
-              <button
-                disabled={translatedChapters.length === 0}
-                onClick={() => {
-                  const latestChapter = translatedChapters[translatedChapters.length - 1];
-                  if (latestChapter) handleSelectChapter(latestChapter.id);
-                }}
-                type="button"
-              >
-                Đến chương mới nhất
-              </button>
-            </div>
-
-            <div className="reader-toc-list reader-drawer-list">
-              {visibleChapters.map((chapter) => {
-                const selected = chapter.id === selectedChapterId;
-                const preview = tocChapterPreviews.get(chapter.id);
-                return (
-                  <button
-                    aria-current={selected ? 'true' : undefined}
-                    aria-label={`Ch. ${chapter.chapter_number} ${chapter.title}`}
-                    key={chapter.id}
-                    onClick={() => handleSelectChapter(chapter.id)}
-                    type="button"
-                  >
-                    <span>Ch. {chapter.chapter_number}</span>
-                    <strong>{chapter.title}</strong>
-                    {preview ? (
-                      <small className="reader-toc-preview">
-                        <span>{preview.wordLabel}</span>
-                        <span>{preview.timeLabel}</span>
-                        <span data-state={preview.readingState}>{preview.stateLabel}</span>
-                      </small>
-                    ) : null}
-                  </button>
-                );
-              })}
-              {visibleChapters.length === 0 ? <p>Không tìm thấy chương.</p> : null}
-            </div>
-          </aside>
-        </div>
-      ) : null}
+      <ReaderTocSheet
+        author={selectedBook?.author}
+        chapterCountLabel={chapterCountLabel}
+        chapters={translatedChapters}
+        currentChapterId={selectedChapterId}
+        open={tocOpen}
+        previews={tocChapterPreviews}
+        title={selectedBook?.title || 'Truyện đã dịch'}
+        onClose={() => setTocOpen(false)}
+        onSelectChapter={handleSelectChapter}
+      />
 
       <ReaderMarksPanel
         exportError={marksError}
