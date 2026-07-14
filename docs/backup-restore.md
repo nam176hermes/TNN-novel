@@ -307,9 +307,9 @@ any residue remains outside normal list/download paths.
 P2C was delivered as narrow commits so an operator can revert the failing seam
 without changing archive/restore format:
 
-- backup API/jobs: `b77fa38` through `04ad491`, plus terminal-audit commits
-  `9d04ffe`/`de94de7` and encrypt-before-publish commits
-  `3f3b83d`/`a4eac8c`/`f744b25`;
+- backup API/jobs/publication: revert `f744b25`, then `a4eac8c`, then
+  `3f3b83d`, then `de94de7`, then `9d04ffe`, then every backup-seam commit
+  from `04ad491` backward through and including `b77fa38`;
 - retention and repository foundations: `38156ce` through `56534d9`;
 - Reader feature ownership: `31093ba` through `987aea0`;
 - CSS layers/features: `46759eb` through `2a77755`;
