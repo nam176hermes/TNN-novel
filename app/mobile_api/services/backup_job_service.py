@@ -159,16 +159,37 @@ class BackupJobCoordinator:
 
                 try:
                     params = dict(job.params) if job is not None else {}
-                    item = await asyncio.to_thread(
-                        self.backup_service.create_backup,
-                        include_audio=bool(params.get("include_audio", True)),
-                        include_exports=bool(params.get("include_exports")),
-                        include_job_logs=bool(params.get("include_job_logs")),
-                        include_secrets=include_secrets,
-                        passphrase=credential,
-                        cancel_check=lambda: self._cancel_requested(job_id),
-                        progress_callback=lambda step: self._publish_step(job_id, step),
+                    local_cancel = threading.Event()
+                    worker = asyncio.create_task(
+                        asyncio.to_thread(
+                            self.backup_service.create_backup,
+                            include_audio=bool(params.get("include_audio", True)),
+                            include_exports=bool(params.get("include_exports")),
+                            include_job_logs=bool(params.get("include_job_logs")),
+                            include_secrets=include_secrets,
+                            passphrase=credential,
+                            cancel_check=lambda: local_cancel.is_set() or self._cancel_requested(job_id),
+                            progress_callback=lambda step: self._publish_step(job_id, step),
+                        )
                     )
+                    try:
+                        item = await asyncio.shield(worker)
+                    except asyncio.CancelledError as cancellation:
+                        local_cancel.set()
+                        self.tracker.update_job(job_id, cancel_requested=True)
+                        while not worker.done():
+                            try:
+                                await asyncio.shield(worker)
+                            except asyncio.CancelledError:
+                                local_cancel.set()
+                            except Exception:
+                                break
+                        if worker.done():
+                            try:
+                                worker.result()
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        raise cancellation
                 except BackupCancelled:
                     self.tracker.update_job(
                         job_id,

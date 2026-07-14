@@ -100,6 +100,51 @@ class FakeBackupService:
             self.finished.set()
 
 
+class DelayedCancellationBackupService(FakeBackupService):
+    """Observes cancellation but stays active until the test releases it."""
+
+    def create_backup(
+        self,
+        *,
+        include_audio: bool,
+        include_exports: bool,
+        include_job_logs: bool,
+        include_secrets: bool,
+        passphrase: str,
+        cancel_check,
+        progress_callback,
+    ) -> dict:
+        with self._lock:
+            self.call_count += 1
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        self.started.set()
+        try:
+            progress_callback("preparing")
+            deadline = time.monotonic() + 2
+            while not self.release.wait(0.01) and time.monotonic() < deadline:
+                if cancel_check():
+                    self.cancel_observed = True
+            if self.cancel_observed or cancel_check():
+                self.cancel_observed = True
+                raise BackupCancelled("Backup cancelled")
+            return {"filename": "novel-pipeline-backup-20260713-120000.tar.gz"}
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+            self.finished.set()
+
+
+class RecordingSecretStore(BackupSecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.discarded = threading.Event()
+
+    def discard(self, job_id: str) -> None:
+        super().discard(job_id)
+        self.discarded.set()
+
+
 def test_backup_service_forwards_cancellation_and_progress_callbacks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -341,6 +386,62 @@ async def test_backup_cancel_is_cooperative_and_discards_secret(tmp_path: Path) 
     assert job.cancel_requested is True
     assert job.status == "cancelled"
     assert secrets.take(job_id) == ""
+
+
+@pytest.mark.asyncio
+async def test_external_wrapper_cancel_holds_directory_lock_until_worker_exits(
+    tmp_path: Path,
+) -> None:
+    tracker = JobTracker()
+    service = DelayedCancellationBackupService(tmp_path / "backups")
+    secrets = RecordingSecretStore()
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service, secret_store=secrets)
+    first_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=True,
+        passphrase="correct horse",
+    )
+    for _ in range(100):
+        if service.started.is_set():
+            break
+        await asyncio.sleep(0.01)
+
+    first_wrapper = tracker._tasks[first_id]
+    first_wrapper.cancel()
+    second_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    for _ in range(100):
+        if service.cancel_observed:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+
+    first_job = tracker.get_job(first_id)
+    assert first_job is not None
+    assert service.cancel_observed
+    assert service.call_count == 1
+    assert service.max_active_calls == 1
+    assert first_job.status not in {"cancelled", "canceled", "completed", "failed", "interrupted"}
+    assert not secrets.discarded.is_set()
+
+    service.release.set()
+    await wait_for_job(tracker, first_id)
+    await wait_for_job(tracker, second_id)
+
+    first_job = tracker.get_job(first_id)
+    assert first_job is not None
+    assert first_job.status == "cancelled"
+    assert service.call_count == 2
+    assert service.max_active_calls == 1
+    assert secrets.discarded.is_set()
+    assert secrets.take(first_id) == ""
 
 
 @pytest.mark.asyncio

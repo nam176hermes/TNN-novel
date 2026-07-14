@@ -66,3 +66,36 @@ Implemented. Backend lifecycle and persistence tests pass in focused runs; front
 
 - The required full backend command stalled in uninterruptible DrvFS I/O after partial progress; it was terminated, then the changed backend surfaces were verified in focused passing runs above.
 - The exact required Vitest command and a single-thread threads-pool retry both stalled before collection under DrvFS and were terminated with a 60-second bound. No stale Pytest/Vitest workers were left. Runtime frontend test completion therefore remains an environment-limited verification gap; TypeScript validation is green.
+
+## Fix: cancellation drain and App orchestration coverage
+
+### Status
+
+- Fixed the review finding that external asyncio cancellation could release the backup-directory lock while `asyncio.to_thread` work was still running.
+- Added App-level proof that a polled backup completion reloads the inventory exactly once and does not retain or render the submitted encryption value.
+
+### Backend RED / GREEN
+
+- RED: `test_external_wrapper_cancel_holds_directory_lock_until_worker_exits` observed `service.call_count == 2` while the first worker was still blocked; expected `1`. The old coordinator had already released its lock and discarded its credential.
+- GREEN targeted: `1 passed, 11 deselected in 6.53s`.
+- GREEN focused coordinator suite: `12 passed in 9.52s`.
+- GREEN combined coordinator and protected backup API suite: `20 passed, 1 warning in 27.65s`; the warning is the pre-existing passlib `crypt` deprecation.
+
+### Cancellation and terminal-ordering evidence
+
+- The coordinator now retains an explicit asyncio task for the thread worker and awaits it through `asyncio.shield`.
+- External cancellation sets a process-local cooperative event and the tracker's durable `cancel_requested` flag, then drains the real worker under the same directory lock before re-propagating cancellation.
+- Repeated task cancellation while draining cannot release the lock early. The tracker wrapper only persists `cancelled` after the worker exits.
+- The focused test proves the first job stays non-terminal, the credential store is not discarded, and the second same-directory job does not enter until the first worker is released. Final cleanup and maximum concurrency of one are also asserted.
+
+### Frontend RED / GREEN
+
+- The new App orchestration test forces the SSE request to fail, advances the existing fallback poll to a completed backup job, and asserts exactly one post-completion `listSystemBackups()` reload.
+- It verifies the submitted encryption value is present only in the POST body and absent from rendered content, local storage, and session storage after resolution.
+- The first focused App-only Vitest attempt hit the intermittent DrvFS collection stall and was terminated by the 60-second bound.
+- GREEN required frontend retry: `2 test files passed`, `18 tests passed`, duration `37.69s` for `src/App.test.tsx` and `src/components/StatusSettingsView.test.tsx`.
+- GREEN TypeScript: `npm --prefix web run typecheck` exited `0`.
+
+### Concerns
+
+- DrvFS test startup remains intermittently slow, but the required frontend test set completed successfully on the bounded retry. No stale test workers remain.
