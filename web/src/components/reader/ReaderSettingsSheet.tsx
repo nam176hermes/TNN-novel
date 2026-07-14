@@ -8,14 +8,17 @@ import type {
   ReaderWidth,
 } from './types';
 
-export type ReaderSettingsSheetProps = {
+export type ReaderModeAvailability = {
+  rawAvailable: boolean;
+};
+
+export type ReaderSettingsSheetProps = Partial<ReaderModeAvailability> & {
   open: boolean;
   settings: ReaderSettings;
   onClose(): void;
   audioAvailable?: boolean;
   audioBusy?: boolean;
   autoScrollEnabled?: boolean;
-  rawAvailable?: boolean;
   textMode?: ReaderTextMode;
   onAudioAction?(): void;
   onAutoScrollChange?(enabled: boolean): void;

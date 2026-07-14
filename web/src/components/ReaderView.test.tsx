@@ -330,6 +330,13 @@ describe('ReaderView', () => {
     expect(screen.getByRole('button', { name: 'Cài đặt chữ' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Thêm tùy chọn' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Điều khiển đọc' })).not.toBeInTheDocument();
+    expect(reader.querySelectorAll('.reader-top-bar')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-bottom-bar')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-reference-chapter-nav')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-text-mode-switcher')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-reference-actions')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Quay lại thư viện' })).toHaveClass('reader-icon-button');
+    expect(screen.getByRole('button', { name: 'Chương trước' })).toHaveClass('reader-chapter-nav-button');
 
     await userEvent.click(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }));
     expect(reader).toHaveAttribute('data-chrome-visible', 'false');

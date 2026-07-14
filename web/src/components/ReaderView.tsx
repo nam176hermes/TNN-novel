@@ -1,15 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
-  ArrowLeft,
   BookOpenText,
   Bookmark,
   Download,
-  List,
-  MoreVertical,
   ScrollText,
-  Search,
   Trash2,
-  Type,
   Upload,
   Volume2,
   Wrench,
@@ -123,11 +118,23 @@ import ReaderAudioBar from './reader/ReaderAudioBar';
 import ReaderDictionaryPanel from './reader/ReaderDictionaryPanel';
 import ReaderMarksPanel, { type ReaderMarkPanelItem } from './reader/ReaderMarksPanel';
 import ReaderAiPanel, { type ReaderAiPanelMode } from './reader/ReaderAiPanel';
-import ReaderProgressBar from './reader/ReaderProgressBar';
+import {
+  ReaderChromeBottom,
+  ReaderChromeTop,
+  type ReaderChromeActions,
+  type ReaderChromeNavigation,
+  type ReaderChromeTitle,
+} from './reader/ReaderChrome';
+import {
+  ReaderQuickActionBar,
+  ReaderQuickSettingsSheet,
+  ReaderTextModeSwitcher,
+  type ReaderQuickModeControls,
+  type ReaderQuickSettingsControls,
+} from './reader/ReaderQuickControls';
 import ReaderSearchPanel from './reader/ReaderSearchPanel';
 import ReaderSelectionPopover, { type ReaderSelectionAction } from './reader/ReaderSelectionPopover';
 import ReaderTocSheet, { type TocChapterPreview } from './reader/ReaderTocSheet';
-import ReaderSettingsSheet from './reader/ReaderSettingsSheet';
 import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichBlock } from './reader/ReaderTextSurface';
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
 import {
@@ -4068,6 +4075,79 @@ export default function ReaderView({
     </section>
   ) : null;
 
+  const chromeTitle: ReaderChromeTitle = {
+    bookTitle: selectedBook?.title || 'Đọc truyện',
+    chapterTitle: activeChapterTitle,
+    cover: selectedBook && readerCoverUrl
+      ? { alt: `Bìa ${selectedBook.title}`, src: readerCoverUrl }
+      : undefined,
+    offlineAvailable: currentChapterAvailableOffline,
+  };
+  const chromeNavigation: ReaderChromeNavigation = {
+    bookProgressLabel,
+    canGoNext,
+    canGoPrevious,
+    chapterCount: translatedChapters.length,
+    chapterNumber: selectedChapter?.chapter_number ?? null,
+    chapterPositionLabel: `${Math.max(currentPosition, 1).toLocaleString('vi-VN')} / ${Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}`,
+    locationLabel,
+    progressLabel,
+    progressPercent,
+    timeRemainingLabel,
+    wordsRemainingLabel,
+  };
+  const chromeActions: ReaderChromeActions = {
+    bookmarked,
+    onExit: exitReader,
+    onNext: handleNextPageOrChapter,
+    onOpenSearch: () => {
+      setReaderSearchOpen(true);
+      setTocOpen(false);
+      setMoreOpen(false);
+      setChromeVisible(true);
+    },
+    onOpenSettings: () => setSettingsOpen(true),
+    onOpenToc: () => setTocOpen(true),
+    onPrevious: handlePreviousPageOrChapter,
+    onToggleBookmark: toggleBookmark,
+    onToggleMore: () => setMoreOpen((current) => !current),
+  };
+  const quickModes: ReaderQuickModeControls = {
+    rawAvailable: rawContentAvailable,
+    value: readerTextMode,
+    onChange: setReaderTextMode,
+  };
+  const quickSettings: ReaderQuickSettingsControls = {
+    audioAvailable: canPlayAudio,
+    audioBusy: audioJobLoading,
+    autoScrollEnabled,
+    canAutoScroll: hasReadableChapterContent,
+    open: settingsOpen,
+    value: readerSettings,
+    onAudioAction: () => {
+      if (canPlayAudio) {
+        setAudioOpen(true);
+        return;
+      }
+      startReaderAudioJob();
+    },
+    onAutoScrollChange: (enabled) => {
+      if (enabled && readerSettings.readingMode !== 'scroll') {
+        updateReaderSettings({ readingMode: 'scroll' });
+      }
+      setAutoScrollEnabled(enabled);
+    },
+    onClose: () => setSettingsOpen(false),
+    onOpen: () => setSettingsOpen(true),
+    onToggleAutoScroll: () => {
+      if (readerSettings.readingMode !== 'scroll') {
+        updateReaderSettings({ readingMode: 'scroll' });
+      }
+      setAutoScrollEnabled((current) => !current);
+    },
+    onUpdate: updateReaderSettings,
+  };
+
   return (
     <section
       aria-label="Trang đọc truyện"
@@ -4077,147 +4157,14 @@ export default function ReaderView({
       data-theme={readerSettings.theme}
     >
       <h2 className="sr-only">Đọc truyện</h2>
-      <header className="reader-top-bar" data-visible={chromeVisible}>
-        <button
-          aria-label="Quay lại thư viện"
-          className="reader-icon-button reader-back-button"
-          onClick={exitReader}
-          title="Quay lại thư viện"
-          type="button"
-        >
-          <ArrowLeft aria-hidden="true" size={22} />
-          <span>Thư viện</span>
-        </button>
+      <ReaderChromeTop
+        actions={chromeActions}
+        navigation={chromeNavigation}
+        title={chromeTitle}
+        visible={chromeVisible}
+      />
 
-        <button
-          aria-label="Mở mục lục từ thanh trên"
-          className="reader-icon-button"
-          disabled={translatedChapters.length === 0}
-          onClick={() => setTocOpen(true)}
-          title="Mục lục"
-          type="button"
-        >
-          <List aria-hidden="true" size={22} />
-        </button>
-
-        <div className="reader-top-title">
-          {selectedBook && readerCoverUrl ? (
-            <img
-              alt={`Bìa ${selectedBook.title}`}
-              className="reader-top-cover"
-              src={readerCoverUrl}
-            />
-          ) : null}
-          <div>
-            <strong>{selectedBook?.title || 'Đọc truyện'}</strong>
-            <span>{activeChapterTitle}</span>
-          </div>
-          {currentChapterAvailableOffline ? (
-            <span aria-label="Có sẵn offline" className="reader-offline-badge">Offline</span>
-          ) : null}
-        </div>
-
-        <button
-          aria-label="Tìm kiếm"
-          className="reader-icon-button"
-          disabled={translatedChapters.length === 0}
-          onClick={() => {
-            setReaderSearchOpen(true);
-            setTocOpen(false);
-            setMoreOpen(false);
-            setChromeVisible(true);
-          }}
-          title="Tìm kiếm"
-          type="button"
-        >
-          <Search aria-hidden="true" size={22} />
-        </button>
-
-        <button
-          aria-label="Đánh dấu trang"
-          aria-pressed={bookmarked}
-          className="reader-icon-button"
-          onClick={toggleBookmark}
-          title="Đánh dấu trang"
-          type="button"
-        >
-          <Bookmark aria-hidden="true" fill={bookmarked ? 'currentColor' : 'none'} size={22} />
-        </button>
-
-        <button
-          aria-label="Cài đặt chữ"
-          className="reader-icon-button reader-type-button"
-          onClick={() => setSettingsOpen(true)}
-          title="Cài đặt chữ"
-          type="button"
-        >
-          <Type aria-hidden="true" size={18} />
-          <span>Aa</span>
-        </button>
-
-        <button
-          aria-label="Thêm tùy chọn"
-          className="reader-icon-button"
-          onClick={() => setMoreOpen((current) => !current)}
-          title="Thêm tùy chọn"
-          type="button"
-        >
-          <MoreVertical aria-hidden="true" size={22} />
-        </button>
-      </header>
-
-      <div aria-label="Điều hướng chương nhanh" className="reader-reference-chapter-nav" data-visible={chromeVisible}>
-        <button disabled={!canGoPrevious} onClick={handlePreviousPageOrChapter} type="button">‹ Chương trước</button>
-        <button disabled={translatedChapters.length === 0} onClick={() => setTocOpen(true)} type="button">
-          Chương {selectedChapter?.chapter_number ?? '-'} / {Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}
-        </button>
-        <button disabled={!canGoNext} onClick={handleNextPageOrChapter} type="button">Chương sau ›</button>
-      </div>
-
-      <div aria-label="Chế độ nội dung" className="reader-text-mode-switcher" data-visible={chromeVisible} role="group">
-        <button
-          aria-pressed={readerTextMode === 'translation'}
-          onClick={() => setReaderTextMode('translation')}
-          type="button"
-        >
-          Bản dịch
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'raw'}
-          disabled={!rawContentAvailable}
-          onClick={() => setReaderTextMode('raw')}
-          title={rawContentAvailable ? 'Đọc raw/source tiếng Trung' : 'Chương này chưa có raw/source text'}
-          type="button"
-        >
-          Raw
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'split'}
-          disabled={!rawContentAvailable}
-          onClick={() => setReaderTextMode('split')}
-          title={rawContentAvailable ? 'Đọc song song raw và bản dịch' : 'Chương này chưa có raw/source text'}
-          type="button"
-        >
-          Song song
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'raw-collapsed'}
-          disabled={!rawContentAvailable}
-          onClick={() => setReaderTextMode('raw-collapsed')}
-          title={rawContentAvailable ? 'Đọc bản dịch và mở raw từng đoạn' : 'Chương này chưa có raw/source text'}
-          type="button"
-        >
-          Raw gọn
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'qa-overlay'}
-          onClick={() => setReaderTextMode('qa-overlay')}
-          title="Hiện cảnh báo QA trực tiếp trên đoạn dịch"
-          type="button"
-        >
-          QA
-        </button>
-      </div>
+      <ReaderTextModeSwitcher modes={quickModes} visible={chromeVisible} />
 
       <section aria-label="Audio và TTS chương" className="reader-audio-panel" data-visible={chromeVisible}>
         <div className="reader-audio-panel-main">
@@ -4890,62 +4837,13 @@ export default function ReaderView({
         onClose={clearReaderSelection}
       />
 
-      <ReaderProgressBar
-        bookProgressLabel={bookProgressLabel}
-        canGoNext={canGoNext}
-        canGoPrevious={canGoPrevious}
-        chapterPositionLabel={`${Math.max(currentPosition, 1).toLocaleString('vi-VN')} / ${Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}`}
-        locationLabel={locationLabel}
-        progressLabel={progressLabel}
-        progressPercent={progressPercent}
-        timeRemainingLabel={timeRemainingLabel}
-        visible={chromeVisible}
-        wordsRemainingLabel={wordsRemainingLabel}
-        onNext={handleNextPageOrChapter}
-        onOpenToc={translatedChapters.length > 0 ? () => setTocOpen(true) : undefined}
-        onPrevious={handlePreviousPageOrChapter}
-      />
+      <ReaderChromeBottom actions={chromeActions} navigation={chromeNavigation} visible={chromeVisible} />
 
-      <div aria-label="Công cụ đọc nhanh" className="reader-reference-actions" data-visible={chromeVisible}>
-        <button aria-label="Mở mục lục đọc" onClick={() => setTocOpen(true)} type="button">
-          <List aria-hidden="true" size={16} />
-          Mục lục
-        </button>
-        <button
-          aria-pressed={readerSettings.instantMode}
-          onClick={() => updateReaderSettings({ instantMode: !readerSettings.instantMode })}
-          type="button"
-        >
-          <BookOpenText aria-hidden="true" size={16} />
-          Tối ưu đọc
-        </button>
-        <button
-          aria-pressed={readerSettings.readingMode === 'scroll'}
-          onClick={() => updateReaderSettings({ readingMode: readerSettings.readingMode === 'scroll' ? 'paginated' : 'scroll' })}
-          type="button"
-        >
-          <ScrollText aria-hidden="true" size={16} />
-          Cuộn đọc
-        </button>
-        <button
-          aria-pressed={autoScrollEnabled}
-          disabled={!hasReadableChapterContent}
-          onClick={() => {
-            if (readerSettings.readingMode !== 'scroll') {
-              updateReaderSettings({ readingMode: 'scroll' });
-            }
-            setAutoScrollEnabled((current) => !current);
-          }}
-          type="button"
-        >
-          <Volume2 aria-hidden="true" size={16} />
-          Tự động cuộn
-        </button>
-        <button onClick={() => setSettingsOpen(true)} type="button">
-          <Type aria-hidden="true" size={16} />
-          Cài đặt
-        </button>
-      </div>
+      <ReaderQuickActionBar
+        settings={quickSettings}
+        visible={chromeVisible}
+        onOpenToc={chromeActions.onOpenToc}
+      />
 
       <ReaderAudioBar
         autoNext={audioAutoNext}
@@ -5036,35 +4934,7 @@ export default function ReaderView({
         onSpoilerModeChange={updateReaderXraySpoilerMode}
       />
 
-      <ReaderSettingsSheet
-        audioAvailable={canPlayAudio}
-        audioBusy={audioJobLoading}
-        autoScrollEnabled={autoScrollEnabled}
-        open={settingsOpen}
-        rawAvailable={rawContentAvailable}
-        settings={readerSettings}
-        textMode={readerTextMode}
-        onAudioAction={() => {
-          setSettingsOpen(false);
-          if (canPlayAudio) {
-            setAudioOpen(true);
-            return;
-          }
-          startReaderAudioJob();
-        }}
-        onAutoScrollChange={(enabled) => {
-          if (enabled && readerSettings.readingMode !== 'scroll') {
-            updateReaderSettings({ readingMode: 'scroll' });
-          }
-          setAutoScrollEnabled(enabled);
-        }}
-        onClose={() => setSettingsOpen(false)}
-        onTextModeChange={(mode) => {
-          setReaderTextMode(mode);
-          setSettingsOpen(false);
-        }}
-        onUpdate={updateReaderSettings}
-      />
+      <ReaderQuickSettingsSheet modes={quickModes} settings={quickSettings} />
 
       {noteDraft ? (
         <div className="reader-sheet-backdrop">
