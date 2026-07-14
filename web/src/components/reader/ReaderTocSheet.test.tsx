@@ -23,7 +23,6 @@ const previews = new Map<number, TocChapterPreview>([
 function renderToc(overrides: Partial<Parameters<typeof ReaderTocSheet>[0]> = {}) {
   const props = {
     author: 'Vong Ngữ',
-    chapterCountLabel: '3 chương đã dịch',
     chapters,
     currentChapterId: 12,
     open: true,
@@ -46,6 +45,15 @@ describe('ReaderTocSheet', () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it('derives the translated count and list from raw chapter data', () => {
+    renderToc();
+    const drawer = screen.getByRole('dialog', { name: 'Mục lục' });
+
+    expect(within(drawer).getByText('3 chương đã dịch')).toBeInTheDocument();
+    expect(chapterButtons()).toHaveLength(3);
+    expect(within(drawer).queryByRole('button', { name: 'Ch. 4 Chưa dịch' })).not.toBeInTheDocument();
   });
 
   it('sorts translated chapters in either direction without changing or navigating the current chapter', async () => {
@@ -118,6 +126,53 @@ describe('ReaderTocSheet', () => {
       await waitFor(() => expect(current).toHaveFocus());
       expect(scrollIntoView).toHaveBeenCalledTimes(1);
       expect(scrollIntoView.mock.contexts[0]).toBe(current);
+    } finally {
+      cleanup();
+      if (originalScrollIntoView) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', originalScrollIntoView);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'scrollIntoView');
+      }
+    }
+  });
+
+  it('anchors when current chapter data arrives without stealing focus during query or order changes', async () => {
+    const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const props = {
+      author: 'Vong Ngữ',
+      chapters: [] as Chapter[],
+      currentChapterId: 12,
+      open: true,
+      previews,
+      title: 'Phàm Nhân Tu Tiên',
+      onClose: vi.fn(),
+      onSelectChapter: vi.fn(),
+    };
+
+    try {
+      const { rerender } = render(<ReaderTocSheet {...props} />);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+
+      rerender(<ReaderTocSheet {...props} chapters={chapters} />);
+      const current = screen.getByRole('button', { name: 'Ch. 2 Thanh Ngưu trấn' });
+      await waitFor(() => expect(current).toHaveFocus());
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+      const search = screen.getByRole('searchbox', { name: 'Tìm trong mục lục' });
+      await userEvent.type(search, 'thanh');
+      expect(search).toHaveFocus();
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+      await userEvent.clear(search);
+      const descending = screen.getByRole('button', { name: 'Cuối → đầu' });
+      await userEvent.click(descending);
+      expect(descending).toHaveFocus();
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
     } finally {
       cleanup();
       if (originalScrollIntoView) {

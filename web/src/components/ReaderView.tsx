@@ -1946,7 +1946,6 @@ export default function ReaderView({
     }),
     [chapterMarks, progressTextBlocks, readerSearchOptions, readerSearchQuery, selectedChapter],
   );
-  const chapterCountLabel = `${translatedChapters.length.toLocaleString()} chương đã dịch`;
   const totalProgressChars = totalTextLength(progressTextBlocks);
   const currentPageStartCharOffset = isPaginatedMode ? currentViewportPage.startChar ?? 0 : 0;
   const currentPageStartAbsoluteCharOffset = isPaginatedMode
@@ -4963,8 +4962,7 @@ export default function ReaderView({
 
       <ReaderTocSheet
         author={selectedBook?.author}
-        chapterCountLabel={chapterCountLabel}
-        chapters={translatedChapters}
+        chapters={chapters}
         currentChapterId={selectedChapterId}
         open={tocOpen}
         previews={tocChapterPreviews}

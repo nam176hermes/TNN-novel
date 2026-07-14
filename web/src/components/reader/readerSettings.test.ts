@@ -8,7 +8,7 @@ import {
   saveReaderSettings,
   saveReaderTextMode,
 } from './readerSettings';
-import type { ReaderSettings } from './types';
+import type { ReaderSettings, ReaderTextMode } from './types';
 
 describe('reader settings persistence', () => {
   afterEach(() => {
@@ -66,6 +66,18 @@ describe('reader settings persistence', () => {
 
     expect(loadReaderSettings(window.localStorage)).toEqual(settings);
     expect(loadReaderTextMode(window.localStorage)).toBe('raw-collapsed');
+  });
+
+  it.each<ReaderTextMode>([
+    'translation',
+    'raw',
+    'split',
+    'raw-collapsed',
+    'qa-overlay',
+  ])('round-trips the %s reader text mode', (mode) => {
+    saveReaderTextMode(mode, window.localStorage);
+
+    expect(loadReaderTextMode(window.localStorage)).toBe(mode);
   });
 
   it('keeps the existing storage keys byte-for-byte unchanged', () => {

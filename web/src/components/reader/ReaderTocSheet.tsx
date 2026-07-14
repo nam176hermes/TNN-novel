@@ -12,7 +12,6 @@ export type TocChapterPreview = {
 
 export type ReaderTocSheetProps = {
   author?: string;
-  chapterCountLabel: string;
   chapters: Chapter[];
   currentChapterId: number | null;
   open: boolean;
@@ -24,7 +23,6 @@ export type ReaderTocSheetProps = {
 
 export default function ReaderTocSheet({
   author,
-  chapterCountLabel,
   chapters,
   currentChapterId,
   open,
@@ -42,12 +40,13 @@ export default function ReaderTocSheet({
     query,
     setOrder,
     setQuery,
+    translatedChapterDatasetKey,
     translatedChapters,
     visibleChapters,
   } = useReaderToc({ chapters, currentChapterId });
   const displayChapterCountLabel = query.trim()
     ? `${visibleChapters.length.toLocaleString()}/${translatedChapters.length.toLocaleString()} chương`
-    : chapterCountLabel;
+    : `${translatedChapters.length.toLocaleString()} chương đã dịch`;
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -57,7 +56,7 @@ export default function ReaderTocSheet({
     if (typeof currentChapter.scrollIntoView === 'function') {
       currentChapter.scrollIntoView({ block: 'nearest' });
     }
-  }, [currentTocChapterId, open]);
+  }, [currentTocChapterId, open, translatedChapterDatasetKey]);
 
   if (!open) return null;
 

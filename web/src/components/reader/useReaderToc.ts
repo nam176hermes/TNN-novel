@@ -30,6 +30,10 @@ export function useReaderToc({ chapters, currentChapterId }: UseReaderTocOptions
     () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
     [chapters],
   );
+  const translatedChapterDatasetKey = useMemo(
+    () => translatedChapters.map((chapter) => chapter.id).join(':'),
+    [translatedChapters],
+  );
   const normalizedQuery = normalizeVietnameseQuery(query.trim());
   const visibleChapters = useMemo(() => {
     const filtered = normalizedQuery
@@ -49,6 +53,7 @@ export function useReaderToc({ chapters, currentChapterId }: UseReaderTocOptions
     query,
     setOrder,
     setQuery,
+    translatedChapterDatasetKey,
     translatedChapters,
     visibleChapters,
   };
