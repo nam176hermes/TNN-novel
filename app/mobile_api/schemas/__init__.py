@@ -44,6 +44,17 @@ class VersionResponse(BaseModel):
     build: str = ""
 
 
+class RetentionRunSummaryResponse(BaseModel):
+    last_run_at: str
+    deleted_counts: dict[str, int] = Field(default_factory=dict)
+    result: Literal["completed", "skipped"]
+
+
+class RetentionStatusResponse(BaseModel):
+    table_counts: dict[str, int] = Field(default_factory=dict)
+    last_run: RetentionRunSummaryResponse | None = None
+
+
 class SystemStatusResponse(BaseModel):
     db_size_bytes: int = 0
     data_size_bytes: int = 0
@@ -70,6 +81,7 @@ class SystemStatusResponse(BaseModel):
     recent_operational_errors: list[dict[str, Any]] = Field(default_factory=list)
     recent_operational_events: list[dict[str, Any]] = Field(default_factory=list)
     recent_backup_events: list[dict[str, Any]] = Field(default_factory=list)
+    retention: RetentionStatusResponse = Field(default_factory=RetentionStatusResponse)
     app_version: str = ""
     build: str = ""
     backup_recommendation: str = ""

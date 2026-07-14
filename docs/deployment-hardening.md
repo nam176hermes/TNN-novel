@@ -167,8 +167,30 @@ The authenticated UI has a `Trạng thái` page. Use it to confirm:
 - last failed job
 - database path in local/private mode
 - backup recommendation
+- retention table counts and the last count-only retention summary
 
 It intentionally does not show API keys or secrets.
+
+## Operational Metadata Retention
+
+The FastAPI lifespan owns one metadata-retention task. It runs once after runtime initialization and then every six hours by default; API requests never trigger deletion. Each repository call uses a bounded transaction, and the task yields between batches so large backlogs do not become one long maintenance transaction.
+
+Approved defaults:
+
+```bash
+AUTH_SESSION_RETENTION_DAYS=30
+AUTH_SESSION_RETENTION_MAX_ROWS=5000
+AUTH_LOGIN_FAILURE_RETENTION_DAYS=30
+AUTH_LOGIN_FAILURE_RETENTION_MAX_ROWS=5000
+OPERATIONAL_EVENT_RETENTION_DAYS=90
+OPERATIONAL_EVENT_RETENTION_MAX_ROWS=50000
+OPERATIONAL_RETENTION_BATCH_SIZE=500
+OPERATIONAL_RETENTION_INTERVAL_SECONDS=21600
+```
+
+All values must be positive integers. Invalid or non-positive configuration fails validation instead of silently disabling or clamping retention. Active, unexpired sessions are never eligible; revoked or expired sessions, login failures, and operational events are bounded by both age and row count.
+
+SQLite lock contention safely skips the current run and retries at the next interval. Runs that delete rows record one sanitized `operational_retention` event containing deleted counts only. Zero-delete runs create no event. Authenticated system status exposes only table labels, row counts, last-run time, deleted counts, and the result—never SQL, database paths, row values, exception text, or secrets.
 
 ## Public Readiness Output
 

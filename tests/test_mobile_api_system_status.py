@@ -207,3 +207,68 @@ async def test_system_status_reports_sanitized_operational_events(
     assert "provider-secret" not in response.text
     assert "sk-test-secret" not in response.text
     assert "/tmp/" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_system_status_exposes_only_safe_retention_counts_and_summary(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.services.retention_service import RetentionService, RetentionSummary
+
+    init_db(temp_db_path)
+    data_dir = tmp_path / "retention-status-data"
+    data_dir.mkdir(parents=True)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = RetentionService(temp_db_path, settings=mobile_settings)
+    service._last_summary = RetentionSummary(
+        last_run_at="2026-07-13T12:00:00+00:00",
+        deleted_counts={
+            "auth_sessions": 3,
+            "auth_login_failures": 4,
+            "operational_events": 5,
+        },
+        result="completed",
+    )
+
+    monkeypatch.setattr(mobile_dependencies, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(mobile_dependencies, "get_data_dir", lambda: data_dir)
+    monkeypatch.setattr(health_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(health_router, "get_data_dir", lambda: data_dir)
+    monkeypatch.setattr(auth_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.session_auth.get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr("app.mobile_api.audit.get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(jobs_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(jobs_router, "get_shared_job_tracker", lambda: tracker)
+    monkeypatch.setattr("app.mobile_api.services.provider_service.get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(app.state, "retention_service", service)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        response = await client.get("/api/system/status", headers=headers)
+
+    assert response.status_code == 200
+    retention = response.json()["retention"]
+    assert set(retention) == {"table_counts", "last_run"}
+    assert set(retention["table_counts"]) == {
+        "auth_sessions",
+        "auth_login_failures",
+        "operational_events",
+    }
+    assert all(isinstance(count, int) for count in retention["table_counts"].values())
+    assert retention["table_counts"]["auth_sessions"] == 1
+    assert retention["last_run"] == {
+        "last_run_at": "2026-07-13T12:00:00+00:00",
+        "deleted_counts": {
+            "auth_sessions": 3,
+            "auth_login_failures": 4,
+            "operational_events": 5,
+        },
+        "result": "completed",
+    }
+    retention_text = str(retention).lower()
+    assert str(temp_db_path) not in str(retention)
+    assert str(data_dir) not in str(retention)
+    assert not any(marker in retention_text for marker in ("select ", "exception", "row_values"))

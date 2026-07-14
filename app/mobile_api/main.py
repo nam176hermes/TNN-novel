@@ -1,6 +1,9 @@
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 import logging
 import os
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +26,7 @@ from app.mobile_api.private_assets import (
 )
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.session_auth import AccessTokenError, validate_access_token
+from app.mobile_api.services.retention_service import RetentionService, run_retention_loop
 from app.mobile_api.routers import (
     auth_router,
     health_router,
@@ -98,6 +102,35 @@ def _prepare_runtime() -> None:
         init_captcha_solver(captcha_key, os.getenv("CAPTCHA_PROVIDER", "2captcha"))
 
 
+@asynccontextmanager
+async def _retention_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    service = app.state.retention_service
+    if service is None:
+        service = RetentionService(get_db_path(), settings=mobile_settings)
+        app.state.retention_service = service
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        run_retention_loop(
+            service,
+            mobile_settings.operational_retention_interval_seconds,
+            stop_event,
+        ),
+        name="novel-operational-retention",
+    )
+    app.state.retention_stop_event = stop_event
+    app.state.retention_task = task
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        app.state.retention_task = None
+        app.state.retention_stop_event = None
+
+
 def _mount_web_app(app: FastAPI) -> None:
     if not mobile_settings.serve_web:
         return
@@ -144,7 +177,7 @@ def _mount_private_asset_routes(app: FastAPI) -> None:
         return response
 
 
-def create_app() -> FastAPI:
+def create_app(*, retention_service: RetentionService | None = None) -> FastAPI:
     try:
         assert_public_deploy_safe(mobile_settings)
     except RuntimeError:
@@ -157,7 +190,11 @@ def create_app() -> FastAPI:
         docs_url=None if mobile_settings.public_deploy else "/docs",
         openapi_url=None if mobile_settings.public_deploy else "/openapi.json",
         redoc_url=None if mobile_settings.public_deploy else "/redoc",
+        lifespan=_retention_lifespan,
     )
+    app.state.retention_service = retention_service
+    app.state.retention_task = None
+    app.state.retention_stop_event = None
 
     # CORS for Flutter
     app.add_middleware(

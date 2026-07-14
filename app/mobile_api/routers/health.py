@@ -15,6 +15,7 @@ from app.mobile_api.config import auth_bypass_enabled, mobile_settings, validate
 from app.mobile_api.public_mode import is_public_request, sanitize_public_payload
 from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStatusResponse, VersionResponse
 from app.mobile_api.dependencies import get_db_path, get_data_dir
+from app.mobile_api.services.retention_service import RetentionService
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -195,6 +196,10 @@ async def system_status(request: Request):
         event for event in recent_events
         if str(event.get("event_type") or "").startswith("backup_")
     ][:5]
+    retention_service = getattr(request.app.state, "retention_service", None)
+    if retention_service is None:
+        retention_service = RetentionService(db_path, settings=mobile_settings)
+    retention_status = await retention_service.get_status(db_path=db_path)
 
     active_provider = ""
     for job in running_jobs:
@@ -255,6 +260,7 @@ async def system_status(request: Request):
         recent_operational_errors=recent_operational_errors,
         recent_operational_events=recent_events[:20],
         recent_backup_events=recent_backup_events,
+        retention=retention_status,
         app_version=mobile_settings.version,
         build="phase1",
         backup_recommendation="System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
 from app.config import PROJECT_ROOT
@@ -24,6 +24,8 @@ def _parse_bool(value: str) -> bool:
 
 
 class MobileAPISettings(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+
     version: str = "0.1.0"
     host: str = os.getenv("MOBILE_API_HOST", "0.0.0.0")
     port: int = int(os.getenv("MOBILE_API_PORT", "7860"))
@@ -40,6 +42,38 @@ class MobileAPISettings(BaseModel):
     login_rate_limit_window_seconds: int = int(os.getenv("MOBILE_API_LOGIN_RATE_LIMIT_WINDOW_SECONDS", "300"))
     job_stale_after_seconds: int = int(os.getenv("JOB_STALE_AFTER_SECONDS", "300"))
     job_heartbeat_interval_seconds: float = float(os.getenv("JOB_HEARTBEAT_INTERVAL_SECONDS", "30"))
+    auth_session_retention_days: int = Field(
+        default=int(os.getenv("AUTH_SESSION_RETENTION_DAYS", "30")),
+        gt=0,
+    )
+    auth_session_retention_max_rows: int = Field(
+        default=int(os.getenv("AUTH_SESSION_RETENTION_MAX_ROWS", "5000")),
+        gt=0,
+    )
+    auth_login_failure_retention_days: int = Field(
+        default=int(os.getenv("AUTH_LOGIN_FAILURE_RETENTION_DAYS", "30")),
+        gt=0,
+    )
+    auth_login_failure_retention_max_rows: int = Field(
+        default=int(os.getenv("AUTH_LOGIN_FAILURE_RETENTION_MAX_ROWS", "5000")),
+        gt=0,
+    )
+    operational_event_retention_days: int = Field(
+        default=int(os.getenv("OPERATIONAL_EVENT_RETENTION_DAYS", "90")),
+        gt=0,
+    )
+    operational_event_retention_max_rows: int = Field(
+        default=int(os.getenv("OPERATIONAL_EVENT_RETENTION_MAX_ROWS", "50000")),
+        gt=0,
+    )
+    operational_retention_batch_size: int = Field(
+        default=int(os.getenv("OPERATIONAL_RETENTION_BATCH_SIZE", "500")),
+        gt=0,
+    )
+    operational_retention_interval_seconds: int = Field(
+        default=int(os.getenv("OPERATIONAL_RETENTION_INTERVAL_SECONDS", "21600")),
+        gt=0,
+    )
     disable_auth: bool = _parse_bool(os.getenv("MOBILE_API_DISABLE_AUTH", "0"))
     allow_public_auth_bypass: bool = _parse_bool(os.getenv("MOBILE_API_ALLOW_PUBLIC_AUTH_BYPASS", "0"))
     cors_origins: list[str] = _parse_cors_origins(
