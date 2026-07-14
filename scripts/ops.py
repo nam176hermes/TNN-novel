@@ -634,10 +634,13 @@ def _publish_ready_encrypted_backup(archive_path: Path, out_dir: Path) -> Path:
         )
         # Sidecar-first publication ensures a directly-addressable archive is never
         # present without READY metadata. Roll back either link on any failure.
-        _publish_backup_file(staged_sidecar_path, backup_sidecar_path(final_path))
+        final_sidecar_path = backup_sidecar_path(final_path)
+        os.link(staged_sidecar_path, final_sidecar_path)
         published_sidecar = True
-        _publish_backup_file(staged_archive_path, final_path)
+        staged_sidecar_path.unlink()
+        os.link(staged_archive_path, final_path)
         published_archive = True
+        staged_archive_path.unlink()
         return final_path
     except Exception:
         if published_archive:

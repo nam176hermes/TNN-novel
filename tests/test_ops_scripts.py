@@ -541,6 +541,61 @@ def test_create_encrypted_backup_collision_preserves_ready_metadata(
         assert item["secrets_included"] is True
 
 
+@pytest.mark.parametrize("failed_source", ["sidecar", "archive"])
+def test_create_encrypted_backup_rolls_back_final_link_when_source_unlink_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_source: str,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_unlink = Path.unlink
+    failure_injected = False
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def fail_final_publication_source_unlink(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal failure_injected
+        is_final_publication_source = (
+            path.parent.parent == backup_dir
+            and path.parent.name.endswith(".tar.gz.enc.partial")
+        )
+        is_sidecar = path.name.endswith(ops.BACKUP_MANIFEST_SUFFIX)
+        matches_requested_source = is_sidecar if failed_source == "sidecar" else not is_sidecar
+        if is_final_publication_source and matches_requested_source and not failure_injected:
+            failure_injected = True
+            raise OSError(f"{failed_source} source unlink failed")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+    monkeypatch.setattr(Path, "unlink", fail_final_publication_source_unlink)
+
+    with pytest.raises(OSError, match=f"{failed_source} source unlink failed"):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+
+    assert failure_injected is True
+    assert list(backup_dir.iterdir()) == []
+
+
 def test_interrupted_secret_backup_staging_is_not_listed_or_downloadable(tmp_path: Path) -> None:
     from app.mobile_api.services.backup_service import BackupService
 
