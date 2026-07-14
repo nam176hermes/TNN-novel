@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from app.database.db import init_db
+from app.database.db import init_db, list_operational_events
+from app.mobile_api.services import backup_job_service as backup_job_module
 from app.mobile_api.services.backup_job_service import BackupJobCoordinator, BackupSecretStore
 from app.mobile_api.services.backup_service import BackupService
 from app.mobile_api.services.job_service import JobTracker
@@ -45,11 +46,13 @@ class FakeBackupService:
         steps: tuple[str, ...] = ("preparing", "collecting", "writing", "validating", "publishing"),
         hold: bool = False,
         failure: Exception | None = None,
+        filename: str = "",
     ) -> None:
         self.backup_dir = backup_dir.resolve()
         self.steps = steps
         self.hold = hold
         self.failure = failure
+        self.filename = filename
         self.started = threading.Event()
         self.finished = threading.Event()
         self.release = threading.Event()
@@ -90,9 +93,12 @@ class FakeBackupService:
             if self.failure is not None:
                 raise self.failure
             return {
-                "filename": "novel-pipeline-backup-20260713-120000.tar.gz.enc"
-                if include_secrets
-                else "novel-pipeline-backup-20260713-120000.tar.gz"
+                "filename": self.filename
+                or (
+                    "novel-pipeline-backup-20260713-120000.tar.gz.enc"
+                    if include_secrets
+                    else "novel-pipeline-backup-20260713-120000.tar.gz"
+                )
             }
         finally:
             with self._lock:
@@ -145,6 +151,14 @@ class RecordingSecretStore(BackupSecretStore):
         self.discarded.set()
 
 
+def terminal_backup_events(db_path: Path, job_id: str) -> list[dict]:
+    return [
+        event
+        for event in list_operational_events(db_path, limit=50, severities=())
+        if event["event_type"] == "backup_job_terminal" and event["job_id"] == job_id
+    ]
+
+
 def test_backup_service_forwards_cancellation_and_progress_callbacks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -160,7 +174,12 @@ def test_backup_service_forwards_cancellation_and_progress_callbacks(
     encrypted_path = backup_dir / "backup.tar.gz.enc"
 
     def create_backup(**kwargs):
-        calls.append(("create", kwargs["cancel_check"], kwargs["progress_callback"]))
+        calls.append((
+            "create",
+            kwargs["cancel_check"],
+            kwargs["progress_callback"],
+            kwargs["record_event"],
+        ))
         plain_path.write_bytes(b"plain")
         return plain_path
 
@@ -187,9 +206,37 @@ def test_backup_service_forwards_cancellation_and_progress_callbacks(
 
     assert item["filename"] == encrypted_path.name
     assert calls == [
-        ("create", cancel_check, progress_callback),
+        ("create", cancel_check, progress_callback, False),
         ("encrypt", cancel_check, progress_callback),
     ]
+
+
+def test_backup_service_disables_the_legacy_ops_success_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
+    backup_path = backup_dir / "backup.tar.gz"
+    calls: list[bool] = []
+
+    def create_backup(**kwargs):
+        calls.append(kwargs["record_event"])
+        backup_path.write_bytes(b"backup")
+        return backup_path
+
+    monkeypatch.setattr("app.mobile_api.services.backup_service.ops.create_backup", create_backup)
+    monkeypatch.setattr(
+        service,
+        "list_backups",
+        lambda: [{"filename": backup_path.name, "metadata_status": "READY"}],
+    )
+
+    service.create_backup()
+
+    assert calls == [False]
 
 
 def test_backup_service_removes_plain_secret_archive_when_encryption_is_cancelled(
@@ -326,6 +373,119 @@ async def test_backup_job_maps_progress_and_completes_with_safe_filename(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_completed_backup_records_exactly_one_safe_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(
+        tmp_path / "backups",
+        steps=("preparing", "collecting", "writing", "validating", "encrypting", "publishing"),
+        filename="private-staging\\finished-backup.tar.gz.enc",
+    )
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=True,
+        passphrase="test credential",
+    )
+    await wait_for_job(tracker, job_id)
+
+    job = tracker.get_job(job_id)
+    assert job is not None
+    assert job.params["backup_filename"] == "finished-backup.tar.gz.enc"
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert len(events) == 1
+    event = events[0]
+    assert event["severity"] == "info"
+    assert event["source"] == "backup_job_coordinator"
+    assert event["message"] == "Backup job reached a terminal state"
+    assert event["job_id"] == job_id
+    duration_ms = event["details"].pop("duration_ms")
+    assert isinstance(duration_ms, int)
+    assert 0 <= duration_ms <= 2_147_483_647
+    assert event["details"] == {
+        "result": "completed",
+        "backup_filename": "finished-backup.tar.gz.enc",
+        "encrypted": True,
+        "secrets_included": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_backup_records_one_sanitized_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups", failure=RuntimeError("raw failure marker"))
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=True,
+        include_job_logs=True,
+        include_secrets=False,
+        passphrase="",
+    )
+    await wait_for_job(tracker, job_id)
+
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert len(events) == 1
+    event = events[0]
+    assert event["severity"] == "error"
+    duration_ms = event["details"].pop("duration_ms")
+    assert 0 <= duration_ms <= 2_147_483_647
+    assert event["details"] == {
+        "result": "failed",
+        "encrypted": False,
+        "secrets_included": False,
+    }
+    persisted_text = json.dumps(
+        list_operational_events(temp_db_path, limit=50, severities=()),
+        ensure_ascii=False,
+    )
+    assert "raw failure marker" not in persisted_text
+    assert "raw failure marker" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_expired_backup_secret_records_a_failed_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    ticks = iter((10.0, 11.0, 12.0))
+    secrets = BackupSecretStore(ttl_seconds=0, monotonic=lambda: next(ticks))
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service, secret_store=secrets)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=True,
+        passphrase="test credential",
+    )
+    await wait_for_job(tracker, job_id)
+
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert len(events) == 1
+    assert events[0]["severity"] == "error"
+    assert events[0]["details"]["result"] == "failed"
+    assert events[0]["details"]["encrypted"] is True
+    assert events[0]["details"]["secrets_included"] is True
+    assert "backup_filename" not in events[0]["details"]
+
+
+@pytest.mark.asyncio
 async def test_backup_jobs_for_one_directory_run_one_at_a_time(tmp_path: Path) -> None:
     tracker = JobTracker()
     service = FakeBackupService(tmp_path / "backups", hold=True)
@@ -386,6 +546,103 @@ async def test_backup_cancel_is_cooperative_and_discards_secret(tmp_path: Path) 
     assert job.cancel_requested is True
     assert job.status == "cancelled"
     assert secrets.take(job_id) == ""
+
+
+@pytest.mark.asyncio
+async def test_cooperative_backup_cancellation_records_one_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups", hold=True)
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    for _ in range(100):
+        if service.started.is_set():
+            break
+        await asyncio.sleep(0.01)
+
+    assert tracker.cancel_job(job_id)
+    await wait_for_job(tracker, job_id)
+
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert len(events) == 1
+    assert events[0]["severity"] == "warning"
+    assert events[0]["details"]["result"] == "cancelled"
+    assert events[0]["details"]["encrypted"] is False
+    assert events[0]["details"]["secrets_included"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_archive_work_records_one_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+
+    assert tracker.cancel_job(job_id)
+    await wait_for_job(tracker, job_id)
+
+    job = tracker.get_job(job_id)
+    assert job is not None
+    assert job.status == "cancelled"
+    assert not service.started.is_set()
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert len(events) == 1
+    assert events[0]["severity"] == "warning"
+    assert events[0]["details"]["result"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_terminal_audit_failure_preserves_the_persisted_job_outcome(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    attempts: list[str] = []
+
+    def fail_audit(*args, **kwargs) -> None:
+        attempts.append(str(kwargs.get("job_id") or ""))
+        raise RuntimeError("raw audit failure marker")
+
+    monkeypatch.setattr(backup_job_module, "record_operational_event", fail_audit, raising=False)
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    await wait_for_job(tracker, job_id)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job_id)
+    assert persisted is not None
+    assert persisted.status == "completed"
+    assert attempts == [job_id]
+    assert "raw audit failure marker" not in caplog.text
 
 
 @pytest.mark.asyncio

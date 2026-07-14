@@ -54,7 +54,9 @@ def _sanitize_operational_details(details: dict[str, Any] | None) -> dict[str, A
     for key, value in (details or {}).items():
         key_text = str(key)
         lowered_key = key_text.lower()
-        if any(marker in lowered_key for marker in ("secret", "key", "token", "password", "authorization")):
+        if lowered_key == "secrets_included" and isinstance(value, bool):
+            safe_details[key_text] = value
+        elif any(marker in lowered_key for marker in ("secret", "key", "token", "password", "authorization")):
             safe_details[key_text] = "[redacted]"
         elif _operational_value_has_sensitive_marker(value):
             safe_details[key_text] = "[redacted]"

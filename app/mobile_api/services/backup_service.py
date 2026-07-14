@@ -44,6 +44,7 @@ class BackupService:
             include_exports=include_exports,
             include_job_logs=include_job_logs,
             out_dir=self.backup_dir,
+            record_event=False,
             cancel_check=cancel_check,
             progress_callback=progress_callback,
         )

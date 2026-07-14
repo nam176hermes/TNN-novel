@@ -646,15 +646,23 @@ def test_create_backup_can_skip_operational_event_for_pre_rehearsal_gate(
     data_dir.mkdir()
     with sqlite3.connect(data_dir / "pipeline.db") as conn:
         conn.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
-    calls: list[Path] = []
+    calls: list[tuple[Path, dict[str, object]]] = []
 
-    def record_event(db_path: Path, **_: object) -> None:
-        calls.append(db_path)
+    def record_event(db_path: Path, **kwargs: object) -> None:
+        calls.append((db_path, kwargs))
 
     monkeypatch.setattr(database_db, "record_operational_event", record_event)
 
-    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-default", record_event=True)
-    assert calls == [data_dir / "pipeline.db"]
+    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-default")
+    assert len(calls) == 1
+    db_path, event = calls[0]
+    assert db_path == data_dir / "pipeline.db"
+    assert event["event_type"] == "backup_success"
+    assert event["severity"] == "info"
+    assert event["source"] == "ops"
+    assert event["message"] == "Backup completed"
+    assert event["details"]["include_env"] is False
+    assert str(event["details"]["backup_name"]).startswith("novel-pipeline-backup-")
 
     calls.clear()
     ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-gated", record_event=False)
