@@ -1,7 +1,8 @@
 // @ts-expect-error -- Vitest-only Node built-in; the browser bundle intentionally omits @types/node.
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 // @ts-expect-error -- Vitest-only Node built-in; the browser bundle intentionally omits @types/node.
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
+import postcss, { type Rule } from 'postcss';
 import { describe, expect, it } from 'vitest';
 
 import { readStyleSources } from './test/readStyleSources';
@@ -19,8 +20,74 @@ const expectedImports = [
   './styles/shell.css',
   './styles/components.css',
   './styles/features.css',
+  './styles/reader.css',
+  './styles/library.css',
+  './styles/import.css',
+  './styles/operations.css',
   './styles/utilities.css',
 ];
+
+type FeatureOwner = 'reader.css' | 'library.css' | 'import.css' | 'operations.css';
+
+const featureOwners: Record<FeatureOwner, RegExp> = {
+  'reader.css': /\.reader-/,
+  'library.css': /(?:\.library-|\.translated-librar(?:y|ies)-|\.translated-books?-|\.book-card)/,
+  'import.css': /(?:\.import-|\.ebook-|\.url-import-|\.source-file-|\.catalog-import-|\.wizard-|\.danger-confirmation)/,
+  'operations.css': /(?:\.status-|\.backup-|\.jobs?-|\.failed-job-|\.tts-job-|\.tts-chunk-|\.stage-timing-|\.auto-refresh-|\.sparkline)/,
+};
+
+function selectorsFor(css: string): Array<{ selector: string; inResponsiveContext: boolean }> {
+  const selectors: Array<{ selector: string; inResponsiveContext: boolean }> = [];
+  postcss.parse(css).walkRules((rule: Rule) => {
+    type CssAncestor = { name?: string; parent?: CssAncestor; type: string };
+    let parent = rule.parent as unknown as CssAncestor | undefined;
+    let inResponsiveContext = false;
+    while (parent) {
+      if (parent.type === 'atrule' && ['media', 'supports', 'container'].includes(parent.name ?? '')) {
+        inResponsiveContext = true;
+        break;
+      }
+      parent = parent.parent;
+    }
+    for (const selector of rule.selectors) {
+      selectors.push({ selector, inResponsiveContext });
+    }
+  });
+  return selectors;
+}
+
+function ownersForSelector(selector: string): FeatureOwner[] {
+  return (Object.entries(featureOwners) as Array<[FeatureOwner, RegExp]>)
+    .filter(([, pattern]) => pattern.test(selector))
+    .map(([owner]) => owner);
+}
+
+function ownershipViolations(sources: Record<string, string>): string[] {
+  const violations: string[] = [];
+  const selectorFiles = new Map<string, Set<string>>();
+
+  for (const [filename, css] of Object.entries(sources)) {
+    for (const { selector } of selectorsFor(css)) {
+      const owners = ownersForSelector(selector);
+      for (const owner of owners) {
+        if (filename !== owner) {
+          violations.push(`${selector} belongs to ${owner}, found in ${filename}`);
+        }
+        const files = selectorFiles.get(`${owner}\0${selector}`) ?? new Set<string>();
+        files.add(filename);
+        selectorFiles.set(`${owner}\0${selector}`, files);
+      }
+    }
+  }
+
+  for (const [key, files] of selectorFiles) {
+    if (files.size > 1) {
+      const [, selector] = key.split('\0');
+      violations.push(`${selector} appears across ${[...files].sort().join(', ')}`);
+    }
+  }
+  return violations;
+}
 
 describe('ordered stylesheet layers', () => {
   it('declares the fixed cascade order before importing each source exactly once', () => {
@@ -45,8 +112,11 @@ describe('ordered stylesheet layers', () => {
 
   it('wraps every imported source in its approved layer', () => {
     for (const importedSource of expectedImports) {
-      const layer = importedSource.match(/\/([^/]+)\.css$/)?.[1];
-      expect(layer).toBeTruthy();
+      const sourceName = importedSource.match(/\/([^/]+)\.css$/)?.[1];
+      expect(sourceName).toBeTruthy();
+      const layer = ['reader', 'library', 'import', 'operations'].includes(sourceName ?? '')
+        ? 'features'
+        : sourceName;
       const source = readFileSync(resolve(__dirname, importedSource), 'utf-8').trim();
       expect(source.startsWith(`@layer ${layer} {\n`)).toBe(true);
       expect(source.endsWith('}')).toBe(true);
@@ -81,5 +151,46 @@ describe('ordered stylesheet layers', () => {
     expect(desktopTable).toBeGreaterThan(baseTable);
     expect(featureStyles.lastIndexOf('@media (min-width: 821px) {', desktopTable)).toBeGreaterThan(baseTable);
     expect(shellStyles).not.toContain('.workflow-management-view .providers-management-table {');
+  });
+
+  it('parses mixed comma groups independently and rejects cross-file feature ownership', () => {
+    expect(selectorsFor('@layer features { .reader-demo, .import-demo:is(.a, .b) { display: block; } }'))
+      .toEqual([
+        { selector: '.reader-demo', inResponsiveContext: false },
+        { selector: '.import-demo:is(.a, .b)', inResponsiveContext: false },
+      ]);
+
+    const violations = ownershipViolations({
+      'reader.css': '@layer features { .reader-demo { display: block; } .import-demo { display: block; } }',
+      'features.css': '@layer features { .reader-demo { color: red; } }',
+    });
+    expect(violations).toContain('.import-demo belongs to import.css, found in reader.css');
+    expect(violations).toContain('.reader-demo belongs to reader.css, found in features.css');
+    expect(violations).toContain('.reader-demo appears across features.css, reader.css');
+  });
+
+  it('gives every known feature selector exactly one authoritative owner', () => {
+    const stylesDir = resolve(__dirname, 'styles');
+    const sources = Object.fromEntries(
+      readdirSync(stylesDir)
+        .filter((filename: string) => filename.endsWith('.css'))
+        .map((filename: string) => [basename(filename), readFileSync(resolve(stylesDir, filename), 'utf-8')]),
+    );
+
+    expect(ownershipViolations(sources)).toEqual([]);
+  });
+
+  it('colocates base and responsive rules in every feature owner', () => {
+    for (const owner of Object.keys(featureOwners) as FeatureOwner[]) {
+      const css = readFileSync(resolve(__dirname, 'styles', owner), 'utf-8');
+      const ownedRules = selectorsFor(css).filter(({ selector }) => ownersForSelector(selector).includes(owner));
+      expect(ownedRules.some(({ inResponsiveContext }) => !inResponsiveContext), `${owner} base rules`).toBe(true);
+      expect(ownedRules.some(({ inResponsiveContext }) => inResponsiveContext), `${owner} responsive rules`).toBe(true);
+    }
+  });
+
+  it('does not introduce a global responsive override tail', () => {
+    expect(expectedImports.some((source) => /(?:mobile|responsive|override)/i.test(source))).toBe(false);
+    expect(entry).not.toContain('./styles/overrides.css');
   });
 });

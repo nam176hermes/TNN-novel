@@ -79,6 +79,86 @@ const styleProfile = {
   is_default: 1,
 };
 
+const systemStatus = {
+  active_jobs: 1,
+  active_provider: 'gemini',
+  api_ready: true,
+  app_version: '0.1.0',
+  asset_protection_enabled: true,
+  backup_recommendation: 'Create a system backup before upgrades.',
+  build: 'test',
+  cache_count: 0,
+  cache_size_bytes: 0,
+  data_directory_available: true,
+  data_size_bytes: 8192,
+  database_available: true,
+  db_size_bytes: 4096,
+  failed_jobs: 0,
+  interrupted_jobs: 0,
+  last_failed_job: null,
+  ollama_host: '',
+  ollama_model: '',
+  public_deploy: false,
+  queued_jobs: 0,
+  recent_operational_errors: [],
+  retrying_jobs: 0,
+  running_jobs: 1,
+  storage_health: 'healthy',
+  storage_label: 'Test storage',
+  upload_max_bytes: 104857600,
+};
+
+const systemBackups = [
+  {
+    archive_available: true,
+    created_at: '2026-07-13T12:00:00Z',
+    download_url: '/api/system/backups/novel-pipeline-backup-ready.tar.gz/download',
+    encrypted: false,
+    excluded_modules: ['secrets'],
+    filename: 'novel-pipeline-backup-ready.tar.gz',
+    included_modules: ['database'],
+    manifest: {},
+    manifest_available: true,
+    metadata_status: 'READY',
+    repair_needed: false,
+    secrets_included: false,
+    size_bytes: 4096,
+    warning: '',
+  },
+  {
+    archive_available: true,
+    created_at: '2026-07-12T12:00:00Z',
+    download_url: '',
+    encrypted: false,
+    excluded_modules: [],
+    filename: 'novel-pipeline-backup-missing.tar.gz',
+    included_modules: [],
+    manifest: {},
+    manifest_available: false,
+    metadata_status: 'METADATA_MISSING',
+    repair_needed: true,
+    secrets_included: false,
+    size_bytes: 2048,
+    warning: 'Backup metadata is missing.',
+  },
+  {
+    archive_available: true,
+    created_at: '2026-07-11T12:00:00Z',
+    download_url: '',
+    encrypted: false,
+    excluded_modules: [],
+    filename: 'novel-pipeline-backup-invalid.tar.gz',
+    included_modules: [],
+    manifest: {},
+    manifest_available: false,
+    metadata_status: 'METADATA_INVALID',
+    repair_needed: true,
+    secrets_included: false,
+    size_bytes: 1024,
+    warning: 'Backup metadata is invalid.',
+  },
+];
+
 function json(route: Route, body: unknown, status = 200, headers: Record<string, string> = {}) {
   return route.fulfill({
     status,
@@ -156,6 +236,8 @@ async function installApiMock(page: Page, state: MockState) {
 
     if (path === '/api/auth/logout' && request.method() === 'POST') return json(route, { ok: true });
     if (path === '/api/providers') return json(route, { providers: [provider] });
+    if (path === '/api/system/status') return json(route, systemStatus);
+    if (path === '/api/system/backups' && request.method() === 'GET') return json(route, { items: systemBackups });
     if (path === '/api/providers/usage') {
       return json(route, {
         usage: {
@@ -297,6 +379,27 @@ async function authenticatedPage(page: Page, state: MockState) {
     ? 'Điều hướng chính trên di động'
     : 'Quy trình';
   await expect(page.getByRole('navigation', { name: navigationName })).toBeVisible();
+}
+
+async function expectNoHorizontalOverflow(page: Page) {
+  const widths = await page.evaluate(() => ({
+    body: document.body.scrollWidth,
+    document: document.documentElement.scrollWidth,
+    viewport: window.innerWidth,
+  }));
+  expect(widths.body).toBeLessThanOrEqual(widths.viewport);
+  expect(widths.document).toBeLessThanOrEqual(widths.viewport);
+}
+
+async function expectActionAboveMobileNavigation(page: Page, actionName: string) {
+  const action = page.getByRole('button', { name: actionName });
+  const navigation = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await action.scrollIntoViewIfNeeded();
+  await expect(action).toBeVisible();
+  const [actionBox, navigationBox] = await Promise.all([action.boundingBox(), navigation.boundingBox()]);
+  expect(actionBox).not.toBeNull();
+  expect(navigationBox).not.toBeNull();
+  expect((actionBox?.y ?? 0) + (actionBox?.height ?? 0)).toBeLessThanOrEqual((navigationBox?.y ?? 0) + 1);
 }
 
 test('login works and protected shell is blocked without a token', async ({ page }) => {
@@ -443,6 +546,37 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
 
   await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+});
+
+test('mobile feature pages keep actions clear and status backup states usable at 390px and 360px', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await expectActionAboveMobileNavigation(page, `Đọc tiếp ${book.title}`);
+  await expectNoHorizontalOverflow(page);
+
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+  await page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Trạng thái' }).click();
+  await expect(page.getByRole('heading', { name: 'Trạng thái hệ thống' })).toBeVisible();
+  await page.getByText('Sao lưu hệ thống').click();
+  const backupList = page.getByRole('list', { name: 'Danh sách backup' });
+  await expect(backupList.getByText('Sẵn sàng')).toBeVisible();
+  await expect(backupList.getByText('Thiếu metadata')).toBeVisible();
+  await expect(backupList.getByText('Metadata không hợp lệ')).toBeVisible();
+  await expect(backupList.getByText(systemBackups[0].filename)).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+
+  await page.setViewportSize({ width: 360, height: 740 });
+  await expectNoHorizontalOverflow(page);
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+  await page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Nhập chương' }).click();
+  await expect(page.getByRole('heading', { name: 'Dán chương nguồn' })).toBeVisible();
+  await expectActionAboveMobileNavigation(page, 'Import chapter');
+  await expectNoHorizontalOverflow(page);
 });
 
 test('exports a translated book as TXT without calling a live API', async ({ page }) => {
