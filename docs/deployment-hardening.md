@@ -146,7 +146,7 @@ Do not add a `location /data/` block.
 
 ```yaml
 tunnel: <TUNNEL_UUID>
-credentials-file: /home/thenam176/.cloudflared/<UUID>.json
+credentials-file: $HOME/.cloudflared/<UUID>.json
 
 ingress:
   - hostname: novel-tnn.tradingcompanydirect.com
@@ -256,9 +256,28 @@ The app records sanitized operational events for high-risk single-operator actio
 - book/chapter/translation/dictionary/glossary/TM deletes
 - job start/retry/cancel/failure
 - reader AI, QA, and TTS-related job activity/failures where applicable
-- backup success/failure
+- backup queue and dedicated terminal outcomes
+- direct operator/CLI backup success
 
 Events intentionally do not store provider keys, submitted passwords, raw prompts, raw book text, translations, stack traces, or full local filesystem paths in public mode. Recent sanitized events are visible through authenticated `/api/system/status`; server logs remain the place for detailed debugging.
+
+Job-backed backup submission records `backup_job_queued`. After the coordinator
+persists a completed, failed, or cancelled job state, it attempts exactly once
+to record one dedicated `backup_job_terminal` event. The event has source
+`backup_job_coordinator`, the constant message `Backup job reached a terminal
+state`, the job id, and severity `info`, `error`, or `warning` respectively.
+Safe details are `result`, `encrypted`, `secrets_included`, a non-negative
+bounded integer `duration_ms`, and, only for completion, an optional
+basename-only `backup_filename`. Completed booleans come from the published
+backup result; failed and cancelled outcomes use request intent because they
+have no completed artifact metadata. Raw exceptions, passphrases, directories,
+and private content are excluded. A terminal-event writer failure is logged
+without raw exception text and is not retried or allowed to undo the durable
+terminal job state.
+
+This dedicated event is separate from generic tracker `job_failure`. The
+job-backed archive path also suppresses the legacy `backup_success` event;
+`backup_success` remains the default only for direct operator/CLI creation.
 
 ## Backup Handling
 

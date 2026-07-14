@@ -26,6 +26,9 @@ seams and must not be moved only to reduce line count.
 
 ## Baseline evidence before P2C
 
+These measurements are the original pre-P2C audit snapshot, not current line
+counts or current ownership.
+
 | Module | Lines | Approx. functions | Why it matters |
 |---|---:|---:|---|
 | `web/src/styles.css` | 12,244 | n/a | Entire visual system and responsive behavior share one change surface |
@@ -39,19 +42,25 @@ seams and must not be moved only to reduce line count.
 | `app/mobile_api/routers/import_routes.py` | 825 | n/a | Multiple import transports and commit orchestration |
 | `app/mobile_api/routers/books.py` | 806 | n/a | Books, chapters, Reader, annotations, dictionaries, X-Ray, and cover routes |
 
-The local import graph also contains a direct circular dependency: `pipeline_service -> qa_service -> pipeline_service`. Remove this through a small interface/extracted pure QA dependency before larger service moves.
+At this pre-P2C baseline, the local import graph also contained the direct
+`pipeline_service -> qa_service -> pipeline_service` cycle. P2C removed that
+runtime cycle through `ChapterContentReader`; it is not current work.
 
 ## Recommended Splits
 
 ### Reader
 
-- Current: `web/src/components/ReaderView.tsx`.
-- Problem: route data ownership, text transformations, optional tools, polling, and UI chrome are coupled; P1 measured duplicate requests and QA up to 599 ms/5,182 DOM nodes.
-- Proposed modules: `ReaderPage`, `ReaderDataController`, `ReaderTextStage`, `ReaderChrome`, `ReaderQaLayer`, and lazy `ReaderAudioPanel`/`ReaderDictionaryPanel`/`ReaderAnnotationPanel`.
+- Current after P2C: `ReaderView` remains the route/data controller; TOC,
+  chrome/quick controls, lazy audio, and offline cache have focused owners.
+- Remaining problem: rendering, annotations, AI/X-Ray, and some feature-opening
+  orchestration remain in the controller.
+- Deferred modules: extract only those remaining surfaces behind narrow APIs;
+  do not re-extract the P2C-owned Reader features.
 - Dependency direction: page/controller owns data; pure text stage receives prepared view data; optional panels depend on narrow APIs.
-- Sequence: first eliminate duplicate request ownership, then extract pure rendering, then lazy optional panels.
+- Sequence: extract one remaining surface at a time behind the existing
+  controller and focused regression tests.
 - Risk: high.
-- Timing: after stale path migration and backup P1 work; regression coverage must remain green.
+- Timing: recommendation-only after P2C; regression coverage must remain green.
 
 ### Import
 
@@ -66,21 +75,31 @@ The local import graph also contains a direct circular dependency: `pipeline_ser
 
 ### Database
 
-- Current: `app/database/db.py`.
-- Problem: lifecycle plus repositories for auth, books, jobs, glossary, sources, Reader, TTS, and operations.
-- Proposed modules: `connection`, `auth_repository`, `book_repository`, `job_repository`, `reader_repository`, `glossary_repository`, `source_repository`, `tts_repository`, `operations_repository`.
+- Current after P2C: connection, auth, operations, and Reader repositories are
+  authoritative behind identity-compatible `db.py` exports.
+- Remaining problem: books, jobs, glossary, sources, and TTS domains are still
+  centralized in the compatibility facade.
+- Deferred modules: `book_repository`, `job_repository`,
+  `glossary_repository`, `source_repository`, and `tts_repository`.
 - Dependency direction: services import domain repositories; repositories depend only on connection/schema primitives.
-- Sequence: preserve a compatibility facade; extract one domain at a time, starting with jobs or auth, not the newly optimized library/import seams.
+- Sequence: preserve the compatibility facade and extract one remaining domain
+  at a time where contract/query-count tests establish the boundary.
 - Risk: medium-high due many callers.
 - Timing: after a clean post-audit baseline and explicit contract/query-count tests.
 
 ### Pipeline Service
 
-- Current: `app/mobile_api/services/pipeline_service.py`.
-- Problem: unrelated domain behavior and circular QA dependency.
-- Proposed modules: `book_service`, `reader_service`, `annotation_service`, `dictionary_service`, `import_commit_service`, `content_file_service`.
+- Current after P2C: `ContentFileService` and `ReaderService` own content
+  resolution plus Reader content/progress/annotation orchestration;
+  `PipelineService` delegates those public methods, and the QA runtime cycle is
+  removed.
+- Remaining problem: book, dictionary, import, and other non-Reader domains
+  still share the compatibility service.
+- Deferred modules: `book_service`, `dictionary_service`, and
+  `import_commit_service` where contract tests support extraction.
 - Dependency direction: routers -> domain services -> repositories/file adapters; QA consumes a protocol/pure content input rather than importing PipelineService.
-- Sequence: break circular dependency, extract content-file resolver, then Reader/annotation services.
+- Sequence: keep the implemented content/Reader delegates stable and extract
+  only one remaining non-Reader domain at a time.
 - Risk: high.
 - Timing: after DB repository seams exist.
 
@@ -95,11 +114,16 @@ The local import graph also contains a direct circular dependency: `pipeline_ser
 
 ### CSS
 
-- Current: `web/src/styles.css`.
-- Problem: 12,244-line global regression surface.
-- Proposed files: tokens/base, shell/navigation, reader, import, library, operations, and responsive overrides.
+- Current after P2C: `styles.css` is a small ordered manifest; tokens, base,
+  shell, shared components, features, utilities, and overrides have explicit
+  order, and responsive rules are colocated with Reader, Library, Import, and
+  Operations ownership.
+- Remaining problem: the deterministic manifest is still eagerly loaded.
+- Deferred work: consider route-lazy CSS only if measurement and cascade tests
+  justify the loading change.
 - Dependency direction: shared tokens/base first, route styles imported with route chunks where Vite behavior remains verified.
-- Sequence: add screenshot/overflow assertions, extract unchanged blocks, compare build and screenshots after every feature.
+- Sequence: retain current cascade/screenshot coverage and change loading only
+  after measuring a route-level benefit.
 - Risk: medium-high visual regression risk.
 - Timing: last.
 
@@ -114,14 +138,15 @@ The local import graph also contains a direct circular dependency: `pipeline_ser
 
 ## Minimum-Risk Sequence
 
-1. Migrate stale artifact paths with backup, copied-DB rehearsal, integrity checks, and rollback.
-2. Fix backup listing and implement job-backed backup without changing restore format.
-3. Remove Reader duplicate requests and establish data-contract tests.
-4. Break the PipelineService/QA circular dependency.
-5. Extract Reader pure rendering and optional panels.
-6. Extract one database repository domain at a time behind compatibility exports.
-7. Split Import by reviewed-plan adapters.
-8. Split CSS only with screenshot and responsive regression coverage.
+1. Preserve the P2C compatibility facades and focused regression coverage.
+2. Extract only remaining Reader rendering/optional surfaces, one tested owner
+   at a time.
+3. Extract one remaining database repository domain at a time behind existing
+   compatibility exports.
+4. Split Import by reviewed-plan adapters.
+5. Split App-shell orchestration only with route/auth regression coverage.
+6. Change eager CSS loading only with measured need plus screenshot and
+   responsive regression coverage.
 
 ## Acceptance Rule
 
@@ -129,13 +154,19 @@ Each extraction must preserve API contracts, full verification, E2E library-to-R
 
 ## P2C rollback map
 
-Revert only the affected seam, newest commit first:
+For the affected seam, run `git revert <commit>` once per commit, newest first.
+These boundaries are inclusive:
 
-- backup: `b77fa38..04ad491`;
-- retention/repository foundation: `38156ce..56534d9`;
-- Reader modules: `31093ba..987aea0`;
-- CSS ownership: `46759eb..2a77755`;
-- Reader repository/services: `6c2ba0a..9f47a41`.
+- backup jobs/publication/terminal audit: revert `de94de7`, then `9d04ffe`,
+  then every backup-seam commit from `04ad491` backward through and including
+  `b77fa38`;
+- retention/repository foundation: revert every affected commit from `56534d9`
+  backward through and including `38156ce`;
+- Reader modules: revert every affected commit from `987aea0` backward through
+  and including `31093ba`;
+- CSS ownership: revert every affected commit from `2a77755` backward through
+  and including `46759eb`;
+- Reader repository/services: revert `9f47a41`, then `6c2ba0a`.
 
 All P2C extractions preserve the schema and public routes except the documented
 backup POST `202` contract. Rollback therefore uses `git revert`, focused tests,

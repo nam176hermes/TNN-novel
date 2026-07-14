@@ -4,7 +4,9 @@
 
 **Branch:** `feat/p2c-background-retention-modularity`
 
-**Verification baseline:** `9f47a41` (`refactor(services): extract reader content seams`)
+**Original verification baseline:** `9f47a41` (`refactor(services): extract reader content seams`)
+
+**Closure code baseline:** `de94de7` (`fix(backups): complete terminal audit coverage`)
 
 **Scope:** P2C only; no operator data migration, restore, retention apply, paid
 provider call, schema redesign, or Reader redesign was performed.
@@ -27,9 +29,11 @@ could not start two workers after 78 files/701 tests had passed. The exact
 failure and the complete bounded ext4 equivalent are recorded below. Do not
 describe the script itself as passing.
 
-**Phase status: NOT COMPLETE.** The documented bounded verification equivalent
-passes, but the additional approved-design audit found the terminal backup
-operational-event gap recorded below. No other incomplete criterion was found.
+**Phase status: COMPLETE.** The only additional approved-design gap found in
+the completion audit was closed by the dedicated terminal backup event in
+`9d04ffe` and its reviewed lifecycle fixes in `de94de7`. The documented bounded
+verification equivalent passes; `scripts/verify.sh` itself still returned RC 1
+and is not described as passing.
 
 ## Implemented architecture
 
@@ -50,6 +54,10 @@ operational-event gap recorded below. No other incomplete criterion was found.
   iteration, validation, collision-safe no-clobber publication, and cleanup of
   owned partial artifacts. A valid archive survives sidecar publication failure
   as `METADATA_MISSING`.
+- Queue submission writes `backup_job_queued`. After durable terminal state,
+  the coordinator attempts one dedicated `backup_job_terminal` event for each
+  completed, failed, or cancelled outcome. The background archive path suppresses
+  the legacy direct-operator `backup_success` event.
 
 ### Operational retention
 
@@ -139,6 +147,9 @@ translation provider, or TTS provider was invoked against live data.
 | Python package check | RC 0; no broken requirements |
 | Frontend package tree | RC 0; `npm ls --depth=0` |
 | Operator safety after verification | DB/integrity/FK/archive/sidecar snapshots unchanged |
+| Task 16 focused terminal-event suite | RC 0; 22 tests passed |
+| Task 16 five-file regression suite | RC 0; 98 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
+| Task 16 compile/lint checks | `compileall` RC 0; Python lint and frontend `tsc --noEmit` RC 0 |
 
 The Vitest error was:
 
@@ -169,29 +180,49 @@ would remain for runtime resolution. It did not fail the build.
 | CSS uses deterministic layers/features with responsive rules colocated | PASS | `styles.layers.test.ts`, mobile Playwright, production build |
 | `db.py` has connection/auth/operations/Reader repository seams behind compatibility exports | PASS | repository identity/behavior tests and full backend suite |
 | PipelineService delegates Reader/content behavior and QA runtime cycle is removed | PASS | content/Reader/QA protocol tests and import smoke |
+| Each coordinator-owned backup terminal outcome has one dedicated sanitized operational event | PASS | `9d04ffe`, `de94de7`; 22 focused tests and 98-test regression suite |
 | Public API/security behavior outside backup POST 202 remains compatible | PASS | full backend 824, focused route suites, authenticated mocked E2E |
 | Full verification/completion audit with no operator mutation | PASS VIA DOCUMENTED EQUIVALENT | verify script RC 1 is disclosed; complete bounded 80-file/705-test suite, backend, E2E, type/build/package checks passed; operator snapshots unchanged |
 
-## Additional approved-design audit
+## Additional approved-design audit closure
 
-One design-detail gap remains and is not inferred as complete:
+Task 16 closed the only additional design-detail gap in `9d04ffe`, with the
+three lifecycle review findings fixed and independently re-reviewed clean at
+`de94de7`.
 
-- **INCOMPLETE:** the queued backup audit exists and generic job failures are
-  operationally recorded, but the coordinator does not currently write one
-  dedicated sanitized terminal operational event for each backup success,
-  failure, and cancellation. Durable job state/job logs still record outcomes.
-  Add this in a narrow follow-up with exactly-once tests; do not mix it with
-  archive format or retention changes.
+- `backup_job_queued` remains the submission event.
+- After terminal persistence, the coordinator attempts exactly once to write
+  `backup_job_terminal` for `completed`, `failed`, or `cancelled`. Event-write
+  failure is swallowed after one attempt and cannot undo the durable terminal
+  job state or cause a duplicate retry.
+- The event uses source `backup_job_coordinator`, a constant message, the job
+  id, result-specific severity, and safe details: `result`, `encrypted`,
+  `secrets_included`, bounded integer `duration_ms`, and an optional
+  basename-only `backup_filename` on completion. Completed booleans come from the
+  published backup result; failure/cancellation use request intent because no
+  completed artifact exists.
+- No passphrase, raw exception, directory, archive member, provider secret, or
+  private content is persisted or logged by this event path.
+- The background service disables the legacy `backup_success` event. That
+  event remains the default for direct operator/CLI backup creation; generic
+  `job_failure` remains a separate tracker event and is not the dedicated
+  backup terminal event.
 
 ## Rollback
 
-Revert newest affected commits first, then run the seam's focused tests:
+For the affected seam, run `git revert <commit>` once per commit, newest first,
+then run that seam's focused tests. The boundaries below are inclusive:
 
-- backup jobs/publication: `b77fa38..04ad491`;
-- repository/retention: `38156ce..56534d9`;
-- Reader features: `31093ba..987aea0`;
-- CSS layers/features: `46759eb..2a77755`;
-- Reader repository/services: `6c2ba0a..9f47a41`.
+- backup jobs/publication/terminal audit: revert `de94de7`, then `9d04ffe`,
+  then every backup-seam commit from `04ad491` backward through and including
+  `b77fa38`;
+- repository/retention: revert every affected commit from `56534d9` backward
+  through and including `38156ce`;
+- Reader features: revert every affected commit from `987aea0` backward through
+  and including `31093ba`;
+- CSS layers/features: revert every affected commit from `2a77755` backward
+  through and including `46759eb`;
+- Reader repository/services: revert `9f47a41`, then `6c2ba0a`.
 
 Stop the app and create/verify a fresh operator backup before rollback. Do not
 delete archives and do not run database downgrade SQL: P2C changes neither the
@@ -203,7 +234,6 @@ schema nor backup/restore format.
 - Process loss does not resume archive work and loses encrypted backup secrets.
 - Pending retention audit recovery is process-local; a hard kill may lose that
   pending summary even though committed deletions remain committed.
-- The dedicated terminal backup operational-event requirement above is open.
 - `ReaderView`, `PipelineService`, `db.py`, App shell, and ImportPanel still have
   intentionally deferred domains.
 - CSS remains eagerly loaded through one ordered manifest.
