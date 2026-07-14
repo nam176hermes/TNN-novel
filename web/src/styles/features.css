@@ -1,4 +1,19 @@
 @layer features {
+.status-error {
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.status-success {
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.4;
+  margin: 0;
+}
 
 .workflow-workbench-layout.workbench-editor-only {
   grid-template-columns: minmax(0, 1fr);
@@ -701,6 +716,39 @@
   font-size: 12px;
   font-weight: 750;
 }
+
+.status-pill {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+
+.status-translated,
+.status-audio_done,
+.status-qa-passed {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  color: var(--accent-strong);
+}
+
+.status-qa_low,
+.status-qa-low {
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+.status-failed {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
 .qa-grid {
   display: grid;
   gap: 10px;
@@ -755,6 +803,16 @@
 .qa-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-top: 12px;
+}
+
+.status-chip {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: 999px;
+  color: var(--warning-text);
+  font-size: 12px;
+  font-weight: 750;
+  padding: 5px 9px;
 }
 
 .run-stats {
@@ -864,6 +922,30 @@
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   padding: 2px 5px;
+}
+
+.status-chip-success {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  color: var(--accent-strong);
+}
+
+.status-chip-warning {
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+.status-chip-danger {
+  background: rgb(239 68 68 / 12%);
+  border-color: rgb(239 68 68 / 32%);
+  color: var(--danger);
+}
+
+.status-chip-muted {
+  background: var(--surface-muted);
+  border-color: var(--border);
+  color: var(--text-soft);
 }
 
 .estimate-grid {
@@ -1039,60 +1121,6 @@
   grid-column: 1 / -1;
   line-height: 1.4;
   margin: -2px 0 0;
-}
-
-.paste-status-panel {
-  background: var(--surface-subtle);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  display: grid;
-  gap: 10px;
-  min-width: 0;
-  padding: 12px;
-}
-
-.paste-status-header {
-  align-items: center;
-  display: flex;
-  gap: 12px;
-  justify-content: space-between;
-  min-width: 0;
-}
-
-.paste-status-header h4 {
-  color: var(--text);
-  font-size: 15px;
-  line-height: 1.25;
-  margin: 2px 0 0;
-}
-
-.paste-status-grid {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin: 0;
-}
-
-.paste-status-grid div {
-  border-left: 3px solid var(--border);
-  min-width: 0;
-  padding-left: 10px;
-}
-
-.paste-status-grid dt {
-  color: var(--text-soft);
-  font-size: 12px;
-  font-weight: 800;
-  margin-bottom: 3px;
-}
-
-.paste-status-grid dd {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 750;
-  line-height: 1.35;
-  margin: 0;
-  overflow-wrap: anywhere;
 }
 
 .source-support-panel {
@@ -1993,6 +2021,35 @@
   color: var(--text);
 }
 
+.status-chip {
+  background: rgb(255 255 255 / 6%);
+  border-color: rgb(255 255 255 / 11%);
+  color: var(--text-muted);
+}
+
+.status-chip-success {
+  background: rgb(35 199 132 / 15%);
+  border-color: rgb(35 199 132 / 30%);
+  color: var(--accent-strong);
+}
+
+.status-chip-warning {
+  background: rgb(239 119 112 / 12%);
+  border-color: rgb(239 119 112 / 28%);
+  color: var(--danger);
+}
+
+.status-chip-danger {
+  background: rgb(239 68 68 / 13%);
+  border-color: rgb(239 68 68 / 30%);
+  color: #ff9a94;
+}
+
+.status-error {
+  color: #ff8d87;
+}
+
+.status-success,
 .export-result {
   color: var(--accent-strong);
 }
@@ -2702,7 +2759,6 @@
 .chapter-editor,
 .editor-grid,
 .glossary-term-metadata,
-.paste-status-grid,
 .quality-summary {
     grid-template-columns: 1fr;
   }
@@ -2794,37 +2850,37 @@
   }
 
   .workflow-management-view .providers-management-table th:nth-child(1),
-  .workflow-management-view .providers-management-table td:nth-child(1) {
+.workflow-management-view .providers-management-table td:nth-child(1) {
     width: 78px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(2),
-  .workflow-management-view .providers-management-table td:nth-child(2) {
+.workflow-management-view .providers-management-table td:nth-child(2) {
     width: 96px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(3),
-  .workflow-management-view .providers-management-table td:nth-child(3) {
+.workflow-management-view .providers-management-table td:nth-child(3) {
     width: 145px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(4),
-  .workflow-management-view .providers-management-table td:nth-child(4) {
+.workflow-management-view .providers-management-table td:nth-child(4) {
     width: 108px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(5),
-  .workflow-management-view .providers-management-table td:nth-child(5) {
+.workflow-management-view .providers-management-table td:nth-child(5) {
     width: 110px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(6),
-  .workflow-management-view .providers-management-table td:nth-child(6) {
+.workflow-management-view .providers-management-table td:nth-child(6) {
     width: 78px;
   }
 
   .workflow-management-view .providers-management-table th:nth-child(7),
-  .workflow-management-view .providers-management-table td:nth-child(7) {
+.workflow-management-view .providers-management-table td:nth-child(7) {
     width: 31px;
   }
 
@@ -3224,74 +3280,10 @@
   width: 112px;
 }
 
-.paste-status-panel {
-  background: rgb(12 18 24 / 78%);
-  border-color: rgb(255 255 255 / 8%);
-  border-radius: 9px;
-  gap: 16px;
-  padding: 18px;
-}
-
-.paste-status-header {
-  justify-content: flex-start;
-}
-
-.paste-status-header > div {
-  flex: 1;
-}
-
-.paste-status-header h4 {
-  color: #f7f7f1;
-  font-size: 18px;
-  font-weight: 730;
-}
-
-.paste-status-header p {
-  color: rgb(245 244 236 / 66%);
-  font-size: 13px;
-  line-height: 1.45;
-  margin: 4px 0 0;
-}
-
-.paste-status-grid {
-  gap: 0;
-}
-
-.paste-status-grid div {
-  border-left: 0;
-  border-right: 1px solid rgb(255 255 255 / 8%);
-  padding: 0 18px 0 0;
-}
-
-.paste-status-grid div + div {
-  padding-left: 18px;
-}
-
-.paste-status-grid div:last-child {
-  border-right: 0;
-}
-
-.paste-status-note {
-  align-items: center;
-  background: rgb(255 255 255 / 3%);
-  border: 1px solid rgb(255 255 255 / 7%);
-  border-radius: 7px;
-  color: rgb(245 244 236 / 66%);
-  display: flex;
-  font-size: 13px;
-  gap: 8px;
-  margin: 0;
-  min-height: 42px;
-  padding: 10px 12px;
-}
-
-.file-status-panel {
-  max-height: none;
-  overflow: visible;
-}
-
-.file-status-panel .paste-status-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+.status-spinner {
+  color: var(--accent-strong);
+  flex: 0 0 auto;
+  filter: drop-shadow(0 0 8px rgb(35 199 132 / 30%));
 }
 
 .glossary-style-view {
@@ -3320,6 +3312,13 @@
   align-self: end;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.glossary-reference-title .status-chip {
+  border-radius: 999px;
+  font-size: 11px;
+  min-height: 22px;
+  padding: 4px 8px;
 }
 
 .style-profile-reference-panel label {
@@ -3436,6 +3435,12 @@
   white-space: nowrap;
 }
 
+.glossary-filter-tabs .status-chip-success {
+  background: rgb(8 139 91 / 24%);
+  border: 1px solid rgb(35 199 132 / 22%);
+  color: var(--accent-strong);
+}
+
 .glossary-management-table {
   border-collapse: collapse;
   font-size: 9px;
@@ -3513,6 +3518,14 @@
   font-size: 9px;
   min-height: 20px;
   padding: 1px 2px;
+}
+
+.glossary-management-table .status-chip {
+  border-radius: 5px;
+  font-size: 8px;
+  min-height: 18px;
+  padding: 2px 4px;
+  white-space: nowrap;
 }
 
 .glossary-management-table .dialog-actions {
@@ -3822,6 +3835,14 @@
   .raw-chapter-row p {
     color: rgb(218 228 224 / 55%);
     font-size: 11px;
+  }
+
+  .raw-chapter-row .status-pill {
+    background: rgb(10 25 24 / 76%);
+    border-color: rgb(71 94 94 / 34%);
+    color: #e7efeb;
+    font-size: 11px;
+    padding: 6px 10px;
   }
 
   .raw-chapter-row .secondary-action {

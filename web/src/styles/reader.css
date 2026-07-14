@@ -2169,7 +2169,10 @@
   max-height: min(58dvh, calc(100dvh - 240px), 620px);
 }
 
-.reader-page-content[data-reading-mode="paginated"] .reader-rich-block :is(table, pre), .reader-page-content[data-reading-mode="paginated"] .reader-rich-block :is(dl, math), .reader-pagination-measure .reader-rich-block :is(table, pre), .reader-pagination-measure .reader-rich-block :is(dl, math) {
+.reader-page-content[data-reading-mode="paginated"] .reader-rich-block :is(table, pre),
+.reader-page-content[data-reading-mode="paginated"] .reader-rich-block :is(dl, math),
+.reader-pagination-measure .reader-rich-block :is(table, pre),
+.reader-pagination-measure .reader-rich-block :is(dl, math) {
   max-height: min(52dvh, calc(100dvh - 280px), 560px);
   overflow: auto;
 }

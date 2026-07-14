@@ -654,12 +654,6 @@
   padding: 11px 18px;
 }
 
-.paste-status-header .section-label {
-  color: rgb(245 244 236 / 64%);
-  font-size: 14px;
-  margin: 0 0 10px;
-}
-
 .inline-help-panel {
   background: rgb(8 30 27 / 78%);
   border: 1px solid rgb(43 201 132 / 18%);

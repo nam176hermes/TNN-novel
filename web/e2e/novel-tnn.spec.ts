@@ -577,6 +577,17 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(page.getByRole('heading', { name: 'Dán chương nguồn' })).toBeVisible();
   await expectActionAboveMobileNavigation(page, 'Import chapter');
   await expectNoHorizontalOverflow(page);
+
+  await page.getByLabel('Chế độ nhập').getByRole('button', { name: 'Tải file', exact: true }).click();
+  await page.getByLabel('Source file').setInputFiles({
+    name: 'chapter-12.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('第12章 山门\n\n山门前人声鼎沸。'),
+  });
+  const filePreview = page.getByRole('region', { name: 'Import preview' });
+  await expect(filePreview).toHaveCSS('padding', '18px');
+  await expect(filePreview).toHaveCSS('max-height', 'none');
+  await expect(filePreview).toHaveCSS('overflow', 'visible');
 });
 
 test('exports a translated book as TXT without calling a live API', async ({ page }) => {

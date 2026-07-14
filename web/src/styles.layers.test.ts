@@ -13,6 +13,9 @@ const entryPath = resolve(__dirname, 'styles.css');
 const entry = readFileSync(entryPath, 'utf-8');
 const componentStyles = readFileSync(resolve(__dirname, 'styles/components.css'), 'utf-8');
 const featureStyles = readFileSync(resolve(__dirname, 'styles/features.css'), 'utf-8');
+const importStyles = readFileSync(resolve(__dirname, 'styles/import.css'), 'utf-8');
+const operationsStyles = readFileSync(resolve(__dirname, 'styles/operations.css'), 'utf-8');
+const readerStyles = readFileSync(resolve(__dirname, 'styles/reader.css'), 'utf-8');
 const shellStyles = readFileSync(resolve(__dirname, 'styles/shell.css'), 'utf-8');
 const expectedImports = [
   './styles/tokens.css',
@@ -32,9 +35,21 @@ type FeatureOwner = 'reader.css' | 'library.css' | 'import.css' | 'operations.cs
 const featureOwners: Record<FeatureOwner, RegExp> = {
   'reader.css': /\.reader-/,
   'library.css': /(?:\.library-|\.translated-librar(?:y|ies)-|\.translated-books?-|\.book-card)/,
-  'import.css': /(?:\.import-|\.ebook-|\.url-import-|\.source-file-|\.catalog-import-|\.wizard-|\.danger-confirmation)/,
-  'operations.css': /(?:\.status-|\.backup-|\.jobs?-|\.failed-job-|\.tts-job-|\.tts-chunk-|\.stage-timing-|\.auto-refresh-|\.sparkline)/,
+  'import.css': /(?:\.import-|\.ebook-|\.paste-status-|\.file-status-panel|\.url-import-|\.source-file-|\.catalog-import-|\.wizard-|\.danger-confirmation)/,
+  'operations.css': /(?:\.status-(?:settings|overview|runtime|performance|detail|header)-|\.backup-|\.jobs?-|\.failed-job-|\.tts-job-|\.tts-chunk-|\.stage-timing-|\.auto-refresh-|\.sparkline)/,
 };
+
+const sharedStatusSelectors = [
+  '.status-error',
+  '.status-success',
+  '.status-pill',
+  '.status-chip',
+  '.status-chip-success',
+  '.status-chip-warning',
+  '.status-chip-danger',
+  '.status-chip-muted',
+  '.status-spinner',
+];
 
 function selectorsFor(css: string): Array<{ selector: string; inResponsiveContext: boolean }> {
   const selectors: Array<{ selector: string; inResponsiveContext: boolean }> = [];
@@ -87,6 +102,64 @@ function ownershipViolations(sources: Record<string, string>): string[] {
     }
   }
   return violations;
+}
+
+function computeSimpleClassCascade(classNames: string[]): Record<string, string> {
+  type Winner = { layer: number; order: number; specificity: number; value: string };
+  const winners = new Map<string, Winner>();
+  const layerOrder = new Map([
+    ['tokens', 0],
+    ['base', 1],
+    ['shell', 2],
+    ['components', 3],
+    ['features', 4],
+    ['utilities', 5],
+    ['overrides', 6],
+  ]);
+  let order = 0;
+
+  for (const importedSource of expectedImports) {
+    const css = readFileSync(resolve(__dirname, importedSource), 'utf-8');
+    const sourceName = importedSource.match(/\/([^/]+)\.css$/)?.[1] ?? '';
+    const layerName = ['reader', 'library', 'import', 'operations'].includes(sourceName)
+      ? 'features'
+      : sourceName;
+    const layer = layerOrder.get(layerName) ?? -1;
+    postcss.parse(css).walkRules((rule: Rule) => {
+      type CssAncestor = { name?: string; parent?: CssAncestor; type: string };
+      let parent = rule.parent as unknown as CssAncestor | undefined;
+      while (parent && parent.type !== 'root') {
+        if (parent.type === 'atrule' && ['media', 'supports', 'container'].includes(parent.name ?? '')) return;
+        parent = parent.parent;
+      }
+      for (const selector of rule.selectors) {
+        if (!/^\.[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/i.test(selector)) continue;
+        const requiredClasses = [...selector.matchAll(/\.([a-z0-9_-]+)/gi)].map((match) => match[1]);
+        if (!requiredClasses.every((className) => classNames.includes(className))) continue;
+        const specificity = requiredClasses.length;
+        for (const node of rule.nodes ?? []) {
+          if (node.type !== 'decl') continue;
+          order += 1;
+          const current = winners.get(node.prop);
+          const candidate = { layer, order, specificity, value: node.value };
+          if (
+            !current
+            || candidate.layer > current.layer
+            || (candidate.layer === current.layer && candidate.specificity > current.specificity)
+            || (
+              candidate.layer === current.layer
+              && candidate.specificity === current.specificity
+              && candidate.order > current.order
+            )
+          ) {
+            winners.set(node.prop, candidate);
+          }
+        }
+      }
+    });
+  }
+
+  return Object.fromEntries([...winners].map(([property, winner]) => [property, winner.value]));
 }
 
 describe('ordered stylesheet layers', () => {
@@ -178,6 +251,47 @@ describe('ordered stylesheet layers', () => {
     );
 
     expect(ownershipViolations(sources)).toEqual([]);
+  });
+
+  it('keeps generic status primitives shared instead of assigning them to operations', () => {
+    expect(ownersForSelector('.status-error')).toEqual([]);
+    expect(ownersForSelector('.status-settings-view')).toEqual(['operations.css']);
+    const operationSelectors = selectorsFor(operationsStyles).map(({ selector }) => selector);
+    for (const selector of sharedStatusSelectors) {
+      expect(operationSelectors, selector).not.toContain(selector);
+    }
+    expect(featureStyles).toContain('.glossary-filter-tabs .status-chip-success {');
+    expect(featureStyles).toContain('.raw-chapter-row .status-pill {');
+    expect(computeSimpleClassCascade(['status-error'])).toMatchObject({
+      'font-size': '13px',
+      'font-weight': '750',
+      'line-height': '1.4',
+    });
+    expect(computeSimpleClassCascade(['status-pill', 'status-translated'])).toMatchObject({
+      background: 'var(--success-bg)',
+      'border-color': 'var(--success-border)',
+      color: 'var(--accent-strong)',
+    });
+  });
+
+  it('preserves the Import file-preview composite cascade', () => {
+    expect(importStyles).toContain('.paste-status-panel {');
+    expect(importStyles).toContain('.file-status-panel {');
+    expect(computeSimpleClassCascade(['import-preview', 'paste-status-panel', 'file-status-panel']))
+      .toMatchObject({
+        'max-height': 'none',
+        overflow: 'visible',
+        padding: '18px',
+      });
+  });
+
+  it('preserves Reader audio-error typography across shared status styles', () => {
+    expect(readerStyles).toContain('.reader-export-status {');
+    expect(computeSimpleClassCascade(['reader-export-status', 'status-error'])).toMatchObject({
+      'font-size': '12px',
+      'font-weight': '760',
+      'line-height': '1.35',
+    });
   });
 
   it('colocates base and responsive rules in every feature owner', () => {
