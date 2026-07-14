@@ -127,7 +127,9 @@ class BackupJobCoordinator:
             and job.params.get("include_secrets")
             and job.state != "ENCRYPTING_BACKUP"
         ):
-            # The plain staging archive is published before it is encrypted.
+            # Secret-bearing backups may report this while publishing only
+            # inside private staging; live publication stays suppressed until
+            # encryption and READY-sidecar validation have completed.
             # Keep the durable state at validation until encryption begins.
             return
         self.tracker.update_job(

@@ -199,6 +199,22 @@ def test_backup_service_blocks_path_traversal(backup_service_fixture: BackupServ
         backup_service_fixture.resolve_download_path("../etc/passwd")
 
 
+@pytest.mark.parametrize("sidecar_bytes", [b"{", b"\xff\xfe"])
+def test_backup_service_denies_download_when_sidecar_is_malformed(
+    backup_service_fixture: BackupService,
+    sidecar_bytes: bytes,
+) -> None:
+    archive = (
+        backup_service_fixture.backup_dir
+        / "novel-pipeline-backup-20260714-120000.tar.gz"
+    )
+    archive.write_bytes(b"artifact")
+    ops.backup_sidecar_path(archive).write_bytes(sidecar_bytes)
+
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        backup_service_fixture.resolve_download_path(archive.name)
+
+
 @pytest.mark.asyncio
 async def test_backup_list_is_sidecar_only_and_gates_download_urls(
     backup_service_fixture: BackupService,

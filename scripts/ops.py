@@ -609,6 +609,117 @@ def encrypt_backup_archive(
     return encrypted_path
 
 
+def _publish_ready_encrypted_backup(archive_path: Path, out_dir: Path) -> Path:
+    """Publish a validated encrypted artifact pair without exposing a bare archive."""
+    archive_path = archive_path.resolve()
+    metadata = read_backup_sidecar(archive_path)
+    if not archive_path.name.endswith(".tar.gz.enc") or not metadata.get("encrypted"):
+        raise ValueError("encrypted READY backup is required")
+    if metadata.get("artifact_state") != "READY":
+        raise ValueError("encrypted backup metadata is not READY")
+
+    destination_dir = out_dir.resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    final_path, staging_root = _reserve_backup_output(destination_dir, archive_path.name)
+    staged_archive_path = staging_root / final_path.name
+    staged_sidecar_path = backup_sidecar_path(staged_archive_path)
+    published_sidecar = False
+    published_archive = False
+    try:
+        os.link(archive_path, staged_archive_path)
+        _fsync_backup_file(staged_archive_path)
+        write_backup_sidecar_atomic(
+            staged_archive_path,
+            build_backup_sidecar(metadata, staged_archive_path),
+        )
+        # Sidecar-first publication ensures a directly-addressable archive is never
+        # present without READY metadata. Roll back either link on any failure.
+        _publish_backup_file(staged_sidecar_path, backup_sidecar_path(final_path))
+        published_sidecar = True
+        _publish_backup_file(staged_archive_path, final_path)
+        published_archive = True
+        return final_path
+    except Exception:
+        if published_archive:
+            final_path.unlink(missing_ok=True)
+        if published_sidecar:
+            backup_sidecar_path(final_path).unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(staging_root)
+
+
+def create_encrypted_backup(
+    data_dir: Path | None = None,
+    out_dir: Path | None = None,
+    *,
+    passphrase: str,
+    include_audio: bool = True,
+    include_exports: bool = False,
+    include_job_logs: bool = False,
+    label: str | None = None,
+    keep: int | None = None,
+    record_event: bool = True,
+    checkpoint_database: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """Create a secret-bearing backup without publishing plaintext metadata or bytes."""
+    if not passphrase.strip():
+        raise ValueError("Backup passphrase is required")
+    source_dir = (data_dir or resolve_data_dir()).resolve()
+    destination_dir = (out_dir or DEFAULT_BACKUP_DIR).resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    private_root = _backup_staging_path(
+        destination_dir,
+        f"novel-pipeline-secret-backup-{secrets.token_hex(8)}",
+    )
+    try:
+        plain_path = create_backup(
+            data_dir=source_dir,
+            out_dir=private_root,
+            include_env=True,
+            include_audio=include_audio,
+            include_exports=include_exports,
+            include_job_logs=include_job_logs,
+            label=label,
+            record_event=False,
+            checkpoint_database=checkpoint_database,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        encrypted_path = encrypt_backup_archive(
+            plain_path,
+            passphrase=passphrase.strip(),
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        _raise_if_backup_cancelled(cancel_check)
+        published_path = _publish_ready_encrypted_backup(encrypted_path, destination_dir)
+    finally:
+        shutil.rmtree(private_root)
+
+    if keep is not None:
+        rotate_backup_files(destination_dir, keep=keep)
+
+    db_path = source_dir / "pipeline.db"
+    if record_event and db_path.exists():
+        try:
+            from app.database.db import record_operational_event
+
+            record_operational_event(
+                db_path,
+                event_type="backup_success",
+                severity="info",
+                source="ops",
+                message="Backup completed",
+                details={"backup_name": published_path.name, "include_env": True},
+            )
+        except Exception:
+            pass
+    return published_path
+
+
 def rotate_backup_files(out_dir: Path, *, keep: int) -> list[str]:
     if keep < 1:
         raise ValueError("keep must be >= 1")
@@ -836,10 +947,18 @@ def list_backups(out_dir: Path | None = None) -> list[dict[str, Any]]:
         path.name: path for path in entries if _is_supported_backup_name(path.name)
     }
     orphan_names: set[str] = set()
+    pending_sidecar_names: set[str] = set()
     for path in entries:
         if not path.name.endswith(BACKUP_MANIFEST_SUFFIX):
             continue
         archive_name = path.name.removesuffix(BACKUP_MANIFEST_SUFFIX)
+        pending_publication = backup_dir / f".{archive_name}.partial"
+        if pending_publication.is_dir() and not pending_publication.is_symlink():
+            # A sidecar-first encrypted publication may be interrupted before
+            # its archive link. The private reservation marks that orphan as
+            # incomplete so restart-time listing cannot expose it as a backup.
+            pending_sidecar_names.add(path.name)
+            continue
         if _is_supported_backup_name(archive_name) and archive_name not in archive_paths:
             orphan_names.add(archive_name)
 
@@ -903,7 +1022,9 @@ def list_backups(out_dir: Path | None = None) -> list[dict[str, Any]]:
         ))
 
     supported_names = set(archive_paths)
-    sidecar_names = {f"{name}{BACKUP_MANIFEST_SUFFIX}" for name in supported_names | orphan_names}
+    sidecar_names = {
+        f"{name}{BACKUP_MANIFEST_SUFFIX}" for name in supported_names | orphan_names
+    } | pending_sidecar_names
     for path in entries:
         if path.name in supported_names or path.name in sidecar_names:
             continue

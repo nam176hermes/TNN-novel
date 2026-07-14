@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import tarfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -375,6 +376,196 @@ def test_encryption_failure_does_not_publish_encrypted_artifacts(
     assert list(backup_dir.glob("*.tar.gz.enc.manifest.json")) == []
     assert list(backup_dir.glob("*.partial*")) == []
     assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_encrypted_backup_is_unlistable_and_undownloadable_until_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    encryption_started = threading.Event()
+    release_encryption = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def blocked_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        encryption_started.set()
+        assert release_encryption.wait(timeout=5)
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def run_backup() -> None:
+        try:
+            outcome["path"] = ops.create_encrypted_backup(
+                data_dir=data_dir,
+                out_dir=backup_dir,
+                passphrase="test passphrase",
+                record_event=False,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports worker failures
+            outcome["error"] = exc
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", blocked_encryption)
+
+    worker = threading.Thread(target=run_backup)
+    worker.start()
+    assert encryption_started.wait(timeout=5)
+
+    staged_plain = next(backup_dir.glob(".*/*.tar.gz"))
+    service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
+    assert ops.list_backups(backup_dir) == []
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(staged_plain.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(f"{staged_plain.name}.enc")
+
+    release_encryption.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    encrypted_path = outcome["path"]
+    assert isinstance(encrypted_path, Path)
+    assert encrypted_path.parent == backup_dir
+    assert encrypted_path.name.endswith(".tar.gz.enc")
+    assert sorted(path.name for path in backup_dir.iterdir()) == sorted(
+        [encrypted_path.name, ops.backup_sidecar_path(encrypted_path).name]
+    )
+    item = ops.list_backups(backup_dir)[0]
+    assert item["metadata_status"] == "READY"
+    assert item["encrypted"] is True
+    assert item["secrets_included"] is True
+
+
+def test_create_encrypted_backup_failure_and_cancellation_leave_live_directory_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+
+    def fail_encryption(command: list[str], **_: object) -> None:
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"partial")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fail_encryption)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+    assert list(backup_dir.iterdir()) == []
+
+    cancel = [False]
+
+    def cancel_during_encryption(step: str) -> None:
+        if step == "encrypting":
+            cancel[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+            cancel_check=lambda: cancel[0],
+            progress_callback=cancel_during_encryption,
+        )
+    assert list(backup_dir.iterdir()) == []
+
+
+def test_create_encrypted_backup_collision_preserves_ready_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+
+    first = ops.create_encrypted_backup(
+        data_dir=first_data,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+    second = ops.create_encrypted_backup(
+        data_dir=second_data,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+
+    assert first != second
+    assert first.is_file() and second.is_file()
+    assert len(list(backup_dir.glob("novel-pipeline-backup-*.tar.gz.enc"))) == 2
+    for item in ops.list_backups(backup_dir):
+        assert item["metadata_status"] == "READY"
+        assert item["encrypted"] is True
+        assert item["secrets_included"] is True
+
+
+def test_interrupted_secret_backup_staging_is_not_listed_or_downloadable(tmp_path: Path) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    residue = backup_dir / ".novel-pipeline-secret-backup-interrupted.partial"
+    residue.mkdir(mode=0o700)
+    plain = residue / "novel-pipeline-backup-20260712-100000.tar.gz"
+    plain.write_bytes(b"plaintext secrets")
+    _write_backup_sidecar(plain, secrets_included=True)
+    partial = backup_dir / "novel-pipeline-backup-20260712-103000.tar.gz.partial"
+    partial.write_bytes(b"partial plaintext secrets")
+    pending_name = "novel-pipeline-backup-20260712-110000.tar.gz.enc"
+    pending_publication = backup_dir / f".{pending_name}.partial"
+    pending_publication.mkdir(mode=0o700)
+    _write_backup_sidecar(backup_dir / pending_name, encrypted=True, secrets_included=True)
+    service = BackupService(backup_dir=backup_dir, data_dir=tmp_path / "data")
+
+    assert service.list_backups() == []
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(plain.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(partial.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(pending_name)
 
 
 def test_backup_listing_ignores_staging_and_partial_publication_names(tmp_path: Path) -> None:

@@ -179,27 +179,23 @@ def test_backup_service_forwards_cancellation_and_progress_callbacks(
     cancel_check = lambda: False
     progress_callback = lambda step: None
     calls: list[tuple[str, object, object]] = []
-    plain_path = backup_dir / "backup.tar.gz"
     encrypted_path = backup_dir / "backup.tar.gz.enc"
 
-    def create_backup(**kwargs):
+    def create_encrypted_backup(**kwargs):
         calls.append((
-            "create",
+            "create_encrypted",
             kwargs["cancel_check"],
             kwargs["progress_callback"],
             kwargs["record_event"],
         ))
-        plain_path.write_bytes(b"plain")
-        return plain_path
-
-    def encrypt_backup_archive(path: Path, **kwargs):
-        assert path == plain_path
-        calls.append(("encrypt", kwargs["cancel_check"], kwargs["progress_callback"]))
         encrypted_path.write_bytes(b"encrypted")
         return encrypted_path
 
-    monkeypatch.setattr("app.mobile_api.services.backup_service.ops.create_backup", create_backup)
-    monkeypatch.setattr("app.mobile_api.services.backup_service.ops.encrypt_backup_archive", encrypt_backup_archive)
+    monkeypatch.setattr(
+        "app.mobile_api.services.backup_service.ops.create_encrypted_backup",
+        create_encrypted_backup,
+        raising=False,
+    )
     monkeypatch.setattr(
         service,
         "list_backups",
@@ -215,8 +211,7 @@ def test_backup_service_forwards_cancellation_and_progress_callbacks(
 
     assert item["filename"] == encrypted_path.name
     assert calls == [
-        ("create", cancel_check, progress_callback, False),
-        ("encrypt", cancel_check, progress_callback),
+        ("create_encrypted", cancel_check, progress_callback, False),
     ]
 
 
@@ -248,7 +243,7 @@ def test_backup_service_disables_the_legacy_ops_success_event(
     assert calls == [False]
 
 
-def test_backup_service_removes_plain_secret_archive_when_encryption_is_cancelled(
+def test_backup_service_secret_cancellation_never_uses_plain_publication_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -256,24 +251,19 @@ def test_backup_service_removes_plain_secret_archive_when_encryption_is_cancelle
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
-    plain_path = backup_dir / "backup.tar.gz"
-
-    def create_backup(**kwargs):
-        plain_path.write_bytes(b"plain secrets")
-        plain_path.with_suffix(plain_path.suffix + ".manifest.json").write_text("{}", encoding="utf-8")
-        return plain_path
-
-    monkeypatch.setattr("app.mobile_api.services.backup_service.ops.create_backup", create_backup)
     monkeypatch.setattr(
-        "app.mobile_api.services.backup_service.ops.encrypt_backup_archive",
-        lambda *args, **kwargs: (_ for _ in ()).throw(BackupCancelled("Backup cancelled")),
+        "app.mobile_api.services.backup_service.ops.create_encrypted_backup",
+        lambda **kwargs: (_ for _ in ()).throw(BackupCancelled("Backup cancelled")),
+    )
+    monkeypatch.setattr(
+        "app.mobile_api.services.backup_service.ops.create_backup",
+        lambda **kwargs: pytest.fail("secret backup used plaintext creation path"),
     )
 
     with pytest.raises(BackupCancelled):
         service.create_backup(include_secrets=True, passphrase="correct horse")
 
-    assert not plain_path.exists()
-    assert not plain_path.with_suffix(plain_path.suffix + ".manifest.json").exists()
+    assert list(backup_dir.iterdir()) == []
 
 
 def test_backup_secret_store_returns_a_secret_only_once() -> None:

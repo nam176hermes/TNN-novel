@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,29 +38,30 @@ class BackupService:
         if include_secrets and not passphrase.strip():
             raise ValueError("Encrypted backup passphrase is required when secrets are included")
 
-        backup_path = ops.create_backup(
-            data_dir=self.data_dir,
-            include_env=include_secrets,
-            include_audio=include_audio,
-            include_exports=include_exports,
-            include_job_logs=include_job_logs,
-            out_dir=self.backup_dir,
-            record_event=False,
-            cancel_check=cancel_check,
-            progress_callback=progress_callback,
-        )
         if include_secrets:
-            try:
-                backup_path = ops.encrypt_backup_archive(
-                    backup_path,
-                    passphrase=passphrase.strip(),
-                    cancel_check=cancel_check,
-                    progress_callback=progress_callback,
-                )
-            except Exception:
-                backup_path.unlink(missing_ok=True)
-                ops.backup_sidecar_path(backup_path).unlink(missing_ok=True)
-                raise
+            backup_path = ops.create_encrypted_backup(
+                data_dir=self.data_dir,
+                include_audio=include_audio,
+                include_exports=include_exports,
+                include_job_logs=include_job_logs,
+                out_dir=self.backup_dir,
+                passphrase=passphrase.strip(),
+                record_event=False,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+        else:
+            backup_path = ops.create_backup(
+                data_dir=self.data_dir,
+                include_env=False,
+                include_audio=include_audio,
+                include_exports=include_exports,
+                include_job_logs=include_job_logs,
+                out_dir=self.backup_dir,
+                record_event=False,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
 
         backups = self.list_backups()
         for item in backups:
@@ -70,7 +72,14 @@ class BackupService:
     def resolve_download_path(self, filename: str) -> Path:
         if not filename or "/" in filename or "\\" in filename or ".." in filename:
             raise ValueError("Invalid backup filename")
-        path = (self.backup_dir / filename).resolve()
+        candidate = self.backup_dir / filename
+        if not ops._is_supported_backup_name(filename) or candidate.is_symlink():
+            raise FileNotFoundError("Backup not found")
+        path = candidate.resolve()
         if self.backup_dir not in path.parents or not path.exists() or not path.is_file():
             raise FileNotFoundError("Backup not found")
+        try:
+            ops.read_backup_sidecar(path)
+        except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            raise FileNotFoundError("Backup not found") from None
         return path
