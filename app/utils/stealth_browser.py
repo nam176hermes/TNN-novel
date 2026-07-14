@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 try:
@@ -20,7 +21,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-from app.utils.cookie_store import load_cookies, save_cookies
+from app.utils.cookie_store import save_cookies
 from app.utils.captcha_solver import get_captcha_solver
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,10 @@ class StealthBrowser:
         if self._initialized:
             return
         self.playwright = await async_playwright().start()
+        # Use headed mode when DISPLAY is available — Cloudflare detects headless
+        headed = bool(os.getenv("DISPLAY"))
         self.browser = await self.playwright.chromium.launch(
-            headless=True,
+            headless=not headed,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -160,57 +163,95 @@ class StealthBrowser:
         *,
         persist_cookies: bool = True,
     ) -> str:
-        """Fetch page with stealth, cookie reuse, and captcha auto-solve.
+        """Fetch page with persistent browser profile for better Cloudflare bypass.
 
-        Flow:
-        1. Load saved cookies → inject into context
-        2. Navigate to URL
-        3. Wait for Cloudflare challenge auto-resolve
-        4. Detect + solve captcha if present
-        5. Save cookies for next session
-        6. Return page HTML
+        Uses a persistent user-data-dir so Cloudflare sees a 'returning visitor'
+        with existing cookies/fingerprint, dramatically improving pass rate.
         """
-        if not self._initialized:
-            await self.init()
+        import tempfile
 
-        context = await self.browser.new_context(
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError("Playwright not installed")
+
+        # Auto-detect display — WSLg provides :0, Xvfb typically :99
+        display = os.getenv("DISPLAY", "")
+        if not display:
+            import subprocess
+            for test_display in (":0", ":99"):
+                try:
+                    result = subprocess.run(
+                        ["xdpyinfo", "-display", test_display],
+                        capture_output=True, timeout=3,
+                    )
+                    if result.returncode == 0:
+                        display = test_display
+                        os.environ["DISPLAY"] = test_display
+                        break
+                except FileNotFoundError:
+                    # xdpyinfo not installed — try connecting directly
+                    display = test_display
+                    os.environ["DISPLAY"] = test_display
+                    break
+                except Exception:
+                    continue
+        headed = bool(display)
+        profile_dir = os.path.join(
+            tempfile.gettempdir(), "pw_stealth_profile"
+        )
+
+        playwright = await async_playwright().start()
+        context = await playwright.chromium.launch_persistent_context(
+            profile_dir,
+            headless=not headed,
             viewport={"width": 1920, "height": 1080},
             user_agent=_DEFAULT_UA,
             java_script_enabled=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--no-zygote",
+            ],
         )
         await context.add_init_script(_STEALTH_INIT_SCRIPT)
 
-        # 1. Load saved cookies
-        saved = load_cookies(url)
-        if saved:
-            await context.add_cookies(saved)
-            logger.debug("Loaded %d cookies for %s", len(saved), url)
-
-        page = await context.new_page()
-        await page.set_default_timeout(timeout)
+        page = context.pages[0] if context.pages else await context.new_page()
+        page.set_default_timeout(timeout)
 
         try:
             await page.goto(url, wait_until="domcontentloaded")
 
-            # 2. Cloudflare interstitial auto-resolve
-            await asyncio.sleep(3)
+            # 2. Cloudflare interstitial — wait longer, then try reload
+            await asyncio.sleep(5)
             title = await page.title()
             if "Checking your browser" in title or "Just a moment" in title:
-                logger.info("Cloudflare challenge page for %s — waiting up to 30s", url)
+                logger.info("Cloudflare challenge page for %s — waiting up to 45s", url)
                 try:
                     await page.wait_for_function(
                         "document.title && !document.title.includes('Just a moment') "
                         "&& !document.title.includes('Checking your browser')",
-                        timeout=30_000,
+                        timeout=45_000,
                     )
                 except Exception:
-                    logger.warning("Cloudflare challenge did not auto-resolve for %s", url)
+                    logger.warning("Cloudflare challenge did not auto-resolve for %s — trying reload", url)
+                    # Try reloading the page — often resolves after first visit sets cookies
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                        await asyncio.sleep(5)
+                        title2 = await page.title()
+                        if "Just a moment" in title2 or "Checking" in title2:
+                            logger.warning("Still blocked after reload for %s", url)
+                        else:
+                            logger.info("Cloudflare resolved after reload for %s", url)
+                    except Exception as reload_err:
+                        logger.warning("Reload failed for %s: %s", url, reload_err)
 
             # 3. Captcha detection + solve
             captcha_found = await self._detect_and_solve_captcha(page, url)
             if captcha_found:
                 # Re-check title after solve attempt
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
             # 4. Save cookies for next time
             if persist_cookies:
@@ -224,6 +265,7 @@ class StealthBrowser:
 
         finally:
             await context.close()
+            await playwright.stop()
 
     # ------------------------------------------------------------------ #
     # Legacy alias (kept for backward compat)

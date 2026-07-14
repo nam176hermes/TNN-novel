@@ -823,6 +823,42 @@ export type SourcePreview = {
   managed_source_trust_level: string;
   automation_allowed: boolean;
   automation_reason: string;
+  bypass_used: boolean;
+  bypass_method: string;
+};
+
+export type URLFetchChapterRequest = {
+  url: string;
+  chapter_number: number;
+  title: string;
+};
+
+export type URLFetchRequest = {
+  source_url: string;
+  title: string;
+  author: string;
+  source: string;
+  chapters: URLFetchChapterRequest[];
+};
+
+export type URLFetchChapterResult = {
+  chapter_number: number;
+  title: string;
+  url: string;
+  success: boolean;
+  error: string;
+  text_length: number;
+  book_id: number;
+  chapter_id: number;
+};
+
+export type URLFetchResponse = {
+  title: string;
+  book_id: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+  chapters: URLFetchChapterResult[];
 };
 
 export type SourceCapability = {

@@ -20,8 +20,17 @@ def test_fetch_public_html_tries_browser_on_cloudflare_block(monkeypatch):
     class FakeBlockedResponse:
         status_code = 403
         headers = {"cf-mitigated": "challenge", "server": "cloudflare", "Content-Type": "text/html"}
+        encoding = None
+        apparent_encoding = None
+
+    class FakeCookies:
+        def get_dict(self):
+            return {}
+        def set(self, *a, **kw):
+            pass
 
     class FakeSession:
+        cookies = FakeCookies()
         def get(self, *a, **kw):
             return FakeBlockedResponse()
 
@@ -45,8 +54,17 @@ def test_fetch_public_html_raises_when_browser_fails(monkeypatch):
     class FakeBlockedResponse:
         status_code = 403
         headers = {"cf-mitigated": "challenge", "server": "cloudflare", "Content-Type": "text/html"}
+        encoding = None
+        apparent_encoding = None
+
+    class FakeCookies:
+        def get_dict(self):
+            return {}
+        def set(self, *a, **kw):
+            pass
 
     class FakeSession:
+        cookies = FakeCookies()
         def get(self, *a, **kw):
             return FakeBlockedResponse()
 
@@ -69,8 +87,17 @@ def test_fetch_public_html_browser_fallback_disabled(monkeypatch):
     class FakeBlockedResponse:
         status_code = 403
         headers = {"cf-mitigated": "challenge", "server": "cloudflare"}
+        encoding = None
+        apparent_encoding = None
+
+    class FakeCookies:
+        def get_dict(self):
+            return {}
+        def set(self, *a, **kw):
+            pass
 
     class FakeSession:
+        cookies = FakeCookies()
         def get(self, *a, **kw):
             return FakeBlockedResponse()
 

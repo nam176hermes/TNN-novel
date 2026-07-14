@@ -78,6 +78,8 @@ import type {
   TokenResponse,
   TranslatedBookSummary,
   TtsJobStatus,
+  URLFetchRequest,
+  URLFetchResponse,
   WizardTextImportRequest,
   WizardTextImportResult,
 } from './types';
@@ -463,6 +465,17 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to preview source URL');
 
     return (await response.json()) as SourcePreview;
+  }
+
+  async fetchSourceChapters(request: URLFetchRequest): Promise<URLFetchResponse> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/url/fetch`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    await this.assertOk(response, 'Failed to fetch source chapters');
+
+    return (await response.json()) as URLFetchResponse;
   }
 
   async getImportSources(): Promise<SourceCapability[]> {

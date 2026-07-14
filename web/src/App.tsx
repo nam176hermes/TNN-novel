@@ -1879,6 +1879,9 @@ function AuthenticatedApp() {
               onPreviewTranslatedEbook={handlePreviewTranslatedEbook}
               onRefreshEbookInbox={loadEbookInbox}
               onStartImportUrlJob={handleStartImportUrl}
+              onFetchSourceChapters={async (request) => {
+                return await session.client.fetchSourceChapters(request);
+              }}
             />
           </>
         );

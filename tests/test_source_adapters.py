@@ -254,6 +254,8 @@ def test_fetch_public_html_rejects_redirect_to_different_source(monkeypatch: pyt
         headers = {"Location": "https://www.biquge.tw/book/1/"}
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
@@ -276,6 +278,8 @@ def test_fetch_public_html_reports_cloudflare_challenge_as_blocked_source(
             raise AssertionError("blocked responses should be handled before raise_for_status")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
@@ -303,6 +307,8 @@ def test_fetch_public_html_decodes_gbk_meta_charset(monkeypatch: pytest.MonkeyPa
             yield html.encode("gb18030")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
@@ -331,6 +337,8 @@ def test_fetch_public_html_prefers_apparent_gbk_over_latin1_response_encoding(
             yield html.encode("gb18030")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 

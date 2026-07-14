@@ -438,12 +438,48 @@ class SourcePreviewResponse(BaseModel):
     managed_source_trust_level: str = ""
     automation_allowed: bool = False
     automation_reason: str = ""
+    bypass_used: bool = False
+    bypass_method: str = ""
 
 
 class URLImportChapter(BaseModel):
     url: str
     chapter_number: int = 1
     title: str = ""
+
+
+class URLFetchChapterRequest(BaseModel):
+    url: str
+    chapter_number: int = 1
+    title: str = ""
+
+
+class URLFetchRequest(BaseModel):
+    source_url: str = ""
+    title: str = ""
+    author: str = ""
+    source: str = ""
+    chapters: list[URLFetchChapterRequest] = Field(default_factory=list)
+
+
+class URLFetchChapterResult(BaseModel):
+    chapter_number: int
+    title: str = ""
+    url: str = ""
+    success: bool = False
+    error: str = ""
+    text_length: int = 0
+    book_id: int = 0
+    chapter_id: int = 0
+
+
+class URLFetchResponse(BaseModel):
+    title: str = ""
+    book_id: int = 0
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    chapters: list[URLFetchChapterResult] = Field(default_factory=list)
 
 
 class URLImportStart(BaseModel):

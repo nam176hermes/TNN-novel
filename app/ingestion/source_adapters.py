@@ -50,6 +50,8 @@ class SourcePreview:
     cover_url: str = ""
     chapters: tuple[SourceChapter, ...] = ()
     policy: dict[str, int | str] | None = None
+    bypass_used: bool = False
+    bypass_method: str = ""
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -267,10 +269,17 @@ class GenericHtmlSourceAdapter:
         return True
 
     def preview(self, url: str) -> SourcePreview:
+        _reset_bypass_info()
         html = fetch_public_html(url)
-        return self.preview_from_html(url, html)
+        info = _get_bypass_info()
+        result = self.preview_from_html(url, html)
+        if info["used"]:
+            from dataclasses import replace as _replace
+            result = _replace(result, bypass_used=True, bypass_method=info["method"])
+        return result
 
     def fetch_chapter(self, url: str) -> SourceChapterContent:
+        _reset_bypass_info()
         html = fetch_public_html(url)
         return self.chapter_from_html(url, html)
 
@@ -482,6 +491,24 @@ def _raise_if_blocked_http_response(url: str, response: requests.Response) -> No
         )
 
 
+import threading
+
+_fetch_context = threading.local()
+
+
+def _get_bypass_info() -> dict:
+    """Return bypass info from the current fetch context."""
+    return getattr(_fetch_context, "bypass", {"used": False, "method": ""})
+
+
+def _reset_bypass_info() -> None:
+    _fetch_context.bypass = {"used": False, "method": ""}
+
+
+def _set_bypass_info(used: bool, method: str = "") -> None:
+    _fetch_context.bypass = {"used": used, "method": method}
+
+
 # --------------------------------------------------------------------------- #
 # Browser fallback — kicked in when direct requests get blocked
 # --------------------------------------------------------------------------- #
@@ -513,6 +540,7 @@ def _try_stealth_fallback(
 
     # Cooldown check on rendered HTML — bail out if browser also saw captcha
     raise_if_cooldown_page(url, html)
+    _set_bypass_info(True, "stealth_browser")
     return html
 
 
@@ -652,7 +680,12 @@ def build_default_source_adapters() -> list[GenericHtmlSourceAdapter]:
             ),
             cover_patterns=(r'<meta property="og:image" content="([^"]+)"', r'<img[^>]+src="([^"]+)"[^>]+(?:cover|bookimg|fmimg)'),
             chapter_link_patterns=(chapter_link_pattern,),
-            content_patterns=(r'<div[^>]+id="content"[^>]*>(.*?)</div>', r'<div[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</div>'),
+            content_patterns=(
+                r'<div[^>]+class="container"[^>]*>(.*?)</div>\s*<div[^>]+class="(?:bottom|foot|pagefoot)',
+                r'<div[^>]+class="[^"]*txtnav[^"]*"[^>]*>(.*?)</div>\s*<div',
+                r'<div[^>]+id="content"[^>]*>(.*?)</div>',
+                r'<div[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</div>',
+            ),
         ),
         SelectorSourceAdapter(
             adapter_id="69shumi",

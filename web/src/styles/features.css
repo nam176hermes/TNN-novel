@@ -1463,6 +1463,104 @@
   margin-top: 6px;
 }
 
+.bypass-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 620;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-top: 6px;
+}
+
+.bypass-badge-active {
+  background: rgb(250 204 21 / 15%);
+  color: rgb(250 204 21);
+  border: 1px solid rgb(250 204 21 / 30%);
+}
+
+.bypass-badge-direct {
+  background: rgb(34 197 94 / 12%);
+  color: rgb(74 222 128);
+  border: 1px solid rgb(34 197 94 / 25%);
+}
+
+.url-fetch-panel {
+  margin-top: 8px;
+}
+
+.url-fetch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.url-fetch-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 620;
+  cursor: pointer;
+}
+
+.url-fetch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 620;
+  padding: 5px 12px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.url-chapter-list li {
+  padding: 6px 4px;
+  border-bottom: 1px solid rgb(255 255 255 / 5%);
+}
+
+.url-chapter-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.url-chapter-item input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.url-chapter-link {
+  font-size: 10px;
+  color: rgb(245 244 236 / 40%);
+  margin: 2px 0 0 22px;
+  word-break: break-all;
+}
+
+.fetch-result-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 620;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin: 3px 0 0 22px;
+}
+
+.fetch-ok {
+  background: rgb(34 197 94 / 15%);
+  color: rgb(74 222 128);
+}
+
+.fetch-fail {
+  background: rgb(239 68 68 / 15%);
+  color: rgb(248 113 113);
+}
+
 .source-row-actions {
   display: inline-flex;
   gap: 5px;

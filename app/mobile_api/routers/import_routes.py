@@ -24,6 +24,9 @@ from app.mobile_api.schemas import (
     PasteImport,
     SourceCapabilityList,
     SourcePreviewResponse,
+    URLFetchChapterResult,
+    URLFetchRequest,
+    URLFetchResponse,
     URLImportStart,
     URLNoteImport,
     URLPreviewRequest,
@@ -813,6 +816,8 @@ async def preview_source_url(
                 else f"Nguồn đang ở trạng thái {managed.get('status', 'NEEDS_REVIEW')} nên chưa thể tạo job tự động."
             )
         )
+        preview.setdefault("bypass_used", False)
+        preview.setdefault("bypass_method", "")
         return preview
     except SourceAdapterError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -891,3 +896,83 @@ async def import_source_url(
         },
     )
     return JobResponse(job_id=job_id, status="pending", message="URL import job started")
+
+
+@router.post("/url/fetch", response_model=URLFetchResponse)
+async def fetch_source_chapters(
+    data: URLFetchRequest,
+    request: Request,
+    pipeline: PipelineService = Depends(get_pipeline),
+):
+    """Fetch and import selected chapters directly — no Source Hub required.
+
+    Each chapter URL is fetched (with auto-bypass for Cloudflare/captcha),
+    text extracted, and imported into the book.
+    """
+    if not data.title.strip():
+        raise HTTPException(status_code=400, detail="Book title is required")
+    if not data.chapters:
+        raise HTTPException(status_code=400, detail="At least one chapter must be selected")
+
+    results: list[URLFetchChapterResult] = []
+    succeeded = 0
+    failed = 0
+    book_id = 0
+
+    for ch in data.chapters:
+        try:
+            result = await asyncio.to_thread(
+                pipeline.import_from_source_url,
+                book_title=data.title,
+                author=data.author,
+                source=data.source,
+                source_url=data.source_url or ch.url,
+                chapter_url=ch.url,
+                chapter_number=ch.chapter_number,
+                chapter_title=ch.title,
+            )
+            book_id = result.get("book_id", 0)
+            results.append(URLFetchChapterResult(
+                chapter_number=ch.chapter_number,
+                title=ch.title,
+                url=ch.url,
+                success=True,
+                text_length=len(result.get("text", "")) if "text" in result else 0,
+                book_id=book_id,
+                chapter_id=result.get("chapter_id", 0),
+            ))
+            succeeded += 1
+        except Exception as exc:
+            logger.warning("Chapter fetch failed for %s: %s", ch.url, exc, exc_info=True)
+            results.append(URLFetchChapterResult(
+                chapter_number=ch.chapter_number,
+                title=ch.title,
+                url=ch.url,
+                success=False,
+                error=str(exc)[:200],
+            ))
+            failed += 1
+
+    record_audit_event(
+        event_type="import_url_fetch",
+        severity="info" if failed == 0 else "warning",
+        source="import",
+        message=f"URL fetch: {succeeded}/{len(data.chapters)} chapters imported",
+        request=request,
+        details={
+            "import_type": "url_fetch",
+            "title": data.title,
+            "total": len(data.chapters),
+            "succeeded": succeeded,
+            "failed": failed,
+        },
+    )
+
+    return URLFetchResponse(
+        title=data.title,
+        book_id=book_id,
+        total=len(data.chapters),
+        succeeded=succeeded,
+        failed=failed,
+        chapters=results,
+    )

@@ -3,6 +3,7 @@ import {
   BookOpen,
   CircleHelp,
   Clipboard,
+  Download,
   FileText,
   Globe2,
   Inbox,
@@ -29,6 +30,8 @@ import type {
   SourceCatalogList,
   SourceCatalogQuery,
   SourcePreview,
+  URLFetchChapterResult,
+  URLFetchResponse,
   WizardTextImportRequest,
   WizardTextImportResult,
 } from '../api/types';
@@ -60,6 +63,13 @@ export type ImportPanelProps = {
   onImportTranslatedEbook?: (request: EbookImportRequest) => Promise<EbookImportResult | void> | void;
   onPreviewImportUrl?: (url: string) => Promise<SourcePreview>;
   onStartImportUrlJob?: (request: ImportUrlRequest) => Promise<JobStartResponse | void> | void;
+  onFetchSourceChapters?: (request: {
+    source_url: string;
+    title: string;
+    author: string;
+    source: string;
+    chapters: Array<{ url: string; chapter_number: number; title: string }>;
+  }) => Promise<URLFetchResponse>;
   onCreateTranslationJob?: (bookId: number, chapterIds: number[]) => Promise<JobStartResponse | void> | void;
   onCreateTtsJob?: (bookId: number, chapterIds: number[]) => Promise<JobStartResponse | void> | void;
   loadSourceCatalog?: (params: SourceCatalogQuery) => Promise<SourceCatalogList>;
@@ -655,6 +665,7 @@ export default function ImportPanel({
   onImportTranslatedEbook,
   onPreviewImportUrl,
   onStartImportUrlJob,
+  onFetchSourceChapters,
   onCreateTranslationJob,
   onCreateTtsJob,
   loadSourceCatalog,
@@ -700,6 +711,10 @@ export default function ImportPanel({
   const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null);
   const [sourcePreviewState, setSourcePreviewState] = useState<EbookPreviewState>('idle');
   const [sourcePreviewError, setSourcePreviewError] = useState('');
+  const [selectedChapterUrls, setSelectedChapterUrls] = useState<Set<string>>(new Set());
+  const [fetchState, setFetchState] = useState<EbookPreviewState>('idle');
+  const [fetchResult, setFetchResult] = useState<URLFetchResponse | null>(null);
+  const [fetchError, setFetchError] = useState('');
   const [catalogQuery, setCatalogQuery] = useState('');
   const [catalogState, setCatalogState] = useState<EbookPreviewState>('idle');
   const [catalogError, setCatalogError] = useState('');
@@ -1034,6 +1049,9 @@ export default function ImportPanel({
     setSourcePreview(null);
     setSourcePreviewError('');
     setSourcePreviewState('loading');
+    setSelectedChapterUrls(new Set());
+    setFetchResult(null);
+    setFetchError('');
     try {
       const preview = await onPreviewImportUrl(sourceUrl.trim());
       setSourcePreview(preview);
@@ -1042,6 +1060,48 @@ export default function ImportPanel({
     } catch (error) {
       setSourcePreviewState('error');
       setSourcePreviewError(errorMessage(error));
+    }
+  }
+
+  function toggleChapterSelection(url: string): void {
+    setSelectedChapterUrls((prev) => {
+      const next = new Set(prev);
+      if (next.has(url)) next.delete(url);
+      else next.add(url);
+      return next;
+    });
+  }
+
+  function toggleSelectAllChapters(): void {
+    if (!sourcePreview?.chapters) return;
+    if (selectedChapterUrls.size === sourcePreview.chapters.length) {
+      setSelectedChapterUrls(new Set());
+    } else {
+      setSelectedChapterUrls(new Set(sourcePreview.chapters.map((c) => c.url)));
+    }
+  }
+
+  async function handleFetchChapters(): Promise<void> {
+    if (!onFetchSourceChapters || !sourcePreview || selectedChapterUrls.size === 0) return;
+    setFetchState('loading');
+    setFetchError('');
+    setFetchResult(null);
+    try {
+      const chapters = sourcePreview.chapters
+        .filter((c) => selectedChapterUrls.has(c.url))
+        .map((c) => ({ url: c.url, chapter_number: c.chapter_number, title: c.title }));
+      const result = await onFetchSourceChapters({
+        source_url: sourcePreview.source_url || sourceUrl,
+        title: title || sourcePreview.title,
+        author: sourcePreview.author,
+        source: sourcePreview.source,
+        chapters,
+      });
+      setFetchResult(result);
+      setFetchState('ready');
+    } catch (error) {
+      setFetchState('error');
+      setFetchError(errorMessage(error));
     }
   }
 
@@ -1753,17 +1813,82 @@ export default function ImportPanel({
                   {sourcePreview.automation_reason ? (
                     <p className="source-invalid-reason">{sourcePreview.automation_reason}</p>
                   ) : null}
-                  <ol className="ebook-preview-chapters">
-                    {sourcePreview.chapters.slice(0, 5).map((chapter) => (
-                      <li key={`${chapter.chapter_number}-${chapter.url}`}>
-                        <div>
-                          <span>#{chapter.chapter_number}</span>
-                          <strong>{chapter.title || `Chương ${chapter.chapter_number}`}</strong>
-                        </div>
-                        <p>{chapter.url}</p>
-                      </li>
-                    ))}
-                  </ol>
+                  {sourcePreview.bypass_used ? (
+                    <p className="bypass-badge bypass-badge-active">
+                      🔒 Auto-bypass: {sourcePreview.bypass_method || 'stealth browser'}
+                    </p>
+                  ) : (
+                    <p className="bypass-badge bypass-badge-direct">
+                      ✅ Kết nối trực tiếp
+                    </p>
+                  )}
+                  {onFetchSourceChapters && sourcePreview.chapters.length > 0 ? (
+                    <div className="url-fetch-panel">
+                      <div className="url-fetch-header">
+                        <label className="url-fetch-select-all">
+                          <input
+                            type="checkbox"
+                            checked={selectedChapterUrls.size === sourcePreview.chapters.length && sourcePreview.chapters.length > 0}
+                            onChange={toggleSelectAllChapters}
+                          />
+                          <span>Chọn tất cả ({selectedChapterUrls.size}/{sourcePreview.chapters.length})</span>
+                        </label>
+                        <button
+                          className="primary-action url-fetch-btn"
+                          disabled={selectedChapterUrls.size === 0 || fetchState === 'loading'}
+                          onClick={() => void handleFetchChapters()}
+                          type="button"
+                        >
+                          {fetchState === 'loading'
+                            ? <><Loader2 aria-hidden="true" className="status-spinner" size={15} /> Đang tải...</>
+                            : <><Download aria-hidden="true" size={15} /> Tải {selectedChapterUrls.size > 0 ? selectedChapterUrls.size : ''} chương</>}
+                        </button>
+                      </div>
+                      <ol className="ebook-preview-chapters url-chapter-list">
+                        {sourcePreview.chapters.map((chapter) => (
+                          <li key={`${chapter.chapter_number}-${chapter.url}`}>
+                            <label className="url-chapter-item">
+                              <input
+                                type="checkbox"
+                                checked={selectedChapterUrls.has(chapter.url)}
+                                onChange={() => toggleChapterSelection(chapter.url)}
+                              />
+                              <div>
+                                <span>#{chapter.chapter_number}</span>
+                                <strong>{chapter.title || `Chương ${chapter.chapter_number}`}</strong>
+                              </div>
+                            </label>
+                            <p className="url-chapter-link">{chapter.url}</p>
+                            {fetchResult?.chapters.find((r) => r.url === chapter.url) ? (
+                              <span className={`fetch-result-badge ${fetchResult.chapters.find((r) => r.url === chapter.url)?.success ? 'fetch-ok' : 'fetch-fail'}`}>
+                                {fetchResult.chapters.find((r) => r.url === chapter.url)?.success
+                                  ? `✅ ${fetchResult.chapters.find((r) => r.url === chapter.url)?.text_length.toLocaleString('vi-VN')} chars`
+                                  : `❌ ${fetchResult.chapters.find((r) => r.url === chapter.url)?.error}`}
+                              </span>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ol>
+                      {fetchError ? <p className="status-error" role="alert">{fetchError}</p> : null}
+                      {fetchResult && fetchResult.succeeded > 0 ? (
+                        <p className="status-chip status-chip-success">
+                          ✅ Đã tải {fetchResult.succeeded}/{fetchResult.total} chương vào "{fetchResult.title}"
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <ol className="ebook-preview-chapters">
+                      {sourcePreview.chapters.slice(0, 5).map((chapter) => (
+                        <li key={`${chapter.chapter_number}-${chapter.url}`}>
+                          <div>
+                            <span>#{chapter.chapter_number}</span>
+                            <strong>{chapter.title || `Chương ${chapter.chapter_number}`}</strong>
+                          </div>
+                          <p>{chapter.url}</p>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
                 </section>
               ) : null}
             </section>
