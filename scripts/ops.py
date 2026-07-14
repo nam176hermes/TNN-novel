@@ -135,6 +135,15 @@ def _publish_backup_file(source: Path, destination: Path) -> None:
     source.unlink()
 
 
+def _cleanup_owned_backup_staging_best_effort(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except Exception:
+        # Owned hidden residue remains outside normal list/download paths. A
+        # cleanup failure must not overturn publication or mask its root cause.
+        pass
+
+
 def _validate_backup_archive(archive_path: Path) -> dict[str, Any]:
     return _inspect_plain_backup_archive(archive_path)
 
@@ -649,7 +658,7 @@ def _publish_ready_encrypted_backup(archive_path: Path, out_dir: Path) -> Path:
             backup_sidecar_path(final_path).unlink(missing_ok=True)
         raise
     finally:
-        shutil.rmtree(staging_root)
+        _cleanup_owned_backup_staging_best_effort(staging_root)
 
 
 def create_encrypted_backup(
@@ -700,7 +709,7 @@ def create_encrypted_backup(
         _raise_if_backup_cancelled(cancel_check)
         published_path = _publish_ready_encrypted_backup(encrypted_path, destination_dir)
     finally:
-        shutil.rmtree(private_root)
+        _cleanup_owned_backup_staging_best_effort(private_root)
 
     if keep is not None:
         rotate_backup_files(destination_dir, keep=keep)

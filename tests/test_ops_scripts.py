@@ -596,6 +596,137 @@ def test_create_encrypted_backup_rolls_back_final_link_when_source_unlink_fails(
     assert list(backup_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("failed_cleanup", ["final-reservation", "private-root"])
+def test_create_encrypted_backup_cleanup_failure_does_not_overturn_ready_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_cleanup: str,
+) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_rmtree = shutil.rmtree
+    cleanup_failure_injected = False
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def fail_selected_cleanup(path: str | Path, *args: object, **kwargs: object) -> None:
+        nonlocal cleanup_failure_injected
+        cleanup_path = Path(path)
+        is_final_reservation = (
+            cleanup_path.parent == backup_dir
+            and cleanup_path.name.endswith(".tar.gz.enc.partial")
+        )
+        is_private_root = (
+            cleanup_path.parent == backup_dir
+            and cleanup_path.name.startswith(".novel-pipeline-secret-backup-")
+        )
+        selected = is_final_reservation if failed_cleanup == "final-reservation" else is_private_root
+        if selected and not cleanup_failure_injected:
+            cleanup_failure_injected = True
+            raise OSError(f"{failed_cleanup} cleanup failed")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+    monkeypatch.setattr(ops.shutil, "rmtree", fail_selected_cleanup)
+
+    encrypted_path = ops.create_encrypted_backup(
+        data_dir=data_dir,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+
+    assert cleanup_failure_injected is True
+    item = ops.list_backups(backup_dir)[0]
+    assert item["filename"] == encrypted_path.name
+    assert item["metadata_status"] == "READY"
+    assert item["encrypted"] is True
+    service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
+    assert service.resolve_download_path(encrypted_path.name) == encrypted_path
+    assert all(not entry["filename"].startswith(".") for entry in service.list_backups())
+    hidden_residue = [path for path in backup_dir.iterdir() if path.name.startswith(".")]
+    assert len(hidden_residue) == 1
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(hidden_residue[0].name)
+
+
+@pytest.mark.parametrize("primary_failure", ["encryption", "publication"])
+def test_create_encrypted_backup_preserves_primary_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: str,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_link = os.link
+    real_rmtree = shutil.rmtree
+    cleanup_failures = 0
+
+    def encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        if primary_failure == "encryption":
+            raise subprocess.CalledProcessError(9, command)
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def publication_link(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+        destination_path = Path(destination)
+        if (
+            primary_failure == "publication"
+            and destination_path.parent == backup_dir
+            and destination_path.name.endswith(".tar.gz.enc")
+        ):
+            raise PermissionError("publication link failed")
+        real_link(source, destination, *args, **kwargs)
+
+    def fail_owned_cleanup(path: str | Path, *args: object, **kwargs: object) -> None:
+        nonlocal cleanup_failures
+        cleanup_path = Path(path)
+        is_owned_live_staging = cleanup_path.parent == backup_dir and (
+            cleanup_path.name.endswith(".tar.gz.enc.partial")
+            or cleanup_path.name.startswith(".novel-pipeline-secret-backup-")
+        )
+        if is_owned_live_staging:
+            cleanup_failures += 1
+            raise OSError("owned staging cleanup failed")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", encryption)
+    monkeypatch.setattr(ops.os, "link", publication_link)
+    monkeypatch.setattr(ops.shutil, "rmtree", fail_owned_cleanup)
+
+    expected_error = subprocess.CalledProcessError if primary_failure == "encryption" else PermissionError
+    with pytest.raises(expected_error):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+
+    assert cleanup_failures >= 1
+    assert ops.list_backups(backup_dir) == []
+
+
 def test_interrupted_secret_backup_staging_is_not_listed_or_downloadable(tmp_path: Path) -> None:
     from app.mobile_api.services.backup_service import BackupService
 
