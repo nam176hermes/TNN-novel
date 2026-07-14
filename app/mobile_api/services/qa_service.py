@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
+from typing import Protocol
 
 from app.database.db import (
     get_qa_report as db_get_qa_report,
@@ -9,7 +11,14 @@ from app.database.db import (
     list_qa_reports,
     save_qa_report,
 )
-from app.mobile_api.services.pipeline_service import PipelineService
+
+
+class ChapterContentReader(Protocol):
+    db_path: Path
+
+    def get_chapter_source(self, chapter_id: int) -> str | None: ...
+
+    def get_chapter_translation(self, chapter_id: int) -> str | None: ...
 
 
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -166,7 +175,7 @@ def build_deterministic_chapter_qa_report(
 
 
 class QAService:
-    def __init__(self, pipeline_service: PipelineService):
+    def __init__(self, pipeline_service: ChapterContentReader):
         self.pipeline = pipeline_service
 
     def get_qa_report(self, book_id: int, chapter_id: int) -> dict | None:
