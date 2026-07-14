@@ -230,6 +230,7 @@ function AuthenticatedApp() {
     selectedChapter,
     expireSession,
     chapterTextPrefetchTargets,
+    { cacheOwnership: activeView === 'reader' ? 'external' : 'internal' },
   );
   const providersState = useProviders(session.client, session.isAuthenticated, expireSession);
   const styleState = useStyleProfiles(session.client, session.isAuthenticated, expireSession);

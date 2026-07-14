@@ -1662,6 +1662,7 @@ export default function ReaderView({
   const readerAudio = useReaderAudio({
     activeBookId,
     apiClient,
+    cachedAudioLoading: readerOfflineCache.metadataLoading,
     cachedAudioUrl: readerOfflineCache.cachedAudioUrl,
     cacheAudio: readerOfflineCache.cacheAudio,
     chapters,

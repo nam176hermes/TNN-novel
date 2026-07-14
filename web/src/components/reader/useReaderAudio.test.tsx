@@ -37,6 +37,7 @@ function options(overrides: Record<string, unknown> = {}) {
     activeBookId: 42,
     apiClient: api(),
     cacheAudio: vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' }),
+    cachedAudioLoading: false,
     cachedAudioUrl: 'blob:cached-audio',
     chapters,
     onDownload: vi.fn(),
@@ -83,6 +84,15 @@ describe('useReaderAudio', () => {
 
     await waitFor(() => expect(cacheAudio).toHaveBeenCalledWith(42, 102, '/api/books/42/chapters/102/audio'));
     expect(result.current.playback.url).toBe('/api/books/42/chapters/102/audio');
+  });
+
+  it('waits for the offline controller metadata lookup before caching live audio', async () => {
+    const cacheAudio = vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' });
+    const hookOptions = options({ cacheAudio, cachedAudioLoading: true, cachedAudioUrl: '' });
+    renderHook(() => useReaderAudio(hookOptions));
+
+    await waitFor(() => expect(hookOptions.apiClient.getBookAudioPlaylist).toHaveBeenCalledTimes(1));
+    expect(cacheAudio).not.toHaveBeenCalled();
   });
 
   it('ignores a stale playlist response after the active book changes', async () => {

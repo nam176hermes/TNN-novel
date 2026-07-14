@@ -3,6 +3,7 @@ import { ApiError, type ApiClient } from '../api/client';
 import type { Chapter } from '../api/types';
 import {
   cacheReaderAssetsFromHtml,
+  getCachedChapterAsync,
   hasCachedChapterAsync,
   hydrateCachedReaderAssetUrls,
   putCachedChapterAsync,
@@ -11,6 +12,10 @@ import {
 import { formatError, type LoadState } from './types';
 
 export type ChapterTextPrefetchTarget = Pick<Chapter, 'book_id' | 'content_html_path' | 'id'>;
+
+export type UseChapterTextOptions = {
+  cacheOwnership?: 'external' | 'internal';
+};
 
 function readerHtmlAssetBase(contentHtmlPath?: string | null): string | undefined {
   const path = contentHtmlPath?.trim() ?? '';
@@ -25,6 +30,7 @@ export function useChapterText(
   chapter: Chapter | null,
   onAuthError?: () => void,
   prefetchTargets: ChapterTextPrefetchTarget[] = [],
+  { cacheOwnership = 'internal' }: UseChapterTextOptions = {},
 ) {
   const chapterId = chapter?.id ?? null;
   const bookId = chapter?.book_id ?? null;
@@ -82,11 +88,34 @@ export function useChapterText(
 
       const requestId = loadRequestIdRef.current + 1;
       loadRequestIdRef.current = requestId;
-      setSourceText('');
-      setTranslationText('');
-      setSavedTranslationText('');
-      setContentHtml('');
-      setState('loading');
+      const cachedChapter = cacheOwnership === 'internal'
+        ? await getCachedChapterAsync(nextChapter.book_id, nextChapter.id)
+        : null;
+      if (requestId !== loadRequestIdRef.current) return;
+      if (cachedChapter) {
+        setSourceText(cachedChapter.sourceText);
+        setTranslationText(cachedChapter.text);
+        setSavedTranslationText(cachedChapter.text);
+        setContentHtml(cachedChapter.html);
+        setState('ready');
+        if (cachedChapter.html.trim()) {
+          const assetBase = readerHtmlAssetBase(nextChapter.content_html_path);
+          void hydrateCachedReaderAssetUrls(
+            nextChapter.book_id,
+            nextChapter.id,
+            cachedChapter.html,
+            assetBase,
+          ).then((hydratedHtml) => {
+            if (requestId === loadRequestIdRef.current) setContentHtml(hydratedHtml);
+          });
+        }
+      } else {
+        setSourceText('');
+        setTranslationText('');
+        setSavedTranslationText('');
+        setContentHtml('');
+        setState('loading');
+      }
       setError('');
 
       try {
@@ -128,13 +157,17 @@ export function useChapterText(
           setState('error');
           throw nextError;
         }
+        if (cachedChapter) {
+          setState('ready');
+          return;
+        }
         reset();
         setError(formatError(nextError));
         setState('error');
         throw nextError;
       }
     },
-    [bookId, cacheChapter, chapterId, client, contentHtmlPath, enabled, hasRichContent, onAuthError, reset],
+    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, enabled, hasRichContent, onAuthError, reset],
   );
 
   const save = useCallback(

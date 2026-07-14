@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
+import { useEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chapter } from '../../api/types';
 import { READER_CACHE_UPDATED_EVENT, type ReaderCachedChapter, type ReaderCacheStatus } from '../../state/readerCache';
@@ -103,6 +104,7 @@ function dependencies(overrides: Partial<ReaderOfflineCacheDependencies> = {}): 
     getCachedAudioUrl: vi.fn().mockResolvedValue('blob:cached-audio'),
     getCachedChapter: vi.fn().mockResolvedValue(cachedChapter()),
     getCachedCoverUrl: vi.fn().mockResolvedValue('blob:cached-cover'),
+    hydrateCachedChapterHtml: vi.fn(async (_bookId, _chapterId, html) => html),
     loadManifest: vi.fn().mockReturnValue(manifest()),
     readStatus: vi.fn().mockResolvedValue(cacheStatus),
     removeBook: vi.fn().mockResolvedValue(undefined),
@@ -179,6 +181,81 @@ describe('useReaderOfflineCache', () => {
     expect(deps.loadManifest).toHaveBeenCalledTimes(2);
     expect(deps.getCachedChapter).toHaveBeenCalledTimes(2);
     expect(deps.getCachedAudioUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a successful cached audio URL stable across its update event and explicit refresh', async () => {
+    const refreshedAudio = deferred<string>();
+    const cacheAudio = vi.fn()
+      .mockImplementationOnce(async () => {
+        window.dispatchEvent(new Event(READER_CACHE_UPDATED_EVENT));
+        return { cached: true, failed: false, sizeBytes: 10, url: '/live-audio' };
+      })
+      .mockResolvedValue({ cached: false, failed: false, sizeBytes: 0, url: '/live-audio' });
+    const getCachedAudioUrl = vi.fn()
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce('blob:stable-audio')
+      .mockReturnValueOnce(refreshedAudio.promise)
+      .mockResolvedValue('blob:stable-audio');
+    const deps = dependencies({ cacheAudio, getCachedAudioUrl });
+
+    const { result } = renderHook(() => {
+      const cache = useReaderOfflineCache(options(deps));
+      useEffect(() => {
+        if (cache.cachedAudioUrl) return;
+        void cache.cacheAudio(42, 102, '/live-audio');
+      }, [cache.cacheAudio, cache.cachedAudioUrl]);
+      return cache;
+    });
+
+    await waitFor(() => expect(getCachedAudioUrl).toHaveBeenCalledTimes(3));
+    expect(cacheAudio).toHaveBeenCalledTimes(1);
+    await act(async () => refreshedAudio.resolve('blob:stable-audio'));
+    await waitFor(() => expect(result.current.cachedAudioUrl).toBe('blob:stable-audio'));
+    act(() => result.current.refresh());
+    await waitFor(() => expect(deps.readStatus).toHaveBeenCalledTimes(4));
+
+    expect(cacheAudio).toHaveBeenCalledTimes(1);
+    expect(result.current.cachedAudioUrl).toBe('blob:stable-audio');
+  });
+
+  it('hydrates cached rich HTML through the existing reader asset resolver before exposing it', async () => {
+    const richCachedChapter = {
+      ...cachedChapter(),
+      html: [
+        '<img src="./images/cover.jpg">',
+        '<div style="background-image:url(\'./images/bg.jpg\')"></div>',
+        '<video poster="./images/poster.jpg"><source src="./media/chapter.mp4"></video>',
+      ].join(''),
+    };
+    const hydratedHtml = richCachedChapter.html
+      .replace('./images/cover.jpg', 'blob:cover')
+      .replace('./images/bg.jpg', 'blob:bg')
+      .replace('./images/poster.jpg', 'blob:poster')
+      .replace('./media/chapter.mp4', 'blob:video');
+    const hydrateCachedChapterHtml = vi.fn().mockResolvedValue(hydratedHtml);
+    const deps = dependencies({
+      getCachedChapter: vi.fn().mockResolvedValue(richCachedChapter),
+      hydrateCachedChapterHtml,
+    } as unknown as Partial<ReaderOfflineCacheDependencies>);
+
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps, {
+      selectedChapter: {
+        ...chapters[1],
+        content_html_path: '/book-assets/42/OEBPS/chapter-2.xhtml',
+      },
+    })));
+
+    await waitFor(() => expect(result.current.cachedChapter?.html).toBe(hydratedHtml));
+    expect(hydrateCachedChapterHtml).toHaveBeenCalledWith(
+      42,
+      102,
+      richCachedChapter.html,
+      '/book-assets/42/OEBPS/chapter-2.xhtml',
+    );
+    expect(result.current.cachedChapter?.html).toContain('blob:cover');
+    expect(result.current.cachedChapter?.html).toContain('blob:bg');
+    expect(result.current.cachedChapter?.html).toContain('blob:poster');
+    expect(result.current.cachedChapter?.html).toContain('blob:video');
   });
 
   it('caches and removes the current chapter while preserving manifest ownership', async () => {

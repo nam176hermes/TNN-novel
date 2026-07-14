@@ -46,6 +46,7 @@ type ReaderAudioRefreshOutcome =
 export type UseReaderAudioOptions = {
   activeBookId: number | null;
   apiClient?: ReaderAudioApiClient;
+  cachedAudioLoading: boolean;
   cachedAudioUrl: string;
   cacheAudio(bookId: number, chapterId: number, url: string): Promise<CacheAudioResult>;
   chapters: Chapter[];
@@ -138,6 +139,7 @@ function audioJobFailureReason(job: JobStatus | null, ttsJob: TtsJobStatus | nul
 export function useReaderAudio({
   activeBookId,
   apiClient,
+  cachedAudioLoading,
   cachedAudioUrl,
   cacheAudio,
   chapters,
@@ -240,9 +242,16 @@ export function useReaderAudio({
   }, [loadPlaylist]);
 
   useEffect(() => {
-    if (!canPlay || !activeBookId || !selectedChapterId || !streamUrl || cachedAudioUrl) return;
+    if (
+      cachedAudioLoading
+      || !canPlay
+      || !activeBookId
+      || !selectedChapterId
+      || !streamUrl
+      || cachedAudioUrl
+    ) return;
     void cacheAudio(activeBookId, selectedChapterId, streamUrl).catch(() => {});
-  }, [activeBookId, cacheAudio, cachedAudioUrl, canPlay, selectedChapterId, streamUrl]);
+  }, [activeBookId, cacheAudio, cachedAudioLoading, cachedAudioUrl, canPlay, selectedChapterId, streamUrl]);
 
   const activateJob = useCallback((nextJobId: string) => {
     activeJobGenerationRef.current += 1;

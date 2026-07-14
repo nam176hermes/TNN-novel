@@ -89,7 +89,39 @@ describe('useChapterText', () => {
     }
   });
 
-  it('leaves cached fallback reads to the offline controller while refreshing from the API', async () => {
+  it('shows cached chapter text immediately by default while refreshing from the API', async () => {
+    putCachedChapter({
+      bookId: 42,
+      chapterId: 4201,
+      html: '',
+      sourceText: '舊原文',
+      text: 'Bản dịch cache',
+    });
+    const source = deferred<string>();
+    const translation = deferred<string | null>();
+    const client = {
+      getChapterSource: vi.fn().mockReturnValue(source.promise),
+      getChapterTranslation: vi.fn().mockReturnValue(translation.promise),
+      getChapterContent: vi.fn(),
+      saveChapterTranslation: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+
+    const { result } = renderHook(() =>
+      useChapterText(client, true, { ...fixtureChapter, audio_path: '' }),
+    );
+
+    await waitFor(() => expect(result.current.translationText).toBe('Bản dịch cache'));
+    expect(result.current.sourceText).toBe('舊原文');
+    expect(result.current.state).toBe('ready');
+
+    source.resolve('新原文');
+    translation.resolve('Bản dịch mới');
+
+    await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
+    expect(result.current.sourceText).toBe('新原文');
+  });
+
+  it('does not read the current cache when the Reader declares external cache ownership', async () => {
     putCachedChapter({
       bookId: 42,
       chapterId: 4201,
@@ -108,7 +140,14 @@ describe('useChapterText', () => {
     } as unknown as ApiClient;
 
     const { result } = renderHook(() =>
-      useChapterText(client, true, { ...fixtureChapter, audio_path: '' }),
+      useChapterText(
+        client,
+        true,
+        { ...fixtureChapter, audio_path: '' },
+        undefined,
+        [],
+        { cacheOwnership: 'external' },
+      ),
     );
 
     await waitFor(() => expect(client.getChapterSource).toHaveBeenCalledTimes(1));
@@ -118,9 +157,7 @@ describe('useChapterText', () => {
 
     source.resolve('新原文');
     translation.resolve('Bản dịch mới');
-
     await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
-    expect(result.current.sourceText).toBe('新原文');
   });
 
   it('removes stale cache when the API no longer has translated text', async () => {

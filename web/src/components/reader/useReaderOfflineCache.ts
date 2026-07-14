@@ -6,6 +6,7 @@ import {
   getCachedChapterAsync,
   getCachedReaderAssetUrl,
   getCachedReaderAudioUrl,
+  hydrateCachedReaderAssetUrls,
   readerCacheStatusAsync,
   removeCachedBookAsync,
   removeCachedChapterAsync,
@@ -39,6 +40,12 @@ export type ReaderOfflineCacheDependencies = {
   getCachedAudioUrl(bookId: number, chapterId: number, url: string): Promise<string>;
   getCachedChapter(bookId: number, chapterId: number): Promise<ReaderCachedChapter | null>;
   getCachedCoverUrl(bookId: number, chapterId: number, url: string): Promise<string>;
+  hydrateCachedChapterHtml(
+    bookId: number,
+    chapterId: number,
+    html: string,
+    assetBase?: string,
+  ): Promise<string>;
   loadManifest(bookId: number): ReaderOfflineManifest | null;
   readStatus(options: {
     bookId: number;
@@ -72,6 +79,7 @@ const defaultDependencies: ReaderOfflineCacheDependencies = {
   getCachedAudioUrl: getCachedReaderAudioUrl,
   getCachedChapter: getCachedChapterAsync,
   getCachedCoverUrl: getCachedReaderAssetUrl,
+  hydrateCachedChapterHtml: hydrateCachedReaderAssetUrls,
   loadManifest: loadReaderOfflineManifest,
   readStatus: readerCacheStatusAsync,
   removeBook: removeCachedBookAsync,
@@ -86,6 +94,13 @@ function onlineNow(): boolean {
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+function readerHtmlAssetBase(contentHtmlPath?: string | null): string | undefined {
+  const path = contentHtmlPath?.trim() ?? '';
+  if (!path) return undefined;
+  if (/^https?:\/\//i.test(path) || path.startsWith('/book-assets/')) return path;
+  return undefined;
 }
 
 export function useReaderOfflineCache({
@@ -122,6 +137,12 @@ export function useReaderOfflineCache({
     identityRef.current = identity;
     operationGenerationRef.current += 1;
     activeOperationRef.current = 0;
+    setCacheStatus(null);
+    setManifest(null);
+    setCachedChapter(null);
+    setCachedAudioUrl('');
+    setResolvedCoverUrl(liveCoverUrl);
+    setMetadataLoading(Boolean(bookId && selectedChapterId));
     setLoading(false);
     setMessage('');
   }, [identity]);
@@ -157,10 +178,6 @@ export function useReaderOfflineCache({
 
     setMetadataLoading(Boolean(bookId && selectedChapterId));
     setManifest(bookId ? dependencies.loadManifest(bookId) : null);
-    setCacheStatus(null);
-    setCachedChapter(null);
-    setCachedAudioUrl('');
-    setResolvedCoverUrl(liveCoverUrl);
 
     if (!bookId || !selectedChapterId) {
       setMetadataLoading(false);
@@ -174,7 +191,18 @@ export function useReaderOfflineCache({
       chapterId: selectedChapterId,
       nextChapterId,
     }).catch(() => null);
-    const chapterRequest = dependencies.getCachedChapter(bookId, selectedChapterId).catch(() => null);
+    const chapterRequest = dependencies.getCachedChapter(bookId, selectedChapterId)
+      .then(async (chapter) => {
+        if (!chapter?.html.trim()) return chapter;
+        const hydratedHtml = await dependencies.hydrateCachedChapterHtml(
+          bookId,
+          selectedChapterId,
+          chapter.html,
+          readerHtmlAssetBase(selectedChapter?.content_html_path),
+        );
+        return { ...chapter, html: hydratedHtml };
+      })
+      .catch(() => null);
     const audioRequest = dependencies.getCachedAudioUrl(
       bookId,
       selectedChapterId,
@@ -207,6 +235,7 @@ export function useReaderOfflineCache({
     liveCoverUrl,
     nextChapterId,
     refreshVersion,
+    selectedChapter?.content_html_path,
     selectedChapterId,
   ]);
 
