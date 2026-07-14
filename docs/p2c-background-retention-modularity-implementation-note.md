@@ -6,7 +6,7 @@
 
 **Original verification baseline:** `9f47a41` (`refactor(services): extract reader content seams`)
 
-**Closure code baseline:** `de94de7` (`fix(backups): complete terminal audit coverage`)
+**Closure code baseline:** `a4eac8c` (`fix(backups): roll back partial publication links`)
 
 **Scope:** P2C only; no operator data migration, restore, retention apply, paid
 provider call, schema redesign, or Reader redesign was performed.
@@ -29,11 +29,13 @@ could not start two workers after 78 files/701 tests had passed. The exact
 failure and the complete bounded ext4 equivalent are recorded below. Do not
 describe the script itself as passing.
 
-**Phase status: COMPLETE.** The only additional approved-design gap found in
-the completion audit was closed by the dedicated terminal backup event in
-`9d04ffe` and its reviewed lifecycle fixes in `de94de7`. The documented bounded
-verification equivalent passes; `scripts/verify.sh` itself still returned RC 1
-and is not described as passing.
+**Phase status: COMPLETE.** The completion audit closed the dedicated terminal
+backup-event gap in `9d04ffe`/`de94de7`. Final whole-branch review then found
+that secret-bearing background backups briefly published plaintext before
+encryption. `3f3b83d` moved that work into private staging and `a4eac8c` made
+partial final-link rollback reliable; independent re-review approved the fix.
+The documented bounded verification equivalent passes; `scripts/verify.sh`
+itself still returned RC 1 and is not described as passing.
 
 ## Implemented architecture
 
@@ -52,8 +54,17 @@ and is not described as passing.
   encrypted retry requires a new submission/passphrase.
 - Archive construction uses private same-directory staging, bounded member
   iteration, validation, collision-safe no-clobber publication, and cleanup of
-  owned partial artifacts. A valid archive survives sidecar publication failure
-  as `METADATA_MISSING`.
+  owned partial artifacts. For non-secret backups, a valid archive survives
+  sidecar publication failure as `METADATA_MISSING`.
+- An API/background secrets-included backup never publishes its plaintext
+  archive or sidecar in the live backup directory. Plaintext creation and
+  encryption remain below a mode-`0700` hidden staging directory; only the
+  completed `.tar.gz.enc` and READY sidecar are linked into the live directory.
+  Sidecar-first publication,
+  an owned hidden reservation, and immediate link-ownership tracking make
+  in-progress/crash residue unlistable and normal publication failures fully
+  reversible. Protected downloads require a supported final name, regular
+  non-symlink artifact, and valid matching sidecar.
 - Queue submission writes `backup_job_queued`. After durable terminal state,
   the coordinator attempts one dedicated `backup_job_terminal` event for each
   completed, failed, or cancelled outcome. The background archive path suppresses
@@ -150,6 +161,9 @@ translation provider, or TTS provider was invoked against live data.
 | Task 16 focused terminal-event suite | RC 0; 22 tests passed |
 | Task 16 five-file regression suite | RC 0; 98 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
 | Task 16 compile/lint checks | `compileall` RC 0; Python lint and frontend `tsc --noEmit` RC 0 |
+| Task 18 backup/ops/job suite | RC 0; 84 tests passed, 1 pre-existing passlib `crypt` deprecation warning |
+| Task 18 real encryption/restore compatibility | RC 0; temp-only OpenSSL `create_encrypted_backup` to `restore_drill` smoke passed |
+| Task 18 static checks | `scripts/lint.sh` and `git diff --check` RC 0 |
 
 The Vitest error was:
 
@@ -173,6 +187,7 @@ would remain for runtime resolution. It did not fail the build.
 | Backup POST returns 202 and archive creation runs through a tracked background job | PASS | `routers/backups.py`, `backup_job_service.py`; focused backend and full backend suites |
 | No backup passphrase is persisted or exposed | PASS | secret-store/coordinator tests; safe API schema and job params |
 | Cancellation before publication leaves no final archive/sidecar | PASS | ops cancellation/failure-window tests; focused backend suite |
+| Secrets-included background backups never expose plaintext through live list/download | PASS | `3f3b83d`, `a4eac8c`; concurrent encryption, crash-residue, malformed-sidecar, collision, and post-link failure-injection tests |
 | Completed archives remain restore-compatible and list through sidecars | PASS | ops restore/list tests and backup API tests; archive format unchanged; no live restore was run |
 | Retention enforces age/count bounds without deleting active sessions or mass-deleting in requests | PASS | retention repository/service/lifespan tests; full backend suite |
 | ReaderView delegates TOC, controls, audio, and offline-cache ownership | PASS | direct feature tests plus ReaderView regression suite |
@@ -186,8 +201,10 @@ would remain for runtime resolution. It did not fail the build.
 
 ## Additional approved-design audit closure
 
-Task 16 closed the only additional design-detail gap in `9d04ffe`, with the
-three lifecycle review findings fixed and independently re-reviewed clean at
+### Terminal operational events
+
+Task 16 closed the terminal-event design gap in `9d04ffe`, with the three
+lifecycle review findings fixed and independently re-reviewed clean at
 `de94de7`.
 
 - `backup_job_queued` remains the submission event.
@@ -208,12 +225,34 @@ three lifecycle review findings fixed and independently re-reviewed clean at
   `job_failure` remains a separate tracker event and is not the dedicated
   backup terminal event.
 
+### Encrypt-before-publish
+
+Final whole-branch review rejected the former service sequence because it
+published a READY plaintext archive before starting encryption. Background
+execution made that previously synchronous window reachable by concurrent
+authenticated list/download requests.
+
+- `3f3b83d` introduced a dedicated secrets-included path whose plaintext bytes
+  and sidecar stay below private mode-`0700` staging on the backup filesystem.
+- Encryption and READY metadata validation complete before final publication.
+  During encryption, normal listing returns no candidate and protected download
+  cannot resolve either the staged plaintext name or future encrypted name.
+- Final publication is sidecar-first. An owned `.final-name.partial` reservation
+  suppresses sidecar-only process-crash residue; after the encrypted link exists,
+  the pair is READY and downloadable.
+- `a4eac8c` records ownership immediately after each successful hardlink, before
+  unlinking its staging source. Injected sidecar-source and archive-source unlink
+  failures both roll back every owned live link.
+- A temp-only real OpenSSL encrypted-backup restore drill passed. The archive,
+  internal manifest, sidecar, and restore formats did not change.
+
 ## Rollback
 
 For the affected seam, run `git revert <commit>` once per commit, newest first,
 then run that seam's focused tests. The boundaries below are inclusive:
 
-- backup jobs/publication/terminal audit: revert `de94de7`, then `9d04ffe`,
+- backup jobs/publication/terminal audit: revert `a4eac8c`, then `3f3b83d`,
+  then `de94de7`, then `9d04ffe`,
   then every backup-seam commit from `04ad491` backward through and including
   `b77fa38`;
 - repository/retention: revert every affected commit from `56534d9` backward

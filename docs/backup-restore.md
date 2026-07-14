@@ -50,7 +50,9 @@ The adjacent sidecar is a compact, versioned, backup-level summary used by norma
 
 Backup creation uses a private `0700` staging directory inside the selected output directory. Files are collected and added to the archive in deterministic path order, with cooperative cancellation checks between bounded file operations. The completed archive is validated before publication. Each invocation atomically reserves a collision-resistant final basename, adding a short suffix only when the timestamped name is already reserved or present. The archive and compact sidecar then move into their established filename patterns with same-filesystem, no-clobber publication; staging and partial names are ignored by normal backup listing.
 
-Cancellation or failure before archive publication leaves no final artifact or sidecar. If archive publication succeeds but sidecar publication fails, the valid archive is preserved and appears as `METADATA_MISSING` so an operator can use the explicit metadata repair workflow. Encrypted output is staged the same way, so a failed encryption does not expose a partial `.enc` artifact under a final backup name.
+Cancellation or failure before archive publication leaves no final artifact or sidecar. For a non-secret backup, if archive publication succeeds but sidecar publication fails, the valid archive is preserved and appears as `METADATA_MISSING` so an operator can use the explicit metadata repair workflow.
+
+Secrets-included API/background backups use a stricter flow. Plaintext archive bytes and their sidecar remain below a hidden mode-`0700` directory on the backup filesystem while encryption runs. Only the completed `.tar.gz.enc` and a matching READY sidecar are published into the live backup directory. Normal listing ignores private/partial names, and protected download rejects unsupported names, symlinks, and artifacts without valid matching sidecars. A failed encryption or normal publication failure therefore exposes neither plaintext nor a partial final encrypted artifact.
 
 The manifest records:
 
@@ -287,18 +289,24 @@ is discarded after the worker finishes. It is never part of persisted job
 parameters. A process restart deliberately loses it, so an interrupted
 encrypted backup cannot resume and must be submitted again.
 
-Publication remains same-filesystem and staged: validate the archive, publish
-the archive with no-clobber semantics, then publish the sidecar. Before archive
-publication, failure/cancel cleans owned staging files. If only sidecar
-publication fails after a valid archive is visible, keep the archive and repair
-its `METADATA_MISSING` state through the explicit dry-run-first tool.
+Publication remains same-filesystem and staged. Plain/non-secret creation
+validates the archive, publishes it with no-clobber semantics, then publishes
+the sidecar; a sidecar failure preserves the valid archive for explicit
+dry-run-first metadata repair. Secrets-included background creation instead
+builds and encrypts entirely below private mode-`0700` staging, validates READY
+metadata, then publishes the sidecar before the completed encrypted artifact.
+An owned hidden reservation suppresses sidecar-only process-crash residue.
+Normal exceptions record each final hardlink immediately and roll back every
+owned link if any later source cleanup or publication step fails.
 
 ## P2C rollback boundaries
 
 P2C was delivered as narrow commits so an operator can revert the failing seam
 without changing archive/restore format:
 
-- backup API/jobs: `b77fa38` through `04ad491`;
+- backup API/jobs: `b77fa38` through `04ad491`, plus terminal-audit commits
+  `9d04ffe`/`de94de7` and encrypt-before-publish commits
+  `3f3b83d`/`a4eac8c`;
 - retention and repository foundations: `38156ce` through `56534d9`;
 - Reader feature ownership: `31093ba` through `987aea0`;
 - CSS layers/features: `46759eb` through `2a77755`;
