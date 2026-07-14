@@ -198,6 +198,65 @@ describe('useReaderAudio', () => {
     await act(async () => Promise.all([firstRefresh, overlappingRefresh]));
   });
 
+  it('times out a stuck refresh, unlocks the next refresh, and ignores late results', async () => {
+    vi.useFakeTimers();
+    const stuckJob = deferred<JobStatus>();
+    const stuckTts = deferred<TtsJobStatus>();
+    const runningJob: JobStatus = {
+      job_id: 'tts-job-123456', job_type: 'tts', status: 'running', progress: 1, total: 2, message: 'running',
+    };
+    const runningTts: TtsJobStatus = {
+      job_id: 'tts-job-123456', status: 'running', progress: 50, chunks: [],
+    };
+    const completedJob: JobStatus = {
+      ...runningJob, status: 'completed', progress: 2, message: 'done',
+    };
+    const completedTts: TtsJobStatus = {
+      ...runningTts, status: 'completed', progress: 100,
+    };
+    const client = api({
+      getJobStatus: vi.fn()
+        .mockResolvedValueOnce(runningJob)
+        .mockReturnValueOnce(stuckJob.promise)
+        .mockResolvedValueOnce(completedJob),
+      getTtsJob: vi.fn()
+        .mockResolvedValueOnce(runningTts)
+        .mockReturnValueOnce(stuckTts.promise)
+        .mockResolvedValueOnce(completedTts),
+    });
+    const hookOptions = options({ apiClient: client });
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
+
+    await act(async () => result.current.actions.startChapterJob());
+    let timedOutRefresh!: Promise<void>;
+    act(() => { timedOutRefresh = result.current.actions.refreshJob(); });
+    expect(result.current.state.jobRefreshing).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await timedOutRefresh;
+    });
+    expect(result.current.state.jobRefreshing).toBe(false);
+    expect(result.current.state.error).toMatch(/hết thời gian chờ/i);
+
+    await act(async () => result.current.actions.refreshJob());
+    expect(client.getJobStatus).toHaveBeenCalledTimes(3);
+    expect(result.current.state.jobSnapshot?.status).toBe('completed');
+    expect(result.current.state.ttsSnapshot?.status).toBe('completed');
+    expect(result.current.state.error).toBe('');
+
+    stuckJob.resolve({ ...runningJob, status: 'failed', message: 'late failure' });
+    stuckTts.resolve({ ...runningTts, status: 'failed', error_message: 'late failure' });
+    await act(async () => {
+      await Promise.all([stuckJob.promise, stuckTts.promise]);
+      await Promise.resolve();
+    });
+
+    expect(result.current.state.jobSnapshot?.status).toBe('completed');
+    expect(result.current.state.ttsSnapshot?.status).toBe('completed');
+    expect(result.current.state.error).toBe('');
+  });
+
   it('ignores a completed refresh from the previous job after a new job starts', async () => {
     const oldJob = deferred<JobStatus>();
     const oldTts = deferred<TtsJobStatus>();

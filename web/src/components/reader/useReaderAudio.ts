@@ -17,6 +17,7 @@ const CANCELABLE_JOB_STATUSES = new Set([
   'qa_checking', 'exporting',
 ]);
 const AUDIO_JOB_POLL_INTERVAL_MS = 3_000;
+const AUDIO_JOB_REFRESH_TIMEOUT_MS = 10_000;
 
 export type ReaderAudioApiClient = Pick<
   ApiClient,
@@ -34,6 +35,13 @@ export type ReaderAudioApiClient = Pick<
 
 type CacheAudioResult = { cached: boolean; failed: boolean; sizeBytes: number; url: string };
 type ReaderAudioJobKind = 'audio' | 'audiobook';
+type ReaderAudioRefreshOutcome =
+  | {
+    kind: 'results';
+    jobResult: PromiseSettledResult<JobStatus>;
+    ttsResult: PromiseSettledResult<TtsJobStatus>;
+  }
+  | { kind: 'cancelled' | 'timeout' };
 
 export type UseReaderAudioOptions = {
   activeBookId: number | null;
@@ -159,6 +167,8 @@ export function useReaderAudio({
   const activeJobIdRef = useRef('');
   const playlistRequestRef = useRef(0);
   const playlistRefreshJobRef = useRef('');
+  const refreshDeadlineRef = useRef(new Map<number, () => void>());
+  const refreshEpochRef = useRef(0);
   const refreshInFlightRef = useRef(new Map<number, Promise<void>>());
   const mountedRef = useRef(true);
 
@@ -166,6 +176,8 @@ export function useReaderAudio({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      for (const cancelDeadline of refreshDeadlineRef.current.values()) cancelDeadline();
+      refreshDeadlineRef.current.clear();
     };
   }, []);
 
@@ -257,16 +269,46 @@ export function useReaderAudio({
     const generation = activeJobGenerationRef.current;
     const existingRefresh = refreshInFlightRef.current.get(generation);
     if (existingRefresh) return existingRefresh;
+    const refreshEpoch = refreshEpochRef.current + 1;
+    refreshEpochRef.current = refreshEpoch;
     setJobRefreshing(true);
-    const refreshPromise = Promise.allSettled([
+    let deadlineSettled = false;
+    let deadlineTimer = 0;
+    let resolveDeadline!: (outcome: ReaderAudioRefreshOutcome) => void;
+    const deadlinePromise = new Promise<ReaderAudioRefreshOutcome>((resolve) => {
+      resolveDeadline = resolve;
+    });
+    const finishDeadline = (kind: 'cancelled' | 'timeout') => {
+      if (deadlineSettled) return;
+      deadlineSettled = true;
+      window.clearTimeout(deadlineTimer);
+      refreshDeadlineRef.current.delete(refreshEpoch);
+      resolveDeadline({ kind });
+    };
+    deadlineTimer = window.setTimeout(() => finishDeadline('timeout'), AUDIO_JOB_REFRESH_TIMEOUT_MS);
+    refreshDeadlineRef.current.set(refreshEpoch, () => finishDeadline('cancelled'));
+    const requestPromise = Promise.allSettled([
       apiClient.getJobStatus(requestedJobId),
       apiClient.getTtsJob(requestedJobId),
-    ]).then(([jobResult, ttsResult]) => {
+    ]).then(([jobResult, ttsResult]): ReaderAudioRefreshOutcome => ({
+      jobResult,
+      kind: 'results',
+      ttsResult,
+    }));
+    const refreshPromise = Promise.race([requestPromise, deadlinePromise]).then((outcome) => {
+      if (outcome.kind === 'results') finishDeadline('cancelled');
       if (
         !mountedRef.current
         || activeJobGenerationRef.current !== generation
         || activeJobIdRef.current !== requestedJobId
+        || refreshEpochRef.current !== refreshEpoch
       ) return;
+      if (outcome.kind === 'timeout') {
+        setError('Không đọc được trạng thái job audio: yêu cầu đã hết thời gian chờ. Hãy thử làm mới lại.');
+        return;
+      }
+      if (outcome.kind !== 'results') return;
+      const { jobResult, ttsResult } = outcome;
       setJobSnapshot(jobResult.status === 'fulfilled' ? jobResult.value : null);
       setTtsSnapshot(ttsResult.status === 'fulfilled' ? ttsResult.value : null);
       if (jobResult.status === 'rejected' && ttsResult.status === 'rejected') {
@@ -282,6 +324,7 @@ export function useReaderAudio({
         mountedRef.current
         && activeJobGenerationRef.current === generation
         && activeJobIdRef.current === requestedJobId
+        && refreshEpochRef.current === refreshEpoch
       ) setJobRefreshing(false);
     });
     refreshInFlightRef.current.set(generation, refreshPromise);
