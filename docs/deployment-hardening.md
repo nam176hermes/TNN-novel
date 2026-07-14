@@ -173,7 +173,7 @@ It intentionally does not show API keys or secrets.
 
 ## Operational Metadata Retention
 
-The FastAPI lifespan owns one metadata-retention task. It runs once after runtime initialization and then every six hours by default; API requests never trigger deletion. Each repository call uses a bounded transaction, and the task yields between batches so large backlogs do not become one long maintenance transaction.
+The FastAPI lifespan owns one metadata-retention task. It runs once after runtime initialization and then every six hours by default; API requests never trigger deletion. Each repository call uses a bounded transaction, and the task uses an initial row-count budget, yields, and checks shutdown between batches so concurrent producers cannot extend one run forever. Shutdown drains the current bounded SQLite worker before task ownership is cleared.
 
 Approved defaults:
 
@@ -190,7 +190,7 @@ OPERATIONAL_RETENTION_INTERVAL_SECONDS=21600
 
 All values must be positive integers. Invalid or non-positive configuration fails validation instead of silently disabling or clamping retention. Active, unexpired sessions are never eligible; revoked or expired sessions, login failures, and operational events are bounded by both age and row count.
 
-SQLite lock contention safely skips the current run and retries at the next interval. Runs that delete rows record one sanitized `operational_retention` event containing deleted counts only. Zero-delete runs create no event. Authenticated system status exposes only table labels, row counts, last-run time, deleted counts, and the result—never SQL, database paths, row values, exception text, or secrets.
+SQLite lock contention safely skips the current run and retries at the next interval. If earlier batches already committed, their exact counts remain pending in memory and the next run finalizes the count-only audit exactly once. Event pruning reserves one row for this audit so the insert cannot leave the table above its configured cap, including a cap of one. Zero-delete runs create no event. Authenticated system status exposes only table labels, row counts, last-run time, deleted counts, and the result—never SQL, database paths, row values, exception text, or secrets.
 
 ## Public Readiness Output
 

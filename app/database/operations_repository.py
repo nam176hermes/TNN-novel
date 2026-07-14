@@ -160,14 +160,18 @@ def prune_operational_events(
     *,
     policy: RetentionPolicy,
     batch_size: int,
+    reserved_rows: int = 0,
     now: str | None = None,
 ) -> int:
     """Delete one deterministic, age-first operational-event batch."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if reserved_rows < 0:
+        raise ValueError("reserved_rows cannot be negative")
 
     comparison_time = now or datetime.now(timezone.utc).isoformat()
     age_modifier = f"-{policy.max_age_days} days"
+    effective_max_rows = max(0, policy.max_rows - reserved_rows)
     deleted = 0
 
     with get_connection(db_path) as conn:
@@ -188,7 +192,7 @@ def prune_operational_events(
             remaining = batch_size - deleted
             if remaining > 0:
                 row = conn.execute("SELECT COUNT(*) AS row_count FROM operational_events").fetchone()
-                overflow = max(0, int(row["row_count"] if row else 0) - policy.max_rows)
+                overflow = max(0, int(row["row_count"] if row else 0) - effective_max_rows)
                 if overflow:
                     count_rows = conn.execute(
                         """

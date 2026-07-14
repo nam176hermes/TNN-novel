@@ -60,8 +60,23 @@ def _count_retention_rows(db_path: Path) -> dict[str, int]:
 
 
 def _is_sqlite_contention(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.OperationalError) and any(
-        marker in str(exc).lower() for marker in ("locked", "busy")
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int) and error_code & 0xFF in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(exc).strip().lower()
+    return any(
+        marker in message
+        for marker in (
+            "database is busy",
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+        )
     )
 
 
@@ -81,6 +96,8 @@ class RetentionService:
         self.settings = settings
         self._yield_control = yield_control
         self._last_summary: RetentionSummary | None = None
+        self._pending_audit_counts = _empty_counts()
+        self._active_worker_task: asyncio.Task[Any] | None = None
         self._session_policy = RetentionPolicy(
             max_age_days=settings.auth_session_retention_days,
             max_rows=settings.auth_session_retention_max_rows,
@@ -98,43 +115,174 @@ class RetentionService:
     def last_summary(self) -> RetentionSummary | None:
         return self._last_summary
 
-    async def run_once(self) -> RetentionSummary:
-        deleted_counts = _empty_counts()
-        batch_size = self.settings.operational_retention_batch_size
+    @staticmethod
+    def _has_deletions(counts: dict[str, int]) -> bool:
+        return sum(counts.values()) > 0
+
+    def _add_pending_audit(self, counts: dict[str, int]) -> None:
+        for label in RETENTION_TABLE_LABELS:
+            self._pending_audit_counts[label] += int(counts.get(label, 0))
+
+    async def _run_sync_call(
+        self,
+        function: Callable[..., Any],
+        /,
+        *args: Any,
+        on_completed: Callable[[Any], None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if self._active_worker_task is not None:
+            raise RuntimeError("Retention repository worker already active")
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        self._active_worker_task = worker
+        callback_called = False
+
+        def publish(result: Any) -> None:
+            nonlocal callback_called
+            if on_completed is not None and not callback_called:
+                on_completed(result)
+            callback_called = True
 
         try:
-            while True:
-                deleted = await asyncio.to_thread(
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                try:
+                    result = await asyncio.shield(worker)
+                except Exception:
+                    pass
+                else:
+                    publish(result)
+                raise
+            publish(result)
+            return result
+        finally:
+            if worker.done():
+                self._active_worker_task = None
+
+    async def _flush_pending_audit(self) -> None:
+        if not self._has_deletions(self._pending_audit_counts):
+            return
+        pending = dict(self._pending_audit_counts)
+
+        def clear_pending(_: Any) -> None:
+            for label in RETENTION_TABLE_LABELS:
+                self._pending_audit_counts[label] -= pending[label]
+
+        await self._run_sync_call(
+            record_operational_event,
+            self.db_path,
+            event_type="operational_retention",
+            severity="info",
+            source="retention",
+            message="Operational retention completed",
+            details=pending,
+            on_completed=clear_pending,
+        )
+
+    async def run_once(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> RetentionSummary:
+        deleted_counts = _empty_counts()
+        batch_size = self.settings.operational_retention_batch_size
+        audit_completed = False
+
+        def stopped() -> bool:
+            return stop_event is not None and stop_event.is_set()
+
+        def skipped_summary() -> RetentionSummary:
+            summary = RetentionSummary(
+                last_run_at=_utcnow_text(),
+                deleted_counts=dict(deleted_counts),
+                result="skipped",
+            )
+            self._last_summary = summary
+            return summary
+
+        try:
+            await self._flush_pending_audit()
+            if stopped():
+                return skipped_summary()
+
+            initial_counts = await self._run_sync_call(_count_retention_rows, self.db_path)
+            auth_budget = int(initial_counts["auth_sessions"]) + int(
+                initial_counts["auth_login_failures"]
+            )
+            event_budget = int(initial_counts["operational_events"])
+            auth_processed = 0
+            event_processed = 0
+
+            while auth_processed < auth_budget:
+                if stopped():
+                    if self._has_deletions(deleted_counts):
+                        self._add_pending_audit(deleted_counts)
+                    return skipped_summary()
+                current_batch_size = min(batch_size, auth_budget - auth_processed)
+
+                def publish_auth(deleted: dict[str, int]) -> None:
+                    nonlocal auth_processed
+                    deleted_total = sum(int(value) for value in deleted.values())
+                    deleted_counts["auth_sessions"] += int(deleted.get("auth_sessions", 0))
+                    deleted_counts["auth_login_failures"] += int(
+                        deleted.get("auth_login_failures", 0)
+                    )
+                    auth_processed += deleted_total
+
+                deleted = await self._run_sync_call(
                     prune_auth_records,
                     self.db_path,
                     session_policy=self._session_policy,
                     login_failure_policy=self._login_failure_policy,
-                    batch_size=batch_size,
+                    batch_size=current_batch_size,
+                    on_completed=publish_auth,
                 )
-                deleted_counts["auth_sessions"] += int(deleted.get("auth_sessions", 0))
-                deleted_counts["auth_login_failures"] += int(
-                    deleted.get("auth_login_failures", 0)
-                )
-                if sum(deleted.values()) < batch_size:
+                if stopped():
+                    self._add_pending_audit(deleted_counts)
+                    return skipped_summary()
+                if sum(deleted.values()) < current_batch_size:
                     break
+                if auth_processed < auth_budget:
+                    await self._yield_control()
+
+            if event_budget > 0 and not stopped():
                 await self._yield_control()
 
-            await self._yield_control()
+            while event_processed < event_budget:
+                if stopped():
+                    if self._has_deletions(deleted_counts):
+                        self._add_pending_audit(deleted_counts)
+                    return skipped_summary()
+                current_batch_size = min(batch_size, event_budget - event_processed)
 
-            while True:
-                deleted = await asyncio.to_thread(
+                def publish_events(deleted: int) -> None:
+                    nonlocal event_processed
+                    deleted_counts["operational_events"] += int(deleted)
+                    event_processed += int(deleted)
+
+                deleted = await self._run_sync_call(
                     prune_operational_events,
                     self.db_path,
                     policy=self._operational_event_policy,
-                    batch_size=batch_size,
+                    batch_size=current_batch_size,
+                    reserved_rows=1,
+                    on_completed=publish_events,
                 )
-                deleted_counts["operational_events"] += int(deleted)
-                if deleted < batch_size:
+                if stopped():
+                    self._add_pending_audit(deleted_counts)
+                    return skipped_summary()
+                if deleted < current_batch_size:
                     break
-                await self._yield_control()
+                if event_processed < event_budget:
+                    await self._yield_control()
 
-            if sum(deleted_counts.values()) > 0:
-                await asyncio.to_thread(
+            if self._has_deletions(deleted_counts):
+                def mark_audit_completed(_: Any) -> None:
+                    nonlocal audit_completed
+                    audit_completed = True
+
+                await self._run_sync_call(
                     record_operational_event,
                     self.db_path,
                     event_type="operational_retention",
@@ -142,20 +290,19 @@ class RetentionService:
                     source="retention",
                     message="Operational retention completed",
                     details=dict(deleted_counts),
+                    on_completed=mark_audit_completed,
                 )
         except asyncio.CancelledError:
+            if self._has_deletions(deleted_counts) and not audit_completed:
+                self._add_pending_audit(deleted_counts)
             raise
         except Exception as exc:
+            if self._has_deletions(deleted_counts) and not audit_completed:
+                self._add_pending_audit(deleted_counts)
             if not _is_sqlite_contention(exc):
                 raise
             logger.info("Retention maintenance skipped because the database is busy")
-            summary = RetentionSummary(
-                last_run_at=_utcnow_text(),
-                deleted_counts=deleted_counts,
-                result="skipped",
-            )
-            self._last_summary = summary
-            return summary
+            return skipped_summary()
 
         summary = RetentionSummary(
             last_run_at=_utcnow_text(),
@@ -165,12 +312,9 @@ class RetentionService:
         self._last_summary = summary
         return summary
 
-    async def get_status(self, *, db_path: Path | None = None) -> dict[str, Any]:
+    async def get_status(self) -> dict[str, Any]:
         try:
-            table_counts = await asyncio.to_thread(
-                _count_retention_rows,
-                Path(db_path) if db_path is not None else self.db_path,
-            )
+            table_counts = await asyncio.to_thread(_count_retention_rows, self.db_path)
         except sqlite3.Error:
             table_counts = _empty_counts()
         return {
@@ -189,7 +333,10 @@ async def run_retention_loop(
 
     while not stop_event.is_set():
         try:
-            await service.run_once()
+            if isinstance(service, RetentionService):
+                await service.run_once(stop_event=stop_event)
+            else:
+                await service.run_once()
         except asyncio.CancelledError:
             raise
         except Exception:

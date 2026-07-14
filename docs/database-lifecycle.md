@@ -42,11 +42,11 @@ Each repository function owns and closes its connection. Write functions retain 
 
 FastAPI starts one process-local retention task from its lifespan after `init_db()` completes. The task runs immediately and every 21,600 seconds by default. Shutdown signals, cancels, and awaits that task so no maintenance task is left behind.
 
-Retention is not a request-path fallback. It drains repository-owned batches of 500 rows by default and yields between batches. Each auth batch shares one short transaction across inactive sessions and login failures; each operational-event batch has its own short transaction. Active, unexpired sessions are excluded by repository predicates from both age and count pruning.
+Retention is not a request-path fallback. It snapshots an initial row-count budget, drains no more than that finite high-water in repository-owned batches of 500 rows by default, and yields and checks shutdown between batches. Concurrent inserts therefore cannot extend one run forever. Each auth batch shares one short transaction across inactive sessions and login failures; each operational-event batch has its own short transaction. Active, unexpired sessions are excluded by repository predicates from both age and count pruning.
 
 The default bounds are 30 days/5,000 rows for revoked or expired auth sessions, 30 days/5,000 rows for login failures, and 90 days/50,000 rows for operational events. All eight retention settings are positive validated environment integers; zero and negative values are rejected.
 
-Concurrent processes may attempt the same idempotent cleanup. A SQLite busy or locked result skips the run safely and retries on the next interval without blocking API startup. Deletion produces one count-only operational event after event pruning; a zero-delete run produces no event. Authenticated status performs count queries only and exposes no paths, SQL, row values, exception text, or secrets.
+Concurrent processes may attempt the same idempotent cleanup. A SQLite busy or locked result skips the run safely and retries on the next interval without blocking API startup. Committed deletion counts whose audit insert is interrupted remain pending in the process-local service and are finalized exactly once on a later run. Event pruning reserves one configured row for that count-only audit, so inserting it does not exceed the operational-event cap; a zero-delete run produces no event. Authenticated status performs count queries only and exposes no paths, SQL, row values, exception text, or secrets.
 
 ## Entry Points
 

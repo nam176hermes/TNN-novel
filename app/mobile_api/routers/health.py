@@ -197,9 +197,9 @@ async def system_status(request: Request):
         if str(event.get("event_type") or "").startswith("backup_")
     ][:5]
     retention_service = getattr(request.app.state, "retention_service", None)
-    if retention_service is None:
+    if retention_service is None or getattr(retention_service, "db_path", None) != db_path:
         retention_service = RetentionService(db_path, settings=mobile_settings)
-    retention_status = await retention_service.get_status(db_path=db_path)
+    retention_status = await retention_service.get_status()
 
     active_provider = ""
     for job in running_jobs:

@@ -104,6 +104,10 @@ def _prepare_runtime() -> None:
 
 @asynccontextmanager
 async def _retention_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    existing_task = app.state.retention_task
+    if existing_task is not None and not existing_task.done():
+        raise RuntimeError("Retention maintenance task already running")
+
     service = app.state.retention_service
     if service is None:
         service = RetentionService(get_db_path(), settings=mobile_settings)
