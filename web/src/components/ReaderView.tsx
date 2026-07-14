@@ -69,14 +69,8 @@ import {
 } from '../state/readerMarks';
 import { formatError, type LoadState } from '../state/types';
 import {
-  READER_CACHE_UPDATED_EVENT,
   cacheReaderAudio,
-  getCachedReaderAssetUrl,
   getCachedReaderAudioUrl,
-  readerCacheStatusAsync,
-  removeCachedBookAsync,
-  removeCachedChapterAsync,
-  type ReaderCacheStatus,
 } from '../state/readerCache';
 import {
   loadCachedReaderDictionaryResult,
@@ -85,14 +79,7 @@ import {
   saveCachedReaderDictionaryResult,
 } from '../state/readerDictionaryCache';
 import { loadReaderDeviceId } from '../state/readerDevice';
-import {
-  cacheBookForOffline,
-  cacheChapterForOffline,
-  loadReaderOfflineManifest,
-  removeReaderOfflineManifestChapter,
-  removeReaderOfflineManifest,
-  type ReaderOfflineManifest,
-} from '../state/readerOfflineCache';
+import type { ReaderOfflineManifest } from '../state/readerOfflineCache';
 import {
   chooseLatestReaderProgressSnapshot,
   loadReaderLastSyncAt,
@@ -115,6 +102,7 @@ import ReaderAudioSummary from './reader/ReaderAudioSummary';
 import ReaderDictionaryPanel from './reader/ReaderDictionaryPanel';
 import ReaderMarksPanel, { type ReaderMarkPanelItem } from './reader/ReaderMarksPanel';
 import ReaderAiPanel, { type ReaderAiPanelMode } from './reader/ReaderAiPanel';
+import { useReaderOfflineCache } from './reader/useReaderOfflineCache';
 import {
   ReaderChromeBottom,
   ReaderChromeTop,
@@ -1569,9 +1557,6 @@ export default function ReaderView({
   const [currentPage, setCurrentPage] = useState(0);
   const [autoScrollEnabled, setAutoScrollEnabled] = useState(false);
   const [renderedParagraphLimit, setRenderedParagraphLimit] = useState(INITIAL_SCROLL_PARAGRAPH_LIMIT);
-  const [readerCacheVersion, setReaderCacheVersion] = useState(0);
-  const [cacheStatus, setCacheStatus] = useState<ReaderCacheStatus | null>(null);
-  const [offlineManifest, setOfflineManifest] = useState<ReaderOfflineManifest | null>(null);
   const [viewportPages, setViewportPages] = useState<ReaderViewportPage[]>([]);
   const [pendingParagraphJump, setPendingParagraphJump] = useState<{
     charOffset?: number;
@@ -1599,9 +1584,6 @@ export default function ReaderView({
   const [dictionaryDeletingFilename, setDictionaryDeletingFilename] = useState('');
   const [dictionaryUploadLoading, setDictionaryUploadLoading] = useState(false);
   const [dictionaryUploadStatus, setDictionaryUploadStatus] = useState('');
-  const [readerCoverUrl, setReaderCoverUrl] = useState('');
-  const [offlineCacheLoading, setOfflineCacheLoading] = useState(false);
-  const [offlineCacheStatus, setOfflineCacheStatus] = useState('');
   const [annotationExportStatus, setAnnotationExportStatus] = useState('');
   const [annotationImportLoading, setAnnotationImportLoading] = useState(false);
   const [annotationExportKind, setAnnotationExportKind] = useState<ReaderAnnotationKind | null>(null);
@@ -1712,10 +1694,33 @@ export default function ReaderView({
   const nextChapter = selectedIndex >= 0 && selectedIndex < translatedChapters.length - 1
     ? translatedChapters[selectedIndex + 1]
     : null;
-  const currentChapterInOfflineManifest = Boolean(
-    selectedChapterId && offlineManifest?.chapterIds.includes(selectedChapterId),
-  );
-  const currentChapterAvailableOffline = Boolean(cacheStatus?.currentCached || currentChapterInOfflineManifest);
+  const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
+  const fallbackCoverUrl = fallbackReaderCover(selectedBook);
+  const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
+  const readerOfflineCache = useReaderOfflineCache({
+    apiClient,
+    audioUrl: readerAudio.playback.streamUrl,
+    bookId: activeBookId,
+    chapters: translatedChapters,
+    coverUrl: fallbackCoverUrl ? '' : backendCoverUrl,
+    liveCoverUrl,
+    nextChapterId: nextChapter?.id ?? null,
+    onError: setMarksError,
+    selectedChapter,
+    selectedChapterId,
+  });
+  const {
+    cacheStatus,
+    currentAvailable: currentChapterAvailableOffline,
+    loading: offlineCacheLoading,
+    manifest: offlineManifest,
+    message: offlineCacheStatus,
+    cacheCurrentBook: cacheCurrentBookOffline,
+    cacheCurrentChapter: cacheCurrentChapterOffline,
+    removeCurrentBook: clearCurrentBookOfflineCache,
+    removeCurrentChapter: clearCurrentChapterOfflineCache,
+  } = readerOfflineCache;
+  const readerCoverUrl = readerOfflineCache.coverUrl;
   const paragraphs = useMemo(() => splitParagraphs(translationText), [translationText]);
   const rawText = useMemo(() => htmlTextContent(contentHtml), [contentHtml]);
   const richBlocks = useMemo(() => extractReaderRichBlocks(contentHtml), [contentHtml]);
@@ -2002,58 +2007,6 @@ export default function ReaderView({
 
     return () => window.clearInterval(interval);
   }, [autoScrollEnabled, isPaginatedMode, updateScrollProgress]);
-
-  useEffect(() => {
-    function handleCacheUpdated(): void {
-      setReaderCacheVersion((current) => current + 1);
-    }
-
-    window.addEventListener(READER_CACHE_UPDATED_EVENT, handleCacheUpdated);
-    return () => window.removeEventListener(READER_CACHE_UPDATED_EVENT, handleCacheUpdated);
-  }, []);
-
-  useEffect(() => {
-    if (!activeBookId || !selectedChapterId) {
-      setCacheStatus(null);
-      return;
-    }
-    let cancelled = false;
-    void readerCacheStatusAsync({
-      bookId: activeBookId,
-      chapterId: selectedChapterId,
-      nextChapterId: nextChapter?.id ?? null,
-    }).then((status) => {
-      if (!cancelled) setCacheStatus(status);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, nextChapter?.id, readerCacheVersion, selectedChapterId]);
-
-  useEffect(() => {
-    setOfflineManifest(activeBookId ? loadReaderOfflineManifest(activeBookId) : null);
-  }, [activeBookId, readerCacheVersion]);
-
-  useEffect(() => {
-    const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
-    const fallbackCoverUrl = fallbackReaderCover(selectedBook);
-    const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
-    setReaderCoverUrl(liveCoverUrl);
-    if (!activeBookId || !backendCoverUrl || fallbackCoverUrl) return;
-
-    let cancelled = false;
-    void getCachedReaderAssetUrl(activeBookId, 0, backendCoverUrl)
-      .then((cachedCoverUrl) => {
-        if (!cancelled && cachedCoverUrl) setReaderCoverUrl(cachedCoverUrl);
-      })
-      .catch(() => {
-        if (!cancelled) setReaderCoverUrl(liveCoverUrl);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, readerCacheVersion, selectedBook]);
 
   useEffect(() => {
     if (!apiClient || !activeBookId) return;
@@ -3233,120 +3186,6 @@ export default function ReaderView({
         setMarksError(error instanceof Error ? error.message : 'Failed to import reader annotations');
       })
       .finally(() => setAnnotationImportLoading(false));
-  }
-
-  function cacheCurrentChapterOffline(): void {
-    if (!apiClient || !activeBookId || !selectedChapter) {
-      setOfflineCacheStatus('Không thể cache chương: thiếu kết nối API hoặc chương đang đọc.');
-      return;
-    }
-    if (!selectedChapter.has_translation) {
-      setOfflineCacheStatus('Chỉ cache offline được chương đã có bản dịch.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
-    void cacheChapterForOffline({
-      audioUrl: readerAudio.playback.streamUrl,
-      bookId: activeBookId,
-      chapter: selectedChapter,
-      client: apiClient,
-    })
-      .then((summary) => {
-        setOfflineCacheStatus([
-          `Đã tải Chương ${selectedChapter.chapter_number} offline`,
-          `${summary.assetsCached}/${summary.assetsTotal} asset`,
-          `${summary.audioCached}/${summary.audioTotal} audio`,
-        ].join(' · '));
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to cache chapter offline');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function clearCurrentChapterOfflineCache(): void {
-    if (!activeBookId || !selectedChapterId || !selectedChapter) {
-      setOfflineCacheStatus('Không thể xóa cache chương: chưa chọn chương.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang xóa cache Chương ${selectedChapter.chapter_number}...`);
-    void removeCachedChapterAsync(activeBookId, selectedChapterId)
-      .then(() => {
-        removeReaderOfflineManifestChapter(activeBookId, selectedChapterId);
-        setOfflineManifest(loadReaderOfflineManifest(activeBookId));
-        setOfflineCacheStatus(`Đã xóa cache offline Chương ${selectedChapter.chapter_number}.`);
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to clear chapter offline cache');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function cacheCurrentBookOffline(): void {
-    if (!apiClient || !activeBookId) {
-      setOfflineCacheStatus('Không thể cache offline: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang cache offline 0/${translatedChapters.length} chương...`);
-    void cacheBookForOffline({
-      bookId: activeBookId,
-      chapters: translatedChapters,
-      client: apiClient,
-      coverUrl: selectedBook?.cover_url ?? null,
-      onProgress: (progress) => {
-        setOfflineCacheStatus(`Đang cache offline ${progress.chaptersCached}/${progress.chaptersTotal} chương...`);
-      },
-    })
-      .then((summary) => {
-        setOfflineCacheStatus([
-          `Đã cache offline ${summary.chaptersCached}/${summary.chaptersTotal} chương`,
-          `${summary.assetsCached}/${summary.assetsTotal} asset`,
-          `${summary.audioCached}/${summary.audioTotal} audio`,
-          summary.dictionaryCached ? 'đã cache từ điển' : 'chưa cache từ điển',
-        ].join(' · '));
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to cache book offline');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function clearCurrentBookOfflineCache(): void {
-    if (!activeBookId) {
-      setOfflineCacheStatus('Không thể xóa cache offline: chưa chọn truyện.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus('Đang xóa cache offline...');
-    void removeCachedBookAsync(activeBookId)
-      .then(() => {
-        removeReaderOfflineManifest(activeBookId);
-        setOfflineManifest(null);
-        setOfflineCacheStatus('Đã xóa cache offline của truyện này.');
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to clear book offline cache');
-      })
-      .finally(() => setOfflineCacheLoading(false));
   }
 
   function loadReaderXray(mode = xraySpoilerMode): void {

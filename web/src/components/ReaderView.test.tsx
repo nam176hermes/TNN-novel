@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ReaderAnnotation } from '../api/types';
@@ -1938,6 +1938,27 @@ describe('ReaderView', () => {
     expect(within(menu).getByText('Manifest 2 chương · abc12345')).toBeInTheDocument();
     expect(within(menu).getByText('Coverage 2/2 chương · 0 lỗi')).toBeInTheDocument();
     expect(within(menu).getByText('Resources 1/1 asset · 1/1 audio · 12 mục từ điển')).toBeInTheDocument();
+  });
+
+  it('refreshes current offline availability after the established cache update event', async () => {
+    renderReader();
+    await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    await waitFor(() => expect(within(menu).getByText('Chương hiện tại chưa cache')).toBeInTheDocument());
+    expect(screen.queryByLabelText('Có sẵn offline')).not.toBeInTheDocument();
+
+    act(() => {
+      putCachedChapter({
+        bookId: 42,
+        chapterId: 102,
+        html: '',
+        sourceText: '',
+        text: 'Hàn Lập khẽ gật đầu.',
+      });
+    });
+
+    expect(await screen.findByLabelText('Có sẵn offline')).toBeInTheDocument();
+    expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument();
   });
 
   it('caches the whole translated book for offline reading from the more menu', async () => {
