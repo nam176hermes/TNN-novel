@@ -36,6 +36,15 @@ from app.database.db import (
 import app.database.db as db_mod
 
 
+def test_db_reexports_connection_function_object(temp_db_path: Path) -> None:
+    from app.database.connection import get_connection as repository_get_connection
+
+    assert db_mod.get_connection is repository_get_connection
+    with db_mod.get_connection(temp_db_path) as conn:
+        assert conn.row_factory is sqlite3.Row
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
 def test_add_and_get_book(temp_db_path: Path):
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Test Book", "Author", "web", "http://example.com")

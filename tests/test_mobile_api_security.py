@@ -9,6 +9,15 @@ import httpx
 import pytest
 
 
+def test_session_auth_uses_db_auth_repository_exports() -> None:
+    from app.database import auth_repository
+    from app.mobile_api import session_auth
+
+    assert session_auth.get_auth_session is auth_repository.get_auth_session
+    assert session_auth.touch_auth_session is auth_repository.touch_auth_session
+    assert session_auth.auth_session_is_active is auth_repository.auth_session_is_active
+
+
 def _build_app_with_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from app import config as app_config
     from app.mobile_api import dependencies as dependencies_mod
