@@ -451,8 +451,24 @@ class JobTracker:
                 step=job.current_step,
                 message="Cancel requested",
             )
+        self.update_job(job_id, cancel_requested=True)
         # Cancel the asyncio task if it exists
         task = self._tasks.get(job_id)
+        if job.job_type == "backup":
+            # Backup creation runs in a worker thread, which asyncio task
+            # cancellation cannot stop. Let its cooperative callback observe
+            # this durable flag before the directory lock is released.
+            if task and not task.done():
+                return True
+            refreshed = self.get_job(job_id)
+            if refreshed and refreshed.status in {"queued", "pending", "retrying"}:
+                return self.update_job(
+                    job_id,
+                    status="cancelled",
+                    message="Job cancelled before claim",
+                    cancel_requested=True,
+                )
+            return True
         if task and not task.done():
             task.cancel()
             return True

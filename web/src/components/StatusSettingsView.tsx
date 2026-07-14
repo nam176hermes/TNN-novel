@@ -1,4 +1,4 @@
-import type { SystemBackupItem, SystemStatus } from '../api/types';
+import type { JobStatus, SystemBackupItem, SystemStatus } from '../api/types';
 import { formatError } from '../state/types';
 import { useState } from 'react';
 import {
@@ -28,10 +28,12 @@ type StatusSettingsViewProps = {
   backupBusy?: boolean;
   backupError?: string;
   backupItems?: SystemBackupItem[];
+  backupJob?: JobStatus | null;
   backupListLoading?: boolean;
   latestBackup?: SystemBackupItem | null;
   onCreateBackup?(): void | Promise<void>;
   onCreateEncryptedBackup?(): void | Promise<void>;
+  onCancelBackup?(): void | Promise<void>;
   onDownloadBackup?(filename: string): void | Promise<void>;
 };
 
@@ -96,10 +98,12 @@ export default function StatusSettingsView({
   backupBusy = false,
   backupError = '',
   backupItems,
+  backupJob = null,
   backupListLoading = false,
   latestBackup = null,
   onCreateBackup,
   onCreateEncryptedBackup,
+  onCancelBackup,
   onDownloadBackup,
 }: StatusSettingsViewProps) {
   const [backupHelpOpen, setBackupHelpOpen] = useState(false);
@@ -114,6 +118,9 @@ export default function StatusSettingsView({
   const rows = status ? statusRows(status) : [];
   const firstColumnRows = rows.slice(0, 7);
   const secondColumnRows = rows.slice(7);
+  const backupJobActive = Boolean(
+    backupJob && ['queued', 'running'].includes(backupJob.status.toLowerCase()),
+  );
 
   return (
     <section aria-labelledby="system-status-title" className="workflow-management-view status-settings-view">
@@ -399,6 +406,28 @@ export default function StatusSettingsView({
           <p className="empty-detail">
             Secrets và provider API keys bị loại khỏi backup mặc định. Muốn kèm secrets phải dùng backup mã hóa.
           </p>
+          {backupJob && backupJobActive ? (
+            <section aria-label="Tiến độ backup" className="inline-help-panel">
+              <div className="section-heading-row">
+                <div>
+                  <strong>{backupJob.message || 'Backup đang chạy'}</strong>
+                  <p className="empty-detail">
+                    {backupJob.progress.toLocaleString()} / {backupJob.total.toLocaleString()}
+                  </p>
+                </div>
+                <button
+                  className="secondary-action"
+                  disabled={!onCancelBackup}
+                  onClick={() => {
+                    void onCancelBackup?.();
+                  }}
+                  type="button"
+                >
+                  Hủy backup
+                </button>
+              </div>
+            </section>
+          ) : null}
           {backupHelpOpen ? (
             <div className="inline-help-panel">
               <p>

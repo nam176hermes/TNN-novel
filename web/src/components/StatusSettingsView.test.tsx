@@ -1,7 +1,7 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { SystemBackupItem, SystemStatus } from '../api/types';
+import type { JobStatus, SystemBackupItem, SystemStatus } from '../api/types';
 import StatusSettingsView from './StatusSettingsView';
 
 afterEach(cleanup);
@@ -57,6 +57,17 @@ const latestBackup: SystemBackupItem = {
   secrets_included: false,
   size_bytes: 4096,
   warning: '',
+};
+
+const runningBackupJob: JobStatus = {
+  job_id: 'backup-job-1',
+  job_type: 'backup',
+  status: 'running',
+  state: 'WRITING_BACKUP',
+  current_step: 'WRITING_BACKUP',
+  progress: 2,
+  total: 6,
+  message: 'Writing backup archive',
 };
 
 describe('StatusSettingsView', () => {
@@ -230,6 +241,57 @@ describe('StatusSettingsView', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Tải backup' }));
     expect(onDownloadBackup).toHaveBeenCalledWith('novel-pipeline-backup-test.tar.gz');
+  });
+
+  it('shows queued backup progress and cancellation without hiding the backup list', async () => {
+    const onCancelBackup = vi.fn().mockResolvedValue(undefined);
+    render(
+      <StatusSettingsView
+        backupBusy
+        backupItems={[latestBackup]}
+        backupJob={runningBackupJob}
+        error=""
+        loading={false}
+        onCancelBackup={onCancelBackup}
+        onCreateBackup={() => undefined}
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
+    expect(screen.getByText('Writing backup archive')).toBeVisible();
+    expect(screen.getByText('2 / 6')).toBeVisible();
+    expect(screen.getByText(latestBackup.filename)).toBeVisible();
+    await userEvent.click(screen.getByRole('button', { name: 'Hủy backup' }));
+    expect(onCancelBackup).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows terminal backup errors while leaving creation and inventory usable', async () => {
+    render(
+      <StatusSettingsView
+        backupBusy={false}
+        backupError="Backup failed. Check server logs."
+        backupItems={[latestBackup]}
+        backupJob={{
+          ...runningBackupJob,
+          status: 'failed',
+          state: 'FAILED',
+          message: 'Backup failed. Check server logs.',
+        }}
+        error=""
+        loading={false}
+        onCreateBackup={() => undefined}
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    await userEvent.click(screen.getByText('Sao lưu hệ thống'));
+    expect(screen.getByText('Backup failed. Check server logs.')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Tạo backup' })).toBeEnabled();
+    expect(screen.getByText(latestBackup.filename)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Hủy backup' })).not.toBeInTheDocument();
   });
 
   it('renders backup metadata states independently and only offers valid downloads', async () => {

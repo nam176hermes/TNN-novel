@@ -173,10 +173,12 @@ function AuthenticatedApp() {
   const [exportLoading, setExportLoading] = useState(false);
   const [exportError, setExportError] = useState('');
   const [lastExport, setLastExport] = useState<ExportResponse | null>(null);
-  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupJobId, setBackupJobId] = useState('');
   const [backupError, setBackupError] = useState('');
+  const [backupListError, setBackupListError] = useState('');
   const [backupListLoading, setBackupListLoading] = useState(false);
   const [backups, setBackups] = useState<SystemBackupItem[]>([]);
+  const handledBackupJobIdRef = useRef('');
   const [selectedPresetId, setSelectedPresetId] = useState(defaultTranslationPresetId);
   const [workbenchMode, setWorkbenchMode] = useState<'edit' | 'reader'>('edit');
   const [translatedBooks, setTranslatedBooks] = useState<AsyncState<TranslatedBookSummary[]>>(emptyTranslatedBooks);
@@ -376,12 +378,12 @@ function AuthenticatedApp() {
     }
   }, [expireSession, session.client, session.isAuthenticated]);
 
-  const loadLatestBackup = useCallback(async (): Promise<void> => {
+  const loadBackups = useCallback(async (): Promise<void> => {
     if (!session.isAuthenticated) {
       setBackups([]);
       return;
     }
-    setBackupError('');
+    setBackupListError('');
     setBackupListLoading(true);
     try {
       const response = await session.client.listSystemBackups();
@@ -391,14 +393,15 @@ function AuthenticatedApp() {
         expireSession();
         return;
       }
-      setBackupError(formatError(error));
+      setBackupListError(formatError(error));
     } finally {
       setBackupListLoading(false);
     }
   }, [expireSession, session.client, session.isAuthenticated]);
 
   const refreshAfterCompletedJob = useCallback(
-    async (job: { job_id: string }) => {
+    async (job: { job_id: string; job_type?: string }) => {
+      if (job.job_type === 'backup') return;
       const refreshBookId = library.selectedChapter?.book_id ?? library.selectedBookId;
 
       const attemptRefresh = async () => {
@@ -469,6 +472,12 @@ function AuthenticatedApp() {
     session.isAuthenticated,
     refreshAfterCompletedJob,
     expireSession,
+  );
+  const backupJob = backupJobId && jobState.activeJob?.job_id === backupJobId
+    ? jobState.activeJob
+    : null;
+  const backupBusy = Boolean(
+    backupJob && ['queued', 'running'].includes(backupJob.status.toLowerCase()),
   );
   const jobAttemptsState = useJobAttempts(
     session.client,
@@ -577,8 +586,29 @@ function AuthenticatedApp() {
 
   useEffect(() => {
     if (activeView !== 'status') return;
-    void loadLatestBackup();
-  }, [activeView, loadLatestBackup]);
+    void loadBackups();
+  }, [activeView, loadBackups]);
+
+  useEffect(() => {
+    if (!backupJob) return;
+    const terminal = ['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'stale_interrupted']
+      .includes(backupJob.status.toLowerCase());
+    if (!terminal || handledBackupJobIdRef.current === backupJob.job_id) return;
+
+    handledBackupJobIdRef.current = backupJob.job_id;
+    if (backupJob.status.toLowerCase() === 'completed') {
+      setBackupError('');
+      setBackendSuccess(backupJob.message || 'System backup completed.');
+      void loadBackups();
+      return;
+    }
+    setBackupError(
+      backupJob.last_safe_error
+      || backupJob.error
+      || backupJob.message
+      || 'Backup job did not complete. Check server logs.',
+    );
+  }, [backupJob, loadBackups]);
 
   useEffect(() => {
     if (!session.isAuthenticated || activeView !== 'status') return undefined;
@@ -1460,25 +1490,29 @@ function AuthenticatedApp() {
     passphrase?: string;
   } = {}): Promise<void> {
     setBackupError('');
-    setBackupBusy(true);
+    setBackendSuccess('');
     try {
-      const item = await session.client.createSystemBackup({
-        include_audio: true,
-        include_exports: false,
-        include_job_logs: false,
-        include_secrets: options.includeSecrets ?? false,
-        passphrase: options.passphrase ?? '',
-      });
-      setBackups((current) => [item, ...current.filter((backup) => backup.filename !== item.filename)]);
-      setBackendSuccess(`Đã tạo system backup ${item.filename}`);
+      const response = await jobState.startJob(
+        () => session.client.createSystemBackup({
+          include_audio: true,
+          include_exports: false,
+          include_job_logs: false,
+          include_secrets: options.includeSecrets ?? false,
+          passphrase: options.passphrase ?? '',
+        }),
+        6,
+      );
+      if (response) {
+        handledBackupJobIdRef.current = '';
+        setBackupJobId(response.job_id);
+        setBackendSuccess(response.message || 'Backup queued.');
+      }
     } catch (error) {
       if (isAuthError(error)) {
         expireSession();
       } else {
         setBackupError(formatError(error));
       }
-    } finally {
-      setBackupBusy(false);
     }
   }
 
@@ -1926,8 +1960,9 @@ function AuthenticatedApp() {
             {statusMessages}
             <StatusSettingsView
               backupBusy={backupBusy}
-              backupError={backupError}
+              backupError={backupError || backupListError}
               backupItems={backups}
+              backupJob={backupJob}
               backupListLoading={backupListLoading}
               error={systemStatus.error}
               loading={systemStatus.state === 'loading'}
@@ -1936,6 +1971,9 @@ function AuthenticatedApp() {
               }}
               onCreateEncryptedBackup={() => {
                 void handleCreateEncryptedBackup();
+              }}
+              onCancelBackup={() => {
+                void handleCancelJob();
               }}
               onDownloadBackup={(filename) => {
                 void handleDownloadBackup(filename);

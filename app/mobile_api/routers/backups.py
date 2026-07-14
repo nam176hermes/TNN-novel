@@ -1,44 +1,33 @@
 from __future__ import annotations
 
-from typing import Protocol
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.dependencies import get_db_path
 from app.mobile_api.schemas import JobResponse, SystemBackupItem, SystemBackupListResponse, SystemBackupRequest
+from app.mobile_api.services.backup_job_service import BackupJobCoordinator
 from app.mobile_api.services.backup_service import BackupService
+from app.mobile_api.services.job_service import get_shared_job_tracker
 
 router = APIRouter(prefix="/api/system/backups", tags=["backups"])
-
-
-class BackupJobCoordinator(Protocol):
-    def start_backup_job(
-        self,
-        *,
-        include_audio: bool,
-        include_exports: bool,
-        include_job_logs: bool,
-        include_secrets: bool,
-        passphrase: str,
-    ) -> str: ...
-
-
-class _UnavailableBackupJobCoordinator:
-    def start_backup_job(
-        self,
-        *,
-        include_audio: bool,
-        include_exports: bool,
-        include_job_logs: bool,
-        include_secrets: bool,
-        passphrase: str,
-    ) -> str:
-        raise RuntimeError("Backup job coordinator is not configured")
+_SHARED_BACKUP_JOB_COORDINATOR: BackupJobCoordinator | None = None
 
 
 def get_backup_job_coordinator() -> BackupJobCoordinator:
-    return _UnavailableBackupJobCoordinator()
+    global _SHARED_BACKUP_JOB_COORDINATOR
+    tracker = get_shared_job_tracker(get_db_path())
+    service = BackupService()
+    if (
+        _SHARED_BACKUP_JOB_COORDINATOR is None
+        or _SHARED_BACKUP_JOB_COORDINATOR.tracker is not tracker
+        or _SHARED_BACKUP_JOB_COORDINATOR.backup_service.backup_dir != service.backup_dir
+    ):
+        _SHARED_BACKUP_JOB_COORDINATOR = BackupJobCoordinator(
+            tracker=tracker,
+            backup_service=service,
+        )
+    return _SHARED_BACKUP_JOB_COORDINATOR
 
 
 def get_backup_service() -> BackupService:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from app.mobile_api.dependencies import get_data_dir
@@ -30,6 +31,8 @@ class BackupService:
         include_job_logs: bool = False,
         include_secrets: bool = False,
         passphrase: str = "",
+        cancel_check: Callable[[], bool] | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> dict:
         if include_secrets and not passphrase.strip():
             raise ValueError("Encrypted backup passphrase is required when secrets are included")
@@ -41,9 +44,21 @@ class BackupService:
             include_exports=include_exports,
             include_job_logs=include_job_logs,
             out_dir=self.backup_dir,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
         if include_secrets:
-            backup_path = ops.encrypt_backup_archive(backup_path, passphrase=passphrase.strip())
+            try:
+                backup_path = ops.encrypt_backup_archive(
+                    backup_path,
+                    passphrase=passphrase.strip(),
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                )
+            except Exception:
+                backup_path.unlink(missing_ok=True)
+                ops.backup_sidecar_path(backup_path).unlink(missing_ok=True)
+                raise
 
         backups = self.list_backups()
         for item in backups:

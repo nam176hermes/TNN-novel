@@ -260,6 +260,12 @@ export type SystemBackupRequest = {
   passphrase?: string;
 };
 
+export type SystemBackupJobStart = {
+  job_id: string;
+  status: string;
+  message: string;
+};
+
 export type SystemBackupItem = {
   filename: string;
   size_bytes: number;

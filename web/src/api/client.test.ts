@@ -1225,11 +1225,16 @@ describe('ApiClient', () => {
       manifest: {},
       download_url: '/api/system/backups/novel-pipeline-backup-20260709-100000.tar.gz/download',
     };
+    const backupJob: import('./types').SystemBackupJobStart = {
+      job_id: 'backup-job-1',
+      status: 'queued',
+      message: 'Backup queued',
+    };
     const backupBlob = new Blob(['backup'], { type: 'application/octet-stream' });
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ items: [backupItem] }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => backupItem })
+      .mockResolvedValueOnce({ ok: true, json: async () => backupJob })
       .mockResolvedValueOnce({
         ok: true,
         blob: async () => backupBlob,
@@ -1242,7 +1247,7 @@ describe('ApiClient', () => {
     client.token = 'access';
 
     await expect(client.listSystemBackups()).resolves.toEqual({ items: [backupItem] });
-    await expect(client.createSystemBackup({ include_audio: true })).resolves.toEqual(backupItem);
+    await expect(client.createSystemBackup({ include_audio: true })).resolves.toEqual(backupJob);
     await expect(client.downloadSystemBackup(backupItem.filename)).resolves.toMatchObject({
       blob: backupBlob,
       filename: backupItem.filename,

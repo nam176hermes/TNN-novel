@@ -17,6 +17,7 @@ import type {
   ExportFormat,
   ExportResponse,
   SystemBackupItem,
+  SystemBackupJobStart,
   SystemBackupList,
   SystemBackupRequest,
   GlossaryTerm,
@@ -1157,14 +1158,14 @@ export class ApiClient {
     return (await response.json()) as SystemBackupList;
   }
 
-  async createSystemBackup(payload: SystemBackupRequest = {}): Promise<SystemBackupItem> {
+  async createSystemBackup(payload: SystemBackupRequest = {}): Promise<SystemBackupJobStart> {
     const response = await this.fetcher(`${this.baseUrl}/api/system/backups`, {
       method: 'POST',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     await this.assertOk(response, 'Failed to create system backup');
-    return (await response.json()) as SystemBackupItem;
+    return (await response.json()) as SystemBackupJobStart;
   }
 
   async downloadSystemBackup(filename: string): Promise<ExportDownload> {
