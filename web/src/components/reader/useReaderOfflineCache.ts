@@ -180,6 +180,8 @@ export function useReaderOfflineCache({
       mountedRef.current = false;
       operationGenerationRef.current += 1;
       activeOperationRef.current = 0;
+      audioCacheEpochByIdentityRef.current.clear();
+      pendingAudioCleanupByIdentityRef.current.clear();
     };
   }, []);
 
@@ -406,10 +408,10 @@ export function useReaderOfflineCache({
         if (pendingAudioCleanupByIdentityRef.current.get(targetIdentity) === cleanup) {
           pendingAudioCleanupByIdentityRef.current.delete(targetIdentity);
         }
-      });
+    });
     pendingAudioCleanupByIdentityRef.current.set(targetIdentity, cleanup);
     await cleanup;
-    refresh();
+    if (mountedRef.current) refresh();
     return true;
   }, [automaticAudioCacheAllowedFor, dependencies, refresh]);
 
