@@ -695,7 +695,9 @@ def _try_stealth_fallback(
         # Surface the original blocked reason; fall back to None.
         import logging
         logging.getLogger(__name__).warning(
-            "Stealth browser fallback failed for %s: %s", url, exc
+            "Stealth browser fallback failed for %s (%s)",
+            redacted_url(url),
+            type(exc).__name__,
         )
         return None
 

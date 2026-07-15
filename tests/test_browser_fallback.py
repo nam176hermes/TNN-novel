@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from app.ingestion.source_adapters import SourceBlockedError
@@ -197,6 +199,28 @@ def test_browser_fallback_skipped_when_no_playwright(monkeypatch):
 
     result = source_adapters._try_stealth_fallback("https://example.com/", "blocked", 20)
     assert result is None
+
+
+def test_browser_fallback_failure_log_redacts_sensitive_query(monkeypatch, caplog):
+    from app.ingestion import source_adapters
+
+    monkeypatch.delenv("ENABLE_BROWSER_FALLBACK", raising=False)
+    monkeypatch.setattr(source_adapters, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(
+        source_adapters,
+        "fetch_with_stealth_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("browser closed")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = source_adapters._try_stealth_fallback(
+            "https://example.com/chapter?token=must-not-log",
+            "blocked",
+            20,
+        )
+
+    assert result is None
+    assert "must-not-log" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

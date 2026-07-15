@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P07 — retry, bounded concurrency, and ordered import.
+- Active milestone: P08 — browser/session containment.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -42,6 +42,12 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - Targeted P07 verification: `20 passed in 36.24s`; the three deadlock/cancellation regressions passed in `6.99s`.
 - Full P07 backend verification: `892 passed, 2 warnings in 1007.99s (0:16:47)`.
 - P07 does not add API routes, SSE, autonomous scheduler threads, real source calls, or source-payload logging.
+- P08 implementation status: implemented and verified.
+- P08 keeps `launch_persistent_context` as the browser mechanism and adds one lazy, serialized session owner with idle/request/page rotation, health checks, crash restart, and explicit shutdown cleanup.
+- P08 hardens cookie state with expiry filtering, corrupt-file rotation, atomic replace, and `0600` permissions; browser profile directories are constrained to `0700` where supported.
+- P08 preserves the existing Cloudflare wait/reload path and compatibility wrapper without adding CAPTCHA, fingerprint, proxy, router, SSE, scheduler, or real-source behavior.
+- Targeted P08 browser/fetch/lifespan verification: `72 passed, 1 warning in 25.11s` using mocked Playwright only.
+- Full P08 backend verification: `909 passed, 2 warnings in 1010.59s (0:16:50)`.
 
 ## Goals
 
@@ -201,9 +207,12 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 
 ### P08 — Browser/session containment
 
-- Constrain legacy browser/session behavior.
-- Ensure cookies are never logged or committed.
-- Do not add stealth expansion or CAPTCHA automation.
+- Keep `launch_persistent_context` and reuse one lazy session instead of launching Playwright for every chapter.
+- Serialize page control per session; use P07's global browser limit as the outer concurrency boundary.
+- Rotate on idle TTL, request/page ceilings, failed health checks, browser crashes, or a corrupt profile.
+- Atomically persist unexpired cookies with private permissions and rotate malformed state without logging it.
+- Disable downloads, close unexpected popups, and validate top-level navigation through P02 URL policy with injectable DNS resolution.
+- Preserve the existing Cloudflare wait/reload behavior and compatibility wrapper without adding stealth or CAPTCHA behavior.
 
 ### P09 — Operational observability
 
@@ -257,8 +266,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P04 | P02, P03 | Canonical URLs and normalized content hashes are prerequisites for idempotent source imports. |
 | P05 | P03 | Import job ownership depends on preview/fetch ownership. |
 | P06 | P04, P05 | Sequential worker relies on idempotent import identity and durable job/task state. |
-| P07 | P04 | Health lifecycle builds on managed source policy. |
-| P08 | P02 | Browser/session containment needs isolated interface and safe logging. |
+| P07 | P04, P05, P06 | Retry/concurrency relies on durable tasks, leases, and idempotent import. |
+| P08 | P02, P07 | Browser containment needs URL policy and the outer global browser concurrency limit. |
 | P09 | P05, P07 | Observability needs stable job/source events. |
 | P10 | P05 | Artifact integrity attaches to import job outputs. |
 | P11 | P06 | Frontend cleanup follows stable import states. |
@@ -295,6 +304,9 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-14 | P05 strips sensitive payload keys before persisting job config/events. | Durable operational metadata must not become a second store for content, cookies, or secrets. |
 | 2026-07-15 | P06 uses per-task leases and `BEGIN IMMEDIATE` claims rather than an in-memory queue. | SQLite remains the source of truth across worker restarts while P06 stays single-task sequential. |
 | 2026-07-15 | P06 exposes retry only as an explicit reset of failed `retryable` tasks. | No automatic retry/backoff policy is introduced before its separate milestone. |
+| 2026-07-15 | P08 owns Playwright persistent context lifecycle in `BrowserSessionManager`; sync callers use one dedicated daemon event-loop thread. | Playwright async objects retain loop affinity while the legacy synchronous API reuses a process/session instead of relaunching per chapter. |
+| 2026-07-15 | P08 checks idle/request/page/health rotation lazily at session use and performs explicit FastAPI/atexit cleanup. | The milestone forbids a scheduler thread; lazy checks provide bounded lifetime without an autonomous timer. |
+| 2026-07-15 | P08 rotates malformed cookie/profile state and logs only redacted URLs plus exception type. | Recovery metadata must not expose cookies, query secrets, HTML, content, or private paths. |
 
 ## Test matrix
 
@@ -312,13 +324,14 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | Source/import safety | Challenge, blocked, timeout, unsupported, duplicate, stored text length/hash, typed failure metadata, and redaction tests | no secrets/content in output |
 | P05 import persistence | State transitions, explicit task retry, cancel idempotency, owner isolation, derived counters, monotonic events, and legacy migration | no worker/API/SSE side effects |
 | P06 import worker | Sequential success, partial failure, cancel before/during stage, expired lease recovery, atomic claim, explicit retry, and fake-pipeline idempotency simulation | no real source/browser calls or parallel execution |
+| P08 browser/session | Mocked persistent-context reuse, per-session serialization, idle/request/health/crash restart, popup/download/navigation containment, cookie expiry/atomic permissions/corrupt recovery, compatibility wrapper, and application shutdown | no real browser/source calls and no cookie/query/content in logs |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks
 
 - The worktree was dirty before P00, including import/source/browser/frontend files.
 - P00 baseline had one failing source adapter test and a pyflakes failure; P01 full verification now passes.
-- Legacy browser/captcha/proxy/cookie utilities exist and conflict with the desired Plan B safety posture if expanded.
+- Legacy CAPTCHA/proxy utilities remain present but P08 does not expand them; future work must continue treating challenge handling as a constrained compatibility path.
 - `docs/upgrade/codex-prompts-modified.md` contains older Plan B prompt text that preserves bypass-style behavior; future tasks must follow this document and root `AGENTS.md` instead.
 - Large files such as `pipeline_service.py`, `db.py`, `ImportPanel.tsx`, `client.ts`, and `types.ts` increase regression risk.
 

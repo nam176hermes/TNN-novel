@@ -27,6 +27,7 @@ from app.mobile_api.private_assets import (
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.session_auth import AccessTokenError, validate_access_token
 from app.mobile_api.services.retention_service import RetentionService, run_retention_loop
+from app.utils.stealth_browser import close_stealth_browser
 from app.mobile_api.routers import (
     auth_router,
     health_router,
@@ -131,6 +132,7 @@ async def _retention_lifespan(app: FastAPI) -> AsyncIterator[None]:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        await close_stealth_browser()
         app.state.retention_task = None
         app.state.retention_stop_event = None
 
