@@ -1,0 +1,595 @@
+"""Durable persistence primitives for the future import-job worker.
+
+P05 deliberately stops at persistence and state transitions.  Nothing in this
+module claims, runs, retries, or streams jobs; later milestones can build those
+behaviours on the transaction-safe repository below.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Mapping
+
+from app.database.connection import get_connection
+
+
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PARTIALLY_SUCCEEDED = "partially_succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TaskStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_RETRY = "waiting_retry"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    USER_VERIFICATION_REQUIRED = "user_verification_required"
+
+
+class TaskStage(str, Enum):
+    QUEUED = "queued"
+    FETCHING = "fetching"
+    WAITING_RETRY = "waiting_retry"
+    PARSING = "parsing"
+    VALIDATING = "validating"
+    IMPORTING = "importing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    USER_VERIFICATION_REQUIRED = "user_verification_required"
+
+
+class InvalidImportJobTransition(ValueError):
+    """Raised before an invalid durable job or task transition is persisted."""
+
+
+class ConcurrentImportJobUpdate(RuntimeError):
+    """Raised when an optimistic compare-and-set update loses its race."""
+
+
+_JOB_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
+    JobStatus.QUEUED: {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELLED},
+    JobStatus.RUNNING: {
+        JobStatus.SUCCEEDED,
+        JobStatus.PARTIALLY_SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    },
+    JobStatus.SUCCEEDED: set(),
+    JobStatus.PARTIALLY_SUCCEEDED: set(),
+    JobStatus.FAILED: set(),
+    JobStatus.CANCELLED: set(),
+}
+
+_TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.QUEUED: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
+    TaskStatus.RUNNING: {
+        TaskStatus.WAITING_RETRY,
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.USER_VERIFICATION_REQUIRED,
+    },
+    TaskStatus.WAITING_RETRY: {TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.SUCCEEDED: set(),
+    TaskStatus.FAILED: set(),
+    TaskStatus.CANCELLED: set(),
+    TaskStatus.USER_VERIFICATION_REQUIRED: set(),
+}
+
+_SENSITIVE_PAYLOAD_MARKERS = ("html", "content", "cookie", "token", "secret", "password", "authorization")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_json_loads(value: object) -> dict[str, Any]:
+    try:
+        loaded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def sanitize_import_job_payload(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return metadata that can safely be persisted as config/event JSON.
+
+    Import content and session credentials belong in neither durable job config
+    nor events.  Drop such fields recursively instead of relying on callers to
+    remember this operational boundary.
+    """
+
+    def clean(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {
+                str(key): clean(child)
+                for key, child in item.items()
+                if not any(marker in str(key).lower() for marker in _SENSITIVE_PAYLOAD_MARKERS)
+            }
+        if isinstance(item, (list, tuple)):
+            return [clean(child) for child in item]
+        if isinstance(item, str):
+            return item[:2_000]
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        return str(item)[:2_000]
+
+    return clean(value or {})
+
+
+@dataclass(frozen=True)
+class ImportJob:
+    id: str
+    owner_user_id: str
+    source: str
+    source_url: str
+    book_id: int | None
+    status: JobStatus
+    total: int
+    queued_count: int
+    running_count: int
+    succeeded_count: int
+    failed_count: int
+    cancelled_count: int
+    waiting_retry_count: int
+    verification_required_count: int
+    created_at: str
+    started_at: str
+    finished_at: str
+    cancel_requested_at: str
+    config_snapshot: dict[str, Any]
+    error_summary: str
+    version: int
+
+
+@dataclass(frozen=True)
+class ChapterTask:
+    id: int
+    job_id: str
+    canonical_identity: str
+    canonical_chapter_url: str
+    chapter_number: int
+    title: str
+    status: TaskStatus
+    stage: TaskStage
+    attempts: int
+    next_attempt_at: str
+    error_code: str
+    error_message: str
+    fetch_method: str
+    text_length: int
+    content_hash: str
+    elapsed_ms: int
+    started_at: str
+    finished_at: str
+    book_id: int | None
+    chapter_id: int | None
+    version: int
+
+
+@dataclass(frozen=True)
+class ImportJobEvent:
+    id: int
+    sequence: int
+    job_id: str
+    task_id: int | None
+    event_type: str
+    payload: dict[str, Any]
+    created_at: str
+
+
+def _job_from_row(row: sqlite3.Row) -> ImportJob:
+    return ImportJob(
+        id=str(row["id"]),
+        owner_user_id=str(row["owner_user_id"] or ""),
+        source=str(row["source"] or ""),
+        source_url=str(row["source_url"] or ""),
+        book_id=int(row["book_id"]) if row["book_id"] is not None else None,
+        status=JobStatus(str(row["status"])),
+        total=int(row["total"] or 0),
+        queued_count=int(row["queued_count"] or 0),
+        running_count=int(row["running_count"] or 0),
+        succeeded_count=int(row["succeeded_count"] or 0),
+        failed_count=int(row["failed_count"] or 0),
+        cancelled_count=int(row["cancelled_count"] or 0),
+        waiting_retry_count=int(row["waiting_retry_count"] or 0),
+        verification_required_count=int(row["verification_required_count"] or 0),
+        created_at=str(row["created_at"] or ""),
+        started_at=str(row["started_at"] or ""),
+        finished_at=str(row["finished_at"] or ""),
+        cancel_requested_at=str(row["cancel_requested_at"] or ""),
+        config_snapshot=_safe_json_loads(row["config_snapshot_json"]),
+        error_summary=str(row["error_summary"] or ""),
+        version=int(row["version"] or 0),
+    )
+
+
+def _task_from_row(row: sqlite3.Row) -> ChapterTask:
+    return ChapterTask(
+        id=int(row["id"]),
+        job_id=str(row["job_id"]),
+        canonical_identity=str(row["canonical_identity"] or ""),
+        canonical_chapter_url=str(row["canonical_chapter_url"] or ""),
+        chapter_number=int(row["chapter_number"] or 0),
+        title=str(row["title"] or ""),
+        status=TaskStatus(str(row["status"])),
+        stage=TaskStage(str(row["stage"])),
+        attempts=int(row["attempts"] or 0),
+        next_attempt_at=str(row["next_attempt_at"] or ""),
+        error_code=str(row["error_code"] or ""),
+        error_message=str(row["error_message"] or ""),
+        fetch_method=str(row["fetch_method"] or ""),
+        text_length=int(row["text_length"] or 0),
+        content_hash=str(row["content_hash"] or ""),
+        elapsed_ms=int(row["elapsed_ms"] or 0),
+        started_at=str(row["started_at"] or ""),
+        finished_at=str(row["finished_at"] or ""),
+        book_id=int(row["book_id"]) if row["book_id"] is not None else None,
+        chapter_id=int(row["chapter_id"]) if row["chapter_id"] is not None else None,
+        version=int(row["version"] or 0),
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> ImportJobEvent:
+    return ImportJobEvent(
+        id=int(row["id"]),
+        sequence=int(row["sequence"]),
+        job_id=str(row["job_id"]),
+        task_id=int(row["task_id"]) if row["task_id"] is not None else None,
+        event_type=str(row["event_type"]),
+        payload=_safe_json_loads(row["payload_json"]),
+        created_at=str(row["created_at"] or ""),
+    )
+
+
+class ImportJobRepository:
+    """Repository with owner-scoped reads and compare-and-set transitions."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+
+    def create_job(
+        self,
+        *,
+        owner_user_id: str,
+        source: str,
+        source_url: str,
+        total: int = 0,
+        book_id: int | None = None,
+        config_snapshot: Mapping[str, Any] | None = None,
+    ) -> ImportJob:
+        now = _now()
+        job_id = uuid.uuid4().hex
+        snapshot = sanitize_import_job_payload(config_snapshot)
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO import_jobs (
+                    id, owner_user_id, source, source_url, book_id, status, total,
+                    created_at, config_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, owner_user_id, source, source_url, book_id, JobStatus.QUEUED.value, max(0, total), now, json.dumps(snapshot, ensure_ascii=False, sort_keys=True)),
+            )
+            self._append_event(conn, job_id, None, "job_created", {"status": JobStatus.QUEUED.value})
+            row = self._job_row(conn, job_id, owner_user_id)
+        return _job_from_row(row)
+
+    def get_job(self, job_id: str, owner_user_id: str) -> ImportJob | None:
+        with get_connection(self.db_path) as conn:
+            row = self._job_row(conn, job_id, owner_user_id, required=False)
+        return _job_from_row(row) if row is not None else None
+
+    def create_task(
+        self,
+        *,
+        job_id: str,
+        owner_user_id: str,
+        canonical_identity: str,
+        canonical_chapter_url: str,
+        chapter_number: int,
+        title: str,
+        book_id: int | None = None,
+    ) -> ChapterTask:
+        if not canonical_identity or not canonical_chapter_url:
+            raise ValueError("canonical task identity and URL are required")
+        now = _now()
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._job_row(conn, job_id, owner_user_id)
+            cursor = conn.execute(
+                """
+                INSERT INTO chapter_tasks (
+                    job_id, canonical_identity, canonical_chapter_url, chapter_number,
+                    title, status, stage, book_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    canonical_identity,
+                    canonical_chapter_url,
+                    chapter_number,
+                    title,
+                    TaskStatus.QUEUED.value,
+                    TaskStage.QUEUED.value,
+                    book_id,
+                    now,
+                    now,
+                ),
+            )
+            task_id = int(cursor.lastrowid)
+            self._sync_job_counters(conn, job_id)
+            self._append_event(conn, job_id, task_id, "task_created", {"status": TaskStatus.QUEUED.value})
+            row = self._task_row(conn, task_id, owner_user_id)
+        return _task_from_row(row)
+
+    def list_tasks(self, job_id: str, owner_user_id: str) -> list[ChapterTask]:
+        with get_connection(self.db_path) as conn:
+            if self._job_row(conn, job_id, owner_user_id, required=False) is None:
+                return []
+            rows = conn.execute(
+                "SELECT * FROM chapter_tasks WHERE job_id = ? ORDER BY id ASC", (job_id,)
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
+    def transition_job(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        status: JobStatus,
+        *,
+        error_summary: str = "",
+    ) -> ImportJob:
+        next_status = JobStatus(status)
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+            if current.status != next_status and next_status not in _JOB_TRANSITIONS[current.status]:
+                raise InvalidImportJobTransition(f"job {current.status.value} cannot transition to {next_status.value}")
+            now = _now()
+            started_at = current.started_at or (now if next_status is JobStatus.RUNNING else "")
+            finished_at = now if next_status in {JobStatus.SUCCEEDED, JobStatus.PARTIALLY_SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED} else current.finished_at
+            result = conn.execute(
+                """
+                UPDATE import_jobs
+                SET status = ?, started_at = ?, finished_at = ?, error_summary = ?, version = version + 1
+                WHERE id = ? AND owner_user_id = ? AND version = ?
+                """,
+                (next_status.value, started_at, finished_at, error_summary[:2_000], job_id, owner_user_id, current.version),
+            )
+            if result.rowcount != 1:
+                raise ConcurrentImportJobUpdate(job_id)
+            self._append_event(conn, job_id, None, "job_transitioned", {"status": next_status.value})
+            row = self._job_row(conn, job_id, owner_user_id)
+        return _job_from_row(row)
+
+    def transition_task(
+        self,
+        task_id: int,
+        owner_user_id: str,
+        *,
+        status: TaskStatus,
+        stage: TaskStage,
+        next_attempt_at: str = "",
+        error_code: str = "",
+        error_message: str = "",
+        fetch_method: str = "",
+        text_length: int | None = None,
+        content_hash: str = "",
+        elapsed_ms: int | None = None,
+        book_id: int | None = None,
+        chapter_id: int | None = None,
+    ) -> ChapterTask:
+        next_status = TaskStatus(status)
+        next_stage = TaskStage(stage)
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _task_from_row(self._task_row(conn, task_id, owner_user_id))
+            if current.status != next_status and next_status not in _TASK_TRANSITIONS[current.status]:
+                raise InvalidImportJobTransition(f"task {current.status.value} cannot transition to {next_status.value}")
+            now = _now()
+            attempts = current.attempts + int(current.status is not TaskStatus.RUNNING and next_status is TaskStatus.RUNNING)
+            started_at = current.started_at or (now if next_status is TaskStatus.RUNNING else "")
+            finished_at = now if next_status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.USER_VERIFICATION_REQUIRED} else current.finished_at
+            result = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, stage = ?, attempts = ?, next_attempt_at = ?,
+                    error_code = ?, error_message = ?, fetch_method = ?,
+                    text_length = ?, content_hash = ?, elapsed_ms = ?, started_at = ?,
+                    finished_at = ?, book_id = ?, chapter_id = ?, updated_at = ?, version = version + 1
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    next_status.value,
+                    next_stage.value,
+                    attempts,
+                    next_attempt_at,
+                    error_code[:255],
+                    error_message[:2_000],
+                    fetch_method[:128],
+                    current.text_length if text_length is None else max(0, text_length),
+                    content_hash or current.content_hash,
+                    current.elapsed_ms if elapsed_ms is None else max(0, elapsed_ms),
+                    started_at,
+                    finished_at,
+                    current.book_id if book_id is None else book_id,
+                    current.chapter_id if chapter_id is None else chapter_id,
+                    now,
+                    task_id,
+                    current.version,
+                ),
+            )
+            if result.rowcount != 1:
+                raise ConcurrentImportJobUpdate(str(task_id))
+            self._sync_job_counters(conn, current.job_id)
+            self._append_event(
+                conn,
+                current.job_id,
+                task_id,
+                "task_transitioned",
+                {"status": next_status.value, "stage": next_stage.value, "error_code": error_code},
+            )
+            row = self._task_row(conn, task_id, owner_user_id)
+        return _task_from_row(row)
+
+    def retry_task(self, task_id: int, owner_user_id: str) -> ChapterTask:
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _task_from_row(self._task_row(conn, task_id, owner_user_id))
+            if current.status not in {
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.USER_VERIFICATION_REQUIRED,
+            }:
+                raise InvalidImportJobTransition(f"task {current.status.value} cannot be retried")
+            now = _now()
+            result = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, stage = ?, next_attempt_at = '', error_code = '',
+                    error_message = '', finished_at = '', updated_at = ?, version = version + 1
+                WHERE id = ? AND version = ?
+                """,
+                (TaskStatus.QUEUED.value, TaskStage.QUEUED.value, now, task_id, current.version),
+            )
+            if result.rowcount != 1:
+                raise ConcurrentImportJobUpdate(str(task_id))
+            self._sync_job_counters(conn, current.job_id)
+            self._append_event(conn, current.job_id, task_id, "task_retry_requested", {})
+            row = self._task_row(conn, task_id, owner_user_id)
+        return _task_from_row(row)
+
+    def request_cancel(self, job_id: str, owner_user_id: str) -> ImportJob:
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+            if not current.cancel_requested_at:
+                requested_at = _now()
+                result = conn.execute(
+                    """
+                    UPDATE import_jobs
+                    SET cancel_requested_at = ?, version = version + 1
+                    WHERE id = ? AND owner_user_id = ? AND version = ? AND cancel_requested_at = ''
+                    """,
+                    (requested_at, job_id, owner_user_id, current.version),
+                )
+                if result.rowcount != 1:
+                    raise ConcurrentImportJobUpdate(job_id)
+                self._append_event(conn, job_id, None, "cancel_requested", {})
+            row = self._job_row(conn, job_id, owner_user_id)
+        return _job_from_row(row)
+
+    def list_events(self, job_id: str, owner_user_id: str) -> list[ImportJobEvent]:
+        with get_connection(self.db_path) as conn:
+            if self._job_row(conn, job_id, owner_user_id, required=False) is None:
+                return []
+            rows = conn.execute(
+                "SELECT * FROM import_job_events WHERE job_id = ? ORDER BY sequence ASC", (job_id,)
+            ).fetchall()
+        return [_event_from_row(row) for row in rows]
+
+    @staticmethod
+    def _append_event(
+        conn: sqlite3.Connection,
+        job_id: str,
+        task_id: int | None,
+        event_type: str,
+        payload: Mapping[str, Any] | None,
+    ) -> None:
+        sequence = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM import_job_events WHERE job_id = ?", (job_id,)
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO import_job_events (job_id, task_id, sequence, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                task_id,
+                sequence,
+                event_type,
+                json.dumps(sanitize_import_job_payload(payload), ensure_ascii=False, sort_keys=True),
+                _now(),
+            ),
+        )
+
+    @staticmethod
+    def _job_row(
+        conn: sqlite3.Connection,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        required: bool = True,
+    ) -> sqlite3.Row | None:
+        row = conn.execute(
+            "SELECT * FROM import_jobs WHERE id = ? AND owner_user_id = ?", (job_id, owner_user_id)
+        ).fetchone()
+        if row is not None or not required:
+            return row
+        existing = conn.execute("SELECT 1 FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
+        if existing:
+            raise PermissionError("import job is not owned by this user")
+        raise LookupError("import job not found")
+
+    @staticmethod
+    def _task_row(conn: sqlite3.Connection, task_id: int, owner_user_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT chapter_tasks.*
+            FROM chapter_tasks
+            JOIN import_jobs ON import_jobs.id = chapter_tasks.job_id
+            WHERE chapter_tasks.id = ? AND import_jobs.owner_user_id = ?
+            """,
+            (task_id, owner_user_id),
+        ).fetchone()
+        if row is not None:
+            return row
+        existing = conn.execute("SELECT 1 FROM chapter_tasks WHERE id = ?", (task_id,)).fetchone()
+        if existing:
+            raise PermissionError("chapter task is not owned by this user")
+        raise LookupError("chapter task not found")
+
+    @staticmethod
+    def _sync_job_counters(conn: sqlite3.Connection, job_id: str) -> None:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM chapter_tasks WHERE job_id = ? GROUP BY status", (job_id,)
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        conn.execute(
+            """
+            UPDATE import_jobs
+            SET total = ?, queued_count = ?, running_count = ?, succeeded_count = ?,
+                failed_count = ?, cancelled_count = ?, waiting_retry_count = ?,
+                verification_required_count = ?
+            WHERE id = ?
+            """,
+            (
+                sum(counts.values()),
+                counts.get(TaskStatus.QUEUED.value, 0),
+                counts.get(TaskStatus.RUNNING.value, 0),
+                counts.get(TaskStatus.SUCCEEDED.value, 0),
+                counts.get(TaskStatus.FAILED.value, 0),
+                counts.get(TaskStatus.CANCELLED.value, 0),
+                counts.get(TaskStatus.WAITING_RETRY.value, 0),
+                counts.get(TaskStatus.USER_VERIFICATION_REQUIRED.value, 0),
+                job_id,
+            ),
+        )

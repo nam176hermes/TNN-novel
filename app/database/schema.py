@@ -475,6 +475,86 @@ CREATE TABLE IF NOT EXISTS job_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(job_id, id DESC);
 
+-- P05 import work is intentionally persisted separately from the existing
+-- mobile_jobs runner so it can be introduced without changing that worker.
+CREATE TABLE IF NOT EXISTS import_jobs (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    book_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'queued',
+    total INTEGER NOT NULL DEFAULT 0,
+    queued_count INTEGER NOT NULL DEFAULT 0,
+    running_count INTEGER NOT NULL DEFAULT 0,
+    succeeded_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_count INTEGER NOT NULL DEFAULT 0,
+    waiting_retry_count INTEGER NOT NULL DEFAULT 0,
+    verification_required_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    error_summary TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_created
+    ON import_jobs(owner_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_status
+    ON import_jobs(owner_user_id, status);
+
+CREATE TABLE IF NOT EXISTS chapter_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    canonical_identity TEXT NOT NULL,
+    canonical_chapter_url TEXT NOT NULL,
+    chapter_number INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    stage TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    fetch_method TEXT NOT NULL DEFAULT '',
+    text_length INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL DEFAULT '',
+    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    book_id INTEGER,
+    chapter_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(job_id, canonical_identity),
+    FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL,
+    FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_job_status
+    ON chapter_tasks(job_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_next_attempt
+    ON chapter_tasks(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS import_job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    task_id INTEGER,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id, sequence),
+    FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES chapter_tasks(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_job_events_job_sequence
+    ON import_job_events(job_id, sequence ASC);
+
 CREATE TABLE IF NOT EXISTS tts_jobs (
     id TEXT PRIMARY KEY,
     book_id INTEGER NOT NULL,

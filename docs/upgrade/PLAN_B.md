@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P04 — source chapter idempotency.
+- Active milestone: P05 — persistent import-job models.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -29,6 +29,12 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P04 scope is limited to canonical source chapter identity, SQLite migration/backfill, and transactional source-backed `import_from_text` upsert semantics.
 - P04 does not add job queues, retry, concurrency scheduling, SSE, or parser DOM work.
 - Full P04 verification: `scripts/verify.sh` completed after the legacy migration regression was fixed; backend pytest advanced to frontend Vitest and production build without a failing stage. The known build asset warning for `sidebar-scenery.png` remains.
+- P05 implementation status: implemented; backend verification complete, frontend full-suite rerun blocked by a pre-existing Vitest stall.
+- P05 scope is limited to additive SQLite schema/migration, immutable models, owner-scoped repository operations, optimistic compare-and-set transitions, task-derived counters, and transactional event append.
+- P05 does not start or claim work, schedule retry, add API/SSE, or modify the existing `mobile_jobs` worker.
+- P05 keeps future import persistence in `import_jobs`, `chapter_tasks`, and `import_job_events`, separate from active `mobile_jobs` behavior.
+- Targeted P05 regression: `8 passed, 1 warning` for import-job state/migration plus existing job and legacy migration checks.
+- P05 full-check note: the final `scripts/verify.sh` run completed backend pytest (it advanced to Vitest), but Vitest produced only its startup banner for more than ten minutes and was terminated. The P05 diff has no frontend changes; a prior frontend test/build on the unchanged web worktree completed, with the known unresolved `sidebar-scenery.png` build asset warning. Re-run frontend verification in an environment without the observed worker stall before release.
 
 ## Goals
 
@@ -162,11 +168,13 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Reuse the P02 URL policy for canonicalization without migration-time network I/O.
 - Do not add job queues, retry/concurrency scheduling, SSE, or parser DOM work.
 
-### P05 — Import job ownership and retry semantics
+### P05 — Persistent import-job models
 
-- Clarify import job lifecycle and retry/cancel behavior.
-- Ensure failure states are durable and user-visible.
-- Keep duplicate handling explicit.
+- Add additive SQLite tables for import jobs, per-chapter tasks, and monotonic events without replacing `mobile_jobs`.
+- Define durable job/task status and stage state machines, with explicit retry as the sole terminal-task requeue operation.
+- Keep reads/transitions owner-scoped, use optimistic compare-and-set versions, and derive import-job counters from tasks in the same transaction.
+- Filter HTML/content/cookie/token/secret fields from configuration snapshots and event payloads.
+- Do not start workers, claim tasks, schedule retry, add HTTP/SSE, or change parser behavior.
 
 ### P06 — Import UX for duplicates and verification-required states
 
@@ -271,6 +279,9 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-14 | P04 treats `(resolved book id, adapter_id, canonical_chapter_url)` as a source chapter identity. | `book_id` is the durable result of the existing canonical `book_key` resolver; including adapter and canonical URL avoids chapter-number-only duplicate decisions. |
 | 2026-07-14 | P04 backfill leaves legacy identity collisions intact and marks the non-canonical row rather than deleting data. | A migration must not silently merge or delete operator records merely to create a unique index. |
 | 2026-07-14 | P04 uses `BEGIN IMMEDIATE` around source-backed book resolution and chapter upsert. | SQLite serializes concurrent writers and lets a second matching import return `skipped_duplicate`, not HTTP 500. |
+| 2026-07-14 | P05 introduces import job persistence beside, rather than inside, `mobile_jobs`. | Existing translation/TTS worker lifecycle remains stable while a later import worker gains a bounded migration seam. |
+| 2026-07-14 | P05 transitions, task-derived counters, and events share one SQLite transaction with optimistic versions. | A persisted state cannot report counters/events that disagree with the task transition that produced it. |
+| 2026-07-14 | P05 strips sensitive payload keys before persisting job config/events. | Durable operational metadata must not become a second store for content, cookies, or secrets. |
 
 ## Test matrix
 
@@ -286,6 +297,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | Diff hygiene | `git diff --check` | pass/fail |
 | API contract changes | Backend schema tests plus frontend type/client tests | compatibility notes |
 | Source/import safety | Challenge, blocked, timeout, unsupported, duplicate, stored text length/hash, typed failure metadata, and redaction tests | no secrets/content in output |
+| P05 import persistence | State transitions, explicit task retry, cancel idempotency, owner isolation, derived counters, monotonic events, and legacy migration | no worker/API/SSE side effects |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks

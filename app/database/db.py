@@ -57,7 +57,7 @@ list_reader_xray_entities = _reader_repository.list_reader_xray_entities
 list_reader_timeline_events = _reader_repository.list_reader_timeline_events
 
 
-CURRENT_SCHEMA_VERSION = "2026-07-14-import-idempotency-phase4"
+CURRENT_SCHEMA_VERSION = "2026-07-14-import-job-persistence-phase5"
 
 
 @dataclass(frozen=True)
@@ -555,6 +555,106 @@ def _ensure_tts_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tts_jobs_owner_user_id ON tts_jobs(owner_user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tts_chunks_job_status ON tts_chunks(job_id, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tts_chunks_hash ON tts_chunks(text_hash)")
+
+
+def _ensure_import_job_tables(conn: sqlite3.Connection) -> None:
+    """Backfill P05 persistence columns for databases created before this milestone.
+
+    Table creation lives in the canonical schema.  This migration is deliberately
+    additive so existing operator databases need no data rewrite or downtime.
+    """
+    if _table_exists(conn, "import_jobs"):
+        for column_sql in (
+            "owner_user_id TEXT NOT NULL DEFAULT ''",
+            "source TEXT NOT NULL DEFAULT ''",
+            "source_url TEXT NOT NULL DEFAULT ''",
+            "book_id INTEGER",
+            "status TEXT NOT NULL DEFAULT 'queued'",
+            "total INTEGER NOT NULL DEFAULT 0",
+            "queued_count INTEGER NOT NULL DEFAULT 0",
+            "running_count INTEGER NOT NULL DEFAULT 0",
+            "succeeded_count INTEGER NOT NULL DEFAULT 0",
+            "failed_count INTEGER NOT NULL DEFAULT 0",
+            "cancelled_count INTEGER NOT NULL DEFAULT 0",
+            "waiting_retry_count INTEGER NOT NULL DEFAULT 0",
+            "verification_required_count INTEGER NOT NULL DEFAULT 0",
+            "created_at TEXT NOT NULL DEFAULT ''",
+            "started_at TEXT NOT NULL DEFAULT ''",
+            "finished_at TEXT NOT NULL DEFAULT ''",
+            "cancel_requested_at TEXT NOT NULL DEFAULT ''",
+            "config_snapshot_json TEXT NOT NULL DEFAULT '{}'",
+            "error_summary TEXT NOT NULL DEFAULT ''",
+            "version INTEGER NOT NULL DEFAULT 0",
+        ):
+            _add_column_if_missing(conn, "import_jobs", column_sql)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_created ON import_jobs(owner_user_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_status ON import_jobs(owner_user_id, status)")
+
+    if _table_exists(conn, "chapter_tasks"):
+        for column_sql in (
+            "canonical_identity TEXT NOT NULL DEFAULT ''",
+            "canonical_chapter_url TEXT NOT NULL DEFAULT ''",
+            "chapter_number INTEGER NOT NULL DEFAULT 0",
+            "title TEXT NOT NULL DEFAULT ''",
+            "status TEXT NOT NULL DEFAULT 'queued'",
+            "stage TEXT NOT NULL DEFAULT 'queued'",
+            "attempts INTEGER NOT NULL DEFAULT 0",
+            "next_attempt_at TEXT NOT NULL DEFAULT ''",
+            "error_code TEXT NOT NULL DEFAULT ''",
+            "error_message TEXT NOT NULL DEFAULT ''",
+            "fetch_method TEXT NOT NULL DEFAULT ''",
+            "text_length INTEGER NOT NULL DEFAULT 0",
+            "content_hash TEXT NOT NULL DEFAULT ''",
+            "elapsed_ms INTEGER NOT NULL DEFAULT 0",
+            "started_at TEXT NOT NULL DEFAULT ''",
+            "finished_at TEXT NOT NULL DEFAULT ''",
+            "book_id INTEGER",
+            "chapter_id INTEGER",
+            "created_at TEXT NOT NULL DEFAULT ''",
+            "updated_at TEXT NOT NULL DEFAULT ''",
+            "version INTEGER NOT NULL DEFAULT 0",
+        ):
+            _add_column_if_missing(conn, "chapter_tasks", column_sql)
+        has_task_identity_collision = conn.execute(
+            """
+            SELECT 1 FROM chapter_tasks
+            WHERE canonical_identity != ''
+            GROUP BY job_id, canonical_identity
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if not has_task_identity_collision:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_chapter_tasks_job_identity "
+                "ON chapter_tasks(job_id, canonical_identity) WHERE canonical_identity != ''"
+            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_tasks_job_status ON chapter_tasks(job_id, status, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_tasks_next_attempt ON chapter_tasks(status, next_attempt_at)")
+
+    if _table_exists(conn, "import_job_events"):
+        for column_sql in (
+            "task_id INTEGER",
+            "sequence INTEGER NOT NULL DEFAULT 0",
+            "event_type TEXT NOT NULL DEFAULT ''",
+            "payload_json TEXT NOT NULL DEFAULT '{}'",
+            "created_at TEXT NOT NULL DEFAULT ''",
+        ):
+            _add_column_if_missing(conn, "import_job_events", column_sql)
+        has_event_sequence_collision = conn.execute(
+            """
+            SELECT 1 FROM import_job_events
+            GROUP BY job_id, sequence
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if not has_event_sequence_collision:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_job_events_job_sequence_unique "
+                "ON import_job_events(job_id, sequence)"
+            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_import_job_events_job_sequence ON import_job_events(job_id, sequence ASC)")
 
 
 def _rebuild_glossary_terms_table(conn: sqlite3.Connection) -> None:
@@ -1531,7 +1631,11 @@ def init_db(db_path: Path) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         _ensure_schema_migrations(conn)
         _migrate_legacy_schema(conn)
+        # Existing partial P05 tables need their columns before SCHEMA creates
+        # indexes against them; fresh tables are created by SCHEMA just below.
+        _ensure_import_job_tables(conn)
         conn.executescript(SCHEMA)
+        _ensure_import_job_tables(conn)
         seed_default_model_providers(conn)
         seed_default_style_profiles(conn)
         operator_user = _seed_operator_user_from_env(conn)
