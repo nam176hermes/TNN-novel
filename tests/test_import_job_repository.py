@@ -215,11 +215,16 @@ def test_init_db_migrates_legacy_database_with_import_job_tables(tmp_path) -> No
             row[1]
             for row in connection.execute("PRAGMA table_info(import_jobs)")
         }
+        task_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(chapter_tasks)")
+        }
         preserved_legacy_rows = connection.execute(
             "SELECT COUNT(*) FROM chapter_tasks WHERE job_id = 'legacy-job'"
         ).fetchone()[0]
 
     assert {"import_jobs", "chapter_tasks", "import_job_events"}.issubset(tables)
     assert {"cancel_requested_at", "config_snapshot_json", "error_summary"}.issubset(columns)
+    assert {"retryable", "lease_token", "lease_owner", "lease_expires_at"}.issubset(task_columns)
     assert preserved_legacy_rows == 2
     assert job.id

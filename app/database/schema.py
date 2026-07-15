@@ -527,6 +527,10 @@ CREATE TABLE IF NOT EXISTS chapter_tasks (
     finished_at TEXT NOT NULL DEFAULT '',
     book_id INTEGER,
     chapter_id INTEGER,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 0,
@@ -539,6 +543,8 @@ CREATE INDEX IF NOT EXISTS idx_chapter_tasks_job_status
     ON chapter_tasks(job_id, status, id);
 CREATE INDEX IF NOT EXISTS idx_chapter_tasks_next_attempt
     ON chapter_tasks(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_lease_expiry
+    ON chapter_tasks(status, lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS import_job_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -610,6 +610,10 @@ def _ensure_import_job_tables(conn: sqlite3.Connection) -> None:
             "finished_at TEXT NOT NULL DEFAULT ''",
             "book_id INTEGER",
             "chapter_id INTEGER",
+            "retryable INTEGER NOT NULL DEFAULT 0",
+            "lease_token TEXT NOT NULL DEFAULT ''",
+            "lease_owner TEXT NOT NULL DEFAULT ''",
+            "lease_expires_at TEXT NOT NULL DEFAULT ''",
             "created_at TEXT NOT NULL DEFAULT ''",
             "updated_at TEXT NOT NULL DEFAULT ''",
             "version INTEGER NOT NULL DEFAULT 0",
@@ -631,6 +635,7 @@ def _ensure_import_job_tables(conn: sqlite3.Connection) -> None:
             )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_tasks_job_status ON chapter_tasks(job_id, status, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_tasks_next_attempt ON chapter_tasks(status, next_attempt_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chapter_tasks_lease_expiry ON chapter_tasks(status, lease_expires_at)")
 
     if _table_exists(conn, "import_job_events"):
         for column_sql in (

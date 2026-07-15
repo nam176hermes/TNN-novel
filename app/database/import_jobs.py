@@ -11,7 +11,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
@@ -177,6 +177,10 @@ class ChapterTask:
     finished_at: str
     book_id: int | None
     chapter_id: int | None
+    retryable: bool
+    lease_token: str
+    lease_owner: str
+    lease_expires_at: str
     version: int
 
 
@@ -239,6 +243,10 @@ def _task_from_row(row: sqlite3.Row) -> ChapterTask:
         finished_at=str(row["finished_at"] or ""),
         book_id=int(row["book_id"]) if row["book_id"] is not None else None,
         chapter_id=int(row["chapter_id"]) if row["chapter_id"] is not None else None,
+        retryable=bool(int(row["retryable"] or 0)),
+        lease_token=str(row["lease_token"] or ""),
+        lease_owner=str(row["lease_owner"] or ""),
+        lease_expires_at=str(row["lease_expires_at"] or ""),
         version=int(row["version"] or 0),
     )
 
@@ -393,6 +401,8 @@ class ImportJobRepository:
         elapsed_ms: int | None = None,
         book_id: int | None = None,
         chapter_id: int | None = None,
+        retryable: bool | None = None,
+        lease_token: str | None = None,
     ) -> ChapterTask:
         next_status = TaskStatus(status)
         next_stage = TaskStage(stage)
@@ -401,6 +411,8 @@ class ImportJobRepository:
             current = _task_from_row(self._task_row(conn, task_id, owner_user_id))
             if current.status != next_status and next_status not in _TASK_TRANSITIONS[current.status]:
                 raise InvalidImportJobTransition(f"task {current.status.value} cannot transition to {next_status.value}")
+            if lease_token is not None and current.lease_token != lease_token:
+                raise ConcurrentImportJobUpdate(str(task_id))
             now = _now()
             attempts = current.attempts + int(current.status is not TaskStatus.RUNNING and next_status is TaskStatus.RUNNING)
             started_at = current.started_at or (now if next_status is TaskStatus.RUNNING else "")
@@ -411,7 +423,9 @@ class ImportJobRepository:
                 SET status = ?, stage = ?, attempts = ?, next_attempt_at = ?,
                     error_code = ?, error_message = ?, fetch_method = ?,
                     text_length = ?, content_hash = ?, elapsed_ms = ?, started_at = ?,
-                    finished_at = ?, book_id = ?, chapter_id = ?, updated_at = ?, version = version + 1
+                    finished_at = ?, book_id = ?, chapter_id = ?, retryable = ?,
+                    lease_token = ?, lease_owner = ?, lease_expires_at = ?,
+                    updated_at = ?, version = version + 1
                 WHERE id = ? AND version = ?
                 """,
                 (
@@ -429,6 +443,10 @@ class ImportJobRepository:
                     finished_at,
                     current.book_id if book_id is None else book_id,
                     current.chapter_id if chapter_id is None else chapter_id,
+                    int(current.retryable if retryable is None else retryable),
+                    "" if next_status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.USER_VERIFICATION_REQUIRED} else current.lease_token,
+                    "" if next_status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.USER_VERIFICATION_REQUIRED} else current.lease_owner,
+                    "" if next_status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.USER_VERIFICATION_REQUIRED} else current.lease_expires_at,
                     now,
                     task_id,
                     current.version,
@@ -462,7 +480,9 @@ class ImportJobRepository:
                 """
                 UPDATE chapter_tasks
                 SET status = ?, stage = ?, next_attempt_at = '', error_code = '',
-                    error_message = '', finished_at = '', updated_at = ?, version = version + 1
+                    error_message = '', retryable = 0, finished_at = '',
+                    lease_token = '', lease_owner = '', lease_expires_at = '',
+                    updated_at = ?, version = version + 1
                 WHERE id = ? AND version = ?
                 """,
                 (TaskStatus.QUEUED.value, TaskStage.QUEUED.value, now, task_id, current.version),
@@ -473,6 +493,219 @@ class ImportJobRepository:
             self._append_event(conn, current.job_id, task_id, "task_retry_requested", {})
             row = self._task_row(conn, task_id, owner_user_id)
         return _task_from_row(row)
+
+    def enqueue_job(self, job_id: str, owner_user_id: str) -> ImportJob:
+        """Record an enqueue request without starting any worker."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+            if current.status is not JobStatus.QUEUED:
+                raise InvalidImportJobTransition(f"job {current.status.value} cannot be enqueued")
+            self._append_event(conn, job_id, None, "job_enqueued", {})
+            row = self._job_row(conn, job_id, owner_user_id)
+        return _job_from_row(row)
+
+    def is_cancel_requested(self, job_id: str, owner_user_id: str) -> bool:
+        with get_connection(self.db_path) as conn:
+            row = self._job_row(conn, job_id, owner_user_id, required=False)
+        return bool(row and row["cancel_requested_at"])
+
+    def claim_next_task(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 120,
+    ) -> ChapterTask | None:
+        """Atomically claim a queued task so concurrent workers cannot share it."""
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        token = uuid.uuid4().hex
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+            if job.cancel_requested_at or job.status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
+                return None
+            row = conn.execute(
+                """
+                SELECT * FROM chapter_tasks
+                WHERE job_id = ? AND status = ? AND COALESCE(lease_token, '') = ''
+                ORDER BY id ASC LIMIT 1
+                """,
+                (job_id, TaskStatus.QUEUED.value),
+            ).fetchone()
+            if row is None:
+                return None
+            task = _task_from_row(row)
+            updated = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, attempts = attempts + 1,
+                    started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                    lease_token = ?, lease_owner = ?, lease_expires_at = ?,
+                    updated_at = ?, version = version + 1
+                WHERE id = ? AND status = ? AND version = ? AND COALESCE(lease_token, '') = ''
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    now_text,
+                    token,
+                    worker_id,
+                    expires_at,
+                    now_text,
+                    task.id,
+                    TaskStatus.QUEUED.value,
+                    task.version,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            self._sync_job_counters(conn, job_id)
+            self._append_event(conn, job_id, task.id, "task_claimed", {"worker_id": worker_id})
+            claimed = self._task_row(conn, task.id, owner_user_id)
+        return _task_from_row(claimed)
+
+    def renew_task_lease(
+        self,
+        task_id: int,
+        owner_user_id: str,
+        *,
+        lease_token: str,
+        lease_seconds: int = 120,
+    ) -> ChapterTask:
+        """Refresh a claimed task lease without changing its stage or event stream."""
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _task_from_row(self._task_row(conn, task_id, owner_user_id))
+            updated = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET lease_expires_at = ?, updated_at = ?, version = version + 1
+                WHERE id = ? AND status = ? AND lease_token = ? AND version = ?
+                """,
+                (
+                    expires_at,
+                    now.isoformat(),
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    lease_token,
+                    current.version,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConcurrentImportJobUpdate(str(task_id))
+            row = self._task_row(conn, task_id, owner_user_id)
+        return _task_from_row(row)
+
+    def cancel_queued_tasks(self, job_id: str, owner_user_id: str) -> int:
+        """Cancel work that has not been claimed yet, transactionally with events."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._job_row(conn, job_id, owner_user_id)
+            rows = conn.execute(
+                "SELECT id FROM chapter_tasks WHERE job_id = ? AND status = ?",
+                (job_id, TaskStatus.QUEUED.value),
+            ).fetchall()
+            now = _now()
+            for row in rows:
+                task_id = int(row["id"])
+                conn.execute(
+                    """
+                    UPDATE chapter_tasks
+                    SET status = ?, stage = ?, error_code = ?, error_message = '',
+                        finished_at = ?, updated_at = ?, version = version + 1
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        TaskStatus.CANCELLED.value,
+                        TaskStage.CANCELLED.value,
+                        "cancelled",
+                        now,
+                        now,
+                        task_id,
+                        TaskStatus.QUEUED.value,
+                    ),
+                )
+                self._append_event(conn, job_id, task_id, "task_cancelled", {"reason": "cancel_requested"})
+            self._sync_job_counters(conn, job_id)
+        return len(rows)
+
+    def recover_expired_tasks(self) -> list[tuple[str, str, int]]:
+        """Requeue expired leases after a process interruption without running work."""
+        now = _now()
+        recovered: list[tuple[str, str, int]] = []
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT chapter_tasks.id, chapter_tasks.job_id, import_jobs.owner_user_id
+                FROM chapter_tasks JOIN import_jobs ON import_jobs.id = chapter_tasks.job_id
+                WHERE chapter_tasks.status = ?
+                    AND COALESCE(chapter_tasks.lease_expires_at, '') != ''
+                    AND chapter_tasks.lease_expires_at <= ?
+                ORDER BY chapter_tasks.id ASC
+                """,
+                (TaskStatus.RUNNING.value, now),
+            ).fetchall()
+            affected_jobs: set[str] = set()
+            for row in rows:
+                task_id = int(row["id"])
+                job_id = str(row["job_id"])
+                conn.execute(
+                    """
+                    UPDATE chapter_tasks
+                    SET status = ?, stage = ?, lease_token = '', lease_owner = '',
+                        lease_expires_at = '', updated_at = ?, version = version + 1
+                    WHERE id = ? AND status = ?
+                    """,
+                    (TaskStatus.QUEUED.value, TaskStage.QUEUED.value, now, task_id, TaskStatus.RUNNING.value),
+                )
+                self._append_event(conn, job_id, task_id, "task_recovered", {"reason": "lease_expired"})
+                recovered.append((job_id, str(row["owner_user_id"]), task_id))
+                affected_jobs.add(job_id)
+            for job_id in affected_jobs:
+                self._sync_job_counters(conn, job_id)
+                conn.execute(
+                    """
+                    UPDATE import_jobs
+                    SET status = ?, finished_at = '', error_summary = '', version = version + 1
+                    WHERE id = ? AND status = ?
+                    """,
+                    (JobStatus.QUEUED.value, job_id, JobStatus.RUNNING.value),
+                )
+                self._append_event(conn, job_id, None, "job_recovered", {"reason": "lease_expired"})
+        return recovered
+
+    def restart_job_for_retry(self, job_id: str, owner_user_id: str) -> ImportJob:
+        """Explicitly reopen a terminal job after its retryable tasks were reset."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+            if current.status not in {
+                JobStatus.FAILED,
+                JobStatus.PARTIALLY_SUCCEEDED,
+                JobStatus.CANCELLED,
+            }:
+                raise InvalidImportJobTransition(f"job {current.status.value} cannot be retried")
+            now = _now()
+            updated = conn.execute(
+                """
+                UPDATE import_jobs
+                SET status = ?, finished_at = '', error_summary = '', cancel_requested_at = '',
+                    version = version + 1
+                WHERE id = ? AND owner_user_id = ? AND version = ?
+                """,
+                (JobStatus.QUEUED.value, job_id, owner_user_id, current.version),
+            )
+            if updated.rowcount != 1:
+                raise ConcurrentImportJobUpdate(job_id)
+            self._append_event(conn, job_id, None, "job_retry_requested", {"at": now})
+            row = self._job_row(conn, job_id, owner_user_id)
+        return _job_from_row(row)
 
     def request_cancel(self, job_id: str, owner_user_id: str) -> ImportJob:
         with get_connection(self.db_path) as conn:

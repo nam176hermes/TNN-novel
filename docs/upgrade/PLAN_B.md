@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P05 — persistent import-job models.
+- Active milestone: P06 — sequential import-job worker core.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -35,6 +35,8 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P05 keeps future import persistence in `import_jobs`, `chapter_tasks`, and `import_job_events`, separate from active `mobile_jobs` behavior.
 - Targeted P05 regression: `8 passed, 1 warning` for import-job state/migration plus existing job and legacy migration checks.
 - P05 full-check note: the final `scripts/verify.sh` run completed backend pytest (it advanced to Vitest), but Vitest produced only its startup banner for more than ten minutes and was terminated. The P05 diff has no frontend changes; a prior frontend test/build on the unchanged web worktree completed, with the known unresolved `sidebar-scenery.png` build asset warning. Re-run frontend verification in an environment without the observed worker stall before release.
+- P06 implementation status: implemented; worker remains sequential and pipeline-injected pending a later real-pipeline integration.
+- P06 adds task leases, atomic DB claims, cooperative cancellation, expired-lease recovery, and explicit retryable-task reset. It does not add API routes, SSE, autonomous scheduler threads, retry scheduling, or parallel task execution.
 
 ## Goals
 
@@ -176,11 +178,13 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Filter HTML/content/cookie/token/secret fields from configuration snapshots and event payloads.
 - Do not start workers, claim tasks, schedule retry, add HTTP/SSE, or change parser behavior.
 
-### P06 — Import UX for duplicates and verification-required states
+### P06 — Sequential import-job worker core
 
-- Surface duplicate book conflicts clearly.
-- Surface `user_verification_required` as an operator action, not an internal exception.
-- Keep current import workflows.
+- Activate P05 jobs through an injected, sequential pipeline: `fetching → parsing → validating → importing → terminal`.
+- Claim one task atomically with a durable lease; use SQLite as the scheduling source of truth.
+- Support cooperative cancel, expired-lease recovery, and an explicit retry operation only for failed retryable tasks.
+- Keep P04 as the idempotency boundary for any real import integration.
+- Do not add API/SSE, autonomous scheduler threads, retry scheduling, or task concurrency.
 
 ### P07 — Source catalog health
 
@@ -245,7 +249,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P03 | P01, P02 | URL preview/fetch ownership needs normalized result states. |
 | P04 | P02, P03 | Canonical URLs and normalized content hashes are prerequisites for idempotent source imports. |
 | P05 | P03 | Import job ownership depends on preview/fetch ownership. |
-| P06 | P01, P05 | UX needs backend states and job semantics. |
+| P06 | P04, P05 | Sequential worker relies on idempotent import identity and durable job/task state. |
 | P07 | P04 | Health lifecycle builds on managed source policy. |
 | P08 | P02 | Browser/session containment needs isolated interface and safe logging. |
 | P09 | P05, P07 | Observability needs stable job/source events. |
@@ -282,6 +286,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-14 | P05 introduces import job persistence beside, rather than inside, `mobile_jobs`. | Existing translation/TTS worker lifecycle remains stable while a later import worker gains a bounded migration seam. |
 | 2026-07-14 | P05 transitions, task-derived counters, and events share one SQLite transaction with optimistic versions. | A persisted state cannot report counters/events that disagree with the task transition that produced it. |
 | 2026-07-14 | P05 strips sensitive payload keys before persisting job config/events. | Durable operational metadata must not become a second store for content, cookies, or secrets. |
+| 2026-07-15 | P06 uses per-task leases and `BEGIN IMMEDIATE` claims rather than an in-memory queue. | SQLite remains the source of truth across worker restarts while P06 stays single-task sequential. |
+| 2026-07-15 | P06 exposes retry only as an explicit reset of failed `retryable` tasks. | No automatic retry/backoff policy is introduced before its separate milestone. |
 
 ## Test matrix
 
@@ -298,6 +304,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | API contract changes | Backend schema tests plus frontend type/client tests | compatibility notes |
 | Source/import safety | Challenge, blocked, timeout, unsupported, duplicate, stored text length/hash, typed failure metadata, and redaction tests | no secrets/content in output |
 | P05 import persistence | State transitions, explicit task retry, cancel idempotency, owner isolation, derived counters, monotonic events, and legacy migration | no worker/API/SSE side effects |
+| P06 import worker | Sequential success, partial failure, cancel before/during stage, expired lease recovery, atomic claim, explicit retry, and fake-pipeline idempotency simulation | no real source/browser calls or parallel execution |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks
