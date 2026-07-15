@@ -286,7 +286,10 @@ def test_fetch_public_html_reports_cloudflare_challenge_as_blocked_source(
     monkeypatch.setattr(source_adapters.requests, "Session", FakeSession)
 
     with pytest.raises(SourceBlockedError, match="Cloudflare challenge"):
-        source_adapters.fetch_public_html("https://www.69shuba.com/book/58851.htm")
+        source_adapters.fetch_public_html(
+            "https://www.69shuba.com/book/58851.htm",
+            allow_browser_fallback=False,
+        )
 
 
 def test_fetch_public_html_decodes_gbk_meta_charset(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -180,6 +180,8 @@ async def test_preview_source_url_endpoint_returns_blocked_source_error(temp_db_
 
     assert response.status_code == 400
     assert "Cloudflare challenge" in response.text
+    assert response.headers["X-Novel-Fetch-Error-Code"] == "user_verification_required"
+    assert response.headers["X-Novel-Fetch-Retryable"] == "0"
 
 
 @pytest.mark.asyncio

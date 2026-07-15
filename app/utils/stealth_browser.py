@@ -23,6 +23,7 @@ except ImportError:
 
 from app.utils.cookie_store import save_cookies
 from app.utils.captcha_solver import get_captcha_solver
+from app.security.url_policy import redacted_url, validate_fetch_url
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ class StealthBrowser:
         Returns True if a captcha was detected (regardless of solve success).
         """
         solver = get_captcha_solver()
+        safe_url = redacted_url(url)
 
         # --- Cloudflare Turnstile ---
         turnstile_el = await page.query_selector(
@@ -98,7 +100,7 @@ class StealthBrowser:
         if turnstile_el:
             sitekey = await turnstile_el.get_attribute("data-sitekey")
             if sitekey:
-                logger.info("Turnstile detected (sitekey=%s) for %s", sitekey[:12], url)
+                logger.info("Turnstile detected (sitekey=%s) for %s", sitekey[:12], safe_url)
                 if solver:
                     token = solver.solve_turnstile(url, sitekey)
                     if token:
@@ -129,7 +131,7 @@ class StealthBrowser:
         if recaptcha_el:
             sitekey = await recaptcha_el.get_attribute("data-sitekey")
             if sitekey:
-                logger.info("reCAPTCHA detected (sitekey=%s) for %s", sitekey[:12], url)
+                logger.info("reCAPTCHA detected (sitekey=%s) for %s", sitekey[:12], safe_url)
                 if solver:
                     token = solver.solve_recaptcha(url, sitekey)
                     if token:
@@ -172,6 +174,9 @@ class StealthBrowser:
 
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError("Playwright not installed")
+        safe_url_result = validate_fetch_url(url)
+        url = safe_url_result.canonical_url
+        safe_url = redacted_url(url)
 
         # Auto-detect display — WSLg provides :0, Xvfb typically :99
         display = os.getenv("DISPLAY", "")
@@ -226,7 +231,7 @@ class StealthBrowser:
             await asyncio.sleep(5)
             title = await page.title()
             if "Checking your browser" in title or "Just a moment" in title:
-                logger.info("Cloudflare challenge page for %s — waiting up to 45s", url)
+                logger.info("Cloudflare challenge page for %s — waiting up to 45s", safe_url)
                 try:
                     await page.wait_for_function(
                         "document.title && !document.title.includes('Just a moment') "
@@ -234,18 +239,18 @@ class StealthBrowser:
                         timeout=45_000,
                     )
                 except Exception:
-                    logger.warning("Cloudflare challenge did not auto-resolve for %s — trying reload", url)
+                    logger.warning("Cloudflare challenge did not auto-resolve for %s — trying reload", safe_url)
                     # Try reloading the page — often resolves after first visit sets cookies
                     try:
                         await page.reload(wait_until="domcontentloaded", timeout=30_000)
                         await asyncio.sleep(5)
                         title2 = await page.title()
                         if "Just a moment" in title2 or "Checking" in title2:
-                            logger.warning("Still blocked after reload for %s", url)
+                            logger.warning("Still blocked after reload for %s", safe_url)
                         else:
-                            logger.info("Cloudflare resolved after reload for %s", url)
+                            logger.info("Cloudflare resolved after reload for %s", safe_url)
                     except Exception as reload_err:
-                        logger.warning("Reload failed for %s: %s", url, reload_err)
+                        logger.warning("Reload failed for %s: %s", safe_url, reload_err)
 
             # 3. Captcha detection + solve
             captcha_found = await self._detect_and_solve_captcha(page, url)
@@ -258,7 +263,7 @@ class StealthBrowser:
                 cookies = await context.cookies()
                 if cookies:
                     save_cookies(url, cookies)
-                    logger.debug("Saved %d cookies for %s", len(cookies), url)
+                    logger.debug("Saved %d cookies for %s", len(cookies), safe_url)
 
             content = await page.content()
             return content

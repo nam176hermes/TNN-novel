@@ -440,6 +440,14 @@ class SourcePreviewResponse(BaseModel):
     automation_reason: str = ""
     bypass_used: bool = False
     bypass_method: str = ""
+    fetch_method: str = ""
+    fetch_status_code: int | None = None
+    fetch_attempts: int = 0
+    fetch_elapsed_ms: int = 0
+    fetch_bytes_received: int = 0
+    fetch_final_url: str = ""
+    fetch_cookies_refreshed: bool = False
+    fetch_cache_hit: bool = False
 
 
 class URLImportChapter(BaseModel):

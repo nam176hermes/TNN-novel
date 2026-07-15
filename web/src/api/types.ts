@@ -825,6 +825,14 @@ export type SourcePreview = {
   automation_reason: string;
   bypass_used: boolean;
   bypass_method: string;
+  fetch_method: string;
+  fetch_status_code: number | null;
+  fetch_attempts: number;
+  fetch_elapsed_ms: number;
+  fetch_bytes_received: number;
+  fetch_final_url: string;
+  fetch_cookies_refreshed: boolean;
+  fetch_cache_hit: boolean;
 };
 
 export type URLFetchChapterRequest = {

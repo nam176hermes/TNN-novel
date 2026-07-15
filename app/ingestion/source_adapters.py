@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from enum import Enum
 from html import unescape
 from html.parser import HTMLParser
-import ipaddress
+import inspect
 import re
-from typing import Iterable, Optional
+import time
+from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urljoin, urlparse
 import os
 
@@ -19,6 +21,13 @@ from app.ingestion.source_policies import (
     is_allowed_source_url,
     source_policy_public_dict,
 )
+from app.security.url_policy import (
+    UrlPolicyViolation,
+    UrlResolver,
+    default_resolver,
+    redacted_url,
+    validate_fetch_url,
+)
 from app.utils.chinese_numbers import parse_chinese_number
 from app.utils.proxy_pool import proxy_pool
 from app.utils.stealth_browser import fetch_with_stealth_sync, PLAYWRIGHT_AVAILABLE
@@ -26,6 +35,75 @@ from app.utils.cookie_store import apply_cookies_to_session
 
 MAX_FETCH_BYTES = 5_000_000
 DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_READ_TIMEOUT_SECONDS = 20
+DEFAULT_TOTAL_TIMEOUT_SECONDS = 30
+DEFAULT_MAX_REDIRECTS = 5
+
+
+class FetchMethod(str, Enum):
+    DIRECT_HTTP = "direct_http"
+    STEALTH_BROWSER_HEADED = "stealth_browser_headed"
+    BROWSER_SESSION = "browser_session"
+    USER_VERIFICATION_REQUIRED = "user_verification_required"
+
+
+class FetchErrorCode(str, Enum):
+    INVALID_URL = "invalid_url"
+    SOURCE_NOT_ALLOWED = "source_not_allowed"
+    PRIVATE_NETWORK_BLOCKED = "private_network_blocked"
+    CONNECT_TIMEOUT = "connect_timeout"
+    READ_TIMEOUT = "read_timeout"
+    RATE_LIMITED = "rate_limited"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    USER_VERIFICATION_REQUIRED = "user_verification_required"
+    CONTENT_NOT_FOUND = "content_not_found"
+    CONTENT_INVALID = "content_invalid"
+    PARSE_FAILED = "parse_failed"
+    DUPLICATE = "duplicate"
+    IMPORT_FAILED = "import_failed"
+    CANCELLED = "cancelled"
+    INTERNAL_ERROR = "internal_error"
+
+
+@dataclass(frozen=True)
+class FetchResult:
+    html: str
+    requested_url: str
+    final_url: str
+    method: FetchMethod
+    status_code: int | None
+    attempts: int
+    elapsed_ms: int
+    bytes_received: int
+    cookies_refreshed: bool
+    cache_hit: bool
+
+
+_SECRET_DETAIL_KEYS = (
+    "authorization",
+    "cookie",
+    "token",
+    "secret",
+    "password",
+    "passphrase",
+    "api_key",
+    "apikey",
+    "proxy",
+)
+
+
+def _sanitize_error_details(details: Mapping[str, Any] | None) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in (details or {}).items():
+        normalized = key.casefold().replace("-", "_")
+        if any(secret_key in normalized for secret_key in _SECRET_DETAIL_KEYS):
+            sanitized[key] = "[redacted]"
+        elif normalized.endswith("url") and isinstance(value, str):
+            sanitized[key] = redacted_url(value)
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 @dataclass(frozen=True)
@@ -52,6 +130,14 @@ class SourcePreview:
     policy: dict[str, int | str] | None = None
     bypass_used: bool = False
     bypass_method: str = ""
+    fetch_method: str = ""
+    fetch_status_code: int | None = None
+    fetch_attempts: int = 0
+    fetch_elapsed_ms: int = 0
+    fetch_bytes_received: int = 0
+    fetch_final_url: str = ""
+    fetch_cookies_refreshed: bool = False
+    fetch_cache_hit: bool = False
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -73,37 +159,80 @@ class SourceChapterContent:
 class SourceAdapterError(ValueError):
     """Raised when a public URL cannot be handled by the source adapter layer."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: FetchErrorCode = FetchErrorCode.INTERNAL_ERROR,
+        retryable: bool = False,
+        http_status: int | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_message = message
+        self.code = code
+        self.retryable = retryable
+        self.http_status = http_status
+        self.details = _sanitize_error_details(details)
+
 
 class SourceBlockedError(SourceAdapterError):
     """Raised when a source asks the importer to stop because of cooldown or verification."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: FetchErrorCode = FetchErrorCode.USER_VERIFICATION_REQUIRED,
+        retryable: bool = False,
+        http_status: int | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            code=code,
+            retryable=retryable,
+            http_status=http_status,
+            details=details,
+        )
+
 
 def validate_public_http_url(url: str) -> str:
-    parsed = urlparse(url.strip())
-    if parsed.scheme not in {"http", "https"}:
-        raise SourceAdapterError("Only http/https source URLs are supported")
-    if not parsed.hostname:
-        raise SourceAdapterError("Source URL must include a hostname")
-    if parsed.username or parsed.password:
-        raise SourceAdapterError("Source URL credentials are not allowed")
+    return validate_source_url(url)
 
-    host = parsed.hostname.casefold().strip("[]").rstrip(".")
-    if host in {"localhost", "0", "0.0.0.0"} or host.endswith(".localhost"):
-        raise SourceAdapterError("Localhost source URLs are not allowed")
 
-    def ensure_allowed(normalized_url: str) -> str:
-        if not is_allowed_source_url(normalized_url):
-            raise SourceAdapterError("Unsupported source domain")
-        return normalized_url
-
+def _fetch_error_code_from_policy(code: str) -> FetchErrorCode:
     try:
-        ip = ipaddress.ip_address(host)
+        return FetchErrorCode(code)
     except ValueError:
-        return ensure_allowed(parsed.geturl())
+        return FetchErrorCode.INTERNAL_ERROR
 
-    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-        raise SourceAdapterError("Private network source URLs are not allowed")
-    return ensure_allowed(parsed.geturl())
+
+def validate_source_url(
+    url: str,
+    *,
+    resolver: UrlResolver | None = None,
+    allowed_domains: Iterable[str] | None = None,
+) -> str:
+    try:
+        result = validate_fetch_url(url, resolver=resolver, allowed_domains=allowed_domains)
+    except UrlPolicyViolation as exc:
+        raise SourceAdapterError(
+            exc.message,
+            code=_fetch_error_code_from_policy(exc.code),
+            retryable=exc.code == FetchErrorCode.SOURCE_UNAVAILABLE.value,
+            http_status=502 if exc.code == FetchErrorCode.SOURCE_UNAVAILABLE.value else 400,
+            details={"url": url},
+        ) from exc
+    if not is_allowed_source_url(result.canonical_url):
+        raise SourceAdapterError(
+            "Unsupported source domain",
+            code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+            retryable=False,
+            http_status=400,
+            details={"url": result.canonical_url},
+        )
+    return result.canonical_url
 
 
 class _AnchorParser(HTMLParser):
@@ -269,19 +398,26 @@ class GenericHtmlSourceAdapter:
         return True
 
     def preview(self, url: str) -> SourcePreview:
-        _reset_bypass_info()
-        html = fetch_public_html(url)
-        info = _get_bypass_info()
-        result = self.preview_from_html(url, html)
-        if info["used"]:
-            from dataclasses import replace as _replace
-            result = _replace(result, bypass_used=True, bypass_method=info["method"])
-        return result
+        fetch = fetch_public_html_result(url)
+        result = self.preview_from_html(fetch.final_url, fetch.html)
+        from dataclasses import replace as _replace
+        return _replace(
+            result,
+            bypass_used=fetch.method is not FetchMethod.DIRECT_HTTP,
+            bypass_method="" if fetch.method is FetchMethod.DIRECT_HTTP else fetch.method.value,
+            fetch_method=fetch.method.value,
+            fetch_status_code=fetch.status_code,
+            fetch_attempts=fetch.attempts,
+            fetch_elapsed_ms=fetch.elapsed_ms,
+            fetch_bytes_received=fetch.bytes_received,
+            fetch_final_url=fetch.final_url,
+            fetch_cookies_refreshed=fetch.cookies_refreshed,
+            fetch_cache_hit=fetch.cache_hit,
+        )
 
     def fetch_chapter(self, url: str) -> SourceChapterContent:
-        _reset_bypass_info()
-        html = fetch_public_html(url)
-        return self.chapter_from_html(url, html)
+        fetch = fetch_public_html_result(url)
+        return self.chapter_from_html(fetch.final_url, fetch.html)
 
     def preview_from_html(self, url: str, html: str) -> SourcePreview:
         safe_url = validate_public_http_url(url)
@@ -439,7 +575,10 @@ def raise_if_cooldown_page(url: str, html: str) -> None:
     policy = get_source_policy(url)
     if policy and policy.detects_cooldown(html[:100_000]):
         raise SourceBlockedError(
-            "Source cooldown or captcha page detected; pause import and retry later or use browser helper"
+            "Source cooldown or captcha page detected; user verification is required",
+            code=FetchErrorCode.USER_VERIFICATION_REQUIRED,
+            retryable=False,
+            http_status=409,
         )
 
 
@@ -481,32 +620,28 @@ def _raise_if_blocked_http_response(url: str, response: requests.Response) -> No
     server = response.headers.get("server", "").casefold()
     if cf_mitigated in {"challenge", "managed_challenge", "interactive"}:
         raise SourceBlockedError(
-            "Source captcha or Cloudflare challenge detected; using headless browser fallback or manual browser helper"
+            "Source captcha or Cloudflare challenge detected; user verification is required",
+            code=FetchErrorCode.USER_VERIFICATION_REQUIRED,
+            retryable=False,
+            http_status=409,
+            details={"url": url},
         )
     if response.status_code == 429:
-        raise SourceBlockedError("Source rate limit detected; pause import and retry later")
+        raise SourceBlockedError(
+            "Source rate limit detected; pause import and retry later",
+            code=FetchErrorCode.RATE_LIMITED,
+            retryable=True,
+            http_status=429,
+            details={"url": url},
+        )
     if response.status_code == 403 and "cloudflare" in server:
         raise SourceBlockedError(
-            "Source Cloudflare protection blocked direct preview; using headless browser fallback or manual browser helper"
+            "Source Cloudflare protection blocked direct preview; user verification is required",
+            code=FetchErrorCode.USER_VERIFICATION_REQUIRED,
+            retryable=False,
+            http_status=409,
+            details={"url": url},
         )
-
-
-import threading
-
-_fetch_context = threading.local()
-
-
-def _get_bypass_info() -> dict:
-    """Return bypass info from the current fetch context."""
-    return getattr(_fetch_context, "bypass", {"used": False, "method": ""})
-
-
-def _reset_bypass_info() -> None:
-    _fetch_context.bypass = {"used": False, "method": ""}
-
-
-def _set_bypass_info(used: bool, method: str = "") -> None:
-    _fetch_context.bypass = {"used": used, "method": method}
 
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +652,10 @@ def _try_stealth_fallback(
     url: str,
     blocked_reason: str,
     timeout: int,
-) -> Optional[str]:
+    requested_url: str | None = None,
+    attempts: int = 0,
+    started_at: float | None = None,
+) -> Optional[FetchResult]:
     """If Playwright is available, retry the blocked URL via stealth browser.
 
     Returns rendered HTML on success; None on failure (original error re-raised
@@ -540,19 +678,60 @@ def _try_stealth_fallback(
 
     # Cooldown check on rendered HTML — bail out if browser also saw captcha
     raise_if_cooldown_page(url, html)
-    _set_bypass_info(True, "stealth_browser")
-    return html
+    return FetchResult(
+        html=html,
+        requested_url=requested_url or url,
+        final_url=url,
+        method=FetchMethod.STEALTH_BROWSER_HEADED,
+        status_code=200,
+        attempts=attempts + 1,
+        elapsed_ms=max(0, int((time.perf_counter() - (started_at or time.perf_counter())) * 1000)),
+        bytes_received=len(html.encode("utf-8")),
+        cookies_refreshed=True,
+        cache_hit=False,
+    )
 
 
-def fetch_public_html(
+def _call_stealth_fallback(
+    url: str,
+    blocked_reason: str,
+    timeout: int,
+    requested_url: str,
+    attempts: int,
+    started_at: float,
+) -> FetchResult | str | None:
+    """Call the fallback while tolerating old test monkeypatch signatures."""
+    try:
+        parameter_count = len(inspect.signature(_try_stealth_fallback).parameters)
+    except (TypeError, ValueError):
+        parameter_count = 6
+    if parameter_count <= 3:
+        return _try_stealth_fallback(url, blocked_reason, timeout)  # type: ignore[misc,call-arg]
+    return _try_stealth_fallback(url, blocked_reason, timeout, requested_url, attempts, started_at)
+
+
+def fetch_public_html_result(
     url: str,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     max_proxy_attempts: int = 3,
     *,
     allow_browser_fallback: bool = True,
-) -> str:
-    current_url = validate_public_http_url(url)
+    resolver: UrlResolver | None = default_resolver,
+    max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    max_response_bytes: int = MAX_FETCH_BYTES,
+    connect_timeout: int | None = None,
+    read_timeout: int | None = None,
+    total_timeout: int | None = None,
+) -> FetchResult:
+    requested_url = url
+    started_at = time.perf_counter()
+    attempts = 0
+    current_url = validate_source_url(url, resolver=resolver)
     original_policy = get_source_policy(current_url)
+    original_domains = original_policy.domains if original_policy else None
+    connect_timeout = connect_timeout if connect_timeout is not None else min(timeout, DEFAULT_CONNECT_TIMEOUT_SECONDS)
+    read_timeout = read_timeout if read_timeout is not None else timeout
+    total_timeout = total_timeout if total_timeout is not None else max(timeout, DEFAULT_TOTAL_TIMEOUT_SECONDS)
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -578,23 +757,57 @@ def fetch_public_html(
             headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
     proxy_attempts = 0
-    for _ in range(6):
+    redirects_followed = 0
+    while True:
+        if time.perf_counter() - started_at > total_timeout:
+            raise SourceAdapterError(
+                "Source fetch exceeded total timeout",
+                code=FetchErrorCode.READ_TIMEOUT,
+                retryable=True,
+                http_status=504,
+                details={"url": current_url},
+            )
         try:
+            attempts += 1
             response = session.get(
                 current_url,
                 headers=headers,
-                timeout=timeout,
+                timeout=(connect_timeout, read_timeout),
                 allow_redirects=False,
                 stream=True,
                 proxies=proxies,
             )
-        except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout) as e:
+        except requests.exceptions.ConnectTimeout as e:
+            if proxy and proxies:
+                proxy_pool.mark_healthy(proxy.url, False)
+            raise SourceAdapterError(
+                "Source connection timed out",
+                code=FetchErrorCode.CONNECT_TIMEOUT,
+                retryable=True,
+                http_status=504,
+                details={"url": current_url},
+            ) from e
+        except requests.exceptions.ReadTimeout as e:
+            raise SourceAdapterError(
+                "Source read timed out",
+                code=FetchErrorCode.READ_TIMEOUT,
+                retryable=True,
+                http_status=504,
+                details={"url": current_url},
+            ) from e
+        except requests.exceptions.ProxyError as e:
             # Mark proxy as unhealthy, retry without proxy or with next one
             if proxy and proxies:
                 proxy_pool.mark_healthy(proxy.url, False)
                 proxy_attempts += 1
                 if proxy_attempts >= max_proxy_attempts:
-                    raise SourceAdapterError(f"Proxy failed after {max_proxy_attempts} attempts: {e}")
+                    raise SourceAdapterError(
+                        f"Proxy failed after {max_proxy_attempts} attempts",
+                        code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                        retryable=True,
+                        http_status=502,
+                        details={"url": current_url, "proxy": getattr(proxy, "url", "")},
+                    ) from e
                 # Try next proxy
                 proxy = proxy_pool.get_next()
                 if proxy:
@@ -603,13 +816,57 @@ def fetch_public_html(
                         proxies["http"] = f"http://{proxy.username}:{proxy.password}@{proxy.url.split('://')[-1]}"
                         proxies["https"] = proxies["http"]
                 continue
-            raise
+            raise SourceAdapterError(
+                "Source connection failed",
+                code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                retryable=True,
+                http_status=502,
+                details={"url": current_url},
+            ) from e
+        except requests.exceptions.RequestException as e:
+            raise SourceAdapterError(
+                "Source request failed",
+                code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                retryable=True,
+                http_status=502,
+                details={"url": current_url},
+            ) from e
 
         if 300 <= response.status_code < 400 and response.headers.get("Location"):
-            next_url = validate_public_http_url(urljoin(current_url, response.headers["Location"]))
+            if redirects_followed >= max_redirects:
+                raise SourceAdapterError(
+                    "Too many redirects while fetching source URL",
+                    code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                    retryable=False,
+                    http_status=508,
+                    details={"url": current_url},
+                )
+            try:
+                next_url = validate_source_url(
+                    urljoin(current_url, response.headers["Location"]),
+                    resolver=resolver,
+                    allowed_domains=original_domains,
+                )
+            except SourceAdapterError as exc:
+                if exc.code is FetchErrorCode.SOURCE_NOT_ALLOWED:
+                    raise SourceAdapterError(
+                        "Source redirect changed to a different supported source",
+                        code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                        retryable=False,
+                        http_status=400,
+                        details={"url": current_url, "redirect": response.headers["Location"]},
+                    ) from exc
+                raise
             next_policy = get_source_policy(next_url)
             if original_policy and (not next_policy or next_policy.source_id != original_policy.source_id):
-                raise SourceAdapterError("Source redirect changed to a different supported source")
+                raise SourceAdapterError(
+                    "Source redirect changed to a different supported source",
+                    code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                    retryable=False,
+                    http_status=400,
+                    details={"url": current_url, "redirect": next_url},
+                )
+            redirects_followed += 1
             current_url = next_url
             continue
 
@@ -618,15 +875,52 @@ def fetch_public_html(
         except SourceBlockedError as e:
             # Browser fallback on blocked responses
             if allow_browser_fallback:
-                html = _try_stealth_fallback(current_url, str(e), timeout)
-                if html is not None:
-                    return html
+                fallback = _call_stealth_fallback(current_url, str(e), timeout, requested_url, attempts, started_at)
+                if isinstance(fallback, FetchResult):
+                    return fallback
+                if isinstance(fallback, str):
+                    return FetchResult(
+                        html=fallback,
+                        requested_url=requested_url,
+                        final_url=current_url,
+                        method=FetchMethod.STEALTH_BROWSER_HEADED,
+                        status_code=200,
+                        attempts=attempts + 1,
+                        elapsed_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+                        bytes_received=len(fallback.encode("utf-8")),
+                        cookies_refreshed=True,
+                        cache_hit=False,
+                    )
             raise
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 404:
+                code = FetchErrorCode.CONTENT_NOT_FOUND
+                retryable = False
+            elif response.status_code >= 500:
+                code = FetchErrorCode.SOURCE_UNAVAILABLE
+                retryable = True
+            else:
+                code = FetchErrorCode.SOURCE_UNAVAILABLE
+                retryable = False
+            raise SourceAdapterError(
+                "Source returned an unsuccessful HTTP status",
+                code=code,
+                retryable=retryable,
+                http_status=response.status_code,
+                details={"url": current_url, "status_code": response.status_code},
+            ) from e
         content_type = response.headers.get("Content-Type", "")
         if content_type and not any(kind in content_type.lower() for kind in ("text/", "html", "xml")):
-            raise SourceAdapterError(f"Unsupported content type: {content_type}")
+            raise SourceAdapterError(
+                f"Unsupported content type: {content_type}",
+                code=FetchErrorCode.CONTENT_INVALID,
+                retryable=False,
+                http_status=415,
+                details={"url": current_url, "content_type": content_type},
+            )
 
         chunks: list[bytes] = []
         total = 0
@@ -634,15 +928,70 @@ def fetch_public_html(
             if not chunk:
                 continue
             total += len(chunk)
-            if total > MAX_FETCH_BYTES:
-                raise SourceAdapterError("Source URL response is too large")
+            if total > max_response_bytes:
+                raise SourceAdapterError(
+                    "Source URL response is too large",
+                    code=FetchErrorCode.CONTENT_INVALID,
+                    retryable=False,
+                    http_status=413,
+                    details={"url": current_url},
+            )
             chunks.append(chunk)
+            if time.perf_counter() - started_at > total_timeout:
+                raise SourceAdapterError(
+                    "Source fetch exceeded total timeout",
+                    code=FetchErrorCode.READ_TIMEOUT,
+                    retryable=True,
+                    http_status=504,
+                    details={"url": current_url},
+                )
         raw = b"".join(chunks)
         text = _decode_html_response(raw, response.encoding, getattr(response, "apparent_encoding", None))
         raise_if_cooldown_page(current_url, text)
-        return text
+        return FetchResult(
+            html=text,
+            requested_url=requested_url,
+            final_url=current_url,
+            method=FetchMethod.DIRECT_HTTP,
+            status_code=response.status_code,
+            attempts=attempts,
+            elapsed_ms=max(0, int((time.perf_counter() - started_at) * 1000)),
+            bytes_received=len(raw),
+            cookies_refreshed=False,
+            cache_hit=False,
+        )
 
-    raise SourceAdapterError("Too many redirects while fetching source URL")
+
+def fetch_public_html(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_proxy_attempts: int = 3,
+    *,
+    allow_browser_fallback: bool = True,
+    resolver: UrlResolver | None = default_resolver,
+    max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    max_response_bytes: int = MAX_FETCH_BYTES,
+    connect_timeout: int | None = None,
+    read_timeout: int | None = None,
+    total_timeout: int | None = None,
+) -> str:
+    """Compatibility wrapper returning only HTML.
+
+    Deprecated for internal callers: use ``fetch_public_html_result`` so fetch
+    metadata is carried with the HTML instead of via side channels.
+    """
+    return fetch_public_html_result(
+        url,
+        timeout=timeout,
+        max_proxy_attempts=max_proxy_attempts,
+        allow_browser_fallback=allow_browser_fallback,
+        resolver=resolver,
+        max_redirects=max_redirects,
+        max_response_bytes=max_response_bytes,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        total_timeout=total_timeout,
+    ).html
 
 
 class SourceAdapterRegistry:

@@ -4,16 +4,21 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P00 — baseline and agent guidance.
+- Active milestone: P02 — URL security and fetch resource limits.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
-- Baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
-- Baseline was run against the current dirty worktree because multiple logic files already had uncommitted changes before P00 documentation was created.
-- Backend pytest baseline: `1 failed, 845 passed, 2 warnings`.
-- Frontend Vitest baseline: `705 passed` across `80` test files.
-- Frontend typecheck: pass.
-- Frontend production build: pass with one unresolved static asset warning.
-- `scripts/lint.sh` and `scripts/verify.sh`: fail on pre-existing `pyflakes` issue in `app/utils/stealth_browser.py`.
-- P00 changes are documentation only. P01 has not started.
+- P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
+- Current implementation commit before P01 edits: `4587885`.
+- P01 implementation status: implemented and verified.
+- P01 scope stayed limited to fetch contract, error taxonomy, direct call-site conversion, source preview metadata, tests, and this plan update.
+- P01 did not add retry, queue, concurrency, SSE, or parser DOM changes.
+- P01 removed production use of thread-local bypass metadata and introduced direct `FetchResult` metadata propagation.
+- Targeted P01 check: `46 passed, 1 warning` for fetch/browser/source/import URL tests; `scripts/lint.sh` passed.
+- Full verification: `scripts/verify.sh` passed with backend `851 passed, 2 warnings`, frontend `705 passed`, and production build passed with the known unresolved `sidebar-scenery.png` asset warning.
+- P02 implementation status: implemented and verified.
+- P02 scope stayed limited to shared URL policy, DNS/IP validation, redirect validation, fetch resource limits, browser top-level URL validation, tests, and this plan update.
+- P02 did not add job queue, retry, concurrency, SSE, parser DOM changes, or frontend behavior.
+- Targeted P02 check before full verification: `65 passed, 1 warning` for URL policy/fetch security/browser/source/import URL tests; `scripts/lint.sh` passed.
+- Full P02 verification: `scripts/verify.sh` passed with backend `870 passed, 2 warnings`, frontend `705 passed`, and production build passed with the known unresolved `sidebar-scenery.png` asset warning.
 
 ## Goals
 
@@ -122,11 +127,14 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Preserve existing import compatibility.
 - Do not add bypass, spoofing, proxy rotation, or auto-solving.
 
-### P02 — Source fetch interface and safe logging
+### P02 — URL security and fetch resource limits
 
-- Isolate direct HTTP/browser/session result mapping behind a narrow service boundary.
-- Sanitize logs and error payloads.
-- Add tests for secret/cookie/content redaction.
+- Add shared URL policy for source fetches.
+- Validate scheme, userinfo, port, canonical hostname/IDNA, DNS/IP class, redirect targets, and adapter/source domain boundaries.
+- Keep direct HTTP redirects manual and re-validated.
+- Bound response bytes and connect/read/total timeouts.
+- Validate browser top-level navigation before `page.goto`.
+- Do not add job queue, retry, frontend work, SSE, or parser DOM changes.
 
 ### P03 — URL preview and chapter fetch ownership
 
@@ -237,6 +245,12 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-14 | Use `user_verification_required` for challenge states. | Keeps import truthful and avoids hidden bypass behavior. |
 | 2026-07-14 | Keep API backward compatibility by default. | Existing frontend, tests, and operator workflows depend on current contracts. |
 | 2026-07-14 | One prompt equals one PR-sized milestone. | Reduces regression risk and keeps verification meaningful. |
+| 2026-07-14 | P01 fetches return immutable `FetchResult` metadata; `fetch_public_html()` remains as a deprecated compatibility wrapper returning HTML. | Removes thread-local side-channel state while preserving legacy HTML callers. |
+| 2026-07-14 | P01 source preview keeps `bypass_used`/`bypass_method` for compatibility and adds direct fetch metadata fields. | Existing UI/API clients remain compatible while new callers can read typed metadata. |
+| 2026-07-14 | P01 source adapter errors keep string `detail` in HTTP responses and add fetch error code/retryable headers. | Avoids breaking old clients while removing the need to parse error strings for converted routes. |
+| 2026-07-14 | P02 centralizes source URL checks in `app/security/url_policy.py`. | Preview, chapter, redirect, and browser navigation need one canonical policy and injectable DNS resolver for tests. |
+| 2026-07-14 | P02 direct HTTP keeps `allow_redirects=False` and validates every redirect target before following. | Prevents public-to-private and cross-adapter redirects without adding retry/queue behavior. |
+| 2026-07-14 | P02 keeps URL query/userinfo out of error details via redacted URL handling. | Fetch errors must carry typed codes without leaking credential/query-bearing URLs. |
 
 ## Test matrix
 
@@ -257,8 +271,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 ## Current known risks
 
 - The worktree was dirty before P00, including import/source/browser/frontend files.
-- Backend pytest currently has one failing source adapter test.
-- `scripts/lint.sh` and `scripts/verify.sh` currently fail on a pre-existing unused import in `app/utils/stealth_browser.py`.
+- P00 baseline had one failing source adapter test and a pyflakes failure; P01 full verification now passes.
 - Legacy browser/captcha/proxy/cookie utilities exist and conflict with the desired Plan B safety posture if expanded.
 - `docs/upgrade/codex-prompts-modified.md` contains older Plan B prompt text that preserves bypass-style behavior; future tasks must follow this document and root `AGENTS.md` instead.
 - Large files such as `pipeline_service.py`, `db.py`, `ImportPanel.tsx`, `client.ts`, and `types.ts` increase regression risk.

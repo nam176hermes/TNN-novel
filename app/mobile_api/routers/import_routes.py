@@ -50,6 +50,17 @@ EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
 )
 
 
+def _source_adapter_http_exception(exc: SourceAdapterError, *, default_status: int = 400) -> HTTPException:
+    return HTTPException(
+        status_code=exc.http_status or default_status,
+        detail=exc.safe_message,
+        headers={
+            "X-Novel-Fetch-Error-Code": exc.code.value,
+            "X-Novel-Fetch-Retryable": "1" if exc.retryable else "0",
+        },
+    )
+
+
 def get_pipeline():
     return PipelineService()
 
@@ -818,9 +829,17 @@ async def preview_source_url(
         )
         preview.setdefault("bypass_used", False)
         preview.setdefault("bypass_method", "")
+        preview.setdefault("fetch_method", "")
+        preview.setdefault("fetch_status_code", None)
+        preview.setdefault("fetch_attempts", 0)
+        preview.setdefault("fetch_elapsed_ms", 0)
+        preview.setdefault("fetch_bytes_received", 0)
+        preview.setdefault("fetch_final_url", "")
+        preview.setdefault("fetch_cookies_refreshed", False)
+        preview.setdefault("fetch_cache_hit", False)
         return preview
     except SourceAdapterError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _source_adapter_http_exception(exc) from exc
     except Exception as exc:
         logger.warning("Source preview failed for %s", data.url, exc_info=True)
         record_audit_event(
@@ -879,7 +898,7 @@ async def import_source_url(
             request=request,
             details={"import_type": "url", "result": "failure"},
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _source_adapter_http_exception(exc) from exc
     record_audit_event(
         event_type="import_start",
         severity="info",
