@@ -858,6 +858,17 @@ export type URLFetchChapterResult = {
   text_length: number;
   book_id: number;
   chapter_id: number;
+  stored_text_length?: number;
+  content_hash?: string;
+  operation?: string;
+  warnings?: string[];
+  error_code?: string;
+  retryable?: boolean;
+  attempts?: number;
+  fetch_method?: string;
+  elapsed_ms?: number;
+  started_at?: string;
+  finished_at?: string;
 };
 
 export type URLFetchResponse = {

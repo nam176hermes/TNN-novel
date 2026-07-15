@@ -479,6 +479,17 @@ class URLFetchChapterResult(BaseModel):
     text_length: int = 0
     book_id: int = 0
     chapter_id: int = 0
+    stored_text_length: int = 0
+    content_hash: str = ""
+    operation: str = ""
+    warnings: list[str] = Field(default_factory=list)
+    error_code: str = ""
+    retryable: bool = False
+    attempts: int = 0
+    fetch_method: str = ""
+    elapsed_ms: int = 0
+    started_at: str = ""
+    finished_at: str = ""
 
 
 class URLFetchResponse(BaseModel):

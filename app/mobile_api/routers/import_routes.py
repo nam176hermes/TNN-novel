@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 
 from app.config import PROJECT_ROOT
 from app.database.db import find_managed_source_for_url, get_managed_source, list_ebook_import_runs
-from app.ingestion.source_adapters import SourceAdapterError, list_source_capabilities, validate_public_http_url
+from app.ingestion.source_adapters import FetchErrorCode, FetchMethod, SourceAdapterError, list_source_capabilities, validate_public_http_url
 from app.ingestion.source_policies import chapter_url_matches_source_book, get_source_policy
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.dependencies import get_db_path
@@ -82,6 +82,24 @@ async def list_sources():
 def _import_error_status(error: ValueError) -> int:
     message = str(error)
     return 409 if "Duplicate chapter" in message else 400
+
+
+def _url_fetch_error_metadata(exc: Exception) -> tuple[FetchErrorCode, bool, str, str]:
+    if isinstance(exc, SourceAdapterError):
+        method = (
+            FetchMethod.USER_VERIFICATION_REQUIRED.value
+            if exc.code is FetchErrorCode.USER_VERIFICATION_REQUIRED
+            else ""
+        )
+        return exc.code, exc.retryable, exc.safe_message, method
+    if isinstance(exc, ValueError) and "Duplicate" in str(exc):
+        return FetchErrorCode.DUPLICATE, False, "Chapter already exists", ""
+    return (
+        FetchErrorCode.IMPORT_FAILED,
+        False,
+        "Chapter import failed. Check the source metadata and try again.",
+        "",
+    )
 
 
 def _safe_import_response(result: dict, request: Request) -> dict:
@@ -939,6 +957,8 @@ async def fetch_source_chapters(
     book_id = 0
 
     for ch in data.chapters:
+        started_at = datetime.now(timezone.utc)
+        started_at_monotonic = time.perf_counter()
         try:
             result = await asyncio.to_thread(
                 pipeline.import_from_source_url,
@@ -950,25 +970,46 @@ async def fetch_source_chapters(
                 chapter_number=ch.chapter_number,
                 chapter_title=ch.title,
             )
-            book_id = result.get("book_id", 0)
+            book_id = result.book_id
             results.append(URLFetchChapterResult(
                 chapter_number=ch.chapter_number,
                 title=ch.title,
                 url=ch.url,
                 success=True,
-                text_length=len(result.get("text", "")) if "text" in result else 0,
+                text_length=result.stored_text_length,
                 book_id=book_id,
-                chapter_id=result.get("chapter_id", 0),
+                chapter_id=result.chapter_id,
+                stored_text_length=result.stored_text_length,
+                content_hash=result.content_hash,
+                operation=result.operation,
+                warnings=list(result.warnings),
+                attempts=result.fetch_attempts,
+                fetch_method=result.fetch_method,
+                elapsed_ms=result.fetch_elapsed_ms or max(0, int((time.perf_counter() - started_at_monotonic) * 1000)),
+                started_at=started_at.isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
             ))
             succeeded += 1
         except Exception as exc:
-            logger.warning("Chapter fetch failed for %s: %s", ch.url, exc, exc_info=True)
+            error_code, retryable, safe_error, fetch_method = _url_fetch_error_metadata(exc)
+            logger.warning(
+                "Chapter fetch/import failed for chapter_number=%s error_code=%s",
+                ch.chapter_number,
+                error_code.value,
+            )
             results.append(URLFetchChapterResult(
                 chapter_number=ch.chapter_number,
                 title=ch.title,
                 url=ch.url,
                 success=False,
-                error=str(exc)[:200],
+                error=safe_error,
+                error_code=error_code.value,
+                retryable=retryable,
+                fetch_method=fetch_method,
+                elapsed_ms=max(0, int((time.perf_counter() - started_at_monotonic) * 1000)),
+                operation="failed",
+                started_at=started_at.isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
             ))
             failed += 1
 

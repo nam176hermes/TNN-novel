@@ -2,13 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from pathlib import Path
 
 from app.utils.chinese_numbers import parse_chinese_number
 
 
+def normalize_import_text(text: str) -> str:
+    """Produce the canonical chapter text stored by text-based imports.
+
+    This is intentionally conservative: it normalizes Unicode and line endings,
+    removes a leading BOM, and trims only outer/trailing whitespace. Paragraph
+    structure and meaningful indentation inside a chapter remain intact.
+    """
+    normalized = unicodedata.normalize("NFC", str(text or ""))
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\u00a0", " ").lstrip("\ufeff")
+    return "\n".join(line.rstrip() for line in normalized.split("\n")).strip()
+
+
 def source_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+    return hashlib.sha256(normalize_import_text(text).encode("utf-8")).hexdigest()
 
 
 def clean_book_title(title: str) -> str:
@@ -51,6 +65,7 @@ def detect_import_metadata(
     text: str = "",
     filename: str = "",
 ) -> dict:
+    text = normalize_import_text(text)
     detected_title = clean_book_title(title)
     detected_chapter_number = chapter_number if chapter_number and chapter_number > 0 else 1
     detected_chapter_title = chapter_title.strip()

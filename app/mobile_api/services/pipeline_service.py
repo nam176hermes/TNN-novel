@@ -16,9 +16,10 @@ import struct
 import time
 import uuid
 import zipfile
+from dataclasses import dataclass, replace
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 
 from app.database.db import (
     get_book_by_id,
@@ -54,12 +55,14 @@ from app.database.db import (
     soft_delete_chapter,
     update_chapter_paths,
     update_import_chapter_with_connection,
+    upsert_import_chapter_with_connection,
+    canonicalize_import_url,
     add_chapter,
     upsert_reader_ai_cache,
     upsert_reader_dictionary_cache,
 )
-from app.ingestion.source_adapters import SourceChapterContent, get_source_registry
-from app.mobile_api.services.import_metadata import detect_import_metadata
+from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
+from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
 from app.mobile_api.services.content_file_service import ContentFileService
 from app.mobile_api.services.reader_service import ReaderService
 from app.translation.ollama_client import call_llm, is_retryable_provider_error, translate_chapter
@@ -78,6 +81,57 @@ from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ChapterImportResult(Mapping[str, object]):
+    """Typed, compatibility-preserving metadata for one stored chapter import."""
+
+    book_id: int
+    chapter_id: int
+    stored_text_length: int
+    content_hash: str
+    operation: str
+    warnings: tuple[str, ...] = ()
+    title: str = ""
+    chapter_number: int = 0
+    chapter_title: str = ""
+    source_type: str = ""
+    source_url: str = ""
+    adapter_id: str = ""
+    path: str = ""
+    fetch_method: str = ""
+    fetch_attempts: int = 0
+    fetch_elapsed_ms: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "book_id": self.book_id,
+            "chapter_id": self.chapter_id,
+            "stored_text_length": self.stored_text_length,
+            "content_hash": self.content_hash,
+            "operation": self.operation,
+            "warnings": list(self.warnings),
+            "title": self.title,
+            "chapter_number": self.chapter_number,
+            "chapter_title": self.chapter_title,
+            "source_type": self.source_type,
+            "source_url": self.source_url,
+            "adapter_id": self.adapter_id,
+            "path": self.path,
+            "fetch_method": self.fetch_method,
+            "fetch_attempts": self.fetch_attempts,
+            "fetch_elapsed_ms": self.fetch_elapsed_ms,
+        }
+
+    def __getitem__(self, key: str) -> object:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
 
 
 CLASSICAL_PRONOUN_STYLE_GUIDE = """Vietnamese classical web-novel style rules:
@@ -4803,54 +4857,125 @@ class PipelineService:
         book_source: str = "manual",
         book_source_url: str = "",
         adapter_id: str = "",
-    ) -> dict:
+    ) -> ChapterImportResult:
+        normalized_text = normalize_import_text(text)
+        if not normalized_text:
+            raise SourceAdapterError(
+                "Chapter content is empty",
+                code=FetchErrorCode.CONTENT_INVALID,
+                retryable=False,
+                http_status=422,
+            )
         metadata = detect_import_metadata(
             title=title,
             chapter_number=chapter_number,
             chapter_title=chapter_title,
-            text=text,
+            text=normalized_text,
         )
         detected_title = metadata["title"]
         detected_chapter_number = metadata["chapter_number"]
         detected_chapter_title = metadata["chapter_title"]
-        book_id = self._book_id_for_import(
-            detected_title,
-            author=author,
-            source=book_source,
-            source_url=book_source_url or source_url,
-        )
+        try:
+            canonical_chapter_url = canonicalize_import_url(source_url)
+            canonical_source_url = canonicalize_import_url(book_source_url or source_url)
+        except Exception as exc:
+            code_value = str(getattr(exc, "code", FetchErrorCode.INVALID_URL.value))
+            try:
+                code = FetchErrorCode(code_value)
+            except ValueError:
+                code = FetchErrorCode.INVALID_URL
+            raise SourceAdapterError(
+                "Source URL is invalid for import",
+                code=code,
+                retryable=False,
+                http_status=400,
+            ) from exc
 
         safe_title = self._safe_filename_part(detected_title) or "book"
         safe_chapter_title = self._safe_filename_part(detected_chapter_title) or "chapter"
         raw_dir = self.data_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         raw_path = raw_dir / f"{safe_title}_ch{detected_chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
-        raw_path.write_text(text, encoding="utf-8")
         try:
-            chapter_id = add_chapter(
-                self.db_path,
-                book_id,
-                detected_chapter_number,
-                detected_chapter_title,
-                source_url,
-                raw_text_path=raw_path,
-                source_hash=metadata["source_hash"],
-                adapter_id=adapter_id,
-            )
-        except Exception:
+            raw_path.write_text(normalized_text, encoding="utf-8")
+            stored_text = raw_path.read_text(encoding="utf-8")
+        except OSError as exc:
             raw_path.unlink(missing_ok=True)
-            raise
-        return {
-            "book_id": book_id,
-            "chapter_id": chapter_id,
-            "path": str(raw_path),
-            "title": detected_title,
-            "chapter_number": detected_chapter_number,
-            "chapter_title": detected_chapter_title,
-            "source_type": source_type,
-            "source_url": source_url,
-            "adapter_id": adapter_id,
-        }
+            raise SourceAdapterError(
+                "Could not store chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        try:
+            with get_connection(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                book = resolve_import_book_with_connection(
+                    conn,
+                    title=detected_title,
+                    author=author,
+                    source=book_source,
+                    source_url=book_source_url or source_url,
+                    canonical_source_url=canonical_source_url,
+                )
+                book_id = int(book["id"])
+                upserted = upsert_import_chapter_with_connection(
+                    conn,
+                    book_id=book_id,
+                    chapter_number=detected_chapter_number,
+                    title=detected_chapter_title,
+                    source_url=source_url,
+                    canonical_chapter_url=canonical_chapter_url,
+                    adapter_id=adapter_id,
+                    raw_text_path=raw_path,
+                    content_hash=metadata["source_hash"],
+                    source_updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                conn.commit()
+        except ValueError as exc:
+            raw_path.unlink(missing_ok=True)
+            if "Duplicate" in str(exc):
+                raise SourceAdapterError(
+                    str(exc),
+                    code=FetchErrorCode.DUPLICATE,
+                    retryable=False,
+                    http_status=409,
+                ) from exc
+            raise SourceAdapterError(
+                "Could not import chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        except Exception as exc:
+            raw_path.unlink(missing_ok=True)
+            raise SourceAdapterError(
+                "Could not import chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        chapter_id = upserted.chapter_id
+        operation = upserted.operation
+        if operation == "skipped_duplicate":
+            raw_path.unlink(missing_ok=True)
+            result_path = upserted.raw_text_path
+        else:
+            result_path = str(raw_path)
+        return ChapterImportResult(
+            book_id=book_id,
+            chapter_id=chapter_id,
+            stored_text_length=len(stored_text),
+            content_hash=source_hash(stored_text),
+            operation=operation,
+            title=detected_title,
+            chapter_number=detected_chapter_number,
+            chapter_title=detected_chapter_title,
+            source_type=source_type,
+            source_url=source_url,
+            adapter_id=adapter_id,
+            path=result_path,
+        )
 
     def _write_import_text_file(
         self,
@@ -5245,9 +5370,9 @@ class PipelineService:
         chapter_url: str,
         chapter_number: int = 1,
         chapter_title: str = "",
-    ) -> dict:
+    ) -> ChapterImportResult:
         chapter = self.fetch_source_chapter(chapter_url)
-        return self.import_from_text(
+        imported = self.import_from_text(
             title=book_title,
             chapter_number=chapter_number or chapter.chapter_number,
             chapter_title=chapter_title or chapter.title,
@@ -5258,6 +5383,12 @@ class PipelineService:
             book_source=source or chapter.source,
             book_source_url=source_url,
             adapter_id=chapter.adapter_id,
+        )
+        return replace(
+            imported,
+            fetch_method=chapter.fetch_method,
+            fetch_attempts=chapter.fetch_attempts,
+            fetch_elapsed_ms=chapter.fetch_elapsed_ms,
         )
 
     def import_from_file(

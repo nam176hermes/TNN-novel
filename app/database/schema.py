@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS books (
     author TEXT DEFAULT '',
     source TEXT DEFAULT 'manual',
     source_url TEXT DEFAULT '',
+    canonical_source_url TEXT DEFAULT '',
     cover_path TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS chapters (
     chapter_number INTEGER NOT NULL,
     title TEXT NOT NULL,
     source_url TEXT DEFAULT '',
+    canonical_chapter_url TEXT DEFAULT '',
     adapter_id TEXT DEFAULT '',
     raw_text_path TEXT,
     cleaned_text_path TEXT,
@@ -26,6 +28,10 @@ CREATE TABLE IF NOT EXISTS chapters (
     content_html_path TEXT,
     audio_path TEXT,
     source_hash TEXT DEFAULT '',
+    content_hash TEXT DEFAULT '',
+    source_updated_at TEXT DEFAULT '',
+    last_import_operation TEXT DEFAULT '',
+    content_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT DEFAULT 'imported',
     imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     translated_at TIMESTAMP,
@@ -41,6 +47,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chapters_active_number
 CREATE INDEX IF NOT EXISTS idx_chapters_active_source_hash
     ON chapters(book_id, source_hash)
     WHERE deleted_at IS NULL AND source_hash != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chapters_active_canonical_identity
+    ON chapters(book_id, adapter_id, canonical_chapter_url)
+    WHERE deleted_at IS NULL
+      AND adapter_id != ''
+      AND canonical_chapter_url != '';
 
 CREATE TABLE IF NOT EXISTS reader_progress (
     book_id INTEGER PRIMARY KEY,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from html import unescape
 from html.parser import HTMLParser
@@ -154,6 +154,9 @@ class SourceChapterContent:
     chapter_number: int
     title: str
     text: str
+    fetch_method: str = ""
+    fetch_attempts: int = 0
+    fetch_elapsed_ms: int = 0
 
 
 class SourceAdapterError(ValueError):
@@ -417,7 +420,13 @@ class GenericHtmlSourceAdapter:
 
     def fetch_chapter(self, url: str) -> SourceChapterContent:
         fetch = fetch_public_html_result(url)
-        return self.chapter_from_html(fetch.final_url, fetch.html)
+        chapter = self.chapter_from_html(fetch.final_url, fetch.html)
+        return replace(
+            chapter,
+            fetch_method=fetch.method.value,
+            fetch_attempts=fetch.attempts,
+            fetch_elapsed_ms=fetch.elapsed_ms,
+        )
 
     def preview_from_html(self, url: str, html: str) -> SourcePreview:
         safe_url = validate_public_http_url(url)
@@ -463,7 +472,13 @@ class GenericHtmlSourceAdapter:
         lines = _extract_lines(html)
         text = clean_chapter("\n\n".join(lines))
         if len(text.strip()) < 20:
-            raise SourceAdapterError("Could not extract enough chapter text from this URL")
+            raise SourceAdapterError(
+                "Could not extract enough chapter text from this URL",
+                code=FetchErrorCode.CONTENT_INVALID,
+                retryable=False,
+                http_status=422,
+                details={"url": safe_url},
+            )
         return SourceChapterContent(
             adapter_id=self.adapter_id,
             source=urlparse(safe_url).netloc,
@@ -560,7 +575,13 @@ class SelectorSourceAdapter(GenericHtmlSourceAdapter):
             return super().chapter_from_html(safe_url, html)
         text = clean_chapter(content)
         if len(text.strip()) < 20:
-            raise SourceAdapterError("Could not extract enough chapter text from this URL")
+            raise SourceAdapterError(
+                "Could not extract enough chapter text from this URL",
+                code=FetchErrorCode.CONTENT_INVALID,
+                retryable=False,
+                http_status=422,
+                details={"url": safe_url},
+            )
         return SourceChapterContent(
             adapter_id=self.adapter_id,
             source=urlparse(safe_url).netloc,

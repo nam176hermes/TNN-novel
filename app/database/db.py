@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +19,7 @@ from app.database.schema import SCHEMA
 from app.database.glossary_history import log_glossary_change
 from app.mobile_api.job_states import normalize_job_state
 from app.mobile_api.services.import_metadata import normalize_book_key
+from app.security.url_policy import UrlPolicyViolation, validate_fetch_url
 from app.translation.styleguide_config import get_locked_terms
 
 
@@ -55,7 +57,28 @@ list_reader_xray_entities = _reader_repository.list_reader_xray_entities
 list_reader_timeline_events = _reader_repository.list_reader_timeline_events
 
 
-CURRENT_SCHEMA_VERSION = "2026-07-09-source-catalog-phase8"
+CURRENT_SCHEMA_VERSION = "2026-07-14-import-idempotency-phase4"
+
+
+@dataclass(frozen=True)
+class ImportChapterUpsert:
+    chapter_id: int
+    operation: str
+    content_hash: str
+    content_revision: int
+    raw_text_path: str
+
+
+def canonicalize_import_url(url: str) -> str:
+    """Canonicalize a persisted source identity through the P02 URL policy.
+
+    Resolution is deliberately omitted here: URLs have already passed the fetch
+    policy before import, while migrations must never perform network I/O.
+    """
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    return validate_fetch_url(value).canonical_url
 
 
 def get_db_path(data_dir: Path) -> Path:
@@ -1260,6 +1283,7 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
     if _table_exists(conn, "books"):
         _add_column_if_missing(conn, "books", "book_key TEXT DEFAULT ''")
         _add_column_if_missing(conn, "books", "owner_user_id TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "books", "canonical_source_url TEXT DEFAULT ''")
         _add_column_if_missing(conn, "books", "cover_path TEXT DEFAULT ''")
         rows = conn.execute(
             "SELECT id, title FROM books WHERE book_key IS NULL OR book_key = ''"
@@ -1271,12 +1295,102 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
             )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_books_book_key ON books(book_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_books_owner_user_id ON books(owner_user_id)")
+        for row in conn.execute(
+            "SELECT id, source_url FROM books WHERE canonical_source_url IS NULL OR canonical_source_url = ''"
+        ).fetchall():
+            try:
+                canonical_source_url = canonicalize_import_url(str(row["source_url"] or ""))
+            except UrlPolicyViolation:
+                canonical_source_url = ""
+            if canonical_source_url:
+                conn.execute(
+                    "UPDATE books SET canonical_source_url = ? WHERE id = ?",
+                    (canonical_source_url, row["id"]),
+                )
 
     if _table_exists(conn, "chapters"):
         _add_column_if_missing(conn, "chapters", "adapter_id TEXT DEFAULT ''")
         _add_column_if_missing(conn, "chapters", "source_hash TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "imported_at TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "canonical_chapter_url TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "content_hash TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "source_updated_at TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "last_import_operation TEXT DEFAULT ''")
+        _add_column_if_missing(conn, "chapters", "content_revision INTEGER NOT NULL DEFAULT 1")
         _add_column_if_missing(conn, "chapters", "content_html_path TEXT")
         _add_column_if_missing(conn, "chapters", "deleted_at TEXT")
+        conn.execute(
+            """
+            UPDATE chapters
+            SET content_hash = source_hash
+            WHERE (content_hash IS NULL OR content_hash = '')
+              AND source_hash IS NOT NULL AND source_hash != ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE chapters
+            SET source_updated_at = COALESCE(NULLIF(imported_at, ''), '')
+            WHERE source_updated_at IS NULL OR source_updated_at = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE chapters
+            SET content_revision = 1
+            WHERE content_revision IS NULL OR content_revision < 1
+            """
+        )
+        occupied_identities: set[tuple[int, str, str]] = {
+            (int(row["book_id"]), str(row["adapter_id"]), str(row["canonical_chapter_url"]))
+            for row in conn.execute(
+                """
+                SELECT book_id, adapter_id, canonical_chapter_url
+                FROM chapters
+                WHERE deleted_at IS NULL
+                  AND adapter_id IS NOT NULL AND adapter_id != ''
+                  AND canonical_chapter_url IS NOT NULL AND canonical_chapter_url != ''
+                """
+            ).fetchall()
+        }
+        for row in conn.execute(
+            """
+            SELECT id, book_id, adapter_id, source_url
+            FROM chapters
+            WHERE deleted_at IS NULL
+              AND (canonical_chapter_url IS NULL OR canonical_chapter_url = '')
+            ORDER BY id ASC
+            """
+        ).fetchall():
+            adapter_id = str(row["adapter_id"] or "")
+            if not adapter_id:
+                continue
+            try:
+                canonical_chapter_url = canonicalize_import_url(str(row["source_url"] or ""))
+            except UrlPolicyViolation:
+                canonical_chapter_url = ""
+            if not canonical_chapter_url:
+                continue
+            identity = (int(row["book_id"]), adapter_id, canonical_chapter_url)
+            if identity in occupied_identities:
+                conn.execute(
+                    "UPDATE chapters SET last_import_operation = 'backfill_identity_conflict' WHERE id = ?",
+                    (row["id"],),
+                )
+                continue
+            occupied_identities.add(identity)
+            conn.execute(
+                """
+                UPDATE chapters
+                SET canonical_chapter_url = ?,
+                    last_import_operation = CASE
+                        WHEN last_import_operation IS NULL OR last_import_operation = '' THEN 'backfilled'
+                        ELSE last_import_operation
+                    END
+                WHERE id = ?
+                """,
+                (canonical_chapter_url, row["id"]),
+            )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_chapters_active_number_lookup
@@ -1289,6 +1403,15 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_chapters_active_source_hash
             ON chapters(book_id, source_hash)
             WHERE deleted_at IS NULL AND source_hash != ''
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chapters_active_canonical_identity
+            ON chapters(book_id, adapter_id, canonical_chapter_url)
+            WHERE deleted_at IS NULL
+              AND adapter_id != ''
+              AND canonical_chapter_url != ''
             """
         )
 
@@ -3709,6 +3832,8 @@ def resolve_import_book_with_connection(
     title: str,
     author: str = "",
     source: str = "wizard",
+    source_url: str = "",
+    canonical_source_url: str = "",
     target_book_id: int | None = None,
 ) -> dict:
     book = find_import_book_with_connection(
@@ -3729,6 +3854,12 @@ def resolve_import_book_with_connection(
         if source and (not current_source or current_source == "manual"):
             updates.append("source = ?")
             params.append(source)
+        if source_url and not str(book.get("source_url") or ""):
+            updates.append("source_url = ?")
+            params.append(source_url)
+        if canonical_source_url and not str(book.get("canonical_source_url") or ""):
+            updates.append("canonical_source_url = ?")
+            params.append(canonical_source_url)
         if updates:
             params.append(int(book["id"]))
             conn.execute(f"UPDATE books SET {', '.join(updates)} WHERE id = ?", params)
@@ -3740,10 +3871,19 @@ def resolve_import_book_with_connection(
     owner_user_id = str(operator_user.get("id") or "")
     cursor = conn.execute(
         """
-        INSERT INTO books (title, book_key, owner_user_id, author, source)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO books (
+            title, book_key, owner_user_id, author, source, source_url, canonical_source_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (title, normalize_book_key(title), owner_user_id, author, source),
+        (
+            title,
+            normalize_book_key(title),
+            owner_user_id,
+            author,
+            source,
+            source_url,
+            canonical_source_url,
+        ),
     )
     row = conn.execute("SELECT * FROM books WHERE id = ?", (cursor.lastrowid,)).fetchone()
     return dict(row)
@@ -3816,6 +3956,192 @@ def update_import_chapter_with_connection(
         params.append(str(translated_text_path))
     params.append(chapter_id)
     conn.execute(f"UPDATE chapters SET {', '.join(fields)} WHERE id = ?", params)
+
+
+def _active_chapter_by_canonical_identity(
+    conn: sqlite3.Connection,
+    *,
+    book_id: int,
+    adapter_id: str,
+    canonical_chapter_url: str,
+) -> sqlite3.Row | None:
+    if not adapter_id or not canonical_chapter_url:
+        return None
+    return conn.execute(
+        """
+        SELECT * FROM chapters
+        WHERE book_id = ?
+          AND adapter_id = ?
+          AND canonical_chapter_url = ?
+          AND deleted_at IS NULL
+        LIMIT 1
+        """,
+        (book_id, adapter_id, canonical_chapter_url),
+    ).fetchone()
+
+
+def upsert_import_chapter_with_connection(
+    conn: sqlite3.Connection,
+    *,
+    book_id: int,
+    chapter_number: int,
+    title: str,
+    source_url: str,
+    canonical_chapter_url: str,
+    adapter_id: str,
+    raw_text_path: Path,
+    content_hash: str,
+    source_updated_at: str,
+) -> ImportChapterUpsert:
+    """Store one sourced chapter using canonical URL identity.
+
+    A canonical identity is only available for source-backed imports.  Manual
+    pastes intentionally keep the existing chapter-number duplicate behavior.
+    The caller owns the surrounding transaction and artifact cleanup.
+    """
+    existing = _active_chapter_by_canonical_identity(
+        conn,
+        book_id=book_id,
+        adapter_id=adapter_id,
+        canonical_chapter_url=canonical_chapter_url,
+    )
+    if existing is not None:
+        existing_hash = str(existing["content_hash"] or existing["source_hash"] or "")
+        if existing_hash == content_hash:
+            conn.execute(
+                "UPDATE chapters SET last_import_operation = 'skipped_duplicate' WHERE id = ?",
+                (existing["id"],),
+            )
+            return ImportChapterUpsert(
+                chapter_id=int(existing["id"]),
+                operation="skipped_duplicate",
+                content_hash=existing_hash,
+                content_revision=max(1, int(existing["content_revision"] or 1)),
+                raw_text_path=str(existing["raw_text_path"] or ""),
+            )
+
+        next_revision = max(1, int(existing["content_revision"] or 1)) + 1
+        conn.execute(
+            """
+            UPDATE chapters
+            SET chapter_number = ?, title = ?, source_url = ?,
+                canonical_chapter_url = ?, adapter_id = ?, raw_text_path = ?,
+                source_hash = ?, content_hash = ?, source_updated_at = ?,
+                last_import_operation = 'updated', content_revision = ?
+            WHERE id = ?
+            """,
+            (
+                chapter_number,
+                title,
+                source_url,
+                canonical_chapter_url,
+                adapter_id,
+                str(raw_text_path),
+                content_hash,
+                content_hash,
+                source_updated_at,
+                next_revision,
+                existing["id"],
+            ),
+        )
+        return ImportChapterUpsert(
+            chapter_id=int(existing["id"]),
+            operation="updated",
+            content_hash=content_hash,
+            content_revision=next_revision,
+            raw_text_path=str(raw_text_path),
+        )
+
+    if not canonical_chapter_url:
+        duplicate_number = conn.execute(
+            """
+            SELECT id FROM chapters
+            WHERE book_id = ? AND chapter_number = ? AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            (book_id, chapter_number),
+        ).fetchone()
+        if duplicate_number is not None:
+            raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id}")
+
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO chapters (
+                book_id, chapter_number, title, source_url, canonical_chapter_url,
+                adapter_id, raw_text_path, source_hash, content_hash,
+                source_updated_at, last_import_operation, content_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', 1)
+            """,
+            (
+                book_id,
+                chapter_number,
+                title,
+                source_url,
+                canonical_chapter_url,
+                adapter_id,
+                str(raw_text_path),
+                content_hash,
+                content_hash,
+                source_updated_at,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # A concurrent import can win after this transaction has started.
+        # Re-read the identity and return its idempotent outcome instead of a 500.
+        existing = _active_chapter_by_canonical_identity(
+            conn,
+            book_id=book_id,
+            adapter_id=adapter_id,
+            canonical_chapter_url=canonical_chapter_url,
+        )
+        if existing is None:
+            raise
+        existing_hash = str(existing["content_hash"] or existing["source_hash"] or "")
+        if existing_hash == content_hash:
+            return ImportChapterUpsert(
+                chapter_id=int(existing["id"]),
+                operation="skipped_duplicate",
+                content_hash=existing_hash,
+                content_revision=max(1, int(existing["content_revision"] or 1)),
+                raw_text_path=str(existing["raw_text_path"] or ""),
+            )
+        next_revision = max(1, int(existing["content_revision"] or 1)) + 1
+        conn.execute(
+            """
+            UPDATE chapters
+            SET chapter_number = ?, title = ?, source_url = ?, raw_text_path = ?,
+                source_hash = ?, content_hash = ?, source_updated_at = ?,
+                last_import_operation = 'updated', content_revision = ?
+            WHERE id = ?
+            """,
+            (
+                chapter_number,
+                title,
+                source_url,
+                str(raw_text_path),
+                content_hash,
+                content_hash,
+                source_updated_at,
+                next_revision,
+                existing["id"],
+            ),
+        )
+        return ImportChapterUpsert(
+            chapter_id=int(existing["id"]),
+            operation="updated",
+            content_hash=content_hash,
+            content_revision=next_revision,
+            raw_text_path=str(raw_text_path),
+        )
+
+    return ImportChapterUpsert(
+        chapter_id=int(cursor.lastrowid),
+        operation="created",
+        content_hash=content_hash,
+        content_revision=1,
+        raw_text_path=str(raw_text_path),
+    )
 
 
 def add_chapter(

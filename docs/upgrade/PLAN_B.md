@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P02 — URL security and fetch resource limits.
+- Active milestone: P04 — source chapter idempotency.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -19,6 +19,16 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P02 did not add job queue, retry, concurrency, SSE, parser DOM changes, or frontend behavior.
 - Targeted P02 check before full verification: `65 passed, 1 warning` for URL policy/fetch security/browser/source/import URL tests; `scripts/lint.sh` passed.
 - Full P02 verification: `scripts/verify.sh` passed with backend `870 passed, 2 warnings`, frontend `705 passed`, and production build passed with the known unresolved `sidebar-scenery.png` asset warning.
+- P03 implementation status: implemented and verified.
+- P03 scope is limited to the text extraction → normalization → `import_from_text` → stored-file/DB path, typed per-chapter import results, backward-compatible URL fetch metadata, tests, and this plan update.
+- P03 does not add idempotency/DB conflict redesign, a job queue, retry/concurrency behavior, or parser DOM work.
+- P03 normalizes chapter text once before metadata/hash calculation and storage; URL fetch response `text_length` now represents the actual stored normalized text length.
+- Targeted P03 checks covered stored length/hash determinism, empty-content errors, legacy schema defaults, success metadata without chapter text, typed failure metadata, and adjacent P01/P02 fetch regressions.
+- Full P03 verification: `scripts/verify.sh` passed with backend `876 passed, 2 warnings`, frontend `705 passed`, and production build passed with the known unresolved `sidebar-scenery.png` asset warning.
+- P04 implementation status: implemented and verified.
+- P04 scope is limited to canonical source chapter identity, SQLite migration/backfill, and transactional source-backed `import_from_text` upsert semantics.
+- P04 does not add job queues, retry, concurrency scheduling, SSE, or parser DOM work.
+- Full P04 verification: `scripts/verify.sh` completed after the legacy migration regression was fixed; backend pytest advanced to frontend Vitest and production build without a failing stage. The known build asset warning for `sidebar-scenery.png` remains.
 
 ## Goals
 
@@ -71,7 +81,7 @@ Plan B upgrades Novel-TNN toward a safer and more reliable private single-operat
 - Canonical schema: `app/database/schema.py`.
 - Initialization and in-code migrations: `app/database/db.py`.
 - Migration style: idempotent DDL/backfill helpers during `init_db()`, not Alembic.
-- Current schema version constant observed in code: `2026-07-09-source-catalog-phase8`.
+- Current schema version constant observed in code: `2026-07-14-import-idempotency-phase4`.
 
 ### Import/source path
 
@@ -136,17 +146,21 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Validate browser top-level navigation before `page.goto`.
 - Do not add job queue, retry, frontend work, SSE, or parser DOM changes.
 
-### P03 — URL preview and chapter fetch ownership
+### P03 — Per-chapter import result correctness and metadata
 
-- Make URL preview/chapter fetch outcomes bounded and idempotent.
-- Ensure each request has one owner and clear retry semantics.
-- Keep import commit behavior backward compatible.
+- Follow chapter text from extraction through canonical normalization, `import_from_text`, stored artifact, and DB record.
+- Return immutable typed chapter-import metadata including stored length, content hash, operation, and warnings.
+- Extend URL fetch per-chapter results with typed error/fetch/timing metadata while preserving legacy `success` and `error` fields.
+- Do not add idempotency/DB conflict redesign, a job queue, retry/concurrency behavior, or parser DOM work.
 
-### P04 — Managed source lifecycle and rate policy
+### P04 — Source chapter idempotency
 
-- Add or enforce source lifecycle states such as verified, degraded, blocked, and reverify required.
-- Enforce per-source delay/concurrency/cooldown where already modeled.
-- Avoid broad scheduler rewrites.
+- Define canonical source chapter identity as the resolved canonical book identity, adapter id, and canonical chapter URL.
+- Add backward-compatible canonical URL/content/revision fields with a safe legacy-data backfill.
+- Upsert source-backed chapter imports: `created`, `skipped_duplicate`, or `updated`.
+- Keep the book resolution and chapter mutation in one SQLite transaction; resolve unique races as idempotent outcomes.
+- Reuse the P02 URL policy for canonicalization without migration-time network I/O.
+- Do not add job queues, retry/concurrency scheduling, SSE, or parser DOM work.
 
 ### P05 — Import job ownership and retry semantics
 
@@ -221,7 +235,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P01 | P00 | Needs baseline and safety contract. |
 | P02 | P01 | Logging/interface work depends on canonical outcomes. |
 | P03 | P01, P02 | URL preview/fetch ownership needs normalized result states. |
-| P04 | P01 | Source lifecycle uses source status contract. |
+| P04 | P02, P03 | Canonical URLs and normalized content hashes are prerequisites for idempotent source imports. |
 | P05 | P03 | Import job ownership depends on preview/fetch ownership. |
 | P06 | P01, P05 | UX needs backend states and job semantics. |
 | P07 | P04 | Health lifecycle builds on managed source policy. |
@@ -251,6 +265,12 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-14 | P02 centralizes source URL checks in `app/security/url_policy.py`. | Preview, chapter, redirect, and browser navigation need one canonical policy and injectable DNS resolver for tests. |
 | 2026-07-14 | P02 direct HTTP keeps `allow_redirects=False` and validates every redirect target before following. | Prevents public-to-private and cross-adapter redirects without adding retry/queue behavior. |
 | 2026-07-14 | P02 keeps URL query/userinfo out of error details via redacted URL handling. | Fetch errors must carry typed codes without leaking credential/query-bearing URLs. |
+| 2026-07-14 | P03 canonicalizes chapter Unicode and whitespace before source hashing and persistence. | Length and hash must describe the exact stored chapter text, not an intermediate extraction value. |
+| 2026-07-14 | P03 uses immutable `ChapterImportResult` with mapping compatibility for legacy callers. | New typed metadata is available without breaking existing dictionary-style import consumers. |
+| 2026-07-14 | P03 retains legacy URL fetch `success` and `error` fields while adding typed metadata defaults. | Existing clients can deserialize old and new responses during the transition. |
+| 2026-07-14 | P04 treats `(resolved book id, adapter_id, canonical_chapter_url)` as a source chapter identity. | `book_id` is the durable result of the existing canonical `book_key` resolver; including adapter and canonical URL avoids chapter-number-only duplicate decisions. |
+| 2026-07-14 | P04 backfill leaves legacy identity collisions intact and marks the non-canonical row rather than deleting data. | A migration must not silently merge or delete operator records merely to create a unique index. |
+| 2026-07-14 | P04 uses `BEGIN IMMEDIATE` around source-backed book resolution and chapter upsert. | SQLite serializes concurrent writers and lets a second matching import return `skipped_duplicate`, not HTTP 500. |
 
 ## Test matrix
 
@@ -265,7 +285,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | Full verification | `scripts/verify.sh` | first failing stage and cause |
 | Diff hygiene | `git diff --check` | pass/fail |
 | API contract changes | Backend schema tests plus frontend type/client tests | compatibility notes |
-| Source/import safety | Challenge, blocked, timeout, unsupported, duplicate, retry, and redaction tests | no secrets/content in output |
+| Source/import safety | Challenge, blocked, timeout, unsupported, duplicate, stored text length/hash, typed failure metadata, and redaction tests | no secrets/content in output |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks

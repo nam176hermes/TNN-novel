@@ -557,3 +557,111 @@ def test_url_import_groups_chapters_with_same_normalized_book_title(
     first_chapter = get_chapter(temp_db_path, first["book_id"], 1)
     assert first_chapter is not None
     assert first_chapter["adapter_id"] == "69shuba"
+
+
+@pytest.mark.asyncio
+async def test_url_fetch_returns_stored_chapter_metadata_without_content(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    pipeline = object.__new__(PipelineService)
+    pipeline.db_path = temp_db_path
+    pipeline.data_dir = tmp_path
+    pipeline.legacy_artifact_root = None
+
+    monkeypatch.setattr(
+        pipeline,
+        "fetch_source_chapter",
+        lambda url: SourceChapterContent(
+            adapter_id="69shuba",
+            source="www.69shuba.com",
+            source_url=url,
+            chapter_number=1,
+            title="Chương một",
+            text="Nội dung chương có đủ độ dài để được lưu an toàn.",
+            fetch_method="direct_http",
+            fetch_attempts=1,
+            fetch_elapsed_ms=123,
+        ),
+    )
+    app.dependency_overrides[import_routes.get_pipeline] = lambda: pipeline
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/import/url/fetch",
+                json={
+                    "title": "Sách URL",
+                    "source_url": "https://www.69shuba.com/book/1",
+                    "chapters": [
+                        {
+                            "url": "https://www.69shuba.com/book/1/chapter/1",
+                            "chapter_number": 1,
+                            "title": "Chương một",
+                        }
+                    ],
+                },
+                headers=headers,
+            )
+    finally:
+        app.dependency_overrides.pop(import_routes.get_pipeline, None)
+
+    assert response.status_code == 200, response.text
+    chapter = response.json()["chapters"][0]
+    assert chapter["success"] is True
+    assert chapter["text_length"] > 0
+    assert chapter["stored_text_length"] == chapter["text_length"]
+    assert chapter["content_hash"]
+    assert chapter["operation"] == "created"
+    assert chapter["error_code"] == ""
+    assert chapter["retryable"] is False
+    assert chapter["attempts"] == 1
+    assert chapter["fetch_method"] == "direct_http"
+    assert chapter["elapsed_ms"] == 123
+    assert chapter["started_at"]
+    assert chapter["finished_at"]
+    assert "text" not in chapter
+
+
+@pytest.mark.asyncio
+async def test_url_fetch_import_failure_returns_typed_safe_metadata(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+
+    class FailingImportPipeline:
+        def import_from_source_url(self, **_: object) -> dict:
+            raise RuntimeError("chapter body must never be returned")
+
+    app.dependency_overrides[import_routes.get_pipeline] = FailingImportPipeline
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/import/url/fetch",
+                json={
+                    "title": "Sách lỗi",
+                    "chapters": [
+                        {
+                            "url": "https://www.69shuba.com/book/1/chapter/1",
+                            "chapter_number": 1,
+                            "title": "Chương lỗi",
+                        }
+                    ],
+                },
+                headers=headers,
+            )
+    finally:
+        app.dependency_overrides.pop(import_routes.get_pipeline, None)
+
+    assert response.status_code == 200, response.text
+    chapter = response.json()["chapters"][0]
+    assert chapter["success"] is False
+    assert chapter["error_code"] == "import_failed"
+    assert chapter["retryable"] is False
+    assert chapter["operation"] == "failed"
+    assert chapter["started_at"]
+    assert chapter["finished_at"]
+    assert "chapter body" not in chapter["error"]
