@@ -168,6 +168,7 @@ class SourceAdapterError(ValueError):
         *,
         code: FetchErrorCode = FetchErrorCode.INTERNAL_ERROR,
         retryable: bool = False,
+        retry_after_seconds: float | None = None,
         http_status: int | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> None:
@@ -175,6 +176,7 @@ class SourceAdapterError(ValueError):
         self.safe_message = message
         self.code = code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
         self.http_status = http_status
         self.details = _sanitize_error_details(details)
 

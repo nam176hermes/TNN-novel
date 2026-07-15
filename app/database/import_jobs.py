@@ -601,6 +601,42 @@ class ImportJobRepository:
             row = self._task_row(conn, task_id, owner_user_id)
         return _task_from_row(row)
 
+    def schedule_task_retry(
+        self,
+        task_id: int,
+        owner_user_id: str,
+        *,
+        lease_token: str,
+        next_attempt_at: str,
+        error_code: str,
+        error_message: str,
+    ) -> ChapterTask:
+        """Persist a retry wait and event without running a scheduler."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = _task_from_row(self._task_row(conn, task_id, owner_user_id))
+            if current.status is not TaskStatus.RUNNING or current.lease_token != lease_token:
+                raise ConcurrentImportJobUpdate(str(task_id))
+            now = _now()
+            updated = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, stage = ?, next_attempt_at = ?, error_code = ?, error_message = ?,
+                    retryable = 1, updated_at = ?, version = version + 1
+                WHERE id = ? AND version = ? AND lease_token = ?
+                """,
+                (TaskStatus.WAITING_RETRY.value, TaskStage.WAITING_RETRY.value, next_attempt_at,
+                 error_code[:255], error_message[:2000], now, task_id, current.version, lease_token),
+            )
+            if updated.rowcount != 1:
+                raise ConcurrentImportJobUpdate(str(task_id))
+            self._sync_job_counters(conn, current.job_id)
+            self._append_event(conn, current.job_id, task_id, "task_retry_scheduled", {
+                "error_code": error_code, "next_attempt_at": next_attempt_at,
+            })
+            row = self._task_row(conn, task_id, owner_user_id)
+        return _task_from_row(row)
+
     def cancel_queued_tasks(self, job_id: str, owner_user_id: str) -> int:
         """Cancel work that has not been claimed yet, transactionally with events."""
         with get_connection(self.db_path) as conn:

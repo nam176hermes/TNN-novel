@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P06 — sequential import-job worker core.
+- Active milestone: P07 — retry, bounded concurrency, and ordered import.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -37,6 +37,11 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P05 full-check note: the final `scripts/verify.sh` run completed backend pytest (it advanced to Vitest), but Vitest produced only its startup banner for more than ten minutes and was terminated. The P05 diff has no frontend changes; a prior frontend test/build on the unchanged web worktree completed, with the known unresolved `sidebar-scenery.png` build asset warning. Re-run frontend verification in an environment without the observed worker stall before release.
 - P06 implementation status: implemented; worker remains sequential and pipeline-injected pending a later real-pipeline integration.
 - P06 adds task leases, atomic DB claims, cooperative cancellation, expired-lease recovery, and explicit retryable-task reset. It does not add API routes, SSE, autonomous scheduler threads, retry scheduling, or parallel task execution.
+- P07 implementation status: implemented and verified, including the ordered-import deadlock regression fix.
+- P07 separates bounded FETCHING/PARSING/VALIDATING callbacks from serialized IMPORTING callbacks so global and per-host network semaphores are released before a task waits for its chapter-order turn.
+- Targeted P07 verification: `20 passed in 36.24s`; the three deadlock/cancellation regressions passed in `6.99s`.
+- Full P07 backend verification: `892 passed, 2 warnings in 1007.99s (0:16:47)`.
+- P07 does not add API routes, SSE, autonomous scheduler threads, real source calls, or source-payload logging.
 
 ## Goals
 
@@ -186,11 +191,13 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Keep P04 as the idempotency boundary for any real import integration.
 - Do not add API/SSE, autonomous scheduler threads, retry scheduling, or task concurrency.
 
-### P07 — Source catalog health
+### P07 — Retry, bounded concurrency, and ordered import
 
-- Make source health checks current and time-bound.
-- Track last success, failure streak, and degraded status.
-- Avoid permanent trust from stale checks.
+- Classify retryable fetch failures with deterministic backoff/time budgets.
+- Bound direct/browser work and queue capacity; keep DB importing serialized by chapter order.
+- Preserve cancellation, durable retry metadata, and task failure isolation.
+- Retry-After is carried on typed source errors and overrides exponential delay.
+- Do not add router/API/SSE, scheduler threads, or real source calls.
 
 ### P08 — Browser/session containment
 

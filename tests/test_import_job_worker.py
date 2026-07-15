@@ -203,8 +203,8 @@ def test_retry_failed_tasks_resets_only_retryable_failures(temp_db_path) -> None
             if task.chapter_number == 2 and stage is TaskStage.FETCHING and self.failed_once:
                 self.failed_once = False
                 raise SourceAdapterError(
-                    "Temporary source error",
-                    code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                    "Invalid source URL",
+                    code=FetchErrorCode.INVALID_URL,
                     retryable=True,
                 )
             return super().run_stage(stage, task, cancel_check=cancel_check)
@@ -220,3 +220,42 @@ def test_retry_failed_tasks_resets_only_retryable_failures(temp_db_path) -> None
     assert [task.chapter_number for task in retried] == [2]
     assert completed.status is JobStatus.SUCCEEDED
     assert [task.attempts for task in repository.list_tasks(job.id, "operator-a")] == [1, 2]
+
+
+def test_ordered_import_out_of_order(temp_db_path) -> None:
+    import time
+
+    stored_chapter_order: list[int] = []
+
+    class Pipeline(SuccessfulPipeline):
+        def run_stage(self, stage, task, *, cancel_check):
+            if stage is TaskStage.FETCHING:
+                time.sleep({3: 0.0, 1: 0.02, 2: 0.01}[task.chapter_number])
+            if stage is TaskStage.IMPORTING:
+                stored_chapter_order.append(task.chapter_number)
+            return super().run_stage(stage, task, cancel_check=cancel_check)
+
+    repository, service = _service(temp_db_path, Pipeline([]))
+    job = _create_job(service, tasks=[_task("chapter-3", 3), _task("chapter-1", 1), _task("chapter-2", 2)])
+    service.enqueue_job(job.id, "operator-a")
+    service.run_job(job.id, "operator-a")
+    assert stored_chapter_order == [1, 2, 3]
+
+
+def test_cancel_during_backoff_at_worker_level(temp_db_path) -> None:
+    class Pipeline(SuccessfulPipeline):
+        service: ImportJobService
+
+        def run_stage(self, stage, task, *, cancel_check):
+            if stage is TaskStage.FETCHING:
+                self.service.request_cancel(task.job_id, "operator-a")
+                raise SourceAdapterError("timeout", code=FetchErrorCode.CONNECT_TIMEOUT, retryable=True)
+            return super().run_stage(stage, task, cancel_check=cancel_check)
+
+    pipeline = Pipeline([])
+    repository, service = _service(temp_db_path, pipeline)
+    pipeline.service = service
+    job = _create_job(service, tasks=[_task("chapter-1", 1)])
+    service.enqueue_job(job.id, "operator-a")
+    service.run_job(job.id, "operator-a")
+    assert repository.list_tasks(job.id, "operator-a")[0].status is TaskStatus.CANCELLED
