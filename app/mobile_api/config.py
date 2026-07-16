@@ -47,6 +47,37 @@ class MobileAPISettings(BaseModel):
         gt=0,
         le=5_000,
     )
+    import_job_max_active_per_user: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_ACTIVE_PER_USER", "4")),
+        gt=0,
+        le=100,
+    )
+    import_job_max_retries_per_task: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_RETRIES_PER_TASK", "3")),
+        gt=0,
+        le=20,
+    )
+    import_job_max_bytes_per_chapter: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_BYTES_PER_CHAPTER", str(5 * 1024 * 1024))),
+        gt=0,
+    )
+    import_job_max_duration_seconds: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_DURATION_SECONDS", "3600")),
+        gt=0,
+    )
+    source_circuit_failure_threshold: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_FAILURE_THRESHOLD", "3")),
+        gt=0,
+        le=100,
+    )
+    source_circuit_window_seconds: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_WINDOW_SECONDS", "60")),
+        gt=0,
+    )
+    source_circuit_cooldown_seconds: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_COOLDOWN_SECONDS", "30")),
+        gt=0,
+    )
     auth_session_retention_days: int = Field(
         default=int(os.getenv("AUTH_SESSION_RETENTION_DAYS", "30")),
         gt=0,

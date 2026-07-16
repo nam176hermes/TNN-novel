@@ -393,6 +393,14 @@ class SourceCatalogHealthResponse(BaseModel):
     http_status: int | None = None
 
 
+class SourceCatalogHealthSummary(BaseModel):
+    total_sources: int = 0
+    supported_sources: int = 0
+    unhealthy_sources: int = 0
+    last_checked_at: str = ""
+    status_counts: dict[str, int] = Field(default_factory=dict)
+
+
 class ParserCandidateCreateRequest(BaseModel):
     sample_url: str = ""
 

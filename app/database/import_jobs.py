@@ -314,6 +314,93 @@ class ImportJobRepository:
             row = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
         return _job_from_row(row) if row is not None else None
 
+    def count_active_jobs(self, owner_user_id: str) -> int:
+        """Count non-terminal durable import jobs for one owner."""
+
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM import_jobs
+                WHERE owner_user_id = ? AND status IN (?, ?)
+                """,
+                (owner_user_id, JobStatus.QUEUED.value, JobStatus.RUNNING.value),
+            ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def workload_counts(self) -> dict[str, int]:
+        """Return bounded global gauges without returning owner or task content."""
+
+        with get_connection(self.db_path) as conn:
+            jobs = conn.execute(
+                "SELECT COUNT(*) AS count FROM import_jobs WHERE status IN (?, ?)",
+                (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
+            ).fetchone()
+            tasks = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM chapter_tasks
+                WHERE status IN (?, ?)
+                """,
+                (TaskStatus.QUEUED.value, TaskStatus.WAITING_RETRY.value),
+            ).fetchone()
+        return {
+            "active_jobs": int(jobs["count"] if jobs else 0),
+            "queue_depth": int(tasks["count"] if tasks else 0),
+        }
+
+    def fail_pending_tasks(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> int:
+        """Fail queued/retry tasks when a job-wide hard limit expires."""
+
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._job_row(conn, job_id, owner_user_id)
+            rows = conn.execute(
+                """
+                SELECT id FROM chapter_tasks
+                WHERE job_id = ? AND status IN (?, ?)
+                ORDER BY id ASC
+                """,
+                (job_id, TaskStatus.QUEUED.value, TaskStatus.WAITING_RETRY.value),
+            ).fetchall()
+            now = _now()
+            for row in rows:
+                task_id = int(row["id"])
+                conn.execute(
+                    """
+                    UPDATE chapter_tasks
+                    SET status = ?, stage = ?, error_code = ?, error_message = ?,
+                        retryable = 0, finished_at = ?, updated_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (
+                        TaskStatus.FAILED.value,
+                        TaskStage.FAILED.value,
+                        error_code[:96],
+                        error_message[:2_000],
+                        now,
+                        now,
+                        task_id,
+                    ),
+                )
+                self._append_event(
+                    conn,
+                    job_id,
+                    task_id,
+                    "task_failed_by_quota",
+                    {"error_code": error_code[:96]},
+                )
+            self._sync_job_counters(conn, job_id)
+            conn.commit()
+        return len(rows)
+
     def create_task(
         self,
         *,

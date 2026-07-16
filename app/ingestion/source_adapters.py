@@ -29,6 +29,7 @@ from app.ingestion.source_policies import (
     source_policy_public_dict,
 )
 from app.ingestion.text_normalization import normalize_import_text, source_hash
+from app.observability import default_observability
 from app.security.url_policy import (
     UrlPolicyViolation,
     UrlResolver,
@@ -169,6 +170,7 @@ class SourceChapterContent:
     fetch_method: str = ""
     fetch_attempts: int = 0
     fetch_elapsed_ms: int = 0
+    fetch_bytes_received: int = 0
     content_hash: str = ""
     adapter_version: str = ""
     parser_method: str = ""
@@ -418,8 +420,26 @@ class GenericHtmlSourceAdapter:
         return True
 
     def preview(self, url: str) -> SourcePreview:
-        fetch = fetch_public_html_result(url)
-        result = self.preview_from_html(fetch.final_url, fetch.html)
+        try:
+            fetch = fetch_public_html_result(url)
+            result = self.preview_from_html(fetch.final_url, fetch.html)
+        except SourceAdapterError as exc:
+            default_observability.record_fetch(
+                adapter_id=self.adapter_id,
+                adapter_version=getattr(self, "adapter_version", ""),
+                fetch_method="direct_http",
+                error_code=exc.code.value,
+                operation="preview",
+            )
+            raise
+        default_observability.record_fetch(
+            adapter_id=self.adapter_id,
+            adapter_version=getattr(self, "adapter_version", ""),
+            fetch_method=fetch.method.value,
+            elapsed_ms=fetch.elapsed_ms,
+            response_bytes=fetch.bytes_received,
+            operation="preview",
+        )
         from dataclasses import replace as _replace
         return _replace(
             result,
@@ -436,13 +456,33 @@ class GenericHtmlSourceAdapter:
         )
 
     def fetch_chapter(self, url: str) -> SourceChapterContent:
-        fetch = fetch_public_html_result(url)
-        chapter = self.chapter_from_html(fetch.final_url, fetch.html)
+        try:
+            fetch = fetch_public_html_result(url)
+            chapter = self.chapter_from_html(fetch.final_url, fetch.html)
+        except SourceAdapterError as exc:
+            default_observability.record_fetch(
+                adapter_id=self.adapter_id,
+                adapter_version=getattr(self, "adapter_version", ""),
+                fetch_method="direct_http",
+                error_code=exc.code.value,
+                operation="fetch_chapter",
+            )
+            raise
+        default_observability.record_fetch(
+            adapter_id=self.adapter_id,
+            adapter_version=getattr(self, "adapter_version", ""),
+            fetch_method=fetch.method.value,
+            elapsed_ms=fetch.elapsed_ms,
+            response_bytes=fetch.bytes_received,
+            parsed_text_length=len(chapter.text),
+            operation="fetch_chapter",
+        )
         return replace(
             chapter,
             fetch_method=fetch.method.value,
             fetch_attempts=fetch.attempts,
             fetch_elapsed_ms=fetch.elapsed_ms,
+            fetch_bytes_received=fetch.bytes_received,
         )
 
     def preview_from_html(self, url: str, html: str) -> SourcePreview:
@@ -672,6 +712,12 @@ class DomSourceAdapter(GenericHtmlSourceAdapter):
                 canonicalize_link=lambda value: self.canonicalize_url(value, base_url=safe_url),
             )
         except DomParserError as exc:
+            default_observability.record_parse(
+                adapter_id=self.adapter_id,
+                adapter_version=self.adapter_version,
+                operation="preview",
+                error_code=exc.code,
+            )
             raise self._source_error(exc, safe_url) from exc
 
         chapters: list[SourceChapter] = []
@@ -691,7 +737,7 @@ class DomSourceAdapter(GenericHtmlSourceAdapter):
                 details={"url": safe_url},
             )
         chapters.sort(key=lambda chapter: (chapter.chapter_number, chapter.url))
-        return SourcePreview(
+        result = SourcePreview(
             adapter_id=self.adapter_id,
             adapter_label=self.label,
             source=urlparse(safe_url).netloc,
@@ -705,15 +751,27 @@ class DomSourceAdapter(GenericHtmlSourceAdapter):
             adapter_version=self.adapter_version,
             parser_method="dom",
         )
+        default_observability.record_parse(
+            adapter_id=self.adapter_id,
+            adapter_version=self.adapter_version,
+            operation="preview",
+        )
+        return result
 
     def parse_chapter(self, url: str, html: str) -> SourceChapterContent:
         safe_url = self.canonicalize_url(url)
         try:
             parsed = self._dom_parser.parse_chapter(html=html)
         except DomParserError as exc:
+            default_observability.record_parse(
+                adapter_id=self.adapter_id,
+                adapter_version=self.adapter_version,
+                operation="chapter",
+                error_code=exc.code,
+            )
             raise self._source_error(exc, safe_url) from exc
         title = parsed.title or _extract_title(html, safe_url)
-        return SourceChapterContent(
+        result = SourceChapterContent(
             adapter_id=self.adapter_id,
             source=urlparse(safe_url).netloc,
             source_url=safe_url,
@@ -724,6 +782,13 @@ class DomSourceAdapter(GenericHtmlSourceAdapter):
             adapter_version=self.adapter_version,
             parser_method="dom",
         )
+        default_observability.record_parse(
+            adapter_id=self.adapter_id,
+            adapter_version=self.adapter_version,
+            operation="chapter",
+            parsed_text_length=len(parsed.text),
+        )
+        return result
 
     def preview_from_html(self, url: str, html: str) -> SourcePreview:
         try:

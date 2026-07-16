@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.database.db import (
     get_source_catalog_entry,
+    get_source_catalog_health_summary,
     insert_source_adapter_candidate,
     list_source_catalog_entries,
     record_source_catalog_health_check,
@@ -17,6 +18,7 @@ from app.mobile_api.schemas import (
     ParserCandidateCreateRequest,
     SourceAdapterCandidate,
     SourceCatalogHealthResponse,
+    SourceCatalogHealthSummary,
     SourceCatalogList,
 )
 
@@ -96,6 +98,13 @@ async def list_source_catalog_slash(
         per_page=per_page,
         page_size=page_size,
     )
+
+
+@router.get("/health", response_model=SourceCatalogHealthSummary)
+async def source_catalog_health_summary(current_user: dict = Depends(get_current_user)):
+    """Return authenticated, aggregate health state for source operations."""
+    del current_user
+    return get_source_catalog_health_summary(get_db_path())
 
 
 @router.post("/{entry_id}/check", response_model=SourceCatalogHealthResponse)

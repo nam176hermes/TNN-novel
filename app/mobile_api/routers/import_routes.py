@@ -66,6 +66,9 @@ from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload_to_temp_limited
 from app.services.import_job_service import ImportJobService
+from app.services.import_job_quotas import ImportJobQuotaError, ImportJobQuotaPolicy
+from app.observability import CircuitBreakerConfig, default_observability
+from app.services.import_job_runtime import RetryPolicy
 from app.services.source_import_task_pipeline import SourceImportTaskPipeline
 
 router = APIRouter(prefix="/api/import", tags=["import"])
@@ -127,10 +130,31 @@ def get_import_job_service(
     pipeline: PipelineService = Depends(get_pipeline),
 ) -> ImportJobService:
     repository = ImportJobRepository(Path(getattr(pipeline, "db_path", get_db_path())))
+    default_observability.configure_circuit_breaker(
+        CircuitBreakerConfig(
+            failure_threshold=mobile_settings.source_circuit_failure_threshold,
+            window_seconds=mobile_settings.source_circuit_window_seconds,
+            cooldown_seconds=mobile_settings.source_circuit_cooldown_seconds,
+        )
+    )
     return ImportJobService(
         repository,
         worker_id=f"api-{os.getpid()}",
-        pipeline=SourceImportTaskPipeline(repository, pipeline),
+        pipeline=SourceImportTaskPipeline(
+            repository,
+            pipeline,
+            observability=default_observability,
+            max_chapter_bytes=mobile_settings.import_job_max_bytes_per_chapter,
+        ),
+        retry_policy=RetryPolicy(max_attempts=mobile_settings.import_job_max_retries_per_task),
+        quota_policy=ImportJobQuotaPolicy(
+            max_chapters_per_job=mobile_settings.import_job_max_chapters,
+            max_active_jobs_per_owner=mobile_settings.import_job_max_active_per_user,
+            max_retries_per_task=mobile_settings.import_job_max_retries_per_task,
+            max_bytes_per_chapter=mobile_settings.import_job_max_bytes_per_chapter,
+            max_job_duration_seconds=mobile_settings.import_job_max_duration_seconds,
+        ),
+        observability=default_observability,
     )
 
 
@@ -156,6 +180,9 @@ def _import_job_http_error(code: str, message: str, status_code: int) -> HTTPExc
 
 
 def _raise_import_job_error(exc: Exception) -> None:
+    if isinstance(exc, ImportJobQuotaError):
+        status_code = 422 if exc.code == "chapter_quota_exceeded" else 429
+        raise _import_job_http_error(exc.code, exc.safe_message, status_code) from exc
     if isinstance(exc, (LookupError, PermissionError)):
         raise _import_job_http_error("job_not_found", "Import job not found", 404) from exc
     if isinstance(exc, InvalidImportJobTransition):

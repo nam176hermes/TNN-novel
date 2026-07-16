@@ -30,6 +30,7 @@ except ImportError:
 
 from app.utils.cookie_store import load_cookies, save_cookies
 from app.utils.captcha_solver import get_captcha_solver
+from app.observability import Observability, default_observability
 from app.security.url_policy import (
     UrlPolicyViolation,
     UrlResolver,
@@ -93,6 +94,7 @@ class BrowserSessionManager:
         resolver: UrlResolver = default_resolver,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        observability: Observability | None = None,
     ) -> None:
         configured_profile = os.getenv("STEALTH_BROWSER_PROFILE_DIR", "").strip()
         self.profile_dir = Path(
@@ -108,6 +110,7 @@ class BrowserSessionManager:
         self._resolver = resolver
         self._clock = clock
         self._sleep = sleep
+        self._observability = observability or default_observability
         self._lock = asyncio.Lock()
         self._playwright: Any | None = None
         self._context: BrowserContext | Any | None = None
@@ -194,6 +197,7 @@ class BrowserSessionManager:
                 raise
             self._rotate_profile()
             await self._launch_persistent_context()
+        self._observability.record_browser_lifecycle("launch")
 
     async def _launch_persistent_context(self) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -319,6 +323,7 @@ class BrowserSessionManager:
         return await page.content()
 
     async def _restart_session(self) -> None:
+        self._observability.record_browser_lifecycle("restart")
         await self._close_session()
         await self._start_session()
 

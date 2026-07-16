@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P13 — migrate all remaining dedicated source adapters to the versioned DOM contract; implemented and verified.
+- Active milestone: P14 — add bounded observability, quotas, source-health reporting, and initial operational runbook; implementation and backend/static verification complete. The full frontend Vitest rerun remains blocked by the existing worker-startup/stall issue described below.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -81,6 +81,12 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P13 keeps regex fallback only for the P12 fixture-proven `69shuba` and `69shumi` layouts; all newly migrated adapters return typed `parse_failed` on selector mismatch.
 - P13 registry contract verification: `46 passed in 3.81s`; broader adapter/fetch/source regression verification: `113 passed, 1 warning in 19.13s`.
 - Full P13 backend verification: `1006 passed, 2 warnings in 1677.20s (0:27:57)`. The two warnings remain existing `passlib/crypt` and `jieba/pkg_resources` deprecations.
+- P14 implementation adds dependency-free, bounded structured event logging and in-process metrics. Sensitive URL components and content/credential-bearing values are redacted; metric labels reject unbounded ids and URLs.
+- P14 applies owner-scoped job limits, retry/byte/duration limits, per-adapter/fetch-method circuit breakers, browser lifecycle counters, parser/fetch/task/job metrics, and authenticated aggregate source-health reporting.
+- P14 does not add a telemetry vendor, a scheduler, a new worker, source bypass behavior, or source payload persistence. Its process-local metrics are intentionally reset on process restart; deployment/exporter work remains a later concern.
+- P14 backend verification: `1020 passed, 2 warnings in 1563.87s (0:26:03)` using the complete collected pytest suite. The warnings remain the existing `passlib/crypt` and `jieba/pkg_resources` deprecations.
+- P14 static verification: `scripts/lint.sh`, Python compileall, `git diff --check`, frontend typecheck, and production build passed. The existing unresolved `sidebar-scenery.png` build warning remains.
+- P14 frontend full-test note: `npm --prefix web test` completed 49 test files / 508 tests successfully but exited with 33 Vitest fork-worker startup timeouts after 778.09 seconds. A subsequent single-worker diagnostic produced no reporter output and was stopped after an extended wait. P14 does not modify frontend code; rerun the full frontend suite in an environment without the existing Vitest worker capacity/stall issue before release.
 
 ## Goals
 
@@ -374,6 +380,9 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-16 | Regex extraction is allowed only after a DOM selector mismatch and emits telemetry containing adapter id, adapter version, and target type only. | Challenge, missing, and invalid content must remain typed failures; logs must not contain URLs, HTML, or chapter text. |
 | 2026-07-16 | P13 treats the runtime registry as source of truth: 20 dedicated domains rather than the 17-domain planning list. | `biquge.tw`, `uukanshu.cc`, and `xbanxia.cc` were already registered and must receive the same safety/fixture coverage as the listed domains. |
 | 2026-07-16 | Only 69shuba-family adapters retain a regex fallback. | P12 has fixture evidence for those fallback layouts; P13 selector mismatches are typed failures until an equivalent fixture proves a compatibility path is needed. |
+| 2026-07-16 | P14 keeps telemetry dependency-free and process-local with bounded label/series/sample limits. | The private single-operator deployment has no existing metrics vendor; safe instrumentation can be added without persisting sensitive source payloads or adding a production dependency. |
+| 2026-07-16 | Circuit breaking is keyed only by adapter id and fetch method and counts transient transport/source failures. | This avoids one source mode poisoning another while ensuring content, parser, duplicate, cancellation, and verification outcomes do not suppress valid work. |
+| 2026-07-16 | Source-health reporting exposes authenticated aggregate counts, not raw source diagnostics. | The operations view needs a safe actionable summary without expanding unauthenticated source metadata or leaking URLs/payloads. |
 
 ## Test matrix
 

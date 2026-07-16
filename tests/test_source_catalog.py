@@ -236,6 +236,41 @@ async def test_source_catalog_api_requires_auth(
 
 
 @pytest.mark.asyncio
+async def test_source_catalog_health_summary_requires_auth_and_reports_safe_counts(
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import auth as auth_mod
+    from app.mobile_api.auth import get_current_user
+    from app.mobile_api.routers import source_catalog as source_catalog_router
+
+    catalog_path = temp_db_path.with_suffix(".sources.json")
+    _write_catalog(
+        catalog_path,
+        [{"id": "1", "name": "69 Source", "url": "https://www.69shuba.com/book/1", "tags": "搜"}],
+    )
+    import_source_catalog_json(temp_db_path, catalog_path)
+    monkeypatch.setattr(source_catalog_router, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(auth_mod, "auth_bypass_enabled", lambda: False)
+    app = FastAPI()
+    app.include_router(source_catalog_router.router)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthorized = await client.get("/api/source-catalog/health")
+        app.dependency_overrides[get_current_user] = lambda: {"username": "admin", "user_id": "u1"}
+        authorized = await client.get("/api/source-catalog/health")
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    payload = authorized.json()
+    assert payload["total_sources"] == 1
+    assert payload["supported_sources"] == 1
+    assert payload["unhealthy_sources"] == 0
+    assert "url" not in json.dumps(payload).lower()
+
+
+@pytest.mark.asyncio
 async def test_source_catalog_check_api_records_health_and_audit(
     temp_db_path: Path,
     tmp_path: Path,

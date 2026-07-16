@@ -27,7 +27,9 @@ from app.database.import_jobs import (
     TaskStatus,
 )
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
+from app.observability import Observability, default_observability
 from app.services.import_job_runtime import BoundedTaskRunner, RetryPolicy
+from app.services.import_job_quotas import ImportJobQuotaError, ImportJobQuotaPolicy
 
 
 class _OrderedImportGate:
@@ -62,6 +64,7 @@ class TaskImportOutcome:
     content_hash: str = ""
     fetch_method: str = ""
     elapsed_ms: int = 0
+    operation: str = ""
 
 
 class ImportTaskPipeline(Protocol):
@@ -91,6 +94,8 @@ class ImportJobService:
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
         bounded_runner: BoundedTaskRunner | None = None,
+        quota_policy: ImportJobQuotaPolicy | None = None,
+        observability: Observability | None = None,
     ) -> None:
         self.repository = repository
         self.worker_id = worker_id
@@ -101,6 +106,8 @@ class ImportJobService:
         self.sleep = sleep
         self.random_value = random_value
         self.bounded_runner = bounded_runner or BoundedTaskRunner()
+        self.quota_policy = quota_policy or ImportJobQuotaPolicy()
+        self.observability = observability or default_observability
 
     @classmethod
     def for_database(
@@ -128,6 +135,16 @@ class ImportJobService:
         book_id: int | None = None,
         config_snapshot: Mapping[str, Any] | None = None,
     ) -> ImportJob:
+        if len(tasks) > self.quota_policy.max_chapters_per_job:
+            raise ImportJobQuotaError(
+                "chapter_quota_exceeded",
+                f"A job can include at most {self.quota_policy.max_chapters_per_job} chapters",
+            )
+        if self.repository.count_active_jobs(owner_user_id) >= self.quota_policy.max_active_jobs_per_owner:
+            raise ImportJobQuotaError(
+                "active_job_quota_exceeded",
+                "The active import-job limit has been reached. Wait for a job to finish before starting another.",
+            )
         job = self.repository.create_job(
             owner_user_id=owner_user_id,
             source=source,
@@ -146,10 +163,15 @@ class ImportJobService:
                 title=str(task.get("title") or ""),
                 book_id=book_id,
             )
-        return self.get_job(job.id, owner_user_id)
+        result = self.get_job(job.id, owner_user_id)
+        self.observability.record_job(status=result.status.value, operation="created", job_id=result.id)
+        self._refresh_workload_metrics()
+        return result
 
     def enqueue_job(self, job_id: str, owner_user_id: str) -> ImportJob:
-        return self.repository.enqueue_job(job_id, owner_user_id)
+        job = self.repository.enqueue_job(job_id, owner_user_id)
+        self._refresh_workload_metrics()
+        return job
 
     def get_job(self, job_id: str, owner_user_id: str) -> ImportJob:
         job = self.repository.get_job(job_id, owner_user_id)
@@ -160,7 +182,10 @@ class ImportJobService:
     def request_cancel(self, job_id: str, owner_user_id: str) -> ImportJob:
         self.repository.request_cancel(job_id, owner_user_id)
         self.repository.cancel_queued_tasks(job_id, owner_user_id)
-        return self._finalize_job(job_id, owner_user_id)
+        result = self._finalize_job(job_id, owner_user_id)
+        self._record_terminal_job(result, operation="cancel")
+        self._refresh_workload_metrics()
+        return result
 
     def retry_failed_tasks(self, job_id: str, owner_user_id: str) -> list[ChapterTask]:
         """Explicit retry only for failed tasks marked retryable by the pipeline."""
@@ -203,11 +228,30 @@ class ImportJobService:
         job = self.get_job(job_id, owner_user_id)
         if job.cancel_requested_at:
             self.repository.cancel_queued_tasks(job_id, owner_user_id)
-            return self._finalize_job(job_id, owner_user_id)
+            result = self._finalize_job(job_id, owner_user_id)
+            self._record_terminal_job(result, operation="run")
+            self._refresh_workload_metrics()
+            return result
         if job.status is JobStatus.QUEUED:
-            self.repository.transition_job(job_id, owner_user_id, JobStatus.RUNNING)
+            job = self.repository.transition_job(job_id, owner_user_id, JobStatus.RUNNING)
         elif job.status is not JobStatus.RUNNING:
             return job
+        if self._duration_limit_exceeded(job):
+            self.repository.fail_pending_tasks(
+                job_id,
+                owner_user_id,
+                error_code="job_duration_exceeded",
+                error_message="Import job exceeded the configured duration limit",
+            )
+            result = self.repository.transition_job(
+                job_id,
+                owner_user_id,
+                JobStatus.FAILED,
+                error_summary="Import job exceeded the configured duration limit",
+            )
+            self._refresh_workload_metrics()
+            self._record_terminal_job(result, operation="quota")
+            return result
 
         claimed: list[ChapterTask] = []
         while len(claimed) < self.bounded_runner.max_queue_size:
@@ -238,7 +282,10 @@ class ImportJobService:
             )
             for task in claimed
         ])
-        return self._finalize_job(job_id, owner_user_id)
+        result = self._finalize_job(job_id, owner_user_id)
+        self._record_terminal_job(result, operation="run")
+        self._refresh_workload_metrics()
+        return result
 
     def _run_claimed_task(
         self,
@@ -257,6 +304,13 @@ class ImportJobService:
         outcome: TaskImportOutcome | None = None
         try:
             for stage in stages:
+                if self._duration_limit_exceeded_for_task(task, owner_user_id):
+                    raise SourceAdapterError(
+                        "Import job exceeded the configured duration limit",
+                        code=FetchErrorCode.IMPORT_FAILED,
+                        retryable=False,
+                        http_status=429,
+                    )
                 if self._cancel_claimed_task(task, owner_user_id):
                     return
                 self.repository.renew_task_lease(
@@ -265,7 +319,7 @@ class ImportJobService:
                     lease_token=task.lease_token,
                     lease_seconds=self.lease_seconds,
                 )
-                self.repository.transition_task(
+                completed_task = self.repository.transition_task(
                     task.id,
                     owner_user_id,
                     status=TaskStatus.RUNNING,
@@ -300,6 +354,15 @@ class ImportJobService:
                             error_code=exc.code.value,
                             error_message=exc.safe_message,
                         )
+                        self.observability.metrics.increment(
+                            "import_task_retries_total",
+                            labels={
+                                "adapter_id": "unknown",
+                                "fetch_method": task.fetch_method or "direct_http",
+                                "stage": stage.value,
+                                "operation": "retry",
+                            },
+                        )
                         if self.repository.is_cancel_requested(task.job_id, owner_user_id):
                             self._cancel_claimed_task(task, owner_user_id)
                             return
@@ -321,7 +384,7 @@ class ImportJobService:
                     return
             if finalize:
                 outcome = outcome or TaskImportOutcome()
-                self.repository.transition_task(
+                completed_task = self.repository.transition_task(
                     task.id,
                     owner_user_id,
                     status=TaskStatus.SUCCEEDED,
@@ -334,6 +397,22 @@ class ImportJobService:
                     chapter_id=outcome.chapter_id,
                     lease_token=task.lease_token,
                 )
+                self.observability.record_task(
+                    status=TaskStatus.SUCCEEDED.value,
+                    stage=TaskStage.SUCCEEDED.value,
+                    operation=outcome.operation or "import",
+                    job_id=task.job_id,
+                    task_id=task.id,
+                    fetch_method=outcome.fetch_method,
+                    attempts=completed_task.attempts,
+                    elapsed_ms=outcome.elapsed_ms,
+                    parsed_text_length=outcome.text_length,
+                    worker_id=self.worker_id,
+                )
+                self.observability.metrics.increment(
+                    "import_operations_total",
+                    labels={"operation": outcome.operation or "import"},
+                )
         except SourceAdapterError as exc:
             status = (
                 TaskStatus.USER_VERIFICATION_REQUIRED
@@ -345,7 +424,7 @@ class ImportJobService:
                 if status is TaskStatus.USER_VERIFICATION_REQUIRED
                 else TaskStage.FAILED
             )
-            self.repository.transition_task(
+            failed_task = self.repository.transition_task(
                 task.id,
                 owner_user_id,
                 status=status,
@@ -355,8 +434,18 @@ class ImportJobService:
                 retryable=bool(exc.retryable),
                 lease_token=task.lease_token,
             )
+            self.observability.record_task(
+                status=status.value,
+                stage=stage.value,
+                operation="import",
+                job_id=task.job_id,
+                task_id=task.id,
+                error_code=exc.code.value,
+                attempts=failed_task.attempts,
+                worker_id=self.worker_id,
+            )
         except Exception:
-            self.repository.transition_task(
+            failed_task = self.repository.transition_task(
                 task.id,
                 owner_user_id,
                 status=TaskStatus.FAILED,
@@ -365,6 +454,16 @@ class ImportJobService:
                 error_message="Import task failed",
                 retryable=False,
                 lease_token=task.lease_token,
+            )
+            self.observability.record_task(
+                status=TaskStatus.FAILED.value,
+                stage=TaskStage.FAILED.value,
+                operation="import",
+                job_id=task.job_id,
+                task_id=task.id,
+                error_code=FetchErrorCode.INTERNAL_ERROR.value,
+                attempts=failed_task.attempts,
+                worker_id=self.worker_id,
             )
         finally:
             if import_gate is not None:
@@ -394,13 +493,23 @@ class ImportJobService:
     def _cancel_claimed_task(self, task: ChapterTask, owner_user_id: str) -> bool:
         if not self.repository.is_cancel_requested(task.job_id, owner_user_id):
             return False
-        self.repository.transition_task(
+        cancelled_task = self.repository.transition_task(
             task.id,
             owner_user_id,
             status=TaskStatus.CANCELLED,
             stage=TaskStage.CANCELLED,
             error_code=FetchErrorCode.CANCELLED.value,
             lease_token=task.lease_token,
+        )
+        self.observability.record_task(
+            status=TaskStatus.CANCELLED.value,
+            stage=TaskStage.CANCELLED.value,
+            operation="cancel",
+            job_id=task.job_id,
+            task_id=task.id,
+            error_code=FetchErrorCode.CANCELLED.value,
+            attempts=cancelled_task.attempts,
+            worker_id=self.worker_id,
         )
         return True
 
@@ -417,3 +526,24 @@ class ImportJobService:
         if job.succeeded_count:
             return self.repository.transition_job(job_id, owner_user_id, JobStatus.PARTIALLY_SUCCEEDED)
         return self.repository.transition_job(job_id, owner_user_id, JobStatus.FAILED)
+
+    def _duration_limit_exceeded(self, job: ImportJob) -> bool:
+        if not job.started_at:
+            return False
+        try:
+            started_at = datetime.fromisoformat(job.started_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return (datetime.now(timezone.utc) - started_at).total_seconds() >= self.quota_policy.max_job_duration_seconds
+
+    def _duration_limit_exceeded_for_task(self, task: ChapterTask, owner_user_id: str) -> bool:
+        job = self.repository.get_job(task.job_id, owner_user_id)
+        return bool(job and self._duration_limit_exceeded(job))
+
+    def _refresh_workload_metrics(self) -> None:
+        counts = self.repository.workload_counts()
+        self.observability.set_workload(**counts)
+
+    def _record_terminal_job(self, job: ImportJob, *, operation: str) -> None:
+        if job.status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            self.observability.record_job(status=job.status.value, operation=operation, job_id=job.id)

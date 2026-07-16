@@ -2932,6 +2932,49 @@ def list_source_catalog_entries(
     }
 
 
+def get_source_catalog_health_summary(db_path: Path) -> dict[str, Any]:
+    """Aggregate safe source-health state for the authenticated admin view.
+
+    This intentionally returns counts and timestamps only.  Full URLs, health
+    check reasons, and source payloads remain in the per-entry authenticated
+    catalog workflow.
+    """
+
+    unhealthy_statuses = ("blocked", "timeout", "captcha", "error")
+    with get_connection(db_path) as conn:
+        total_row = conn.execute("SELECT COUNT(*) AS count FROM source_catalog_entries").fetchone()
+        supported_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM source_catalog_entries WHERE supported_status = 'supported'"
+        ).fetchone()
+        unhealthy_row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM source_catalog_entries
+            WHERE lower(last_check_status) IN (?, ?, ?, ?)
+            """,
+            unhealthy_statuses,
+        ).fetchone()
+        last_row = conn.execute("SELECT MAX(last_check_at) AS checked_at FROM source_catalog_entries").fetchone()
+        status_rows = conn.execute(
+            """
+            SELECT lower(COALESCE(last_check_status, '')) AS status, COUNT(*) AS count
+            FROM source_catalog_entries
+            GROUP BY lower(COALESCE(last_check_status, ''))
+            ORDER BY status ASC
+            """
+        ).fetchall()
+    return {
+        "total_sources": int(total_row["count"] if total_row else 0),
+        "supported_sources": int(supported_row["count"] if supported_row else 0),
+        "unhealthy_sources": int(unhealthy_row["count"] if unhealthy_row else 0),
+        "last_checked_at": str(last_row["checked_at"] or "") if last_row else "",
+        "status_counts": {
+            str(row["status"] or "not_checked"): int(row["count"] or 0)
+            for row in status_rows
+        },
+    }
+
+
 def record_source_catalog_health_check(db_path: Path, result: dict[str, Any]) -> int:
     catalog_entry_id = str(result.get("catalog_entry_id") or "").strip()
     status = str(result.get("status") or "").strip()

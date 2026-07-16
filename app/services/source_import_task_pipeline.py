@@ -13,15 +13,25 @@ from app.database.import_jobs import ImportJobRepository, TaskStage
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent
 from app.mobile_api.services.import_metadata import normalize_import_text
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.observability import Observability, default_observability
 from app.services.import_job_service import TaskImportOutcome
 
 
 class SourceImportTaskPipeline:
     """Bridge ``PipelineService`` into the P06/P07 staged worker contract."""
 
-    def __init__(self, repository: ImportJobRepository, pipeline: PipelineService) -> None:
+    def __init__(
+        self,
+        repository: ImportJobRepository,
+        pipeline: PipelineService,
+        *,
+        observability: Observability | None = None,
+        max_chapter_bytes: int = 5 * 1024 * 1024,
+    ) -> None:
         self.repository = repository
         self.pipeline = pipeline
+        self.observability = observability or default_observability
+        self.max_chapter_bytes = max(1, int(max_chapter_bytes))
         self._chapters: dict[int, SourceChapterContent] = {}
         self._lock = RLock()
 
@@ -29,6 +39,16 @@ class SourceImportTaskPipeline:
         if cancel_check():
             return None
         if stage is TaskStage.FETCHING:
+            job = self.repository.get_job_internal(task.job_id)
+            adapter_id = (job.source if job else "") or "unknown"
+            fetch_method = task.fetch_method or "direct_http"
+            if not self.observability.circuit_breaker.allow(adapter_id, fetch_method):
+                raise SourceAdapterError(
+                    "The source is temporarily unavailable. Try again later.",
+                    code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                    retryable=True,
+                    http_status=503,
+                )
             fetch_chapter = getattr(self.pipeline, "fetch_source_chapter", None)
             if not callable(fetch_chapter):
                 raise SourceAdapterError(
@@ -37,7 +57,46 @@ class SourceImportTaskPipeline:
                     retryable=False,
                     http_status=500,
                 )
-            chapter = fetch_chapter(task.canonical_chapter_url)
+            try:
+                chapter = fetch_chapter(task.canonical_chapter_url)
+            except SourceAdapterError as exc:
+                self.observability.circuit_breaker.record_failure(adapter_id, fetch_method, exc.code)
+                self.observability.record_fetch(
+                    adapter_id=adapter_id,
+                    fetch_method=fetch_method,
+                    error_code=exc.code.value,
+                    job_id=task.job_id,
+                    task_id=task.id,
+                )
+                raise
+            response_bytes = max(0, int(chapter.fetch_bytes_received or len(chapter.text.encode("utf-8"))))
+            if response_bytes > self.max_chapter_bytes:
+                self.observability.record_fetch(
+                    adapter_id=chapter.adapter_id or adapter_id,
+                    adapter_version=chapter.adapter_version,
+                    fetch_method=chapter.fetch_method or fetch_method,
+                    error_code=FetchErrorCode.CONTENT_INVALID.value,
+                    elapsed_ms=chapter.fetch_elapsed_ms,
+                    response_bytes=response_bytes,
+                    job_id=task.job_id,
+                    task_id=task.id,
+                )
+                raise SourceAdapterError(
+                    "Chapter response exceeds the configured size limit",
+                    code=FetchErrorCode.CONTENT_INVALID,
+                    retryable=False,
+                    http_status=413,
+                )
+            self.observability.circuit_breaker.record_success(chapter.adapter_id or adapter_id, chapter.fetch_method or fetch_method)
+            self.observability.record_fetch(
+                adapter_id=chapter.adapter_id or adapter_id,
+                adapter_version=chapter.adapter_version,
+                fetch_method=chapter.fetch_method or fetch_method,
+                elapsed_ms=chapter.fetch_elapsed_ms,
+                response_bytes=response_bytes,
+                job_id=task.job_id,
+                task_id=task.id,
+            )
             with self._lock:
                 self._chapters[task.id] = chapter
             return None
@@ -93,6 +152,7 @@ class SourceImportTaskPipeline:
             content_hash=result.content_hash,
             fetch_method=chapter.fetch_method,
             elapsed_ms=chapter.fetch_elapsed_ms,
+            operation=result.operation,
         )
 
     def release_task(self, task_id: int) -> None:

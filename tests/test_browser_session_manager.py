@@ -230,16 +230,19 @@ async def test_browser_session_serializes_fetches_with_per_session_lock(tmp_path
 
 @pytest.mark.asyncio
 async def test_browser_session_restarts_after_browser_crash(tmp_path) -> None:
+    from app.observability import InMemoryMetrics, Observability
     from app.utils.stealth_browser import BrowserSessionManager
 
     factory, contexts, playwrights, _launch_options = fake_playwright_factory(
         [FakePage(crash_once=True), FakePage()]
     )
+    metrics = InMemoryMetrics()
     manager = BrowserSessionManager(
         playwright_factory=factory,
         profile_dir=tmp_path / "profile",
         resolver=public_resolver,
         sleep=lambda _seconds: asyncio.sleep(0),
+        observability=Observability(metrics=metrics),
     )
 
     html = await manager.fetch("https://example.com/chapter/1")
@@ -248,6 +251,9 @@ async def test_browser_session_restarts_after_browser_crash(tmp_path) -> None:
     assert len(contexts) == 2
     assert contexts[0].closed
     assert playwrights[0].stopped
+    counters = {entry["name"]: entry["value"] for entry in metrics.snapshot()["counters"]}
+    assert counters["browser_launches_total"] == 2
+    assert counters["browser_restarts_total"] == 1
     await manager.close()
 
 
