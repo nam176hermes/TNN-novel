@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app.database import db
 from app.database.db import get_book_by_title, get_chapter, init_db, list_chapters
 from app.mobile_api.services.pipeline_service import PipelineService
 
@@ -174,3 +175,23 @@ def test_init_db_backfills_legacy_import_identity_without_removing_records(tmp_p
     assert chapter["canonical_chapter_url"] == "https://example.test/books/old/1"
     assert chapter["content_hash"] == "legacy-hash"
     assert chapter["content_revision"] == 1
+
+
+def test_canonicalize_import_url_does_not_resolve_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class Result:
+        canonical_url = "https://example.test/chapter/1"
+
+    def validate(url: str, *, resolver: object) -> Result:
+        captured["url"] = url
+        captured["resolver"] = resolver
+        return Result()
+
+    monkeypatch.setattr(db, "validate_fetch_url", validate)
+
+    assert db.canonicalize_import_url("HTTPS://Example.TEST/chapter/1") == Result.canonical_url
+    assert captured == {
+        "url": "HTTPS://Example.TEST/chapter/1",
+        "resolver": None,
+    }

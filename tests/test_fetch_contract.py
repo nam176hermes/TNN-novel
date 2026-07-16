@@ -119,6 +119,37 @@ def test_fetch_error_mapping_has_code_retryable_and_safe_details() -> None:
     assert error.details["cookie"] == "[redacted]"
 
 
+def test_rate_limit_retry_after_header_is_preserved_as_safe_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.ingestion import source_adapters
+    from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "10"}
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.cookies = _fake_cookie_jar()
+
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(source_adapters.requests, "Session", FakeSession)
+
+    with pytest.raises(SourceAdapterError) as exc:
+        source_adapters.fetch_public_html_result(
+            "https://www.69shuba.com/book/1/",
+            allow_browser_fallback=False,
+            resolver=lambda _hostname, _port: ["93.184.216.34"],
+        )
+
+    assert exc.value.code is FetchErrorCode.RATE_LIMITED
+    assert exc.value.retryable is True
+    assert exc.value.retry_after_seconds == 10
+
+
 def test_concurrent_fetches_do_not_leak_method_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.ingestion import source_adapters
     from app.ingestion.source_adapters import FetchMethod

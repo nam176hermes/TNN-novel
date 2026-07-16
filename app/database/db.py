@@ -78,7 +78,7 @@ def canonicalize_import_url(url: str) -> str:
     value = str(url or "").strip()
     if not value:
         return ""
-    return validate_fetch_url(value).canonical_url
+    return validate_fetch_url(value, resolver=None).canonical_url
 
 
 def get_db_path(data_dir: Path) -> Path:

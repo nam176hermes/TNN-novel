@@ -4,7 +4,16 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P15 — deployment hardening is implemented and backend-verified in the worktree. Container verification is blocked because Docker is unavailable, and the unchanged full Vitest run stalls before reporting; both remain release gates.
+- P16 independent review completed in the worktree. Decision: **NO-GO**. Full
+  backend validation passed (`1026 passed, 2 warnings in 1647.85s`), but the
+  exact Vitest command stalls before reporting and Docker is unavailable for
+  P15 image/Compose/health verification. P16 fixed network-dependent P04
+  migration canonicalization, HTTP `Retry-After` propagation, and unsafe
+  CAPTCHA utility logging. See `docs/upgrade/RELEASE_REPORT.md`.
+- Production release remains blocked until Vitest, Docker/Compose verification,
+  and the legacy CAPTCHA/proxy/fingerprint paths that conflict with this plan's
+  safety boundary are resolved or explicitly disabled in production.
+- Active milestone: P16 — independent final review; release gates are not met.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -397,6 +406,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-16 | P15 recovers `waiting_retry` only after the retry lease expires. | A live P07 worker may be sleeping through a durable backoff; another worker must not steal that task merely because `next_attempt_at` is due. |
 | 2026-07-16 | Browser URL interception validates subresources as well as top-level navigation. | Navigation-only validation cannot prevent a page from probing a private or metadata endpoint through a script/image/fetch request. |
 | 2026-07-16 | The production deployment default is one import worker. | Per-task leases permit races safely, but cross-worker ordered-import behavior must be benchmarked before scaling browser/import replicas. |
+| 2026-07-16 | P16 release decision is NO-GO. | Full backend validation passes, but frontend Vitest stalls, Docker/Compose verification is unavailable, and legacy anti-bot behavior conflicts with the Plan B safety boundary. |
 
 ## Test matrix
 

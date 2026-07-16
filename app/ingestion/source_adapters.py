@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from html import unescape
 from html.parser import HTMLParser
@@ -207,6 +209,7 @@ class SourceBlockedError(SourceAdapterError):
         *,
         code: FetchErrorCode = FetchErrorCode.USER_VERIFICATION_REQUIRED,
         retryable: bool = False,
+        retry_after_seconds: float | None = None,
         http_status: int | None = None,
         details: Mapping[str, Any] | None = None,
     ) -> None:
@@ -214,6 +217,7 @@ class SourceBlockedError(SourceAdapterError):
             message,
             code=code,
             retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
             http_status=http_status,
             details=details,
         )
@@ -918,6 +922,24 @@ def _decode_html_response(
     return raw.decode("utf-8", errors="replace")
 
 
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    """Parse a bounded Retry-After value without persisting its raw header."""
+
+    raw_value = str(response.headers.get("Retry-After", "")).strip()
+    if not raw_value:
+        return None
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
 def _raise_if_blocked_http_response(url: str, response: requests.Response) -> None:
     cf_mitigated = response.headers.get("cf-mitigated", "").casefold()
     server = response.headers.get("server", "").casefold()
@@ -934,6 +956,7 @@ def _raise_if_blocked_http_response(url: str, response: requests.Response) -> No
             "Source rate limit detected; pause import and retry later",
             code=FetchErrorCode.RATE_LIMITED,
             retryable=True,
+            retry_after_seconds=_retry_after_seconds(response),
             http_status=429,
             details={"url": url},
         )

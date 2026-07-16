@@ -63,9 +63,15 @@ class WorkerHeartbeat:
                 json.dump({"updated_at": int(timestamp)}, handle, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temporary_path, 0o600)
+            try:
+                os.chmod(temporary_path, 0o600)
+            except (OSError, PermissionError):
+                pass
             os.replace(temporary_path, self.path)
-            os.utime(self.path, (timestamp, timestamp))
+            try:
+                os.utime(self.path, (timestamp, timestamp))
+            except (OSError, PermissionError):
+                pass
         finally:
             temporary_path.unlink(missing_ok=True)
 

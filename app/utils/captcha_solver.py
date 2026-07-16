@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Optional
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 class CaptchaSolver:
@@ -52,8 +56,8 @@ class CaptchaSolver:
             resp = requests.post(create_task_url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-        except Exception as e:
-            print(f"[Captcha] Create task failed: {e}")
+        except Exception:
+            logger.warning("Captcha task creation request failed")
             return None
 
         if self.provider == "2captcha":
@@ -62,7 +66,7 @@ class CaptchaSolver:
             task_id = data.get("taskId") or data.get("taskId")
 
         if not task_id:
-            print(f"[Captcha] No task ID returned: {data}")
+            logger.warning("Captcha provider response did not include a task ID")
             return None
 
         # Poll for result
@@ -83,12 +87,12 @@ class CaptchaSolver:
             if status == "ready" or status is True:
                 return result_data.get("solution", {}).get("token")
             elif status == "error" or result_data.get("error"):
-                print(f"[Captcha] Task error: {result_data}")
+                logger.warning("Captcha provider returned a task error")
                 return None
 
             time.sleep(5)
 
-        print(f"[Captcha] Timeout after {timeout}s")
+        logger.warning("Captcha task timed out")
         return None
 
     def solve_recaptcha(
@@ -123,13 +127,13 @@ class CaptchaSolver:
             resp = requests.post(create_task_url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-        except Exception as e:
-            print(f"[Captcha] Create task failed: {e}")
+        except Exception:
+            logger.warning("Captcha task creation request failed")
             return None
 
         task_id = data.get("taskId")
         if not task_id:
-            print(f"[Captcha] No task ID returned: {data}")
+            logger.warning("Captcha provider response did not include a task ID")
             return None
 
         start_time = time.time()
@@ -149,7 +153,7 @@ class CaptchaSolver:
             if status == "ready" or status is True:
                 return result_data.get("solution", {}).get("gRecaptchaResponse")
             elif status == "error" or result_data.get("error"):
-                print(f"[Captcha] Task error: {result_data}")
+                logger.warning("Captcha provider returned a task error")
                 return None
 
             time.sleep(5)
