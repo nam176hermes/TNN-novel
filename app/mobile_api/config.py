@@ -42,6 +42,11 @@ class MobileAPISettings(BaseModel):
     login_rate_limit_window_seconds: int = int(os.getenv("MOBILE_API_LOGIN_RATE_LIMIT_WINDOW_SECONDS", "300"))
     job_stale_after_seconds: int = int(os.getenv("JOB_STALE_AFTER_SECONDS", "300"))
     job_heartbeat_interval_seconds: float = float(os.getenv("JOB_HEARTBEAT_INTERVAL_SECONDS", "30"))
+    import_job_max_chapters: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_CHAPTERS", "200")),
+        gt=0,
+        le=5_000,
+    )
     auth_session_retention_days: int = Field(
         default=int(os.getenv("AUTH_SESSION_RETENTION_DAYS", "30")),
         gt=0,

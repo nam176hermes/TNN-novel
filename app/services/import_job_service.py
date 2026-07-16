@@ -164,6 +164,7 @@ class ImportJobService:
 
     def retry_failed_tasks(self, job_id: str, owner_user_id: str) -> list[ChapterTask]:
         """Explicit retry only for failed tasks marked retryable by the pipeline."""
+        self.get_job(job_id, owner_user_id)
         retried: list[ChapterTask] = []
         for task in self.repository.list_tasks(job_id, owner_user_id):
             if task.status is TaskStatus.FAILED and task.retryable:
@@ -171,6 +172,26 @@ class ImportJobService:
         if retried:
             self.repository.restart_job_for_retry(job_id, owner_user_id)
         return retried
+
+    def list_tasks(self, job_id: str, owner_user_id: str) -> list[ChapterTask]:
+        self.get_job(job_id, owner_user_id)
+        return self.repository.list_tasks(job_id, owner_user_id)
+
+    def list_events(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ):
+        self.get_job(job_id, owner_user_id)
+        return self.repository.list_events(
+            job_id,
+            owner_user_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
 
     def recover_interrupted_jobs(self) -> list[str]:
         """Recover only expired task leases; it never reruns a task itself."""

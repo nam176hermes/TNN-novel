@@ -880,6 +880,68 @@ export type URLFetchResponse = {
   chapters: URLFetchChapterResult[];
 };
 
+export type ImportJobAccepted = {
+  job_id: string;
+  status: string;
+  total: number;
+};
+
+export type ImportJobTaskSummary = {
+  id: number;
+  chapter_number: number;
+  title: string;
+  status: string;
+  stage: string;
+  attempts: number;
+  next_attempt_at: string;
+  error_code: string;
+  error_message: string;
+  retryable: boolean;
+  fetch_method: string;
+  text_length: number;
+  content_hash: string;
+  elapsed_ms: number;
+  started_at: string;
+  finished_at: string;
+  book_id: number | null;
+  chapter_id: number | null;
+};
+
+export type ImportJobSnapshot = {
+  job_id: string;
+  status: string;
+  source: string;
+  book_id: number | null;
+  total: number;
+  queued_count: number;
+  running_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  waiting_retry_count: number;
+  verification_required_count: number;
+  created_at: string;
+  started_at: string;
+  finished_at: string;
+  cancel_requested_at: string;
+  error_summary: string;
+  tasks: ImportJobTaskSummary[];
+};
+
+export type ImportJobEvent = {
+  sequence: number;
+  job_id: string;
+  task_id: number | null;
+  type: string;
+  data: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ImportJobEventStream = {
+  abort: () => void;
+  done: Promise<void>;
+};
+
 export type SourceCapability = {
   source_id: string;
   label: string;

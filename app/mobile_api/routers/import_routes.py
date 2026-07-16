@@ -11,16 +11,43 @@ import shutil
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
 
 from app.config import PROJECT_ROOT
-from app.database.db import find_managed_source_for_url, get_managed_source, list_ebook_import_runs
+from app.database.db import find_managed_source_for_url, get_chapter_by_id, get_managed_source, list_ebook_import_runs
+from app.database.import_jobs import (
+    ImportJob,
+    ImportJobRepository,
+    InvalidImportJobTransition,
+    JobStatus as DurableImportJobStatus,
+    TaskStatus as DurableImportTaskStatus,
+)
 from app.ingestion.source_adapters import FetchErrorCode, FetchMethod, SourceAdapterError, list_source_capabilities, validate_public_http_url
 from app.ingestion.source_policies import chapter_url_matches_source_book, get_source_policy
+from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.config import mobile_settings
 from app.mobile_api.dependencies import get_db_path
 from app.mobile_api.schemas import (
     JobResponse,
+    ImportJobAcceptedResponse,
+    ImportJobCreateRequest,
+    ImportJobErrorResponse,
+    ImportJobEventData,
+    ImportJobSnapshotResponse,
     PasteImport,
     SourceCapabilityList,
     SourcePreviewResponse,
@@ -38,6 +65,8 @@ from app.mobile_api.services.job_service import JobService, get_shared_job_track
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload_to_temp_limited
+from app.services.import_job_service import ImportJobService
+from app.services.source_import_task_pipeline import SourceImportTaskPipeline
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 logger = logging.getLogger(__name__)
@@ -48,6 +77,31 @@ MAX_WIZARD_TEXT_IMPORT_BYTES = 5 * 1024 * 1024
 EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
     "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
 )
+IMPORT_JOB_TERMINAL_STATUSES = {
+    DurableImportJobStatus.SUCCEEDED,
+    DurableImportJobStatus.PARTIALLY_SUCCEEDED,
+    DurableImportJobStatus.FAILED,
+    DurableImportJobStatus.CANCELLED,
+}
+IMPORT_JOB_SSE_POLL_SECONDS = 0.25
+IMPORT_JOB_SSE_KEEPALIVE_SECONDS = 15.0
+IMPORT_JOB_ERROR_RESPONSES = {
+    400: {"model": ImportJobErrorResponse, "description": "Invalid import request"},
+    404: {"model": ImportJobErrorResponse, "description": "Import job not found"},
+    409: {"model": ImportJobErrorResponse, "description": "Import job state conflict"},
+    422: {"model": ImportJobErrorResponse, "description": "Import request quota or validation failure"},
+}
+IMPORT_JOB_SSE_RESPONSES = {
+    **IMPORT_JOB_ERROR_RESPONSES,
+    200: {
+        "description": "Persisted import job events",
+        "content": {
+            "text/event-stream": {
+                "schema": ImportJobEventData.model_json_schema(),
+            }
+        },
+    },
+}
 
 
 def _source_adapter_http_exception(exc: SourceAdapterError, *, default_status: int = 400) -> HTTPException:
@@ -69,8 +123,246 @@ def get_job_service():
     return JobService(PipelineService(), tracker=get_shared_job_tracker(get_db_path()))
 
 
+def get_import_job_service(
+    pipeline: PipelineService = Depends(get_pipeline),
+) -> ImportJobService:
+    repository = ImportJobRepository(Path(getattr(pipeline, "db_path", get_db_path())))
+    return ImportJobService(
+        repository,
+        worker_id=f"api-{os.getpid()}",
+        pipeline=SourceImportTaskPipeline(repository, pipeline),
+    )
+
+
 def get_ebook_import_service():
     return EbookImportService()
+
+
+def _import_job_owner(current_user: dict) -> str:
+    owner = str(current_user.get("user_id") or current_user.get("username") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "invalid_owner", "retryable": False, "message": "Authenticated owner is unavailable"},
+        )
+    return owner
+
+
+def _import_job_http_error(code: str, message: str, status_code: int) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "retryable": False, "message": message},
+    )
+
+
+def _raise_import_job_error(exc: Exception) -> None:
+    if isinstance(exc, (LookupError, PermissionError)):
+        raise _import_job_http_error("job_not_found", "Import job not found", 404) from exc
+    if isinstance(exc, InvalidImportJobTransition):
+        raise _import_job_http_error("invalid_job_state", "Import job state does not allow this action", 409) from exc
+    if isinstance(exc, SourceAdapterError):
+        raise HTTPException(
+            status_code=exc.http_status or 400,
+            detail={"code": exc.code.value, "retryable": exc.retryable, "message": exc.safe_message},
+        ) from exc
+    raise exc
+
+
+def _validated_import_job_selection(
+    data: ImportJobCreateRequest | URLFetchRequest,
+) -> tuple[str, str, list[dict[str, object]]]:
+    if not data.title.strip():
+        raise _import_job_http_error("invalid_request", "Book title is required", 422)
+    if not data.chapters:
+        raise _import_job_http_error("invalid_request", "At least one chapter must be selected", 422)
+    if len(data.chapters) > mobile_settings.import_job_max_chapters:
+        raise _import_job_http_error(
+            "chapter_quota_exceeded",
+            f"A job can include at most {mobile_settings.import_job_max_chapters} chapters",
+            422,
+        )
+
+    source_url = validate_public_http_url(data.source_url or data.chapters[0].url)
+    source_policy = get_source_policy(source_url)
+    if source_policy is None:
+        raise SourceAdapterError(
+            "Unsupported source domain",
+            code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+            retryable=False,
+            http_status=400,
+        )
+
+    tasks: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for chapter in data.chapters:
+        chapter_url = validate_public_http_url(chapter.url)
+        chapter_policy = get_source_policy(chapter_url)
+        if chapter_policy is None or chapter_policy.source_id != source_policy.source_id:
+            raise SourceAdapterError(
+                "Selected chapters must belong to the same supported source",
+                code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                retryable=False,
+                http_status=400,
+            )
+        if not chapter_url_matches_source_book(source_url, chapter_url):
+            raise SourceAdapterError(
+                "Selected chapters must belong to the same source book",
+                code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                retryable=False,
+                http_status=400,
+            )
+        if chapter_url in seen:
+            raise SourceAdapterError(
+                "Duplicate chapter selection",
+                code=FetchErrorCode.DUPLICATE,
+                retryable=False,
+                http_status=409,
+            )
+        seen.add(chapter_url)
+        tasks.append(
+            {
+                "canonical_identity": f"{source_policy.source_id}:{chapter_url}",
+                "canonical_chapter_url": chapter_url,
+                "chapter_number": chapter.chapter_number,
+                "title": chapter.title,
+            }
+        )
+    return source_url, source_policy.source_id, tasks
+
+
+def _create_durable_import_job(
+    service: ImportJobService,
+    data: ImportJobCreateRequest | URLFetchRequest,
+    owner_user_id: str,
+) -> ImportJob:
+    source_url, source_id, tasks = _validated_import_job_selection(data)
+    job = service.create_job(
+        owner_user_id=owner_user_id,
+        source=data.source.strip() or source_id,
+        source_url=source_url,
+        tasks=tasks,
+        config_snapshot={
+            "title": data.title.strip(),
+            "author": data.author.strip(),
+            "source": data.source.strip() or source_id,
+            "source_url": source_url,
+        },
+    )
+    return service.enqueue_job(job.id, owner_user_id)
+
+
+def _run_import_job_until_idle(
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+) -> ImportJob:
+    """Drain bounded P07 batches without introducing an autonomous scheduler."""
+    while True:
+        before = service.get_job(job_id, owner_user_id)
+        job = service.run_job(job_id, owner_user_id)
+        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
+            return job
+        if job.cancel_requested_at or job.queued_count == 0:
+            return job
+        if job.version == before.version:
+            return job
+
+
+def _import_job_snapshot(
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+) -> dict:
+    job = service.get_job(job_id, owner_user_id)
+    tasks = service.list_tasks(job_id, owner_user_id)
+    return {
+        "job_id": job.id,
+        "status": job.status.value,
+        "source": job.source,
+        "book_id": job.book_id,
+        "total": job.total,
+        "queued_count": job.queued_count,
+        "running_count": job.running_count,
+        "succeeded_count": job.succeeded_count,
+        "failed_count": job.failed_count,
+        "cancelled_count": job.cancelled_count,
+        "waiting_retry_count": job.waiting_retry_count,
+        "verification_required_count": job.verification_required_count,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "cancel_requested_at": job.cancel_requested_at,
+        "error_summary": job.error_summary,
+        "tasks": [
+            {
+                "id": task.id,
+                "chapter_number": task.chapter_number,
+                "title": task.title,
+                "status": task.status.value,
+                "stage": task.stage.value,
+                "attempts": task.attempts,
+                "next_attempt_at": task.next_attempt_at,
+                "error_code": task.error_code,
+                "error_message": task.error_message,
+                "retryable": task.retryable,
+                "fetch_method": task.fetch_method,
+                "text_length": task.text_length,
+                "content_hash": task.content_hash,
+                "elapsed_ms": task.elapsed_ms,
+                "started_at": task.started_at,
+                "finished_at": task.finished_at,
+                "book_id": task.book_id,
+                "chapter_id": task.chapter_id,
+            }
+            for task in tasks
+        ],
+    }
+
+
+def _sse_event(event) -> str:
+    payload = {
+        "sequence": event.sequence,
+        "job_id": event.job_id,
+        "task_id": event.task_id,
+        "type": event.event_type,
+        "data": event.payload,
+        "created_at": event.created_at,
+    }
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event.sequence}\nevent: import_job_event\ndata: {data}\n\n"
+
+
+async def _stream_import_job_events(
+    request: Request,
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+    *,
+    cursor: int,
+):
+    last_sequence = max(0, cursor)
+    last_emit_at = time.monotonic()
+    while True:
+        if await request.is_disconnected():
+            return
+        events = await asyncio.to_thread(
+            service.list_events,
+            job_id,
+            owner_user_id,
+            after_sequence=last_sequence,
+        )
+        for event in events:
+            last_sequence = event.sequence
+            last_emit_at = time.monotonic()
+            yield _sse_event(event)
+
+        job = await asyncio.to_thread(service.get_job, job_id, owner_user_id)
+        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
+            return
+        if time.monotonic() - last_emit_at >= IMPORT_JOB_SSE_KEEPALIVE_SECONDS:
+            last_emit_at = time.monotonic()
+            yield ": keepalive\n\n"
+        await asyncio.sleep(IMPORT_JOB_SSE_POLL_SECONDS)
 
 
 @router.get("/sources", response_model=SourceCapabilityList)
@@ -935,83 +1227,188 @@ async def import_source_url(
     return JobResponse(job_id=job_id, status="pending", message="URL import job started")
 
 
+@router.post(
+    "/jobs",
+    response_model=ImportJobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def create_import_job(
+    data: ImportJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    """Create and enqueue a durable URL import job."""
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        job = _create_durable_import_job(service, data, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    background_tasks.add_task(_run_import_job_until_idle, service, job.id, owner_user_id)
+    return ImportJobAcceptedResponse(job_id=job.id, status=job.status.value, total=job.total)
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def get_import_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        return _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+
+
+@router.get(
+    "/jobs/{job_id}/events",
+    response_class=StreamingResponse,
+    responses=IMPORT_JOB_SSE_RESPONSES,
+)
+async def stream_import_job_events(
+    job_id: str,
+    request: Request,
+    cursor: int = Query(default=0, ge=0),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        service.get_job(job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    header_cursor = 0
+    if last_event_id:
+        try:
+            header_cursor = max(0, int(last_event_id))
+        except ValueError as exc:
+            raise _import_job_http_error("invalid_cursor", "Last-Event-ID must be an integer", 400) from exc
+    resolved_cursor = max(cursor, header_cursor)
+    return StreamingResponse(
+        _stream_import_job_events(
+            request,
+            service,
+            job_id,
+            owner_user_id,
+            cursor=resolved_cursor,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def cancel_import_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        service.request_cancel(job_id, owner_user_id)
+        return _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+
+
+@router.post(
+    "/jobs/{job_id}/retry-failed",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def retry_failed_import_job_tasks(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        retried = service.retry_failed_tasks(job_id, owner_user_id)
+        snapshot = _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    if retried:
+        background_tasks.add_task(_run_import_job_until_idle, service, job_id, owner_user_id)
+    return snapshot
+
+
 @router.post("/url/fetch", response_model=URLFetchResponse)
 async def fetch_source_chapters(
     data: URLFetchRequest,
     request: Request,
-    pipeline: PipelineService = Depends(get_pipeline),
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
 ):
-    """Fetch and import selected chapters directly — no Source Hub required.
+    """Compatibility response backed by the same durable P09 job engine."""
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        job = _create_durable_import_job(service, data, owner_user_id)
+        await asyncio.to_thread(_run_import_job_until_idle, service, job.id, owner_user_id)
+        tasks = service.list_tasks(job.id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
 
-    Each chapter URL is fetched (with auto-bypass for Cloudflare/captcha),
-    text extracted, and imported into the book.
-    """
-    if not data.title.strip():
-        raise HTTPException(status_code=400, detail="Book title is required")
-    if not data.chapters:
-        raise HTTPException(status_code=400, detail="At least one chapter must be selected")
-
+    original_by_number = {chapter.chapter_number: chapter for chapter in data.chapters}
     results: list[URLFetchChapterResult] = []
-    succeeded = 0
-    failed = 0
     book_id = 0
-
-    for ch in data.chapters:
-        started_at = datetime.now(timezone.utc)
-        started_at_monotonic = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(
-                pipeline.import_from_source_url,
-                book_title=data.title,
-                author=data.author,
-                source=data.source,
-                source_url=data.source_url or ch.url,
-                chapter_url=ch.url,
-                chapter_number=ch.chapter_number,
-                chapter_title=ch.title,
+    for task in tasks:
+        original = original_by_number.get(task.chapter_number)
+        succeeded_task = task.status is DurableImportTaskStatus.SUCCEEDED
+        operation = "created" if succeeded_task else "failed"
+        warnings: list[str] = []
+        if task.chapter_id:
+            stored = get_chapter_by_id(service.repository.db_path, task.chapter_id)
+            if stored:
+                operation = str(stored.get("last_import_operation") or operation)
+        if succeeded_task and task.book_id:
+            book_id = task.book_id
+        results.append(
+            URLFetchChapterResult(
+                chapter_number=task.chapter_number,
+                title=task.title,
+                url=original.url if original is not None else "",
+                success=succeeded_task,
+                error="" if succeeded_task else task.error_message,
+                text_length=task.text_length,
+                book_id=task.book_id or 0,
+                chapter_id=task.chapter_id or 0,
+                stored_text_length=task.text_length,
+                content_hash=task.content_hash,
+                operation=operation,
+                warnings=warnings,
+                error_code=task.error_code,
+                retryable=task.retryable,
+                attempts=task.attempts,
+                fetch_method=task.fetch_method,
+                elapsed_ms=task.elapsed_ms,
+                started_at=task.started_at,
+                finished_at=task.finished_at,
             )
-            book_id = result.book_id
-            results.append(URLFetchChapterResult(
-                chapter_number=ch.chapter_number,
-                title=ch.title,
-                url=ch.url,
-                success=True,
-                text_length=result.stored_text_length,
-                book_id=book_id,
-                chapter_id=result.chapter_id,
-                stored_text_length=result.stored_text_length,
-                content_hash=result.content_hash,
-                operation=result.operation,
-                warnings=list(result.warnings),
-                attempts=result.fetch_attempts,
-                fetch_method=result.fetch_method,
-                elapsed_ms=result.fetch_elapsed_ms or max(0, int((time.perf_counter() - started_at_monotonic) * 1000)),
-                started_at=started_at.isoformat(),
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            ))
-            succeeded += 1
-        except Exception as exc:
-            error_code, retryable, safe_error, fetch_method = _url_fetch_error_metadata(exc)
-            logger.warning(
-                "Chapter fetch/import failed for chapter_number=%s error_code=%s",
-                ch.chapter_number,
-                error_code.value,
-            )
-            results.append(URLFetchChapterResult(
-                chapter_number=ch.chapter_number,
-                title=ch.title,
-                url=ch.url,
-                success=False,
-                error=safe_error,
-                error_code=error_code.value,
-                retryable=retryable,
-                fetch_method=fetch_method,
-                elapsed_ms=max(0, int((time.perf_counter() - started_at_monotonic) * 1000)),
-                operation="failed",
-                started_at=started_at.isoformat(),
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            ))
-            failed += 1
+        )
+    succeeded = sum(int(item.success) for item in results)
+    failed = len(results) - succeeded
 
     record_audit_event(
         event_type="import_url_fetch",

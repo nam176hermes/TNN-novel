@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P08 — browser/session containment.
+- Active milestone: P09 — durable import job API and SSE.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -48,6 +48,14 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P08 preserves the existing Cloudflare wait/reload path and compatibility wrapper without adding CAPTCHA, fingerprint, proxy, router, SSE, scheduler, or real-source behavior.
 - Targeted P08 browser/fetch/lifespan verification: `72 passed, 1 warning in 25.11s` using mocked Playwright only.
 - Full P08 backend verification: `909 passed, 2 warnings in 1010.59s (0:16:50)`.
+- P09 implementation status: implemented and verified.
+- P09 exposes owner-scoped create/get/cancel/retry endpoints and an SSE stream backed by persisted `ImportJobEvent.sequence` cursors.
+- P09 keeps GET snapshot as the reconciliation source of truth, supports `Last-Event-ID`/query reconnect, keepalive, terminal close, and disconnect without cancellation.
+- P09 moves the compatibility `/api/import/url/fetch` route onto the same durable worker and adds authenticated fetch-streaming transport without changing React UI.
+- Targeted P09 backend verification: `43 passed, 1 warning in 103.58s` across the job API, URL compatibility, repository, runtime, and worker suites.
+- Targeted P09 client verification: `40 passed in 44.63s` for the API client, including authenticated streaming, cursor reconnect, abort, and typed errors.
+- Full P09 backend verification: `927 passed, 2 warnings in 1115.04s (0:18:35)`.
+- P09 static verification: backend compile/lint, frontend typecheck, production build, and `git diff --check` passed; the existing unresolved `sidebar-scenery.png` build warning remains.
 
 ## Goals
 
@@ -214,10 +222,13 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Disable downloads, close unexpected popups, and validate top-level navigation through P02 URL policy with injectable DNS resolution.
 - Preserve the existing Cloudflare wait/reload behavior and compatibility wrapper without adding stealth or CAPTCHA behavior.
 
-### P09 — Operational observability
+### P09 — Durable import job API and SSE
 
-- Add useful operational events and dashboards for source/import failures.
-- Keep private data out of logs and UI.
+- Expose owner-scoped create/get/cancel/retry operations for the P05–P07 import engine.
+- Stream persisted safe events in sequence order with reconnect cursor, keepalive, and terminal close.
+- Keep GET snapshot authoritative and ensure client disconnect never cancels durable work.
+- Route legacy synchronous URL fetch through the same job engine without breaking its response contract.
+- Add authenticated fetch/AbortController transport and typed client errors; do not change UI.
 
 ### P10 — Import artifact integrity
 
@@ -307,6 +318,10 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-15 | P08 owns Playwright persistent context lifecycle in `BrowserSessionManager`; sync callers use one dedicated daemon event-loop thread. | Playwright async objects retain loop affinity while the legacy synchronous API reuses a process/session instead of relaunching per chapter. |
 | 2026-07-15 | P08 checks idle/request/page/health rotation lazily at session use and performs explicit FastAPI/atexit cleanup. | The milestone forbids a scheduler thread; lazy checks provide bounded lifetime without an autonomous timer. |
 | 2026-07-15 | P08 rotates malformed cookie/profile state and logs only redacted URLs plus exception type. | Recovery metadata must not expose cookies, query secrets, HTML, content, or private paths. |
+| 2026-07-15 | P09 treats the authenticated `user_id` (username fallback only for auth-bypass compatibility) as the owner on every import-job route. | Ownership is server-derived; cross-owner existence is hidden behind a typed 404. |
+| 2026-07-15 | P09 uses persisted event sequence as SSE id and GET snapshot as the reconciliation source of truth. | Reconnect remains deterministic and event delivery cannot become a second mutable state store. |
+| 2026-07-15 | P09 uses FastAPI background tasks only as an immediate run trigger while SQLite remains the durable queue. | Client disconnect does not cancel work and no autonomous scheduler is added in this milestone. |
+| 2026-07-15 | P09 keeps fetched source text in the worker's in-memory stage cache and persists only safe task metadata. | Durable config/events must not contain chapter text, HTML, cookies, tokens, or secrets. |
 
 ## Test matrix
 
@@ -325,6 +340,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P05 import persistence | State transitions, explicit task retry, cancel idempotency, owner isolation, derived counters, monotonic events, and legacy migration | no worker/API/SSE side effects |
 | P06 import worker | Sequential success, partial failure, cancel before/during stage, expired lease recovery, atomic claim, explicit retry, and fake-pipeline idempotency simulation | no real source/browser calls or parallel execution |
 | P08 browser/session | Mocked persistent-context reuse, per-session serialization, idle/request/health/crash restart, popup/download/navigation containment, cookie expiry/atomic permissions/corrupt recovery, compatibility wrapper, and application shutdown | no real browser/source calls and no cookie/query/content in logs |
+| P09 import API/SSE | Create/get/cancel/retry, owner isolation, quota/URL validation, ordered persisted events, cursor/header reconnect, keepalive, disconnect, terminal close, legacy route, client fetch stream/abort, and typed errors | no Internet calls, no source content in snapshot/events, GET snapshot remains authoritative |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks
@@ -332,6 +348,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - The worktree was dirty before P00, including import/source/browser/frontend files.
 - P00 baseline had one failing source adapter test and a pyflakes failure; P01 full verification now passes.
 - Legacy CAPTCHA/proxy utilities remain present but P08 does not expand them; future work must continue treating challenge handling as a constrained compatibility path.
+- P09 triggers accepted jobs in-process; durable queued state survives, but there is still no autonomous polling worker that starts orphaned queued jobs without an operational trigger.
 - `docs/upgrade/codex-prompts-modified.md` contains older Plan B prompt text that preserves bypass-style behavior; future tasks must follow this document and root `AGENTS.md` instead.
 - Large files such as `pipeline_service.py`, `db.py`, `ImportPanel.tsx`, `client.ts`, and `types.ts` increase regression risk.
 

@@ -302,6 +302,18 @@ class ImportJobRepository:
             row = self._job_row(conn, job_id, owner_user_id, required=False)
         return _job_from_row(row) if row is not None else None
 
+    def get_job_internal(self, job_id: str) -> ImportJob | None:
+        """Load trusted worker context without exposing an unscoped API read.
+
+        HTTP callers must continue to use :meth:`get_job`.  A claimed chapter
+        task already carries a database-owned ``job_id``; the source pipeline
+        uses this method only to recover its sanitized durable config after a
+        process restart.
+        """
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
+        return _job_from_row(row) if row is not None else None
+
     def create_task(
         self,
         *,
@@ -763,12 +775,25 @@ class ImportJobRepository:
             row = self._job_row(conn, job_id, owner_user_id)
         return _job_from_row(row)
 
-    def list_events(self, job_id: str, owner_user_id: str) -> list[ImportJobEvent]:
+    def list_events(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ) -> list[ImportJobEvent]:
         with get_connection(self.db_path) as conn:
             if self._job_row(conn, job_id, owner_user_id, required=False) is None:
                 return []
             rows = conn.execute(
-                "SELECT * FROM import_job_events WHERE job_id = ? ORDER BY sequence ASC", (job_id,)
+                """
+                SELECT * FROM import_job_events
+                WHERE job_id = ? AND sequence > ?
+                ORDER BY sequence ASC
+                LIMIT ?
+                """,
+                (job_id, max(0, int(after_sequence)), max(1, min(int(limit), 1_000))),
             ).fetchall()
         return [_event_from_row(row) for row in rows]
 

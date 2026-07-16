@@ -501,6 +501,77 @@ class URLFetchResponse(BaseModel):
     chapters: list[URLFetchChapterResult] = Field(default_factory=list)
 
 
+class ImportJobCreateRequest(URLFetchRequest):
+    """Create a durable import job from the existing URL chapter selection."""
+
+
+class ImportJobAcceptedResponse(BaseModel):
+    job_id: str
+    status: str = "queued"
+    total: int = 0
+
+
+class ImportJobTaskSummary(BaseModel):
+    id: int
+    chapter_number: int
+    title: str = ""
+    status: str
+    stage: str
+    attempts: int = 0
+    next_attempt_at: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    retryable: bool = False
+    fetch_method: str = ""
+    text_length: int = 0
+    content_hash: str = ""
+    elapsed_ms: int = 0
+    started_at: str = ""
+    finished_at: str = ""
+    book_id: int | None = None
+    chapter_id: int | None = None
+
+
+class ImportJobSnapshotResponse(BaseModel):
+    job_id: str
+    status: str
+    source: str = ""
+    book_id: int | None = None
+    total: int = 0
+    queued_count: int = 0
+    running_count: int = 0
+    succeeded_count: int = 0
+    failed_count: int = 0
+    cancelled_count: int = 0
+    waiting_retry_count: int = 0
+    verification_required_count: int = 0
+    created_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    cancel_requested_at: str = ""
+    error_summary: str = ""
+    tasks: list[ImportJobTaskSummary] = Field(default_factory=list)
+
+
+class ImportJobEventData(BaseModel):
+    sequence: int
+    job_id: str
+    task_id: int | None = None
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+
+
+class ImportJobErrorDetail(BaseModel):
+    code: str
+    retryable: bool = False
+    message: str
+
+
+class ImportJobErrorResponse(BaseModel):
+    detail: ImportJobErrorDetail
+
+
 class URLImportStart(BaseModel):
     url: str
     title: str = ""

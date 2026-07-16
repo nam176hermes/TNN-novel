@@ -1630,4 +1630,79 @@ describe('ApiClient', () => {
       }),
     );
   });
+
+  it('streams import job SSE with bearer auth and a reconnect cursor', async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('id: 7\nevent: import_job_event\ndata: {"sequence":7,"job_id":"job-1",'));
+        controller.enqueue(encoder.encode('"task_id":null,"type":"job_transitioned","data":{"status":"running"},"created_at":"now"}\n\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const events: unknown[] = [];
+
+    const stream = client.openImportJobEventStream('job 1', (event) => events.push(event), { cursor: 6 });
+    await stream.done;
+
+    expect(events).toEqual([
+      {
+        sequence: 7,
+        job_id: 'job-1',
+        task_id: null,
+        type: 'job_transitioned',
+        data: { status: 'running' },
+        created_at: 'now',
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job%201/events?cursor=6',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it('aborts import job streaming without surfacing an AbortError', async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+
+    const stream = client.openImportJobEventStream('job-1', vi.fn());
+    stream.abort();
+
+    await expect(stream.done).resolves.toBeUndefined();
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.signal?.aborted).toBe(true);
+  });
+
+  it('preserves typed import job errors without parsing the message', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      statusText: 'Not Found',
+      json: async () => ({
+        detail: { code: 'job_not_found', retryable: false, message: 'Import job not found' },
+      }),
+    });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+
+    const error: unknown = await client.getImportJob('missing').then(
+      () => null,
+      (value: unknown) => value,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+    expect(error.code).toBe('job_not_found');
+    expect(error.retryable).toBe(false);
+  });
 });

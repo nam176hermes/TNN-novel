@@ -23,6 +23,10 @@ import type {
   GlossaryTerm,
   GlossaryTermUpdate,
   ImportFileRequest,
+  ImportJobAccepted,
+  ImportJobEvent,
+  ImportJobEventStream,
+  ImportJobSnapshot,
   ImportPasteRequest,
   ImportResponse,
   ImportUrlRequest,
@@ -98,11 +102,15 @@ export type ReaderBookSearchOptions = {
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: string;
+  readonly retryable: boolean;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code = '', retryable = false) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
+    this.retryable = retryable;
   }
 }
 
@@ -182,21 +190,43 @@ export class ApiClient {
     const status = response.status;
     const statusText = response.statusText ? ` ${response.statusText}` : '';
     const statusLabel = typeof status === 'number' && status > 0 ? ` (${status}${statusText})` : '';
-    const detail = await this.errorDetail(response);
-    const detailLabel = detail ? `: ${detail}` : '';
+    const error = await this.errorInfo(response);
+    const detailLabel = error.message ? `: ${error.message}` : '';
 
-    throw new ApiError(`${fallbackMessage}${statusLabel}${detailLabel}`, status);
+    throw new ApiError(
+      `${fallbackMessage}${statusLabel}${detailLabel}`,
+      status,
+      error.code,
+      error.retryable,
+    );
   }
 
   private async errorDetail(response: Response): Promise<string> {
+    return (await this.errorInfo(response)).message;
+  }
+
+  private async errorInfo(response: Response): Promise<{ message: string; code: string; retryable: boolean }> {
     try {
       const payload = (await response.json()) as ErrorPayload;
-      return formatDetail(payload.detail ?? payload.message ?? payload);
+      const detail = payload.detail;
+      if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+        const typed = detail as Record<string, unknown>;
+        return {
+          message: formatDetail(typed.message ?? detail),
+          code: typeof typed.code === 'string' ? typed.code : '',
+          retryable: typed.retryable === true,
+        };
+      }
+      return {
+        message: formatDetail(detail ?? payload.message ?? payload),
+        code: '',
+        retryable: false,
+      };
     } catch {
       try {
-        return (await response.text()).trim();
+        return { message: (await response.text()).trim(), code: '', retryable: false };
       } catch {
-        return '';
+        return { message: '', code: '', retryable: false };
       }
     }
   }
@@ -476,6 +506,105 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to fetch source chapters');
 
     return (await response.json()) as URLFetchResponse;
+  }
+
+  async createImportJob(request: URLFetchRequest): Promise<ImportJobAccepted> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    await this.assertOk(response, 'Failed to create import job');
+    return (await response.json()) as ImportJobAccepted;
+  }
+
+  async getImportJob(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load import job');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  async cancelImportJob(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to cancel import job');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  async retryFailedImportTasks(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/retry-failed`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to retry import tasks');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  openImportJobEventStream(
+    jobId: string,
+    onEvent: (event: ImportJobEvent) => void,
+    options: { cursor?: number } = {},
+  ): ImportJobEventStream {
+    const controller = new AbortController();
+    const query = options.cursor != null ? `?cursor=${Math.max(0, Math.trunc(options.cursor))}` : '';
+    const done = (async () => {
+      try {
+        const response = await this.fetcher(
+          `${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/events${query}`,
+          { headers: this.headers(), signal: controller.signal },
+        );
+        await this.assertOk(response, 'Failed to stream import job events');
+        if (!response.body) throw new ApiError('Import job event stream has no response body', response.status);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done: readerDone } = await reader.read();
+          if (readerDone) break;
+          buffer += decoder.decode(value, { stream: true });
+          buffer = this.consumeImportJobSseBlocks(buffer, onEvent);
+        }
+        buffer += decoder.decode();
+        this.consumeImportJobSseBlocks(`${buffer}\n\n`, onEvent);
+      } catch (error) {
+        if (
+          controller.signal.aborted &&
+          typeof error === 'object' &&
+          error !== null &&
+          'name' in error &&
+          error.name === 'AbortError'
+        ) {
+          return;
+        }
+        throw error;
+      }
+    })();
+    return { abort: () => controller.abort(), done };
+  }
+
+  private consumeImportJobSseBlocks(
+    input: string,
+    onEvent: (event: ImportJobEvent) => void,
+  ): string {
+    let buffer = input;
+    while (true) {
+      const boundary = buffer.match(/\r?\n\r?\n/);
+      if (!boundary || boundary.index == null) return buffer;
+      const block = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary[0].length);
+      if (!block || block.startsWith(':')) continue;
+      const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+      if (data) onEvent(JSON.parse(data) as ImportJobEvent);
+    }
   }
 
   async getImportSources(): Promise<SourceCapability[]> {
