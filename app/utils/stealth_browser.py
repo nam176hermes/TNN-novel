@@ -42,16 +42,11 @@ from app.security.url_policy import (
 
 logger = logging.getLogger(__name__)
 
-_STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-window.chrome = { runtime: {} };
-"""
-
-_DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+from app.utils.stealth_scripts import (
+    STEALTH_LAUNCH_ARGS,
+    build_stealth_script,
+    pick_user_agent,
+    pick_viewport,
 )
 
 
@@ -208,22 +203,18 @@ class BrowserSessionManager:
             pass
         self._playwright = await self._playwright_factory()
         display = _detect_display()
+        ua = pick_user_agent()
+        viewport = pick_viewport()
         self._context = await self._playwright.chromium.launch_persistent_context(
             str(self.profile_dir),
             headless=not bool(display),
-            viewport={"width": 1920, "height": 1080},
-            user_agent=_DEFAULT_UA,
+            viewport=viewport,
+            user_agent=ua,
             java_script_enabled=True,
             accept_downloads=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-                "--no-zygote",
-            ],
+            args=STEALTH_LAUNCH_ARGS,
         )
-        await self._context.add_init_script(_STEALTH_INIT_SCRIPT)
+        await self._context.add_init_script(build_stealth_script(ua))
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         for extra_page in tuple(self._context.pages[1:]):
             await extra_page.close()
@@ -287,33 +278,9 @@ class BrowserSessionManager:
         await self._sleep(5)
         title = await page.title()
         safe_url = redacted_url(url)
-        if "Checking your browser" in title or "Just a moment" in title:
-            logger.info("Cloudflare challenge page for %s — waiting up to 45s", safe_url)
-            try:
-                await page.wait_for_function(
-                    "document.title && !document.title.includes('Just a moment') "
-                    "&& !document.title.includes('Checking your browser')",
-                    timeout=45_000,
-                )
-            except Exception:
-                logger.warning(
-                    "Cloudflare challenge did not auto-resolve for %s — trying reload",
-                    safe_url,
-                )
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
-                    await self._sleep(5)
-                    title_after_reload = await page.title()
-                    if "Just a moment" in title_after_reload or "Checking" in title_after_reload:
-                        logger.warning("Still blocked after reload for %s", safe_url)
-                    else:
-                        logger.info("Cloudflare resolved after reload for %s", safe_url)
-                except Exception as reload_error:
-                    logger.warning(
-                        "Reload failed for %s (%s)",
-                        safe_url,
-                        type(reload_error).__name__,
-                    )
+
+        # --- Multi-strategy Cloudflare challenge handling ---
+        await self._handle_cloudflare_challenge(page, url, title, safe_url)
 
         captcha_found = await StealthBrowser._detect_and_solve_captcha(page, url)
         if captcha_found:
@@ -324,6 +291,97 @@ class BrowserSessionManager:
                 save_cookies(url, current_cookies)
                 logger.debug("Saved %d cookies for %s", len(current_cookies), safe_url)
         return await page.content()
+
+    async def _handle_cloudflare_challenge(
+        self,
+        page: Page | Any,
+        url: str,
+        initial_title: str,
+        safe_url: str,
+    ) -> None:
+        """Detect and resolve Cloudflare challenges using multiple strategies.
+
+        Strategy 1: Wait up to 45s for managed challenge auto-resolve.
+        Strategy 2: Reload page and wait again.
+        Strategy 3: Fresh navigation (clear cookies for domain, reload).
+        """
+        challenge_keywords = ("Just a moment", "Checking your browser", "Attention Required")
+
+        def is_challenge(title_text: str) -> bool:
+            return any(kw in title_text for kw in challenge_keywords)
+
+        if not is_challenge(initial_title):
+            return
+
+        logger.info("Cloudflare challenge detected for %s (strategy 1: wait)", safe_url)
+
+        # Strategy 1: Wait for auto-resolve
+        try:
+            await page.wait_for_function(
+                "document.title && !document.title.includes('Just a moment') "
+                "&& !document.title.includes('Checking your browser') "
+                "&& !document.title.includes('Attention Required')",
+                timeout=45_000,
+            )
+            logger.info("Cloudflare challenge auto-resolved for %s", safe_url)
+            return
+        except Exception:
+            logger.warning(
+                "Cloudflare challenge did not auto-resolve for %s (strategy 2: reload)",
+                safe_url,
+            )
+
+        # Strategy 2: Reload
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            await self._sleep(5)
+            title_after_reload = await page.title()
+            if not is_challenge(title_after_reload):
+                logger.info("Cloudflare resolved after reload for %s", safe_url)
+                return
+            logger.warning("Still blocked after reload for %s (strategy 3: fresh nav)", safe_url)
+        except Exception as reload_error:
+            logger.warning(
+                "Reload failed for %s (%s) — trying fresh navigation",
+                safe_url,
+                type(reload_error).__name__,
+            )
+
+        # Strategy 3: Clear cookies and navigate fresh
+        try:
+            # Clear cookies for this domain to force a fresh challenge cycle
+            context = self._context
+            if context is not None:
+                parsed = urlsplit(url)
+                domain = parsed.hostname or ""
+                if domain:
+                    # Clear all cookies for this domain
+                    all_cookies = await context.cookies()
+                    domain_cookies = [c for c in all_cookies if domain in c.get("domain", "")]
+                    if domain_cookies:
+                        for cookie in domain_cookies:
+                            try:
+                                await context.clear_cookies(
+                                    name=cookie.get("name", ""),
+                                    domain=cookie.get("domain", ""),
+                                )
+                            except Exception:
+                                pass
+                        logger.info("Cleared %d cookies for %s", len(domain_cookies), safe_url)
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await self._sleep(8)
+            title_after_fresh = await page.title()
+            if not is_challenge(title_after_fresh):
+                logger.info("Cloudflare resolved after fresh navigation for %s", safe_url)
+                return
+            logger.warning("Cloudflare challenge persists after all strategies for %s", safe_url)
+        except Exception as nav_error:
+            logger.warning(
+                "Fresh navigation failed for %s (%s)",
+                safe_url,
+                type(nav_error).__name__,
+            )
 
     async def _restart_session(self) -> None:
         self._observability.record_browser_lifecycle("restart")
@@ -401,42 +459,42 @@ class StealthBrowser:
         await self.manager.close()
 
     # ------------------------------------------------------------------ #
-    # Captcha detection (in-page JS)
+    # Captcha detection (in-page JS + iframe scanning)
     # ------------------------------------------------------------------ #
 
     @staticmethod
     async def _detect_and_solve_captcha(page: Page, url: str) -> bool:
-        """Detect Turnstile/reCAPTCHA on page. Solve if solver configured.
+        """Detect Turnstile/reCAPTCHA on page and in child iframes.
+
+        Solves via configured API solver if available. Injects token using
+        callback-based approach that actually triggers the page's submit flow.
 
         Returns True if a captcha was detected (regardless of solve success).
         """
         solver = get_captcha_solver()
         safe_url = redacted_url(url)
 
-        # --- Cloudflare Turnstile ---
-        turnstile_el = await page.query_selector(
-            '[data-sitekey], .cf-turnstile, div[data-testid="turnstile"]'
+        # --- Search main frame AND child frames for Turnstile ---
+        turnstile_result = await StealthBrowser._find_captcha_element(
+            page,
+            selectors=[
+                '[data-sitekey]:not(.g-recaptcha)',
+                '.cf-turnstile',
+                'div[data-testid="turnstile"]',
+            ],
         )
-        if turnstile_el:
-            sitekey = await turnstile_el.get_attribute("data-sitekey")
+        if turnstile_result:
+            frame, element = turnstile_result
+            sitekey = await element.get_attribute("data-sitekey")
             if sitekey:
                 logger.info("Turnstile detected (sitekey=%s) for %s", sitekey[:12], safe_url)
                 if solver:
-                    token = solver.solve_turnstile(url, sitekey)
+                    # Use the frame's URL as page_url for solver API
+                    frame_url = frame.url if frame != page.main_frame else url
+                    token = solver.solve_turnstile(frame_url, sitekey)
                     if token:
-                        await page.evaluate(
-                            """(args) => {
-                                const [token] = args;
-                                const el = document.querySelector('[data-sitekey]');
-                                if (el) el.setAttribute('data-response', token);
-                                // Also try cf-turnstile callback
-                                if (window.turnstile) {
-                                    window.turnstile.reset();
-                                }
-                            }""",
-                            [token],
-                        )
-                        logger.info("Turnstile token injected")
+                        await StealthBrowser._inject_turnstile_token(frame, token)
+                        logger.info("Turnstile token injected via callback")
                         await page.wait_for_timeout(3000)
                         return True
                     else:
@@ -447,21 +505,20 @@ class StealthBrowser:
                     return True
 
         # --- reCAPTCHA v2 ---
-        recaptcha_el = await page.query_selector('.g-recaptcha[data-sitekey]')
-        if recaptcha_el:
-            sitekey = await recaptcha_el.get_attribute("data-sitekey")
+        recaptcha_result = await StealthBrowser._find_captcha_element(
+            page,
+            selectors=['.g-recaptcha[data-sitekey]'],
+        )
+        if recaptcha_result:
+            frame, element = recaptcha_result
+            sitekey = await element.get_attribute("data-sitekey")
             if sitekey:
                 logger.info("reCAPTCHA detected (sitekey=%s) for %s", sitekey[:12], safe_url)
                 if solver:
-                    token = solver.solve_recaptcha(url, sitekey)
+                    frame_url = frame.url if frame != page.main_frame else url
+                    token = solver.solve_recaptcha(frame_url, sitekey)
                     if token:
-                        await page.evaluate(
-                            """(args) => {
-                                const [token] = args;
-                                document.getElementById('g-recaptcha-response').innerHTML = token;
-                            }""",
-                            [token],
-                        )
+                        await StealthBrowser._inject_recaptcha_token(frame, token)
                         logger.info("reCAPTCHA token injected")
                         await page.wait_for_timeout(3000)
                         return True
@@ -473,6 +530,137 @@ class StealthBrowser:
                     return True
 
         return False
+
+    @staticmethod
+    async def _find_captcha_element(
+        page: Page,
+        selectors: list[str],
+    ) -> tuple[Any, Any] | None:
+        """Search main frame and all child frames for a captcha element.
+
+        Returns (frame, element) tuple or None.
+        """
+        # Check main frame first
+        for selector in selectors:
+            el = await page.query_selector(selector)
+            if el:
+                return page.main_frame, el
+
+        # Check child frames (Turnstile often embeds in cross-origin iframe)
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            for selector in selectors:
+                try:
+                    el = await frame.query_selector(selector)
+                    if el:
+                        return frame, el
+                except Exception:
+                    # Cross-origin frames may block query_selector
+                    continue
+
+        return None
+
+    @staticmethod
+    async def _inject_turnstile_token(frame: Any, token: str) -> None:
+        """Inject Turnstile token using callback-based approach.
+
+        Tries multiple strategies to ensure the token actually triggers
+        the page's form submission or callback flow.
+        """
+        await frame.evaluate(
+            """(token) => {
+                // Strategy 1: Find the data-callback and invoke it directly
+                const widget = document.querySelector('[data-sitekey]');
+                if (widget) {
+                    // Set hidden response field
+                    const responseInput = document.querySelector(
+                        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+                    );
+                    if (responseInput) {
+                        responseInput.value = token;
+                    }
+
+                    // Try explicit callback
+                    const callbackName = widget.getAttribute('data-callback');
+                    if (callbackName && typeof window[callbackName] === 'function') {
+                        window[callbackName](token);
+                        return;
+                    }
+
+                    // Try turnstile.execute / success callback
+                    if (window.turnstile) {
+                        // Set response on the widget widget ID
+                        const widgetId = widget.getAttribute('data-turnstile-id');
+                        if (widgetId && window.turnstile.getResponse) {
+                            // Manually trigger the callback if registered
+                            const successCallback = window.turnstile._callbacks?.[widgetId];
+                            if (successCallback) {
+                                successCallback(token);
+                                return;
+                            }
+                        }
+                    }
+
+                    // Strategy 2: Set token on element and submit parent form
+                    widget.setAttribute('data-response', token);
+                    const form = widget.closest('form');
+                    if (form) {
+                        form.submit();
+                        return;
+                    }
+
+                    // Strategy 3: Dispatch a custom event
+                    widget.dispatchEvent(new CustomEvent('cf:turnstile:success', {
+                        detail: { token },
+                        bubbles: true,
+                    }));
+                }
+            }""",
+            token,
+        )
+
+    @staticmethod
+    async def _inject_recaptcha_token(frame: Any, token: str) -> None:
+        """Inject reCAPTCHA v2 token using textarea + callback approach."""
+        await frame.evaluate(
+            """(token) => {
+                // Set the hidden textarea
+                const textarea = document.getElementById('g-recaptcha-response');
+                if (textarea) {
+                    textarea.innerHTML = token;
+                    textarea.value = token;
+                }
+
+                // Try explicit callback
+                const widget = document.querySelector('.g-recaptcha');
+                if (widget) {
+                    const callbackName = widget.getAttribute('data-callback');
+                    if (callbackName && typeof window[callbackName] === 'function') {
+                        window[callbackName](token);
+                        return;
+                    }
+                }
+
+                // Try calling grecaptcha.execute if available
+                if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') {
+                    try {
+                        const widgetId = widget?.getAttribute('data-widget-id');
+                        if (widgetId !== null && widgetId !== undefined) {
+                            // Can't set response via execute, but trigger callback
+                        }
+                    } catch(e) {}
+                }
+
+                // Fallback: submit parent form
+                const form = document.querySelector('.g-recaptcha')?.closest('form');
+                if (form) {
+                    // Give the page time to process the token
+                    setTimeout(() => form.submit(), 500);
+                }
+            }""",
+            token,
+        )
 
     # ------------------------------------------------------------------ #
     # Main fetch

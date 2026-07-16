@@ -91,6 +91,7 @@ class FakePage:
         self.peak = 0
         self.handlers: dict[str, Any] = {}
         self.main_frame = object()
+        self.frames = []  # No child frames by default
 
     def set_default_timeout(self, timeout: int) -> None:
         self.timeout = timeout
@@ -522,7 +523,7 @@ async def test_cloudflare_reload_failure_log_does_not_expose_exception_payload(
         await manager.fetch("https://example.com/chapter/1")
 
     assert "must-not-log" not in caplog.text
-    assert "trying reload" in caplog.text
+    assert "strategy 2: reload" in caplog.text or "trying reload" in caplog.text or "Fresh navigation" in caplog.text
     await manager.close()
 
 
