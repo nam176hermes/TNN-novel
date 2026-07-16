@@ -5,6 +5,7 @@ from enum import Enum
 from html import unescape
 from html.parser import HTMLParser
 import inspect
+import logging
 import re
 import time
 from typing import Any, Iterable, Mapping, Optional
@@ -14,6 +15,12 @@ import os
 import requests
 
 from app.ingestion.chapter_cleaner import clean_chapter
+from app.ingestion.dom_parser import (
+    DomParserError,
+    DomParserFramework,
+    DomSelector,
+    DomSelectorConfig,
+)
 from app.ingestion.source_policies import (
     SOURCE_POLICIES,
     SourcePolicy,
@@ -21,6 +28,7 @@ from app.ingestion.source_policies import (
     is_allowed_source_url,
     source_policy_public_dict,
 )
+from app.ingestion.text_normalization import normalize_import_text, source_hash
 from app.security.url_policy import (
     UrlPolicyViolation,
     UrlResolver,
@@ -39,6 +47,8 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_READ_TIMEOUT_SECONDS = 20
 DEFAULT_TOTAL_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_REDIRECTS = 5
+
+logger = logging.getLogger(__name__)
 
 
 class FetchMethod(str, Enum):
@@ -138,6 +148,8 @@ class SourcePreview:
     fetch_final_url: str = ""
     fetch_cookies_refreshed: bool = False
     fetch_cache_hit: bool = False
+    adapter_version: str = ""
+    parser_method: str = ""
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -157,6 +169,9 @@ class SourceChapterContent:
     fetch_method: str = ""
     fetch_attempts: int = 0
     fetch_elapsed_ms: int = 0
+    content_hash: str = ""
+    adapter_version: str = ""
+    parser_method: str = ""
 
 
 class SourceAdapterError(ValueError):
@@ -591,6 +606,206 @@ class SelectorSourceAdapter(GenericHtmlSourceAdapter):
             chapter_number=_parse_chapter_number(title, 1),
             title=title or "Chapter",
             text=text,
+        )
+
+
+class _DomFallbackRequired(SourceAdapterError):
+    """Internal marker for a selector mismatch that may use the legacy parser."""
+
+
+class DomSourceAdapter(GenericHtmlSourceAdapter):
+    """Versioned DOM adapter with an explicit, safe legacy-regex fallback."""
+
+    def __init__(
+        self,
+        *,
+        adapter_id: str,
+        label: str,
+        domains: tuple[str, ...],
+        selectors: DomSelectorConfig,
+        adapter_version: str,
+        regex_fallback: SelectorSourceAdapter | None = None,
+    ) -> None:
+        if not domains:
+            raise ValueError("DOM source adapter requires at least one allowed domain")
+        self.adapter_id = adapter_id
+        self.label = label
+        self.domains = domains
+        self.adapter_version = adapter_version
+        self.selectors = selectors
+        self._dom_parser = DomParserFramework(selectors)
+        self._regex_fallback = regex_fallback
+
+    def supports_url(self, url: str) -> bool:
+        safe_url = validate_public_http_url(url)
+        return self.domain_policy(safe_url)
+
+    def domain_policy(self, url: str) -> bool:
+        try:
+            hostname = urlparse(validate_public_http_url(url)).hostname or ""
+        except SourceAdapterError:
+            return False
+        return any(hostname == domain or hostname.endswith(f".{domain}") for domain in self.domains)
+
+    def canonicalize_url(self, url: str, *, base_url: str | None = None) -> str:
+        absolute = urljoin(base_url, url) if base_url else url
+        return validate_source_url(absolute, allowed_domains=self.domains)
+
+    @staticmethod
+    def normalize_cleanup(text: str) -> str:
+        return DomParserFramework.normalize_cleanup(text)
+
+    def validate_content(self, text: str, *, html: str = "") -> None:
+        try:
+            if html:
+                self._dom_parser.raise_for_page_state(html)
+            self._dom_parser.validate_content(text)
+        except DomParserError as exc:
+            raise self._source_error(exc) from exc
+
+    def parse_preview(self, url: str, html: str) -> SourcePreview:
+        safe_url = self.canonicalize_url(url)
+        try:
+            parsed = self._dom_parser.parse_preview(
+                base_url=safe_url,
+                html=html,
+                canonicalize_link=lambda value: self.canonicalize_url(value, base_url=safe_url),
+            )
+        except DomParserError as exc:
+            raise self._source_error(exc, safe_url) from exc
+
+        chapters: list[SourceChapter] = []
+        fallback_number = 1
+        for title, chapter_url in parsed.chapter_links:
+            if not _CHAPTER_LINK_RE.search(title):
+                continue
+            chapter_number = _parse_chapter_number(title, fallback_number)
+            fallback_number = max(fallback_number + 1, chapter_number + 1)
+            chapters.append(SourceChapter(chapter_number=chapter_number, title=title, url=chapter_url))
+        if not chapters:
+            raise _DomFallbackRequired(
+                "DOM parser did not find valid chapter links",
+                code=FetchErrorCode.PARSE_FAILED,
+                retryable=False,
+                http_status=422,
+                details={"url": safe_url},
+            )
+        chapters.sort(key=lambda chapter: (chapter.chapter_number, chapter.url))
+        return SourcePreview(
+            adapter_id=self.adapter_id,
+            adapter_label=self.label,
+            source=urlparse(safe_url).netloc,
+            source_url=safe_url,
+            title=parsed.title,
+            author=parsed.author,
+            description=parsed.description,
+            cover_url=self._safe_asset_url(parsed.cover_url),
+            chapters=tuple(chapters),
+            policy=source_policy_public_dict(safe_url),
+            adapter_version=self.adapter_version,
+            parser_method="dom",
+        )
+
+    def parse_chapter(self, url: str, html: str) -> SourceChapterContent:
+        safe_url = self.canonicalize_url(url)
+        try:
+            parsed = self._dom_parser.parse_chapter(html=html)
+        except DomParserError as exc:
+            raise self._source_error(exc, safe_url) from exc
+        title = parsed.title or _extract_title(html, safe_url)
+        return SourceChapterContent(
+            adapter_id=self.adapter_id,
+            source=urlparse(safe_url).netloc,
+            source_url=safe_url,
+            chapter_number=_parse_chapter_number(title, 1),
+            title=title or "Chapter",
+            text=parsed.text,
+            content_hash=parsed.content_hash,
+            adapter_version=self.adapter_version,
+            parser_method="dom",
+        )
+
+    def preview_from_html(self, url: str, html: str) -> SourcePreview:
+        try:
+            return self.parse_preview(url, html)
+        except _DomFallbackRequired:
+            if self._regex_fallback is None:
+                raise
+            self._log_regex_fallback("preview")
+            fallback = self._regex_fallback.preview_from_html(self.canonicalize_url(url), html)
+            return replace(
+                fallback,
+                cover_url=self._safe_asset_url(fallback.cover_url),
+                adapter_version=self.adapter_version,
+                parser_method="regex_fallback",
+            )
+
+    def chapter_from_html(self, url: str, html: str) -> SourceChapterContent:
+        try:
+            return self.parse_chapter(url, html)
+        except _DomFallbackRequired:
+            if self._regex_fallback is None:
+                raise
+            self._log_regex_fallback("chapter")
+            fallback = self._regex_fallback.chapter_from_html(self.canonicalize_url(url), html)
+            normalized = normalize_import_text(fallback.text)
+            try:
+                self._dom_parser.raise_for_page_state(html)
+                self._dom_parser.validate_content(normalized, title=fallback.title)
+            except DomParserError as exc:
+                raise self._source_error(exc, self.canonicalize_url(url)) from exc
+            return replace(
+                fallback,
+                text=normalized,
+                content_hash=source_hash(normalized),
+                adapter_version=self.adapter_version,
+                parser_method="regex_fallback",
+            )
+
+    def _log_regex_fallback(self, target: str) -> None:
+        logger.warning(
+            "dom_parser_fallback adapter=%s version=%s target=%s",
+            self.adapter_id,
+            self.adapter_version,
+            target,
+        )
+
+    @staticmethod
+    def _safe_asset_url(url: str) -> str:
+        if not url:
+            return ""
+        try:
+            return validate_fetch_url(url, resolver=None).canonical_url
+        except UrlPolicyViolation:
+            return ""
+
+    @staticmethod
+    def _source_error(exc: DomParserError, url: str = "") -> SourceAdapterError:
+        try:
+            code = FetchErrorCode(exc.code)
+        except ValueError:
+            code = FetchErrorCode.PARSE_FAILED
+        error_type: type[SourceAdapterError]
+        if code is FetchErrorCode.USER_VERIFICATION_REQUIRED:
+            error_type = SourceBlockedError
+        elif code is FetchErrorCode.PARSE_FAILED and exc.fallback_allowed:
+            error_type = _DomFallbackRequired
+        else:
+            error_type = SourceAdapterError
+        status_by_code = {
+            FetchErrorCode.USER_VERIFICATION_REQUIRED: 409,
+            FetchErrorCode.RATE_LIMITED: 429,
+            FetchErrorCode.SOURCE_UNAVAILABLE: 502,
+            FetchErrorCode.CONTENT_NOT_FOUND: 404,
+            FetchErrorCode.CONTENT_INVALID: 422,
+            FetchErrorCode.PARSE_FAILED: 422,
+        }
+        return error_type(
+            exc.message,
+            code=code,
+            retryable=code in {FetchErrorCode.RATE_LIMITED, FetchErrorCode.SOURCE_UNAVAILABLE},
+            http_status=status_by_code.get(code, 422),
+            details={"url": url} if url else None,
         )
 
 
@@ -1041,36 +1256,120 @@ def build_default_source_adapters() -> list[GenericHtmlSourceAdapter]:
         r'<a[^>]+href="([^"]+)"[^>]*>\s*(?:<[^>]+>\s*)*'
         r'([^<]*(?:第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章节回卷話话][^<]*)?)</a>'
     )
-    return [
-        SelectorSourceAdapter(
+    legacy_69shuba = SelectorSourceAdapter(
+        adapter_id="69shuba",
+        label="69shuba",
+        domains=("69shuba.com", "69shuba.cx", "69shux.com"),
+        title_patterns=(r"<h1[^>]*>(.*?)</h1>", r'<meta property="og:title" content="([^"]+)"'),
+        author_patterns=(r"(?:作者|作\s*者)\s*[:：]\s*([^<\n\r]{1,40})",),
+        description_patterns=(
+            r'<meta name="description" content="([^"]+)"',
+            r'<div[^>]+class="[^"]*intro[^"]*"[^>]*>(.*?)</div>',
+        ),
+        cover_patterns=(
+            r'<meta property="og:image" content="([^"]+)"',
+            r'<img[^>]+src="([^"]+)"[^>]+(?:cover|bookimg|fmimg)',
+        ),
+        chapter_link_patterns=(chapter_link_pattern,),
+        content_patterns=(
+            r'<div[^>]+class="container"[^>]*>(.*?)</div>\s*<div[^>]+class="(?:bottom|foot|pagefoot)',
+            r'<div[^>]+class="[^"]*txtnav[^"]*"[^>]*>(.*?)</div>\s*<div',
+            r'<div[^>]+id="content"[^>]*>(.*?)</div>',
+            r'<div[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</div>',
+        ),
+    )
+    legacy_69shumi = SelectorSourceAdapter(
+        adapter_id="69shumi",
+        label="69shumi",
+        domains=("69shumi.net", "69shumi.com"),
+        title_patterns=(
+            r'<h1[^>]+class="[^"]*bookTitle[^"]*"[^>]*>(.*?)</h1>',
+            r"<h1[^>]*>(.*?)</h1>",
+        ),
+        author_patterns=(r'<p[^>]+class="[^"]*booktag[^"]*"[^>]*>(.*?)</p>',),
+        description_patterns=(r'<p[^>]+id="bookIntro"[^>]*>(.*?)</p>',),
+        cover_patterns=(r'<div[^>]+class="[^"]*col-sm-2[^"]*"[^>]*>\s*<img[^>]+src="([^"]+)"',),
+        chapter_link_patterns=(r'<dd[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([^<]+)',),
+        content_patterns=(r'<div[^>]+id="booktxt"[^>]*>(.*?)</div>', r'<div[^>]+id="content"[^>]*>(.*?)</div>'),
+    )
+    remove_selectors = (
+        "script",
+        "style",
+        "noscript",
+        "nav",
+        "footer",
+        ".advertisement",
+        ".ads",
+        ".ad",
+        ".breadcrumb",
+        ".popup",
+        ".bottom",
+        ".foot",
+        ".pagefoot",
+    )
+    registered_adapters: list[GenericHtmlSourceAdapter] = [
+        DomSourceAdapter(
             adapter_id="69shuba",
             label="69shuba",
             domains=("69shuba.com", "69shuba.cx", "69shux.com"),
-            title_patterns=(r"<h1[^>]*>(.*?)</h1>", r'<meta property="og:title" content="([^"]+)"'),
-            author_patterns=(r"(?:作者|作\s*者)\s*[:：]\s*([^<\n\r]{1,40})",),
-            description_patterns=(
-                r'<meta name="description" content="([^"]+)"',
-                r'<div[^>]+class="[^"]*intro[^"]*"[^>]*>(.*?)</div>',
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                    DomSelector("title"),
+                ),
+                chapter_title=(
+                    DomSelector("h1.chapter-title"),
+                    DomSelector("h1"),
+                    DomSelector("title"),
+                ),
+                author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+                description=(
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector('meta[property="og:image"]', "content"),
+                    DomSelector("img.cover", "src"),
+                    DomSelector(".bookimg img", "src"),
+                    DomSelector(".fmimg img", "src"),
+                ),
+                chapter_links=(
+                    DomSelector("#list a", "href"),
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#content"),
+                    DomSelector(".txtnav"),
+                    DomSelector(".chapter-content"),
+                ),
+                remove_selectors=remove_selectors,
             ),
-            cover_patterns=(r'<meta property="og:image" content="([^"]+)"', r'<img[^>]+src="([^"]+)"[^>]+(?:cover|bookimg|fmimg)'),
-            chapter_link_patterns=(chapter_link_pattern,),
-            content_patterns=(
-                r'<div[^>]+class="container"[^>]*>(.*?)</div>\s*<div[^>]+class="(?:bottom|foot|pagefoot)',
-                r'<div[^>]+class="[^"]*txtnav[^"]*"[^>]*>(.*?)</div>\s*<div',
-                r'<div[^>]+id="content"[^>]*>(.*?)</div>',
-                r'<div[^>]+class="[^"]*content[^"]*"[^>]*>(.*?)</div>',
-            ),
+            adapter_version="69shuba-dom-v1",
+            regex_fallback=legacy_69shuba,
         ),
-        SelectorSourceAdapter(
+        DomSourceAdapter(
             adapter_id="69shumi",
             label="69shumi",
             domains=("69shumi.net", "69shumi.com"),
-            title_patterns=(r'<h1[^>]+class="[^"]*bookTitle[^"]*"[^>]*>(.*?)</h1>', r"<h1[^>]*>(.*?)</h1>"),
-            author_patterns=(r'<p[^>]+class="[^"]*booktag[^"]*"[^>]*>(.*?)</p>',),
-            description_patterns=(r'<p[^>]+id="bookIntro"[^>]*>(.*?)</p>',),
-            cover_patterns=(r'<div[^>]+class="[^"]*col-sm-2[^"]*"[^>]*>\s*<img[^>]+src="([^"]+)"',),
-            chapter_link_patterns=(r'<dd[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([^<]+)',),
-            content_patterns=(r'<div[^>]+id="booktxt"[^>]*>(.*?)</div>', r'<div[^>]+id="content"[^>]*>(.*?)</div>'),
+            selectors=DomSelectorConfig(
+                title=(DomSelector("h1.bookTitle"), DomSelector("h1"), DomSelector("title")),
+                chapter_title=(DomSelector("h1.chapter-title"), DomSelector("h1"), DomSelector("title")),
+                author=(DomSelector(".booktag"), DomSelector('meta[name="author"]', "content")),
+                description=(
+                    DomSelector("#bookIntro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".col-sm-2 img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(DomSelector("dd a", "href"), DomSelector(".chapter-list a", "href")),
+                chapter_content=(DomSelector("#booktxt"), DomSelector("#content")),
+                remove_selectors=remove_selectors,
+            ),
+            adapter_version="69shumi-dom-v1",
+            regex_fallback=legacy_69shumi,
         ),
         SelectorSourceAdapter(
             adapter_id="biquge",
@@ -1212,6 +1511,146 @@ def build_default_source_adapters() -> list[GenericHtmlSourceAdapter]:
             content_patterns=(r'<div[^>]+class="[^"]*read-content[^"]*"[^>]*>(.*?)</div>',),
         ),
         GenericHtmlSourceAdapter(),
+    ]
+
+    # Selector configurations below were the pre-P12 registry implementation.
+    # P13 keeps their adapter identity/domain declarations while replacing their
+    # runtime extraction path with explicit versioned DOM selector configs. They
+    # are not used as regex fallbacks.
+    dom_selector_configs: dict[str, DomSelectorConfig] = {
+        "biquge": DomSelectorConfig(
+            title=(DomSelector("h1.book-title"), DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector('meta[property="og:image"]', "content"), DomSelector("img.cover", "src")),
+            chapter_links=(DomSelector("#list a", "href"), DomSelector(".chapter-list a", "href"), DomSelector("dd a", "href")),
+            chapter_content=(DomSelector("#chaptercontent"), DomSelector("#content"), DomSelector(".read-content")),
+            remove_selectors=remove_selectors,
+        ),
+        "uukanshu": DomSelectorConfig(
+            title=(DomSelector("h1.booktitle"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector('meta[property="og:image"]', "content"), DomSelector("img.cover", "src")),
+            chapter_links=(DomSelector("#list a", "href"), DomSelector(".chapter-list a", "href"), DomSelector("dd a", "href")),
+            chapter_content=(DomSelector("#contentbox"), DomSelector("#content")),
+            remove_selectors=remove_selectors,
+        ),
+        "17k": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".name"), DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector("img.cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("#list a", "href"), DomSelector("a[data-bid]", "href")),
+            chapter_content=(DomSelector(".readAreaBox.content"), DomSelector(".readAreaBox"), DomSelector(".content")),
+            remove_selectors=remove_selectors,
+        ),
+        "52shuku": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".info"), DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector("img.cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("li a", "href")),
+            chapter_content=(DomSelector("article.content"), DomSelector(".content")),
+            remove_selectors=remove_selectors,
+        ),
+        "fanqienovel": DomSelectorConfig(
+            title=(DomSelector('meta[property="og:novel:book_name"]', "content"), DomSelector('meta[property="og:title"]', "content"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector('meta[property="og:novel:author"]', "content"), DomSelector(".info-author"), DomSelector(".author")),
+            description=(DomSelector('meta[name="description"]', "content"), DomSelector(".intro")),
+            cover=(DomSelector('meta[property="og:image"]', "content"), DomSelector("img.cover", "src")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("a.chapter-link", "href")),
+            chapter_content=(DomSelector(".muye-reader-content"), DomSelector(".reader-content")),
+            remove_selectors=remove_selectors,
+        ),
+        "jjwxc": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector("a.oneauthor"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector('meta[name="description"]', "content"), DomSelector(".intro")),
+            cover=(DomSelector("img.cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("a.chapter-link", "href")),
+            chapter_content=(DomSelector(".noveltext"), DomSelector(".read-content")),
+            remove_selectors=remove_selectors,
+        ),
+        "qidian": DomSelectorConfig(
+            title=(DomSelector('meta[property="og:novel:book_name"]', "content"), DomSelector('meta[property="og:title"]', "content"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector('meta[property="og:novel:author"]', "content"), DomSelector(".author")),
+            description=(DomSelector('meta[name="description"]', "content"), DomSelector(".intro")),
+            cover=(DomSelector('meta[property="og:image"]', "content"), DomSelector("img.cover", "src")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("a.chapter-link", "href"), DomSelector("a[data-bid]", "href")),
+            chapter_content=(DomSelector(".read-content"), DomSelector(".j_readContent")),
+            remove_selectors=remove_selectors,
+        ),
+        "novel543": DomSelectorConfig(
+            title=(DomSelector("h1.title"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector(".cover img", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("li a", "href")),
+            chapter_content=(DomSelector(".content"),),
+            remove_selectors=remove_selectors,
+        ),
+        "hetushu": DomSelectorConfig(
+            title=(DomSelector("h2"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1"), DomSelector("h2")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector("img.cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector("#list a", "href"), DomSelector(".chapter-list a", "href")),
+            chapter_content=(DomSelector("#content"),),
+            remove_selectors=remove_selectors,
+        ),
+        "ixdzs8": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".bauthor"), DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector("#intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector("img.cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("#list a", "href")),
+            chapter_content=(DomSelector(".content"), DomSelector("#content")),
+            remove_selectors=remove_selectors,
+        ),
+        "xbanxia": DomSelectorConfig(
+            title=(DomSelector(".book-describe h1"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".describe-html"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector(".book-img img", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("li a", "href")),
+            chapter_content=(DomSelector("#content"), DomSelector(".content")),
+            remove_selectors=remove_selectors,
+        ),
+        "bookqq": DomSelectorConfig(
+            title=(DomSelector("h1.book-title"), DomSelector("h1"), DomSelector("title")),
+            chapter_title=(DomSelector(".chapter-title"), DomSelector("h1")),
+            author=(DomSelector(".author"), DomSelector('meta[name="author"]', "content")),
+            description=(DomSelector(".book-intro"), DomSelector('meta[name="description"]', "content")),
+            cover=(DomSelector("img.book-cover", "src"), DomSelector('meta[property="og:image"]', "content")),
+            chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("a.chapter-link", "href")),
+            chapter_content=(DomSelector(".read-content"),),
+            remove_selectors=remove_selectors,
+        ),
+    }
+
+    return [
+        DomSourceAdapter(
+            adapter_id=adapter.adapter_id,
+            label=adapter.label,
+            domains=adapter.domains,
+            selectors=dom_selector_configs[adapter.adapter_id],
+            adapter_version=f"{adapter.adapter_id}-dom-v1",
+        )
+        if isinstance(adapter, SelectorSourceAdapter)
+        else adapter
+        for adapter in registered_adapters
     ]
 
 

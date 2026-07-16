@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P11 — durable ImportPanel job UX, implementation and verification complete.
+- Active milestone: P13 — migrate all remaining dedicated source adapters to the versioned DOM contract; implemented and verified.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -71,6 +71,16 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - Full P11 frontend verification: `82 test files passed`, `731 tests passed in 543.02s`.
 - P11 Chromium regression smoke: the existing mocked Import wizard flow passed `1 test in 12.7s`.
 - P11 lint/typecheck and production build passed. The existing unresolved `sidebar-scenery.png` build warning remains; no P11 runtime dependency was added.
+- P12 reuses Python's standard-library `html.parser`; no production dependency was added.
+- P12 introduces ordered selector fallbacks, typed content validation, canonical P03 normalization/hash reuse, and safe regex-fallback telemetry.
+- The default `69shuba` and `69shumi` entries now use versioned DOM adapters for `69shuba.com`, `69shuba.cx`, `69shux.com`, `69shumi.com`, and `69shumi.net`, while preserving adapter ids and compatibility.
+- Sanitized local fixture plus source/import regression verification: `56 passed in 12.68s`.
+- P12 tests make no live source or browser calls. Full backend verification: `960 passed, 2 warnings in 1538.47s (0:25:38)`.
+- P13 migrates the remaining 12 dedicated adapters across 16 domains to the P12 DOM contract. The actual registry has 20 dedicated domains, not the 17-domain planning list: `biquge.tw`, `uukanshu.cc`, and `xbanxia.cc` are additional and included.
+- P13 preserves the generic catch-all intentionally, but it is not a source-specific versioned DOM adapter.
+- P13 keeps regex fallback only for the P12 fixture-proven `69shuba` and `69shumi` layouts; all newly migrated adapters return typed `parse_failed` on selector mismatch.
+- P13 registry contract verification: `46 passed in 3.81s`; broader adapter/fetch/source regression verification: `113 passed, 1 warning in 19.13s`.
+- Full P13 backend verification: `1006 passed, 2 warnings in 1677.20s (0:27:57)`. The two warnings remain existing `passlib/crypt` and `jieba/pkg_resources` deprecations.
 
 ## Goals
 
@@ -262,29 +272,39 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Keep reconnecting distinct from failure and provide live-region/focus/touch-target/mobile behavior.
 - Do not redesign paste/file/ebook or unrelated desktop flows.
 
-### P12 — Backend test matrix expansion
+### P12 — DOM parser framework and 69shuba-family migration
 
-- Add targeted tests for source outcomes, import jobs, challenge states, and logging safety.
-- Preserve isolated temp DB/data behavior.
+- Add a versioned DOM parser contract covering domain policy, P02 URL canonicalization, preview/chapter parsing, normalization, validation, and content hashing.
+- Use ordered selector fallbacks for metadata, chapter links/content, and junk-removal selectors.
+- Detect status-200 challenge/error pages, empty/short content, chapter-list misclassification, and abnormal boilerplate.
+- Migrate the `69shuba` and `69shumi` family domains while preserving adapter ids and backward-compatible result fields.
+- Retain regex extraction only as a selector-mismatch fallback with safe adapter/version/target telemetry.
+- Verify exclusively with sanitized local fixtures; do not call live sources.
 
-### P13 — Frontend and E2E smoke coverage
+### P13 — Migrate remaining source adapters
 
-- Add or update Vitest/Playwright coverage for import, duplicate, verification-required, and mobile states where practical.
+- Move every remaining registered source to the P12 versioned parser contract.
+- Add sanitized local fixtures and parameterized contract tests per adapter.
+- Keep regex fallback only where fixture evidence proves it remains necessary.
+- Document the process for adding and versioning a source adapter.
 
-### P14 — Runbooks and operator docs
+### P14 — Observability and load protection
 
-- Document source import troubleshooting, provider limits, verification-required handling, and safe support steps.
+- Add bounded-cardinality structured logs and metrics for jobs, tasks, adapters, parser versions, fetch methods, errors, latency, and operations.
+- Enforce redaction, quotas, and per-adapter/fetch-method circuit breakers.
+- Add authenticated source-health reporting and an initial alert/runbook specification.
 
-### P15 — Release gate
+### P15 — Deployment hardening
 
-- Align CI/release requirements with local verification.
-- Document rollback and version/commit evidence.
+- Separate API and durable import/browser worker entrypoints in production.
+- Harden containers, lifecycle, health checks, resource limits, browser egress, secret injection, startup recovery, and rollback/runbooks.
+- Verify crash recovery and idempotent work continuation in an isolated deployment environment.
 
-### P16 — Final Plan B verification
+### P16 — Independent final review
 
-- Run full verification.
-- Confirm no safety boundary regressions.
-- Produce final status and remaining limitations.
+- Review P00-P15 as a maintainer/security reviewer without adding new product features.
+- Run the complete backend, frontend, migration, mock-source, SSE, recovery, SSRF, concurrency, and redaction matrix.
+- Produce `docs/upgrade/RELEASE_REPORT.md` and an evidence-based GO / GO WITH CONDITIONS / NO-GO decision.
 
 ## Milestone dependencies
 
@@ -302,11 +322,11 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P09 | P05, P07 | Observability needs stable job/source events. |
 | P10 | P09 | The frontend state machine requires the durable job snapshot and persisted SSE contract. |
 | P11 | P10 | ImportPanel cleanup consumes the stable P10 hook instead of owning transport state. |
-| P12 | P01-P10 | Expands backend tests after contracts stabilize. |
-| P13 | P06, P11 | UI/E2E tests need stable UX. |
-| P14 | P01-P13 | Runbooks should reflect implemented behavior. |
-| P15 | P12, P13 | Release gate depends on stable tests. |
-| P16 | P15 | Final verification closes the program. |
+| P12 | P01, P02, P03 | Uses typed source errors, shared URL policy, and canonical normalization/hash semantics. |
+| P13 | P12 | Remaining adapters consume the versioned DOM parser contract and fixture conventions. |
+| P14 | P05-P13 | Observability and quotas require stable jobs, workers, browser lifecycle, APIs, UI, and parsers. |
+| P15 | P05-P14 | Deployment isolation depends on the durable worker and operational contracts. |
+| P16 | P00-P15 | Final independent verification closes the complete program. |
 
 ## Decision log
 
@@ -348,6 +368,12 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-15 | P11 production wiring uses the P10 durable client; the old blocking URL chapter callback remains an optional compatibility fallback only. | The operator sees immediate job acceptance and recoverable progress while existing external ImportPanel callers do not break. |
 | 2026-07-15 | P11 paginates source chapters and task details instead of adding a virtualization dependency. | Fixed pages bound DOM size, preserve simple checkbox semantics, and meet the milestone without changing the dependency graph. |
 | 2026-07-15 | P11 displays a conservative `Đã lưu` operation when P09 omits the optional operation field. | The UI must not invent `created` versus `updated`; a future additive snapshot field can provide the exact P04 outcome without breaking the client. |
+| 2026-07-16 | P12 uses Python's standard-library `html.parser` instead of importing transitive `lxml` or adding a parser dependency. | The repository had no declared general-purpose HTML parser dependency; the scoped selector subset is sufficient and keeps installation reproducible. |
+| 2026-07-16 | P12 centralizes canonical text normalization/hash in a neutral ingestion module and preserves the existing import-metadata import path. | DOM extraction and P03 persistence metadata must calculate the same deterministic stored-text hash without breaking callers. |
+| 2026-07-16 | `69shuba` and `69shumi` keep their existing adapter ids/domains while moving to versioned DOM selector configs. | Registry, persisted identity, telemetry, and existing callers remain backward compatible. |
+| 2026-07-16 | Regex extraction is allowed only after a DOM selector mismatch and emits telemetry containing adapter id, adapter version, and target type only. | Challenge, missing, and invalid content must remain typed failures; logs must not contain URLs, HTML, or chapter text. |
+| 2026-07-16 | P13 treats the runtime registry as source of truth: 20 dedicated domains rather than the 17-domain planning list. | `biquge.tw`, `uukanshu.cc`, and `xbanxia.cc` were already registered and must receive the same safety/fixture coverage as the listed domains. |
+| 2026-07-16 | Only 69shuba-family adapters retain a regex fallback. | P12 has fixture evidence for those fallback layouts; P13 selector mismatches are typed failures until an equivalent fixture proves a compatibility path is needed. |
 
 ## Test matrix
 
@@ -369,6 +395,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P09 import API/SSE | Create/get/cancel/retry, owner isolation, quota/URL validation, ordered persisted events, cursor/header reconnect, keepalive, disconnect, terminal close, legacy route, client fetch stream/abort, and typed errors | no Internet calls, no source content in snapshot/events, GET snapshot remains authoritative |
 | P10 frontend import state | Typed job/task/event contracts, reducer phases, idempotent cursor, snapshot reconciliation, SSE reconnect/backoff, polling fallback, cancel/retry, resume storage, and typed error mapping | no ImportPanel redesign, no source payload or secret persistence |
 | P11 ImportPanel job UX | Selected-chapter create, progress reconciliation, partial result, cancel/retry, refresh resume, reconnecting, fetch badges, operation/error copy, source/task pagination, range selection, focus and live-region behavior | no blocking fetch in production wiring, no thousand-row checkbox/task DOM, no source payload or secret rendering |
+| P12 DOM parser | Sanitized 69shuba-family fixtures for preview/chapter extraction, relative/absolute links, entities/Unicode, junk removal, selector fallback, regex fallback, 404, status-200 challenge, empty/short content, chapter-list misclassification, boilerplate ratio, and all five allowed domains; then full backend pytest | no Internet/browser calls; typed errors preserved; fallback telemetry contains no URL, HTML, or chapter content |
+| P13 all dedicated adapters | Parameterized normal fixture and status-200 challenge coverage for 12 remaining adapters / 16 domains; inventory assertion for all 20 dedicated domains and fallback allowlist assertion | no Internet/browser calls; P13 selectors have no regex fallback; generic catch-all is explicitly excluded |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks
@@ -378,6 +406,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Legacy CAPTCHA/proxy utilities remain present but P08 does not expand them; future work must continue treating challenge handling as a constrained compatibility path.
 - P09 triggers accepted jobs in-process; durable queued state survives, but there is still no autonomous polling worker that starts orphaned queued jobs without an operational trigger.
 - `docs/upgrade/codex-prompts-modified.md` contains older Plan B prompt text that preserves bypass-style behavior; future tasks must follow this document and root `AGENTS.md` instead.
+- P13 validates all dedicated adapters against sanitized local fixtures only. Live-layout validation remains outside CI; regex fallback is limited to the P12-proven 69shuba-family compatibility seam.
 - Large files such as `pipeline_service.py`, `db.py`, `ImportPanel.tsx`, `client.ts`, and `types.ts` increase regression risk.
 
 ## Update rules for future PRs
