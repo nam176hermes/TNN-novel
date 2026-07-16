@@ -880,18 +880,66 @@ export type URLFetchResponse = {
   chapters: URLFetchChapterResult[];
 };
 
-export type ImportJobAccepted = {
+export type ImportJobStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partially_succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type ChapterTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_retry'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'user_verification_required';
+
+export type ChapterTaskStage =
+  | 'queued'
+  | 'fetching'
+  | 'waiting_retry'
+  | 'parsing'
+  | 'validating'
+  | 'importing'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'user_verification_required';
+
+export type ImportJobEventType =
+  | 'job_created'
+  | 'job_enqueued'
+  | 'job_transitioned'
+  | 'job_recovered'
+  | 'job_retry_requested'
+  | 'cancel_requested'
+  | 'task_created'
+  | 'task_claimed'
+  | 'task_transitioned'
+  | 'task_cancelled'
+  | 'task_recovered'
+  | 'task_retry_requested'
+  | 'task_retry_scheduled';
+
+export type ImportJobCreateRequest = URLFetchRequest;
+
+export type ImportJobAcceptedResponse = {
   job_id: string;
-  status: string;
+  status: ImportJobStatus;
   total: number;
 };
 
-export type ImportJobTaskSummary = {
+export type ImportJobAccepted = ImportJobAcceptedResponse;
+
+export type ChapterTask = {
   id: number;
   chapter_number: number;
   title: string;
-  status: string;
-  stage: string;
+  status: ChapterTaskStatus;
+  stage: ChapterTaskStage;
   attempts: number;
   next_attempt_at: string;
   error_code: string;
@@ -905,11 +953,15 @@ export type ImportJobTaskSummary = {
   finished_at: string;
   book_id: number | null;
   chapter_id: number | null;
+  /** Optional until every P09 snapshot producer exposes the P04 import outcome. */
+  operation?: string;
 };
 
-export type ImportJobSnapshot = {
+export type ImportJobTaskSummary = ChapterTask;
+
+export type ImportJob = {
   job_id: string;
-  status: string;
+  status: ImportJobStatus;
   source: string;
   book_id: number | null;
   total: number;
@@ -925,21 +977,32 @@ export type ImportJobSnapshot = {
   finished_at: string;
   cancel_requested_at: string;
   error_summary: string;
-  tasks: ImportJobTaskSummary[];
+  tasks: ChapterTask[];
 };
 
-export type ImportJobEvent = {
+export type ImportJobSnapshot = ImportJob;
+
+export type JobEvent = {
   sequence: number;
   job_id: string;
   task_id: number | null;
-  type: string;
+  type: ImportJobEventType;
   data: Record<string, unknown>;
   created_at: string;
 };
 
-export type ImportJobEventStream = {
+export type ImportJobEvent = JobEvent;
+
+export type JobEventSubscription = {
   abort: () => void;
   done: Promise<void>;
+};
+
+export type ImportJobEventStream = JobEventSubscription;
+
+export type JobEventSubscriptionOptions = {
+  cursor?: number;
+  lastEventId?: number;
 };
 
 export type SourceCapability = {

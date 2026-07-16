@@ -14,7 +14,7 @@ import {
   UploadCloud,
 } from 'lucide-react';
 import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
-import { ApiError } from '../api/client';
+import { ApiClient, ApiError } from '../api/client';
 import type {
   EbookDuplicateStrategy,
   EbookInboxFile,
@@ -42,8 +42,11 @@ import {
   type ImportContentKind,
 } from '../state/importWizard';
 import { detectImportMetadata, type DetectedImportMetadata } from '../state/importMetadata';
+import { useImportJob } from '../state/useImportJob';
+import ImportJobProgress from './ImportJobProgress';
 
 export type ImportPanelProps = {
+  importJobClient?: ApiClient;
   onImportPaste: (request: ImportPasteRequest) => Promise<void> | void;
   onImportFile?: (request: ImportFileRequest) => Promise<void> | void;
   onImportWizardText?: (
@@ -75,6 +78,7 @@ export type ImportPanelProps = {
   loadSourceCatalog?: (params: SourceCatalogQuery) => Promise<SourceCatalogList>;
   onOpenImportedBook?: (result: WizardTextImportResult) => void;
   onOpenJob?: (jobId: string) => void;
+  onReturnToLibrary?: () => void;
   onCancel: () => void;
   books?: Array<{ id: number; title: string }>;
   chapters?: Array<{ book_id: number; chapter_number: number; title?: string }>;
@@ -99,6 +103,8 @@ const MAX_BROWSER_TEXT_UPLOAD_BYTES = 5 * 1024 * 1024;
 const TEXT_IMPORT_SUFFIXES = new Set(['.txt', '.md', '.markdown', '.html', '.htm']);
 const TEXT_IMPORT_MIME_TYPES = new Set(['', 'text/plain', 'text/markdown', 'text/html']);
 const BLOCKING_EBOOK_WARNING_TYPES = new Set(['unreadable_ebook']);
+const SOURCE_CHAPTER_PAGE_SIZE = 25;
+const disabledImportJobClient = new ApiClient('');
 
 function formatBytes(value: number): string {
   if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
@@ -652,6 +658,7 @@ function TextWizardPreview({
 }
 
 export default function ImportPanel({
+  importJobClient,
   books = [],
   chapters = [],
   ebookInboxDirectory = 'inbox/ebooks',
@@ -671,6 +678,7 @@ export default function ImportPanel({
   loadSourceCatalog,
   onOpenImportedBook,
   onOpenJob,
+  onReturnToLibrary,
   onCancel,
   ebookImportHistory = [],
   loading = false,
@@ -712,6 +720,9 @@ export default function ImportPanel({
   const [sourcePreviewState, setSourcePreviewState] = useState<EbookPreviewState>('idle');
   const [sourcePreviewError, setSourcePreviewError] = useState('');
   const [selectedChapterUrls, setSelectedChapterUrls] = useState<Set<string>>(new Set());
+  const [chapterPage, setChapterPage] = useState(0);
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
   const [fetchState, setFetchState] = useState<EbookPreviewState>('idle');
   const [fetchResult, setFetchResult] = useState<URLFetchResponse | null>(null);
   const [fetchError, setFetchError] = useState('');
@@ -719,6 +730,9 @@ export default function ImportPanel({
   const [catalogState, setCatalogState] = useState<EbookPreviewState>('idle');
   const [catalogError, setCatalogError] = useState('');
   const [catalog, setCatalog] = useState<SourceCatalogList | null>(null);
+  const importJob = useImportJob(importJobClient ?? disabledImportJobClient, {
+    enabled: Boolean(importJobClient),
+  });
 
   const parsedChapterNumber = Number.parseInt(chapterNumber, 10);
   const selectedInboxEntry = ebookInboxFiles.find((entry) => entry.name === selectedInboxFile) ?? null;
@@ -747,6 +761,17 @@ export default function ImportPanel({
     ),
     [chapters, effectiveTargetBookId],
   );
+  const sourceChapterPageCount = Math.max(
+    1,
+    Math.ceil((sourcePreview?.chapters.length ?? 0) / SOURCE_CHAPTER_PAGE_SIZE),
+  );
+  const visibleSourceChapters = sourcePreview?.chapters.slice(
+    chapterPage * SOURCE_CHAPTER_PAGE_SIZE,
+    (chapterPage + 1) * SOURCE_CHAPTER_PAGE_SIZE,
+  ) ?? [];
+  const allVisibleChaptersSelected = visibleSourceChapters.length > 0
+    && visibleSourceChapters.every((chapter) => selectedChapterUrls.has(chapter.url));
+  const durableImportActive = Boolean(importJobClient && importJob.state.phase !== 'idle');
   const textPreview = useMemo(
     () => (
       textDraft.trim()
@@ -1050,6 +1075,9 @@ export default function ImportPanel({
     setSourcePreviewError('');
     setSourcePreviewState('loading');
     setSelectedChapterUrls(new Set());
+    setChapterPage(0);
+    setRangeStart('');
+    setRangeEnd('');
     setFetchResult(null);
     setFetchError('');
     try {
@@ -1072,17 +1100,39 @@ export default function ImportPanel({
     });
   }
 
-  function toggleSelectAllChapters(): void {
-    if (!sourcePreview?.chapters) return;
-    if (selectedChapterUrls.size === sourcePreview.chapters.length) {
-      setSelectedChapterUrls(new Set());
-    } else {
-      setSelectedChapterUrls(new Set(sourcePreview.chapters.map((c) => c.url)));
-    }
+  function toggleSelectVisibleChapters(): void {
+    if (visibleSourceChapters.length === 0) return;
+    setSelectedChapterUrls((current) => {
+      const next = new Set(current);
+      if (allVisibleChaptersSelected) {
+        visibleSourceChapters.forEach((chapter) => next.delete(chapter.url));
+      } else {
+        visibleSourceChapters.forEach((chapter) => next.add(chapter.url));
+      }
+      return next;
+    });
+  }
+
+  function selectChapterRange(): void {
+    if (!sourcePreview) return;
+    const first = Number.parseInt(rangeStart, 10);
+    const last = Number.parseInt(rangeEnd, 10);
+    if (!Number.isFinite(first) || !Number.isFinite(last)) return;
+    const minimum = Math.min(first, last);
+    const maximum = Math.max(first, last);
+    setSelectedChapterUrls((current) => {
+      const next = new Set(current);
+      sourcePreview.chapters.forEach((chapter) => {
+        if (chapter.chapter_number >= minimum && chapter.chapter_number <= maximum) {
+          next.add(chapter.url);
+        }
+      });
+      return next;
+    });
   }
 
   async function handleFetchChapters(): Promise<void> {
-    if (!onFetchSourceChapters || !sourcePreview || selectedChapterUrls.size === 0) return;
+    if (!sourcePreview || selectedChapterUrls.size === 0) return;
     setFetchState('loading');
     setFetchError('');
     setFetchResult(null);
@@ -1090,13 +1140,19 @@ export default function ImportPanel({
       const chapters = sourcePreview.chapters
         .filter((c) => selectedChapterUrls.has(c.url))
         .map((c) => ({ url: c.url, chapter_number: c.chapter_number, title: c.title }));
-      const result = await onFetchSourceChapters({
+      const request = {
         source_url: sourcePreview.source_url || sourceUrl,
         title: title || sourcePreview.title,
         author: sourcePreview.author,
         source: sourcePreview.source,
         chapters,
-      });
+      };
+      if (importJobClient) {
+        await importJob.createJob(request);
+        return;
+      }
+      if (!onFetchSourceChapters) return;
+      const result = await onFetchSourceChapters(request);
       setFetchResult(result);
       setFetchState('ready');
     } catch (error) {
@@ -1431,6 +1487,32 @@ export default function ImportPanel({
       setConfirmedExistingBookId(null);
     }
     onCancel();
+  }
+
+  function returnToLibrary(): void {
+    importJob.clearJob();
+    onReturnToLibrary?.();
+  }
+
+  if (durableImportActive) {
+    return (
+      <section aria-labelledby="import-panel-title" className="import-panel import-reference-view panel">
+        <div className="import-reference-header">
+          <div>
+            <p className="section-label">Nhập chương <span aria-hidden="true">›</span> Import từ URL</p>
+            <h3 id="import-panel-title">Tiến độ import</h3>
+            <p className="view-subtitle">Job tiếp tục chạy trên máy chủ kể cả khi kết nối trình duyệt bị gián đoạn.</p>
+          </div>
+        </div>
+        <ImportJobProgress
+          onCancel={importJob.cancelJob}
+          onReset={importJob.clearJob}
+          onRetryFailed={importJob.retryFailedTasks}
+          onReturnToLibrary={onReturnToLibrary ? returnToLibrary : undefined}
+          state={importJob.state}
+        />
+      </section>
+    );
   }
 
   return (
@@ -1822,16 +1904,17 @@ export default function ImportPanel({
                       ✅ Kết nối trực tiếp
                     </p>
                   )}
-                  {onFetchSourceChapters && sourcePreview.chapters.length > 0 ? (
+                  {(importJobClient || onFetchSourceChapters) && sourcePreview.chapters.length > 0 ? (
                     <div className="url-fetch-panel">
                       <div className="url-fetch-header">
                         <label className="url-fetch-select-all">
                           <input
+                            aria-label="Chọn tất cả chương đang hiển thị"
                             type="checkbox"
-                            checked={selectedChapterUrls.size === sourcePreview.chapters.length && sourcePreview.chapters.length > 0}
-                            onChange={toggleSelectAllChapters}
+                            checked={allVisibleChaptersSelected}
+                            onChange={toggleSelectVisibleChapters}
                           />
-                          <span>Chọn tất cả ({selectedChapterUrls.size}/{sourcePreview.chapters.length})</span>
+                          <span>Chọn trang này</span>
                         </label>
                         <button
                           className="primary-action url-fetch-btn"
@@ -1841,14 +1924,52 @@ export default function ImportPanel({
                         >
                           {fetchState === 'loading'
                             ? <><Loader2 aria-hidden="true" className="status-spinner" size={15} /> Đang tải...</>
-                            : <><Download aria-hidden="true" size={15} /> Tải {selectedChapterUrls.size > 0 ? selectedChapterUrls.size : ''} chương</>}
+                            : importJobClient
+                              ? <><Download aria-hidden="true" size={15} /> Tạo job {selectedChapterUrls.size} chương</>
+                              : <><Download aria-hidden="true" size={15} /> Tải {selectedChapterUrls.size > 0 ? selectedChapterUrls.size : ''} chương</>}
                         </button>
                       </div>
+                      <div className="url-chapter-selection-tools">
+                        <strong>Đã chọn {selectedChapterUrls.size}/{sourcePreview.chapters.length} chương</strong>
+                        <div className="url-chapter-range">
+                          <label>
+                            <span>Từ chương</span>
+                            <input
+                              aria-label="Từ chương"
+                              inputMode="numeric"
+                              min="1"
+                              onChange={(event) => setRangeStart(event.target.value)}
+                              type="number"
+                              value={rangeStart}
+                            />
+                          </label>
+                          <label>
+                            <span>Đến chương</span>
+                            <input
+                              aria-label="Đến chương"
+                              inputMode="numeric"
+                              min="1"
+                              onChange={(event) => setRangeEnd(event.target.value)}
+                              type="number"
+                              value={rangeEnd}
+                            />
+                          </label>
+                          <button
+                            className="secondary-action"
+                            disabled={!rangeStart || !rangeEnd}
+                            onClick={selectChapterRange}
+                            type="button"
+                          >
+                            Chọn khoảng chương
+                          </button>
+                        </div>
+                      </div>
                       <ol className="ebook-preview-chapters url-chapter-list">
-                        {sourcePreview.chapters.map((chapter) => (
+                        {visibleSourceChapters.map((chapter) => (
                           <li key={`${chapter.chapter_number}-${chapter.url}`}>
                             <label className="url-chapter-item">
                               <input
+                                aria-label={`Chọn ${chapter.title || `Chương ${chapter.chapter_number}`}`}
                                 type="checkbox"
                                 checked={selectedChapterUrls.has(chapter.url)}
                                 onChange={() => toggleChapterSelection(chapter.url)}
@@ -1869,6 +1990,29 @@ export default function ImportPanel({
                           </li>
                         ))}
                       </ol>
+                      {sourceChapterPageCount > 1 ? (
+                        <nav aria-label="Phân trang chương nguồn" className="import-pagination">
+                          <button
+                            aria-label="Trang trước"
+                            className="secondary-action"
+                            disabled={chapterPage === 0}
+                            onClick={() => setChapterPage((page) => Math.max(0, page - 1))}
+                            type="button"
+                          >
+                            Trước
+                          </button>
+                          <span>Trang {chapterPage + 1}/{sourceChapterPageCount}</span>
+                          <button
+                            aria-label="Trang sau"
+                            className="secondary-action"
+                            disabled={chapterPage >= sourceChapterPageCount - 1}
+                            onClick={() => setChapterPage((page) => Math.min(sourceChapterPageCount - 1, page + 1))}
+                            type="button"
+                          >
+                            Sau
+                          </button>
+                        </nav>
+                      ) : null}
                       {fetchError ? <p className="status-error" role="alert">{fetchError}</p> : null}
                       {fetchResult && fetchResult.succeeded > 0 ? (
                         <p className="status-chip status-chip-success">
@@ -2292,15 +2436,17 @@ export default function ImportPanel({
           <button aria-label="Cancel" className="secondary-action" disabled={loading} onClick={handleCancel} type="button">
             Hủy
           </button>
-          <button
-            aria-describedby={importActionStatusId}
-            className="primary-action"
-            disabled={!canSubmit}
-            type="submit"
-          >
-            {mode === 'paste' ? <Upload aria-hidden="true" size={16} /> : mode === 'file' ? <Upload aria-hidden="true" size={16} /> : <ArrowRight aria-hidden="true" size={16} />}
-            {submitLabel}
-          </button>
+          {importJobClient && (mode === 'url' || mode === 'catalog') ? null : (
+            <button
+              aria-describedby={importActionStatusId}
+              className="primary-action"
+              disabled={!canSubmit}
+              type="submit"
+            >
+              {mode === 'paste' ? <Upload aria-hidden="true" size={16} /> : mode === 'file' ? <Upload aria-hidden="true" size={16} /> : <ArrowRight aria-hidden="true" size={16} />}
+              {submitLabel}
+            </button>
+          )}
         </div>
       </form>
     </section>

@@ -36,6 +36,7 @@ import type {
   JobLogEntry,
   JobStartResponse,
   JobStatus,
+  JobEventSubscriptionOptions,
   Provider,
   ProviderDefaults,
   ProviderTestResult,
@@ -535,7 +536,7 @@ export class ApiClient {
     return (await response.json()) as ImportJobSnapshot;
   }
 
-  async retryFailedImportTasks(jobId: string): Promise<ImportJobSnapshot> {
+  async retryFailedTasks(jobId: string): Promise<ImportJobSnapshot> {
     const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/retry-failed`, {
       method: 'POST',
       headers: this.headers(),
@@ -544,18 +545,26 @@ export class ApiClient {
     return (await response.json()) as ImportJobSnapshot;
   }
 
-  openImportJobEventStream(
+  async retryFailedImportTasks(jobId: string): Promise<ImportJobSnapshot> {
+    return this.retryFailedTasks(jobId);
+  }
+
+  subscribeJobEvents(
     jobId: string,
     onEvent: (event: ImportJobEvent) => void,
-    options: { cursor?: number } = {},
+    options: JobEventSubscriptionOptions = {},
   ): ImportJobEventStream {
     const controller = new AbortController();
     const query = options.cursor != null ? `?cursor=${Math.max(0, Math.trunc(options.cursor))}` : '';
+    const headers = this.headers();
+    if (options.lastEventId != null) {
+      headers['Last-Event-ID'] = String(Math.max(0, Math.trunc(options.lastEventId)));
+    }
     const done = (async () => {
       try {
         const response = await this.fetcher(
           `${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/events${query}`,
-          { headers: this.headers(), signal: controller.signal },
+          { headers, signal: controller.signal },
         );
         await this.assertOk(response, 'Failed to stream import job events');
         if (!response.body) throw new ApiError('Import job event stream has no response body', response.status);
@@ -585,6 +594,14 @@ export class ApiClient {
       }
     })();
     return { abort: () => controller.abort(), done };
+  }
+
+  openImportJobEventStream(
+    jobId: string,
+    onEvent: (event: ImportJobEvent) => void,
+    options: JobEventSubscriptionOptions = {},
+  ): ImportJobEventStream {
+    return this.subscribeJobEvents(jobId, onEvent, options);
   }
 
   private consumeImportJobSseBlocks(

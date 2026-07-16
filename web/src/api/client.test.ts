@@ -1684,6 +1684,100 @@ describe('ApiClient', () => {
     expect(init?.signal?.aborted).toBe(true);
   });
 
+  it('supports the canonical P10 retryFailedTasks method', async () => {
+    const snapshot = { job_id: 'job-1', status: 'queued', tasks: [] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await expect(client.retryFailedTasks('job 1')).resolves.toEqual(snapshot);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job%201/retry-failed',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('creates, loads, and cancels import jobs through the P09 endpoints', async () => {
+    const accepted = { job_id: 'job-1', status: 'queued', total: 1 };
+    const snapshot = { job_id: 'job-1', status: 'running', tasks: [] };
+    const cancelled = { job_id: 'job-1', status: 'cancelled', tasks: [] };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => accepted })
+      .mockResolvedValueOnce({ ok: true, json: async () => snapshot })
+      .mockResolvedValueOnce({ ok: true, json: async () => cancelled });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const createRequest = {
+      source_url: 'https://www.69shuba.com/book/1',
+      title: 'Đại Đạo Triều Thiên',
+      author: '',
+      source: '69shuba',
+      chapters: [{
+        url: 'https://www.69shuba.com/book/1/1.html',
+        chapter_number: 1,
+        title: 'Chương 1',
+      }],
+    };
+
+    await expect(client.createImportJob(createRequest)).resolves.toEqual(accepted);
+    await expect(client.getImportJob('job-1')).resolves.toEqual(snapshot);
+    await expect(client.cancelImportJob('job-1')).resolves.toEqual(cancelled);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://test/api/import/jobs',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access',
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify(createRequest),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://test/api/import/jobs/job-1',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access' }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/import/jobs/job-1/cancel',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('supports the canonical P10 subscribeJobEvents method with Last-Event-ID', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await client.subscribeJobEvents('job-1', vi.fn(), { cursor: 7, lastEventId: 7 }).done;
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job-1/events?cursor=7',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access',
+          'Last-Event-ID': '7',
+        }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
   it('preserves typed import job errors without parsing the message', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

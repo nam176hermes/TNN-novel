@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P09 — durable import job API and SSE.
+- Active milestone: P11 — durable ImportPanel job UX, implementation and verification complete.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -56,6 +56,21 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - Targeted P09 client verification: `40 passed in 44.63s` for the API client, including authenticated streaming, cursor reconnect, abort, and typed errors.
 - Full P09 backend verification: `927 passed, 2 warnings in 1115.04s (0:18:35)`.
 - P09 static verification: backend compile/lint, frontend typecheck, production build, and `git diff --check` passed; the existing unresolved `sidebar-scenery.png` build warning remains.
+- P10 implementation status: implemented and verified.
+- P10 adds canonical TypeScript job/task/event status contracts, compatibility API aliases, and a standalone `useImportJob` state machine without wiring or redesigning `ImportPanel`.
+- P10 keeps GET snapshot authoritative: persisted events only advance an idempotent cursor and trigger snapshot reconciliation.
+- P10 resumes the latest non-terminal job from a versioned localStorage key, reconnects SSE with exponential backoff/cursor headers, and falls back to bounded polling.
+- Targeted P10 verification: `56 passed in 25.24s` across API client and import-job hook tests; frontend typecheck passed.
+- Full P10 frontend verification: `81 test files passed`, `724 tests passed in 545.78s`.
+- P10 lint/typecheck, production build, and `git diff --check` passed; the existing unresolved `sidebar-scenery.png` build warning remains.
+- P11 implementation status: implemented and verified.
+- P11 connects URL chapter selection to the P10 durable job hook, keeps preview/source policy and bypass badges, and leaves paste/file/ebook workflows unchanged.
+- P11 pages source selection at 25 rows and task progress at 20 rows, with visible-page selection and full-preview chapter-range selection.
+- P11 exposes safe task stage/status/fetch/length/operation/error metadata, cancel/retry/resume/return actions, reconnecting state, live progress, focus management, and responsive 44px controls.
+- Targeted P11 verification: `7 passed in 50.40s` for the durable ImportPanel job UX; the CSS ownership regression suite passed `13 tests in 44.13s`.
+- Full P11 frontend verification: `82 test files passed`, `731 tests passed in 543.02s`.
+- P11 Chromium regression smoke: the existing mocked Import wizard flow passed `1 test in 12.7s`.
+- P11 lint/typecheck and production build passed. The existing unresolved `sidebar-scenery.png` build warning remains; no P11 runtime dependency was added.
 
 ## Goals
 
@@ -230,17 +245,22 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - Route legacy synchronous URL fetch through the same job engine without breaking its response contract.
 - Add authenticated fetch/AbortController transport and typed client errors; do not change UI.
 
-### P10 — Import artifact integrity
+### P10 — Frontend import job client and state hook
 
-- Verify metadata-to-file consistency for imported artifacts.
-- Provide dry-run reports for missing or invalid artifacts.
-- Do not auto-delete or regenerate without explicit confirmation.
+- Complete typed frontend contracts for import jobs, chapter tasks, statuses, stages, events, and mutation responses.
+- Preserve P09 client methods while adding canonical `retryFailedTasks` and `subscribeJobEvents` names.
+- Add an isolated `useImportJob` state machine for create/resume/reconcile/cancel/retry without redesigning `ImportPanel`.
+- Treat GET snapshot as authoritative and persisted SSE sequence only as an idempotent reconnect cursor.
+- Resume the latest non-terminal job from minimal versioned browser storage, reconnect SSE with bounded backoff, and fall back to polling.
 
-### P11 — Frontend import/mobile cleanup
+### P11 — Durable ImportPanel job UX
 
-- Reduce mobile overflow and improve touch targets.
-- Keep one source of truth for import loading/error states.
-- Do not redesign unrelated desktop flows.
+- Replace blocking URL chapter fetch in production wiring with P10 `useImportJob` create/reconcile/cancel/retry/resume behavior.
+- Keep URL preview, source policy, chapter selection, bypass badge, and legacy callback compatibility.
+- Show aggregate and per-chapter progress with safe fetch-method and error labels.
+- Bound source and task DOM size through pagination, visible-page selection, and chapter-range selection.
+- Keep reconnecting distinct from failure and provide live-region/focus/touch-target/mobile behavior.
+- Do not redesign paste/file/ebook or unrelated desktop flows.
 
 ### P12 — Backend test matrix expansion
 
@@ -280,8 +300,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P07 | P04, P05, P06 | Retry/concurrency relies on durable tasks, leases, and idempotent import. |
 | P08 | P02, P07 | Browser containment needs URL policy and the outer global browser concurrency limit. |
 | P09 | P05, P07 | Observability needs stable job/source events. |
-| P10 | P05 | Artifact integrity attaches to import job outputs. |
-| P11 | P06 | Frontend cleanup follows stable import states. |
+| P10 | P09 | The frontend state machine requires the durable job snapshot and persisted SSE contract. |
+| P11 | P10 | ImportPanel cleanup consumes the stable P10 hook instead of owning transport state. |
 | P12 | P01-P10 | Expands backend tests after contracts stabilize. |
 | P13 | P06, P11 | UI/E2E tests need stable UX. |
 | P14 | P01-P13 | Runbooks should reflect implemented behavior. |
@@ -322,6 +342,12 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-15 | P09 uses persisted event sequence as SSE id and GET snapshot as the reconciliation source of truth. | Reconnect remains deterministic and event delivery cannot become a second mutable state store. |
 | 2026-07-15 | P09 uses FastAPI background tasks only as an immediate run trigger while SQLite remains the durable queue. | Client disconnect does not cancel work and no autonomous scheduler is added in this milestone. |
 | 2026-07-15 | P09 keeps fetched source text in the worker's in-memory stage cache and persists only safe task metadata. | Durable config/events must not contain chapter text, HTML, cookies, tokens, or secrets. |
+| 2026-07-15 | P10 uses GET snapshot as the only mutable frontend job truth; events only advance a monotonic cursor and request reconciliation. | Duplicate or out-of-order SSE delivery cannot double-apply counters or regress task state. |
+| 2026-07-15 | P10 stores only the latest non-terminal `job_id` under a versioned localStorage key. | Page refresh can resume safely without persisting task payloads, source data, HTML, content, cookies, or secrets. |
+| 2026-07-15 | P10 adds canonical client names as wrappers while retaining P09 method names. | P11 can use a clear API without breaking existing callers during migration. |
+| 2026-07-15 | P11 production wiring uses the P10 durable client; the old blocking URL chapter callback remains an optional compatibility fallback only. | The operator sees immediate job acceptance and recoverable progress while existing external ImportPanel callers do not break. |
+| 2026-07-15 | P11 paginates source chapters and task details instead of adding a virtualization dependency. | Fixed pages bound DOM size, preserve simple checkbox semantics, and meet the milestone without changing the dependency graph. |
+| 2026-07-15 | P11 displays a conservative `Đã lưu` operation when P09 omits the optional operation field. | The UI must not invent `created` versus `updated`; a future additive snapshot field can provide the exact P04 outcome without breaking the client. |
 
 ## Test matrix
 
@@ -341,6 +367,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P06 import worker | Sequential success, partial failure, cancel before/during stage, expired lease recovery, atomic claim, explicit retry, and fake-pipeline idempotency simulation | no real source/browser calls or parallel execution |
 | P08 browser/session | Mocked persistent-context reuse, per-session serialization, idle/request/health/crash restart, popup/download/navigation containment, cookie expiry/atomic permissions/corrupt recovery, compatibility wrapper, and application shutdown | no real browser/source calls and no cookie/query/content in logs |
 | P09 import API/SSE | Create/get/cancel/retry, owner isolation, quota/URL validation, ordered persisted events, cursor/header reconnect, keepalive, disconnect, terminal close, legacy route, client fetch stream/abort, and typed errors | no Internet calls, no source content in snapshot/events, GET snapshot remains authoritative |
+| P10 frontend import state | Typed job/task/event contracts, reducer phases, idempotent cursor, snapshot reconciliation, SSE reconnect/backoff, polling fallback, cancel/retry, resume storage, and typed error mapping | no ImportPanel redesign, no source payload or secret persistence |
+| P11 ImportPanel job UX | Selected-chapter create, progress reconciliation, partial result, cancel/retry, refresh resume, reconnecting, fetch badges, operation/error copy, source/task pagination, range selection, focus and live-region behavior | no blocking fetch in production wiring, no thousand-row checkbox/task DOM, no source payload or secret rendering |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks

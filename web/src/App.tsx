@@ -1857,6 +1857,7 @@ function AuthenticatedApp() {
             <ImportPanel
               books={books}
               chapters={chapters}
+              importJobClient={session.client}
               ebookInboxDirectory={ebookInboxDirectory}
               ebookInboxError={ebookInboxError}
               ebookInboxFiles={ebookInboxFiles}
@@ -1874,14 +1875,12 @@ function AuthenticatedApp() {
                 void handleOpenReader(result.book_id, result.chapter_ids[0] ?? null);
               }}
               onOpenJob={() => setActiveView('jobs')}
+              onReturnToLibrary={() => setActiveView('library')}
               onPreviewInboxEbook={handlePreviewInboxEbook}
               onPreviewImportUrl={handleImportUrlPreview}
               onPreviewTranslatedEbook={handlePreviewTranslatedEbook}
               onRefreshEbookInbox={loadEbookInbox}
               onStartImportUrlJob={handleStartImportUrl}
-              onFetchSourceChapters={async (request) => {
-                return await session.client.fetchSourceChapters(request);
-              }}
             />
           </>
         );

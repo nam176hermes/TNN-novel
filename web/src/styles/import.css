@@ -1161,4 +1161,242 @@
     padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 8px);
   }
 }
+
+.url-chapter-selection-tools {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  justify-content: space-between;
+  padding: 8px 0;
+}
+
+.url-chapter-selection-tools > strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.url-chapter-range {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.url-chapter-range label {
+  color: var(--text-soft);
+  display: grid;
+  font-size: 11px;
+  font-weight: 700;
+  gap: 3px;
+}
+
+.url-chapter-range input {
+  min-height: 44px;
+  width: 92px;
+}
+
+.url-chapter-range button,
+.import-pagination button,
+.import-job-actions button,
+.url-fetch-header button,
+.url-fetch-select-all {
+  min-height: 44px;
+}
+
+.import-pagination {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  padding-top: 10px;
+}
+
+.import-pagination span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.import-job-progress {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+}
+
+.import-job-progress-header {
+  align-items: flex-start;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.import-job-progress-header h4 {
+  margin: 3px 0;
+  outline: none;
+}
+
+.import-job-progress-header h4:focus-visible {
+  border-radius: 6px;
+  box-shadow: 0 0 0 3px rgb(16 185 129 / 24%);
+}
+
+.import-job-progress-header p:last-child {
+  color: var(--text-soft);
+  margin: 0;
+}
+
+.import-job-counts {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin: 0;
+}
+
+.import-job-counts div {
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.import-job-counts dt,
+.import-job-task-meta dt {
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.import-job-counts dd {
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 850;
+  margin: 4px 0 0;
+}
+
+.import-job-task-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.import-job-task-list > li {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  content-visibility: auto;
+  padding: 12px;
+}
+
+.import-job-task-list > li[data-status='failed'],
+.import-job-task-list > li[data-status='user_verification_required'] {
+  border-color: rgb(248 113 113 / 34%);
+}
+
+.import-job-task-title {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.import-job-task-title > span:first-child {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.import-job-task-title strong {
+  overflow-wrap: anywhere;
+}
+
+.import-job-task-meta {
+  display: grid;
+  gap: 6px 12px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin: 10px 0 0;
+}
+
+.import-job-task-meta div {
+  min-width: 0;
+}
+
+.import-job-task-meta dd {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.import-job-task-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 10px 0 0;
+}
+
+.import-job-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 760px) {
+  .import-job-counts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .import-job-task-meta {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .url-chapter-range,
+  .url-chapter-selection-tools {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .url-chapter-selection-tools > strong,
+  .url-chapter-range button {
+    grid-column: 1 / -1;
+  }
+
+  .url-chapter-range input {
+    width: 100%;
+  }
+}
+
+@media (max-width: 420px) {
+  .import-job-progress {
+    padding: 12px;
+  }
+
+  .import-job-progress-header {
+    display: grid;
+  }
+
+  .import-job-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .import-job-task-title {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .import-job-task-title .status-chip {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+
+  .import-job-actions button {
+    flex: 1 1 100%;
+  }
+}
 }
