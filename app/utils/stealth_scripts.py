@@ -121,7 +121,8 @@ Object.defineProperty(navigator, 'webdriver', {
     ];
 
     function makeMimeType(mt, enabledPlugin) {
-        return Object.create(MimeType.prototype, {
+        const proto = typeof MimeType !== 'undefined' ? MimeType.prototype : Object.prototype;
+        return Object.create(proto, {
             type: { value: mt.type, enumerable: true },
             suffixes: { value: mt.suffixes, enumerable: true },
             description: { value: mt.description, enumerable: true },
@@ -130,7 +131,8 @@ Object.defineProperty(navigator, 'webdriver', {
     }
 
     function makePlugin(data) {
-        const plugin = Object.create(Plugin.prototype, {
+        const proto = typeof Plugin !== 'undefined' ? Plugin.prototype : Object.prototype;
+        const plugin = Object.create(proto, {
             name: { value: data.name, enumerable: true },
             filename: { value: data.filename, enumerable: true },
             description: { value: data.description, enumerable: true },
