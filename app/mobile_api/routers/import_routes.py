@@ -30,7 +30,6 @@ from app.config import PROJECT_ROOT
 from app.database.db import find_managed_source_for_url, get_chapter_by_id, get_managed_source, list_ebook_import_runs
 from app.database.import_jobs import (
     ImportJob,
-    ImportJobRepository,
     InvalidImportJobTransition,
     JobStatus as DurableImportJobStatus,
     TaskStatus as DurableImportTaskStatus,
@@ -66,10 +65,8 @@ from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload_to_temp_limited
 from app.services.import_job_service import ImportJobService
-from app.services.import_job_quotas import ImportJobQuotaError, ImportJobQuotaPolicy
-from app.observability import CircuitBreakerConfig, default_observability
-from app.services.import_job_runtime import RetryPolicy
-from app.services.source_import_task_pipeline import SourceImportTaskPipeline
+from app.services.import_job_quotas import ImportJobQuotaError
+from app.services.import_job_factory import create_import_job_service
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 logger = logging.getLogger(__name__)
@@ -129,32 +126,10 @@ def get_job_service():
 def get_import_job_service(
     pipeline: PipelineService = Depends(get_pipeline),
 ) -> ImportJobService:
-    repository = ImportJobRepository(Path(getattr(pipeline, "db_path", get_db_path())))
-    default_observability.configure_circuit_breaker(
-        CircuitBreakerConfig(
-            failure_threshold=mobile_settings.source_circuit_failure_threshold,
-            window_seconds=mobile_settings.source_circuit_window_seconds,
-            cooldown_seconds=mobile_settings.source_circuit_cooldown_seconds,
-        )
-    )
-    return ImportJobService(
-        repository,
+    return create_import_job_service(
         worker_id=f"api-{os.getpid()}",
-        pipeline=SourceImportTaskPipeline(
-            repository,
-            pipeline,
-            observability=default_observability,
-            max_chapter_bytes=mobile_settings.import_job_max_bytes_per_chapter,
-        ),
-        retry_policy=RetryPolicy(max_attempts=mobile_settings.import_job_max_retries_per_task),
-        quota_policy=ImportJobQuotaPolicy(
-            max_chapters_per_job=mobile_settings.import_job_max_chapters,
-            max_active_jobs_per_owner=mobile_settings.import_job_max_active_per_user,
-            max_retries_per_task=mobile_settings.import_job_max_retries_per_task,
-            max_bytes_per_chapter=mobile_settings.import_job_max_bytes_per_chapter,
-            max_job_duration_seconds=mobile_settings.import_job_max_duration_seconds,
-        ),
-        observability=default_observability,
+        pipeline=pipeline,
+        db_path=Path(getattr(pipeline, "db_path", get_db_path())),
     )
 
 
@@ -1273,7 +1248,8 @@ async def create_import_job(
     except Exception as exc:
         _raise_import_job_error(exc)
         raise
-    background_tasks.add_task(_run_import_job_until_idle, service, job.id, owner_user_id)
+    if mobile_settings.import_job_run_in_api:
+        background_tasks.add_task(_run_import_job_until_idle, service, job.id, owner_user_id)
     return ImportJobAcceptedResponse(job_id=job.id, status=job.status.value, total=job.total)
 
 
@@ -1375,7 +1351,7 @@ async def retry_failed_import_job_tasks(
     except Exception as exc:
         _raise_import_job_error(exc)
         raise
-    if retried:
+    if retried and mobile_settings.import_job_run_in_api:
         background_tasks.add_task(_run_import_job_until_idle, service, job_id, owner_user_id)
     return snapshot
 

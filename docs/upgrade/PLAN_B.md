@@ -4,7 +4,7 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
-- Active milestone: P14 — add bounded observability, quotas, source-health reporting, and initial operational runbook; implementation and backend/static verification complete. The full frontend Vitest rerun remains blocked by the existing worker-startup/stall issue described below.
+- Active milestone: P15 — deployment hardening is implemented and backend-verified in the worktree. Container verification is blocked because Docker is unavailable, and the unchanged full Vitest run stalls before reporting; both remain release gates.
 - Branch: `upgrade-b/00-baseline-and-agent-guidance`.
 - P00 baseline commit: `c03dbb4169a100b4f316c8d3abe7d2cac2a6d4b0`.
 - Current implementation commit before P01 edits: `4587885`.
@@ -87,6 +87,15 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 - P14 backend verification: `1020 passed, 2 warnings in 1563.87s (0:26:03)` using the complete collected pytest suite. The warnings remain the existing `passlib/crypt` and `jieba/pkg_resources` deprecations.
 - P14 static verification: `scripts/lint.sh`, Python compileall, `git diff --check`, frontend typecheck, and production build passed. The existing unresolved `sidebar-scenery.png` build warning remains.
 - P14 frontend full-test note: `npm --prefix web test` completed 49 test files / 508 tests successfully but exited with 33 Vitest fork-worker startup timeouts after 778.09 seconds. A subsequent single-worker diagnostic produced no reporter output and was stopped after an extended wait. P14 does not modify frontend code; rerun the full frontend suite in an environment without the existing Vitest worker capacity/stall issue before release.
+- P15 implementation separates the API and import/browser process with `app.import_worker`. Both instantiate the same P14-aware job-service factory, while production Compose sets `IMPORT_JOB_RUN_IN_API=0`; the existing in-API runner remains an explicit local-development compatibility mode.
+- P15 makes the worker's durable SQLite job store authoritative across API restart and worker crash. Startup/recovery requeues expired running leases and only requeues a due retry after its lease expires, so a live P07 backoff is not stolen by another worker.
+- P15 separates network-bound fetch/parse/browser work from the API image, runs both containers as non-root read-only processes with bounded resources, and keeps Chromium profile/cookie state in worker-only tmpfs. API-only auth/provider secrets are not mounted into the worker.
+- P15 applies P02 URL policy interception to browser subresources as well as top-level navigation, so mock/private requests are aborted at the browser network layer.
+- P15 targeted verification: `49 passed, 1 warning in 111.07s (0:01:51)` across worker recovery/multi-worker lease, API external-worker compatibility, browser interception, job, fetch, and deployment-static coverage. The warning remains the existing `passlib/crypt` deprecation.
+- P15 full backend verification: `1030 passed, 2 warnings in 1684.10s (0:28:04)`. The warnings remain the existing `passlib/crypt` and `jieba/pkg_resources` deprecations.
+- P15 static/frontend verification: `scripts/lint.sh`, Python compileall, shell syntax, `scripts/check-environment.sh`, `git diff --check`, frontend typecheck, and production build passed. The production build retains the existing unresolved `sidebar-scenery.png` asset warning.
+- P15 frontend full-test note: `npm --prefix web test` reached its Vitest startup banner but emitted no reporter/test output for approximately ten minutes and was stopped (`exit 130`). P15 has no frontend code changes; rerun the full suite in an environment without this existing worker-startup/stall issue before release.
+- P15 container verification note: `docker --version && docker compose version && docker build -t novel-pipeline:local .` could not start because `/bin/bash: docker: command not found`. Image build, Compose startup, and in-container API/worker health checks remain required on a Docker-capable deployment host.
 
 ## Goals
 
@@ -304,7 +313,8 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 
 - Separate API and durable import/browser worker entrypoints in production.
 - Harden containers, lifecycle, health checks, resource limits, browser egress, secret injection, startup recovery, and rollback/runbooks.
-- Verify crash recovery and idempotent work continuation in an isolated deployment environment.
+- Keep the local in-API execution switch solely for development compatibility; production Compose must leave execution to `import-worker`.
+- Verify crash recovery and idempotent work continuation in an isolated deployment environment before release.
 
 ### P16 — Independent final review
 
@@ -383,6 +393,10 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | 2026-07-16 | P14 keeps telemetry dependency-free and process-local with bounded label/series/sample limits. | The private single-operator deployment has no existing metrics vendor; safe instrumentation can be added without persisting sensitive source payloads or adding a production dependency. |
 | 2026-07-16 | Circuit breaking is keyed only by adapter id and fetch method and counts transient transport/source failures. | This avoids one source mode poisoning another while ensuring content, parser, duplicate, cancellation, and verification outcomes do not suppress valid work. |
 | 2026-07-16 | Source-health reporting exposes authenticated aggregate counts, not raw source diagnostics. | The operations view needs a safe actionable summary without expanding unauthenticated source metadata or leaking URLs/payloads. |
+| 2026-07-16 | P15 uses a standalone `app.import_worker` and a shared job-service factory; Compose disables the API's background runner. | The same durable P05/P06 store continues across API restarts without allowing API and browser dependencies/secrets into one production process. |
+| 2026-07-16 | P15 recovers `waiting_retry` only after the retry lease expires. | A live P07 worker may be sleeping through a durable backoff; another worker must not steal that task merely because `next_attempt_at` is due. |
+| 2026-07-16 | Browser URL interception validates subresources as well as top-level navigation. | Navigation-only validation cannot prevent a page from probing a private or metadata endpoint through a script/image/fetch request. |
+| 2026-07-16 | The production deployment default is one import worker. | Per-task leases permit races safely, but cross-worker ordered-import behavior must be benchmarked before scaling browser/import replicas. |
 
 ## Test matrix
 
@@ -406,6 +420,7 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 | P11 ImportPanel job UX | Selected-chapter create, progress reconciliation, partial result, cancel/retry, refresh resume, reconnecting, fetch badges, operation/error copy, source/task pagination, range selection, focus and live-region behavior | no blocking fetch in production wiring, no thousand-row checkbox/task DOM, no source payload or secret rendering |
 | P12 DOM parser | Sanitized 69shuba-family fixtures for preview/chapter extraction, relative/absolute links, entities/Unicode, junk removal, selector fallback, regex fallback, 404, status-200 challenge, empty/short content, chapter-list misclassification, boilerplate ratio, and all five allowed domains; then full backend pytest | no Internet/browser calls; typed errors preserved; fallback telemetry contains no URL, HTML, or chapter content |
 | P13 all dedicated adapters | Parameterized normal fixture and status-200 challenge coverage for 12 remaining adapters / 16 domains; inventory assertion for all 20 dedicated domains and fallback allowlist assertion | no Internet/browser calls; P13 selectors have no regex fallback; generic catch-all is explicitly excluded |
+| P15 deployment hardening | Worker process/recovery/lease tests, API external-worker compatibility, browser private-subresource interception, Docker/Compose/static configuration checks, then image build and Compose health verification | no live source/browser calls in unit tests; record Docker-unavailable environment explicitly and run the documented Compose checks before release |
 | Mobile UI changes | Vitest and Playwright where practical | viewport, touch-target, overflow notes |
 
 ## Current known risks
@@ -413,10 +428,11 @@ Plan B target architecture keeps the existing single-operator app but tightens o
 - The worktree was dirty before P00, including import/source/browser/frontend files.
 - P00 baseline had one failing source adapter test and a pyflakes failure; P01 full verification now passes.
 - Legacy CAPTCHA/proxy utilities remain present but P08 does not expand them; future work must continue treating challenge handling as a constrained compatibility path.
-- P09 triggers accepted jobs in-process; durable queued state survives, but there is still no autonomous polling worker that starts orphaned queued jobs without an operational trigger.
+- P15 adds a durable polling worker; production deployment must keep `IMPORT_JOB_RUN_IN_API=0` and ensure the worker shares the intended SQLite data mount with the API.
 - `docs/upgrade/codex-prompts-modified.md` contains older Plan B prompt text that preserves bypass-style behavior; future tasks must follow this document and root `AGENTS.md` instead.
 - P13 validates all dedicated adapters against sanitized local fixtures only. Live-layout validation remains outside CI; regex fallback is limited to the P12-proven 69shuba-family compatibility seam.
 - Large files such as `pipeline_service.py`, `db.py`, `ImportPanel.tsx`, `client.ts`, and `types.ts` increase regression risk.
+- Docker/Compose build, healthcheck, API-restart, and real container crash-recovery verification remain blocked in the present Codex environment because `docker` is unavailable. Run the P15 runbook commands in the target deployment environment before release.
 
 ## Update rules for future PRs
 

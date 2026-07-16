@@ -143,6 +143,28 @@ async def test_create_get_cancel_and_retry_import_jobs(temp_db_path: Path) -> No
     finally:
         _clear_import_job_service_override()
 
+
+@pytest.mark.asyncio
+async def test_api_can_leave_durable_import_execution_to_the_external_worker(
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(temp_db_path)
+    _override_import_job_service(service)
+    monkeypatch.setattr(mobile_settings, "import_job_run_in_api", False, raising=False)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            created = await client.post("/api/import/jobs", json=_payload(chapters=1), headers=headers)
+    finally:
+        _clear_import_job_service_override()
+
+    assert created.status_code == 202
+    job = service.repository.get_job_internal(created.json()["job_id"])
+    assert job is not None
+    assert job.status is JobStatus.QUEUED
+
     paused = _service(temp_db_path, paused=True)
     _override_import_job_service(paused)
     try:

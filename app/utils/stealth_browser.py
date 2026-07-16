@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 try:
     from playwright.async_api import async_playwright, BrowserContext, Page
@@ -245,10 +246,12 @@ class BrowserSessionManager:
             try:
                 is_navigation = request.is_navigation_request()
                 is_top_level = request.frame == page.main_frame
-                if is_navigation and is_top_level:
+                scheme = urlsplit(request.url).scheme.casefold()
+                if scheme not in {"about", "blob", "data"}:
                     validate_fetch_url(request.url, resolver=self._resolver)
             except UrlPolicyViolation as exc:
-                self._navigation_violation = exc
+                if is_navigation and is_top_level:
+                    self._navigation_violation = exc
                 await route.abort("blockedbyclient")
                 return
             await route.continue_()

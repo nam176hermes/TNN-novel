@@ -398,6 +398,48 @@ async def test_browser_session_navigation_guard_blocks_private_top_level_target(
     await manager.close()
 
 
+@pytest.mark.asyncio
+async def test_browser_session_blocks_private_subresource_at_network_layer(tmp_path) -> None:
+    from app.utils.stealth_browser import BrowserSessionManager
+
+    class Request:
+        url = "http://127.0.0.1/private-script.js"
+
+        def __init__(self, frame) -> None:
+            self.frame = frame
+
+        def is_navigation_request(self) -> bool:
+            return False
+
+    class Route:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self, reason: str) -> None:
+            self.aborted = True
+
+        async def continue_(self) -> None:
+            self.continued = True
+
+    page = FakePage()
+    factory, _contexts, _playwrights, _launch_options = fake_playwright_factory([page])
+    manager = BrowserSessionManager(
+        playwright_factory=factory,
+        profile_dir=tmp_path / "profile",
+        resolver=public_resolver,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    await manager.fetch("https://example.com/chapter/1")
+    route = Route()
+
+    await page.route_handler(route, Request(page.main_frame))
+
+    assert route.aborted and not route.continued
+    assert manager._navigation_violation is None
+    await manager.close()
+
+
 def test_fetch_with_stealth_sync_delegates_to_session_runtime(monkeypatch) -> None:
     from app.utils import stealth_browser
 

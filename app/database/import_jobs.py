@@ -349,6 +349,42 @@ class ImportJobRepository:
             "queue_depth": int(tasks["count"] if tasks else 0),
         }
 
+    def list_runnable_jobs(self, *, limit: int = 1) -> list[ImportJob]:
+        """Return trusted worker candidates without exposing an unscoped API read.
+
+        Claims remain atomic at the task level.  This query merely lets a
+        process discover a durable queue after an API restart; a competing
+        worker that sees the same job cannot process the same task lease.
+        """
+
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM import_jobs
+                WHERE status IN (?, ?)
+                  AND (
+                    status = ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM chapter_tasks
+                        WHERE chapter_tasks.job_id = import_jobs.id
+                          AND chapter_tasks.status = ?
+                    )
+                  )
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    JobStatus.RUNNING.value,
+                    JobStatus.QUEUED.value,
+                    TaskStatus.QUEUED.value,
+                    max(1, limit),
+                ),
+            ).fetchall()
+        return [_job_from_row(row) for row in rows]
+
     def fail_pending_tasks(
         self,
         job_id: str,
@@ -770,21 +806,36 @@ class ImportJobRepository:
         return len(rows)
 
     def recover_expired_tasks(self) -> list[tuple[str, str, int]]:
-        """Requeue expired leases after a process interruption without running work."""
+        """Requeue expired running or retry leases after a process interruption."""
         now = _now()
         recovered: list[tuple[str, str, int]] = []
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT chapter_tasks.id, chapter_tasks.job_id, import_jobs.owner_user_id
+                SELECT chapter_tasks.id, chapter_tasks.job_id, import_jobs.owner_user_id,
+                       chapter_tasks.status
                 FROM chapter_tasks JOIN import_jobs ON import_jobs.id = chapter_tasks.job_id
-                WHERE chapter_tasks.status = ?
+                WHERE (
+                    chapter_tasks.status = ?
                     AND COALESCE(chapter_tasks.lease_expires_at, '') != ''
                     AND chapter_tasks.lease_expires_at <= ?
+                ) OR (
+                    chapter_tasks.status = ?
+                    AND COALESCE(chapter_tasks.next_attempt_at, '') != ''
+                    AND chapter_tasks.next_attempt_at <= ?
+                    AND COALESCE(chapter_tasks.lease_expires_at, '') != ''
+                    AND chapter_tasks.lease_expires_at <= ?
+                )
                 ORDER BY chapter_tasks.id ASC
                 """,
-                (TaskStatus.RUNNING.value, now),
+                (
+                    TaskStatus.RUNNING.value,
+                    now,
+                    TaskStatus.WAITING_RETRY.value,
+                    now,
+                    now,
+                ),
             ).fetchall()
             affected_jobs: set[str] = set()
             for row in rows:
@@ -793,13 +844,25 @@ class ImportJobRepository:
                 conn.execute(
                     """
                     UPDATE chapter_tasks
-                    SET status = ?, stage = ?, lease_token = '', lease_owner = '',
-                        lease_expires_at = '', updated_at = ?, version = version + 1
-                    WHERE id = ? AND status = ?
+                    SET status = ?, stage = ?, next_attempt_at = '', lease_token = '',
+                        lease_owner = '', lease_expires_at = '', updated_at = ?, version = version + 1
+                    WHERE id = ? AND status IN (?, ?)
                     """,
-                    (TaskStatus.QUEUED.value, TaskStage.QUEUED.value, now, task_id, TaskStatus.RUNNING.value),
+                    (
+                        TaskStatus.QUEUED.value,
+                        TaskStage.QUEUED.value,
+                        now,
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.WAITING_RETRY.value,
+                    ),
                 )
-                self._append_event(conn, job_id, task_id, "task_recovered", {"reason": "lease_expired"})
+                reason = (
+                    "retry_lease_expired"
+                    if str(row["status"]) == TaskStatus.WAITING_RETRY.value
+                    else "lease_expired"
+                )
+                self._append_event(conn, job_id, task_id, "task_recovered", {"reason": reason})
                 recovered.append((job_id, str(row["owner_user_id"]), task_id))
                 affected_jobs.add(job_id)
             for job_id in affected_jobs:

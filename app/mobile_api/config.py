@@ -65,6 +65,16 @@ class MobileAPISettings(BaseModel):
         default=int(os.getenv("IMPORT_JOB_MAX_DURATION_SECONDS", "3600")),
         gt=0,
     )
+    import_job_run_in_api: bool = _parse_bool(os.getenv("IMPORT_JOB_RUN_IN_API", "1"))
+    import_worker_poll_interval_seconds: float = Field(
+        default=float(os.getenv("IMPORT_WORKER_POLL_INTERVAL_SECONDS", "1")),
+        gt=0,
+        le=60,
+    )
+    import_worker_heartbeat_max_age_seconds: int = Field(
+        default=int(os.getenv("IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS", "45")),
+        gt=0,
+    )
     source_circuit_failure_threshold: int = Field(
         default=int(os.getenv("SOURCE_CIRCUIT_FAILURE_THRESHOLD", "3")),
         gt=0,
