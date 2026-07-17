@@ -8,7 +8,9 @@ import pytest
 from app.database.db import add_book, add_chapter, init_db, update_chapter_paths
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
+import app.mobile_api.routers.jobs as jobs_router
 import app.mobile_api.routers.tts as tts_router
+from app.services.tts.availability import TTSUnavailableError
 from app.services.tts.tts_pipeline import TTSPipeline
 
 
@@ -28,6 +30,15 @@ class RecordingJobService:
     def start_tts_job(self, **kwargs) -> str:
         self.kwargs = kwargs
         return "tts-api-job"
+
+
+class UnavailableJobService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def start_tts_job(self, **kwargs) -> str:
+        self.calls += 1
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
 
 
 @pytest.mark.asyncio
@@ -56,6 +67,53 @@ async def test_tts_chapter_endpoint_starts_existing_job_runner() -> None:
         "rate": "-3%",
         "volume": "+0%",
     }
+
+
+@pytest.mark.asyncio
+async def test_tts_chapter_endpoint_returns_safe_unavailable() -> None:
+    service = UnavailableJobService()
+    app.dependency_overrides[tts_router.get_job_service] = lambda: service
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/tts/chapter",
+                json={"book_id": 1, "chapter_id": 9, "voice_config": {}},
+                headers=headers,
+            )
+    finally:
+        app.dependency_overrides.pop(tts_router.get_job_service, None)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "tts_unavailable"
+    assert service.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tts_job_endpoint_returns_safe_unavailable_before_audit(monkeypatch) -> None:
+    service = UnavailableJobService()
+    app.dependency_overrides[jobs_router.get_job_service] = lambda: service
+    monkeypatch.setattr(
+        jobs_router,
+        "record_audit_event",
+        lambda **kwargs: pytest.fail("The unavailable request must not record a job-start audit event"),
+    )
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/jobs/tts",
+                json={"book_id": 1, "chapter_ids": [9], "limit": 1, "params": {}},
+                headers=headers,
+            )
+    finally:
+        app.dependency_overrides.pop(jobs_router.get_job_service, None)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "tts_unavailable"
+    assert service.calls == 1
 
 
 @pytest.mark.asyncio

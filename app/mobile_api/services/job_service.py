@@ -31,6 +31,7 @@ from app.ingestion.source_policies import chapter_url_matches_source_book, get_s
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.job_states import is_valid_job_state_transition, normalize_job_state, state_for_stage
+from app.services.tts.availability import require_tts_runtime_available
 from app.translation.ollama_client import is_retryable_provider_error
 from app.translation.presets import get_translation_preset
 
@@ -1287,6 +1288,8 @@ class JobService:
         rate: str = "-5%",
         volume: str = "+0%",
     ) -> str:
+        require_tts_runtime_available()
+
         # Determine target chapters with translations
         if chapter_ids:
             target_ids = chapter_ids
