@@ -77,6 +77,7 @@ from app.translation.pronoun_memory import render_pronoun_memory
 from app.scheduler.daily_queue import get_pending_chapters, get_failed_chapters
 from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.config import settings
+from app.services.tts.availability import is_f5_provider, require_tts_runtime_available
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 
@@ -4773,10 +4774,15 @@ class PipelineService:
         text = self.get_chapter_translation(chapter_id)
         if not text:
             return None
+        provider = settings.tts_provider
+        legacy_fallback = text_to_speech_file
+        if is_f5_provider(provider):
+            require_tts_runtime_available(provider=provider)
+            legacy_fallback = None
         pipeline = TTSPipeline(
             self.db_path,
             self.data_dir,
-            legacy_fallback=text_to_speech_file,
+            legacy_fallback=legacy_fallback,
         )
         generate_kwargs: dict[str, object] = {
             "book_id": book_id,
