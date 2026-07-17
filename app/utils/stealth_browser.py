@@ -420,6 +420,11 @@ class BrowserSessionManager:
 
 
 def _detect_display() -> str:
+    """Detect available X display. Returns empty string for headless.
+
+    In Docker containers without X server, xdpyinfo is missing and we
+    should NOT assume :99 exists — that causes headed launch crash.
+    """
     display = os.getenv("DISPLAY", "")
     if display:
         return display
@@ -436,8 +441,8 @@ def _detect_display() -> str:
                 os.environ["DISPLAY"] = candidate
                 return candidate
         except FileNotFoundError:
-            os.environ["DISPLAY"] = candidate
-            return candidate
+            # xdpyinfo not installed → no X server → headless
+            return ""
         except Exception:
             continue
     return ""
