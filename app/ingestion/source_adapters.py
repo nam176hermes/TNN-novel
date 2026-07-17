@@ -373,7 +373,7 @@ _CHAPTER_NUMBER_RE = re.compile(
 _CHAPTER_LINK_RE = re.compile(
     r"(第\s*[0-9零〇一二两三四五六七八九十百千万]+\s*[章节回卷話话]|"
     r"(?:chapter|chap|ch\.?|chương)\s*[0-9]+|"
-    r"^[0-9]{1,5}\s*[.、:\-：]\s*.+)",
+    r"^[0-9]{1,4}\s*[.、]\s*.+)",  # Tightened: 1-4 digits + dot/ideographic comma only
     re.IGNORECASE,
 )
 _JUNK_LINE_RE = re.compile(
@@ -1724,6 +1724,38 @@ def build_default_source_adapters() -> list[GenericHtmlSourceAdapter]:
             cover=(DomSelector("img.book-cover", "src"), DomSelector('meta[property="og:image"]', "content")),
             chapter_links=(DomSelector(".chapter-list a", "href"), DomSelector("a.chapter-link", "href")),
             chapter_content=(DomSelector(".read-content"),),
+            remove_selectors=remove_selectors,
+        ),
+        "69shuba": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector("h1"), DomSelector(".chapter-title")),
+            author=(DomSelector('meta[name="author"]', "content"), DomSelector(".author")),
+            description=(DomSelector('meta[name="description"]', "content"),),
+            cover=(DomSelector('meta[property="og:image"]', "content"),),
+            chapter_links=(
+                DomSelector("li[data-num] a", "href"),
+                DomSelector(".muluh1 + ul li a", "href"),
+                DomSelector("ul li a[href*='/txt/']", "href"),
+            ),
+            chapter_content=(
+                DomSelector(".txtnav"),
+                DomSelector("#content"),
+                DomSelector("#chaptercontent"),
+                DomSelector(".read-content"),
+            ),
+            remove_selectors=remove_selectors,
+        ),
+        "69shumi": DomSelectorConfig(
+            title=(DomSelector("h1"), DomSelector('meta[property="og:title"]', "content"), DomSelector("title")),
+            chapter_title=(DomSelector("h1"), DomSelector(".chapter-title")),
+            author=(DomSelector('meta[name="author"]', "content"), DomSelector(".author")),
+            description=(DomSelector('meta[name="description"]', "content"),),
+            cover=(DomSelector('meta[property="og:image"]', "content"),),
+            chapter_links=(
+                DomSelector("li[data-num] a", "href"),
+                DomSelector("ul li a[href*='/txt/']", "href"),
+            ),
+            chapter_content=(DomSelector("#content"), DomSelector("#chaptercontent"), DomSelector(".read-content")),
             remove_selectors=remove_selectors,
         ),
     }
