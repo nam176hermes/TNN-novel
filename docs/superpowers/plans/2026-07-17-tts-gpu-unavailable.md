@@ -4,7 +4,7 @@
 
 **Goal:** Reject F5 TTS requests before job creation or synthesis whenever the host cannot run the local CUDA-backed F5 runtime.
 
-**Architecture:** A small domain guard classifies F5 provider aliases and checks only local prerequisites: CUDA device configuration, PyTorch CUDA availability, and the installed `f5_tts` package. `JobService` invokes it before tracker-job creation, the two API routes translate its domain exception to a safe HTTP 503 detail, and `PipelineService` invokes the same guard before it can construct a fallback-capable TTS pipeline.
+**Architecture:** A small domain guard classifies F5 provider aliases and checks only local prerequisites: CUDA device configuration, PyTorch CUDA availability, and the installed `f5_tts` package. `JobService` invokes it before tracker-job creation, the two API routes translate its domain exception to a safe HTTP 503 detail, `PipelineService` invokes it before it can construct a fallback-capable TTS pipeline, and `TTSPipeline` applies it again before direct synthesis can write a job row or audit event.
 
 **Tech Stack:** Python 3.11, FastAPI, Pydantic, pytest, monkeypatch, existing SQLite-backed job tracker.
 
@@ -24,9 +24,10 @@
 - Create `app/services/tts/availability.py`: provider aliases, safe `TTSUnavailableError`, and local-only readiness guard.
 - Modify `app/mobile_api/services/job_service.py`: invoke the guard before target selection/tracker creation.
 - Modify `app/mobile_api/services/pipeline_service.py`: guard direct generation and remove legacy fallback for F5 only.
+- Modify `app/services/tts/tts_pipeline.py`: enforce the same guard at the direct synthesis boundary.
 - Modify `app/mobile_api/routers/jobs.py` and `app/mobile_api/routers/tts.py`: translate the domain exception to the approved 503 payload.
 - Create `tests/test_tts_availability.py`: unit coverage for F5/non-F5 availability decisions.
-- Modify `tests/test_job_service_logic.py` and `tests/test_mobile_api_tts.py`: verify no job/fallback on rejection and identical API behavior on both entry points.
+- Modify `tests/test_job_service_logic.py`, `tests/test_mobile_api_tts.py`, and `tests/test_tts_pipeline.py`: verify no job/fallback on rejection and identical API behavior on both entry points.
 
 ### Task 1: Add a local-only F5 readiness guard
 
@@ -203,11 +204,14 @@ git commit -m "fix: reject unavailable f5 tts jobs before queueing"
 
 **Files:**
 - Modify: `app/mobile_api/services/pipeline_service.py:4754-4800`
+- Modify: `app/services/tts/tts_pipeline.py:122-150`
 - Modify: `tests/test_mobile_api_db_logic.py`
+- Modify: `tests/test_tts_pipeline.py`
 
 **Interfaces:**
 - Consumes `is_f5_provider`, `require_tts_runtime_available`, and `TTSUnavailableError`.
 - `PipelineService.generate_audio` invokes the guard before constructing `TTSPipeline` for F5.
+- `TTSPipeline.generate_chapter` invokes the same guard after input validation but before creating output directories, TTS rows, or audit events; this also covers CLI and retry synthesis paths.
 - For F5, construct `TTSPipeline` with `legacy_fallback=None`. Explicit non-F5 providers retain `legacy_fallback=text_to_speech_file`.
 
 - [x] **Step 1: Write failing direct-pipeline tests**
@@ -286,19 +290,19 @@ git commit -m "fix: prevent f5 fallback without gpu"
 **Interfaces:**
 - Validates the domain guard, both API routes, job service, and direct pipeline behavior together.
 
-- [ ] **Step 1: Compile changed Python modules**
+- [x] **Step 1: Compile changed Python modules**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m compileall -q app/services/tts/availability.py app/mobile_api/services/job_service.py app/mobile_api/services/pipeline_service.py app/mobile_api/routers/jobs.py app/mobile_api/routers/tts.py`
 
 Expected: exit 0.
 
-- [ ] **Step 2: Run focused regression suite**
+- [x] **Step 2: Run focused regression suite**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_tts_availability.py tests/test_job_service_logic.py tests/test_mobile_api_tts.py tests/test_mobile_api_db_logic.py`
 
 Expected: PASS with no network/GPU dependency.
 
-- [ ] **Step 3: Check the worktree diff**
+- [x] **Step 3: Check the worktree diff**
 
 Run: `git diff --check 331cdc5..HEAD && git status --short`
 

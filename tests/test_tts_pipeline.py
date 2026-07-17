@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from app.database.db import add_book, add_chapter, get_chapter_by_id, init_db, update_chapter_paths
+import app.services.tts.tts_pipeline as tts_pipeline_module
+from app.services.tts.availability import TTSUnavailableError
 from app.services.tts.f5_vietnamese_engine import TTSEngineError, VoiceConfig
 from app.services.tts.tts_pipeline import EdgeTtsChunkEngine, TTSPipeline
 from app.services.tts.audio_qa import AudioQAResult
@@ -26,6 +28,11 @@ def _write_wav(path: Path, *, duration_seconds: float = 0.25) -> None:
         for index in range(frames):
             payload.extend(struct.pack("<h", int(math.sin(index / 10) * 8000)))
         wav.writeframes(bytes(payload))
+
+
+@pytest.fixture(autouse=True)
+def allow_injected_tts_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_pipeline_module, "require_tts_runtime_available", lambda **kwargs: None, raising=False)
 
 
 class FakeEngine:
@@ -114,6 +121,38 @@ def test_tts_tables_exist_after_initialization(temp_db_path: Path) -> None:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
     assert {"tts_jobs", "tts_chunks"}.issubset(tables)
+
+
+def test_direct_f5_pipeline_rejects_unavailable_runtime_before_writing_job_state(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    monkeypatch.setattr(tts_pipeline_module.settings, "tts_provider", "f5_vietnamese")
+
+    def reject_unavailable_runtime(*, provider: str) -> None:
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+
+    pipeline = TTSPipeline(temp_db_path, tmp_path)
+    monkeypatch.setattr(
+        tts_pipeline_module,
+        "require_tts_runtime_available",
+        reject_unavailable_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_build_engine",
+        lambda *args, **kwargs: pytest.fail("The F5 engine must not be built"),
+    )
+
+    with pytest.raises(TTSUnavailableError):
+        pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="tts-unavailable")
+
+    with sqlite3.connect(temp_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tts_jobs").fetchone()[0] == 0
+    assert not (tmp_path / "audio" / "tts_jobs" / "tts-unavailable").exists()
 
 
 def test_tts_pipeline_generates_report_and_updates_chapter_audio(
