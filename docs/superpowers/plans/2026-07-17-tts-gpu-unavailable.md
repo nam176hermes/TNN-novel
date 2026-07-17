@@ -119,7 +119,7 @@ git commit -m "feat: gate F5 tts on local gpu availability"
 - `JobService.start_tts_job` raises `TTSUnavailableError` before target selection and `tracker.create_job`.
 - Both API routes convert that exception to `HTTPException(status_code=503, detail=exc.detail())`.
 
-- [ ] **Step 1: Write failing service and route tests**
+- [x] **Step 1: Write failing service and route tests**
 
 ```python
 def test_start_tts_job_rejects_before_tracker_creation(monkeypatch):
@@ -159,13 +159,13 @@ async def test_tts_start_endpoints_return_safe_unavailable(path, payload):
     assert service.calls == 1
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm they fail**
+- [x] **Step 2: Run the focused tests and confirm they fail**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_job_service_logic.py tests/test_mobile_api_tts.py`
 
 Expected: FAIL because unavailable requests currently create/return pending jobs.
 
-- [ ] **Step 3: Add the pre-creation guard and router translation**
+- [x] **Step 3: Add the pre-creation guard and router translation**
 
 ```python
 # JobService.start_tts_job, before target selection
@@ -186,13 +186,13 @@ except TTSUnavailableError as exc:
 
 Do not record a `job_start` audit event in the error path; the existing audit call must remain after a successful service return.
 
-- [ ] **Step 4: Run focused service and API tests**
+- [x] **Step 4: Run focused service and API tests**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_job_service_logic.py tests/test_mobile_api_tts.py tests/test_tts_availability.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the API gate**
+- [x] **Step 5: Commit the API gate**
 
 ```bash
 git add app/mobile_api/services/job_service.py app/mobile_api/routers/jobs.py app/mobile_api/routers/tts.py tests/test_job_service_logic.py tests/test_mobile_api_tts.py

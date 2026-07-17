@@ -11,6 +11,7 @@ from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.mobile_api.routers.jobs import get_job_service, get_shared_job_tracker
 from app.mobile_api.public_mode import is_public_request, sanitize_public_payload
 from app.mobile_api.services.job_service import JobService
+from app.services.tts.availability import TTSUnavailableError
 from app.services.tts.tts_pipeline import TTSPipeline
 
 router = APIRouter(prefix="/api/tts", tags=["tts"])
@@ -65,14 +66,17 @@ async def start_tts_chapter(
     service: JobService = Depends(get_job_service),
 ):
     """Start TTS for one translated chapter using the existing job runner."""
-    job_id = service.start_tts_job(
-        book_id=payload.book_id,
-        chapter_ids=[payload.chapter_id],
-        limit=1,
-        voice=payload.voice_config.get("voice") or payload.voice_config.get("voice_id"),
-        rate=payload.voice_config.get("rate") or "-5%",
-        volume=payload.voice_config.get("volume") or "+0%",
-    )
+    try:
+        job_id = service.start_tts_job(
+            book_id=payload.book_id,
+            chapter_ids=[payload.chapter_id],
+            limit=1,
+            voice=payload.voice_config.get("voice") or payload.voice_config.get("voice_id"),
+            rate=payload.voice_config.get("rate") or "-5%",
+            volume=payload.voice_config.get("volume") or "+0%",
+        )
+    except TTSUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=exc.detail()) from exc
     return TTSJobResponse(job_id=job_id, status="pending", message="TTS job started")
 
 

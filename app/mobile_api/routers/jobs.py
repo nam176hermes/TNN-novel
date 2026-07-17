@@ -22,6 +22,7 @@ from app.mobile_api.schemas import (
 from app.mobile_api.services.job_service import JobService, JobTracker, get_shared_job_tracker as shared_tracker_for_db
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.provider_service import ProviderService
+from app.services.tts.availability import TTSUnavailableError
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 _SHARED_JOB_TRACKER: JobTracker | None = None
@@ -177,12 +178,15 @@ async def start_tts_job(
     service: JobService = Depends(get_job_service),
 ):
     """Start TTS job."""
-    job_id = service.start_tts_job(
-        book_id=job.book_id,
-        chapter_ids=job.chapter_ids,
-        limit=job.limit,
-        voice=job.params.get("voice") if job.params else None,
-    )
+    try:
+        job_id = service.start_tts_job(
+            book_id=job.book_id,
+            chapter_ids=job.chapter_ids,
+            limit=job.limit,
+            voice=job.params.get("voice") if job.params else None,
+        )
+    except TTSUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=exc.detail()) from exc
     record_audit_event(
         event_type="job_start",
         severity="info",
