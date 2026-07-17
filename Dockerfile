@@ -48,8 +48,14 @@ CMD ["python", "-m", "app.import_worker"]
 
 FROM runtime-base AS api
 
-ENV MOBILE_API_SERVE_WEB=1 \
+# Chromium installed here too so preview/fetch can do stealth browser fallback
+# without delegating to the import-worker.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    MOBILE_API_SERVE_WEB=1 \
     WEB_DIST_DIR=/app/web/dist
+
+RUN playwright install --with-deps chromium \
+    && chown -R novel:novel /ms-playwright
 
 USER novel
 EXPOSE 7860
