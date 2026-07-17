@@ -39,7 +39,7 @@
 - Produces `is_f5_provider(provider: str | None) -> bool` and `require_tts_runtime_available(provider: str | None = None, device: str | None = None) -> None`.
 - Consumes `settings.tts_provider`, `settings.tts_device`, `importlib.util.find_spec`, and a lazy PyTorch CUDA probe.
 
-- [ ] **Step 1: Write failing availability tests**
+- [x] **Step 1: Write failing availability tests**
 
 ```python
 import pytest
@@ -62,13 +62,13 @@ def test_explicit_non_f5_provider_is_not_blocked(monkeypatch):
     require_tts_runtime_available(provider="edge_tts", device="cpu")
 ```
 
-- [ ] **Step 2: Run the new test file and confirm import failure**
+- [x] **Step 2: Run the new test file and confirm import failure**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_tts_availability.py`
 
 Expected: FAIL because `app.services.tts.availability` does not exist.
 
-- [ ] **Step 3: Implement the minimal guard**
+- [x] **Step 3: Implement the minimal guard**
 
 ```python
 F5_PROVIDER_ALIASES = frozenset({"f5", "f5_tts", "f5_vietnamese", "vivioice", "vivoice"})
@@ -92,13 +92,13 @@ def require_tts_runtime_available(provider: str | None = None, device: str | Non
 
 The lazy CUDA probe must catch missing PyTorch and return `False`; it must not load F5, download a model, or perform network I/O.
 
-- [ ] **Step 4: Run the availability tests**
+- [x] **Step 4: Run the availability tests**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_tts_availability.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the guard and tests**
+- [x] **Step 5: Commit the guard and tests**
 
 ```bash
 git add app/services/tts/availability.py tests/test_tts_availability.py
