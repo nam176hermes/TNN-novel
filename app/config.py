@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,6 +53,14 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     artifact_legacy_root: Path | None = None
     log_level: str = "INFO"
+
+    @field_validator("artifact_legacy_root", mode="before")
+    @classmethod
+    def blank_artifact_legacy_root_is_unset(cls, value: object) -> object:
+        """Keep optional Compose interpolation from becoming ``Path('.')``."""
+        if value is None or not str(value).strip():
+            return None
+        return value
 
     @property
     def resolved_data_dir(self) -> Path:

@@ -16,6 +16,7 @@ def test_compose_separates_api_and_import_browser_worker_without_api_secrets() -
     assert "IMPORT_JOB_RUN_IN_API: \"0\"" in compose
     assert "MOBILE_API_SECRET" not in worker
     assert "MOBILE_API_ADMIN_PASSWORD" not in worker
+    assert compose.count('ARTIFACT_LEGACY_ROOT: "${ARTIFACT_LEGACY_ROOT:-}"') == 2
     assert "pids_limit:" in worker
     assert "tmpfs:" in worker
     assert "--healthcheck" in worker

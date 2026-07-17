@@ -11,6 +11,8 @@ services:
       - "${MOBILE_API_BIND:-127.0.0.1}:${MOBILE_API_PORT:-7860}:7860"
     environment:
       DATA_DIR: /data
+      # Temporary exact-prefix compatibility for artifact metadata created before Docker.
+      ARTIFACT_LEGACY_ROOT: "${ARTIFACT_LEGACY_ROOT:-}"
       MOBILE_API_HOST: 0.0.0.0
       MOBILE_API_PORT: 7860
       MOBILE_API_SERVE_WEB: "1"
@@ -62,6 +64,8 @@ services:
     command: ["python", "-m", "app.import_worker"]
     environment:
       DATA_DIR: /data
+      # The worker reads existing chapter artifacts too; it needs the same bounded remap.
+      ARTIFACT_LEGACY_ROOT: "${ARTIFACT_LEGACY_ROOT:-}"
       IMPORT_JOB_RUN_IN_API: "0"
       IMPORT_WORKER_POLL_INTERVAL_SECONDS: "1"
       IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS: "45"

@@ -423,7 +423,18 @@ class GenericHtmlSourceAdapter:
         validate_public_http_url(url)
         return True
 
+    def transform_preview_url(self, url: str) -> str:
+        """Rewrite the URL before fetching preview HTML.
+
+        Override in subclasses for sites where the book-info page
+        (e.g. ``/book/123.htm``) only shows a few latest chapters while
+        the full list lives at a different path (e.g. ``/book/123/``).
+        Default: return as-is.
+        """
+        return url
+
     def preview(self, url: str) -> SourcePreview:
+        url = self.transform_preview_url(url)
         try:
             fetch = fetch_public_html_result(url)
             result = self.preview_from_html(fetch.final_url, fetch.html)
@@ -694,6 +705,20 @@ class DomSourceAdapter(GenericHtmlSourceAdapter):
     def canonicalize_url(self, url: str, *, base_url: str | None = None) -> str:
         absolute = urljoin(base_url, url) if base_url else url
         return validate_source_url(absolute, allowed_domains=self.domains)
+
+    def transform_preview_url(self, url: str) -> str:
+        """Rewrite book-info URLs to chapter-list URLs for 69shuba/69shumi.
+
+        ``/book/123.htm`` → ``/book/123/`` (full chapter list page).
+        """
+        if self.adapter_id in ("69shuba", "69shumi"):
+            # /book/123.htm → /book/123/
+            import re
+
+            m = re.match(r"^(https?://[^/]+/book/\d+)\.htm$", url)
+            if m:
+                return m.group(1) + "/"
+        return url
 
     @staticmethod
     def normalize_cleanup(text: str) -> str:
