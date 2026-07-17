@@ -33,6 +33,7 @@ from app.mobile_api.services import audio_service as audio_service_module
 from app.mobile_api.services.qa_service import QAService
 from app.mobile_api.services.audio_service import AudioService
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.services.tts.availability import TTSUnavailableError
 
 
 LEGACY_ROOT = Path("/legacy/novel-pipeline")
@@ -1097,9 +1098,12 @@ def test_generate_audio_writes_under_pipeline_data_dir(
     translation_path.write_text("translation", encoding="utf-8")
     update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
 
+    captured: dict[str, object] = {}
+
     class FakeTTSPipeline:
         def __init__(self, db_path: Path, data_dir: Path, **_: object) -> None:
             self.data_dir = data_dir
+            captured.update(_)
 
         def generate_chapter(self, *, book_id: int, chapter_id: int, job_id: str, voice_config: dict[str, str]):
             output_path = self.data_dir / "audio" / f"book{book_id}_ch{chapter_id}_{job_id or 'tts'}.mp3"
@@ -1111,6 +1115,7 @@ def test_generate_audio_writes_under_pipeline_data_dir(
                 {"status": "completed", "output_mp3_path": str(output_path), "error_message": ""},
             )()
 
+    monkeypatch.setattr(pipeline_mod, "require_tts_runtime_available", lambda **kwargs: None, raising=False)
     monkeypatch.setattr(pipeline_mod, "TTSPipeline", FakeTTSPipeline)
 
     audio_path = temp_pipeline.generate_audio(book_id, chapter_id)
@@ -1118,6 +1123,69 @@ def test_generate_audio_writes_under_pipeline_data_dir(
     assert audio_path is not None
     assert temp_pipeline.data_dir in audio_path.parents
     assert audio_path.read_bytes() == b"fake mp3"
+    assert captured["legacy_fallback"] is None
+
+
+def test_generate_audio_rejects_unavailable_f5_before_constructing_pipeline(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter")
+    translation_path = tmp_path / "translation.txt"
+    translation_path.write_text("translation", encoding="utf-8")
+    update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
+
+    def reject_unavailable_runtime(*, provider: str) -> None:
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "require_tts_runtime_available",
+        reject_unavailable_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "TTSPipeline",
+        lambda *args, **kwargs: pytest.fail("TTSPipeline must not be constructed"),
+    )
+
+    with pytest.raises(TTSUnavailableError):
+        temp_pipeline.generate_audio(book_id, chapter_id)
+
+
+def test_generate_audio_keeps_legacy_fallback_for_explicit_non_f5_provider(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter")
+    translation_path = tmp_path / "translation.txt"
+    translation_path.write_text("translation", encoding="utf-8")
+    update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
+    captured: dict[str, object] = {}
+
+    class CapturingPipeline:
+        def __init__(self, db_path: Path, data_dir: Path, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def generate_chapter(self, **kwargs: object):
+            return type(
+                "FakeTTSReport",
+                (),
+                {"status": "completed", "output_mp3_path": str(tmp_path / "audio.mp3"), "error_message": ""},
+            )()
+
+    monkeypatch.setattr(pipeline_mod.settings, "tts_provider", "edge_tts")
+    monkeypatch.setattr(pipeline_mod, "TTSPipeline", CapturingPipeline)
+
+    audio_path = temp_pipeline.generate_audio(book_id, chapter_id)
+
+    assert audio_path == tmp_path / "audio.mp3"
+    assert captured["legacy_fallback"] is pipeline_mod.text_to_speech_file
 
 
 def test_import_from_text_writes_under_pipeline_data_dir(

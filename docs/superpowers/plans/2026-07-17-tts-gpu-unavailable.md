@@ -210,7 +210,7 @@ git commit -m "fix: reject unavailable f5 tts jobs before queueing"
 - `PipelineService.generate_audio` invokes the guard before constructing `TTSPipeline` for F5.
 - For F5, construct `TTSPipeline` with `legacy_fallback=None`. Explicit non-F5 providers retain `legacy_fallback=text_to_speech_file`.
 
-- [ ] **Step 1: Write failing direct-pipeline tests**
+- [x] **Step 1: Write failing direct-pipeline tests**
 
 ```python
 def test_generate_audio_rejects_unavailable_f5_before_constructing_pipeline(monkeypatch, temp_pipeline, book_id, chapter_id):
@@ -245,13 +245,13 @@ def test_generate_audio_keeps_legacy_fallback_for_explicit_non_f5_provider(monke
     assert callable(captured["legacy_fallback"])
 ```
 
-- [ ] **Step 2: Run the targeted direct-pipeline tests and confirm failure**
+- [x] **Step 2: Run the targeted direct-pipeline tests and confirm failure**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_mobile_api_db_logic.py -k 'generate_audio'`
 
 Expected: FAIL because F5 currently constructs `TTSPipeline` with `text_to_speech_file`.
 
-- [ ] **Step 3: Implement provider-aware pipeline construction**
+- [x] **Step 3: Implement provider-aware pipeline construction**
 
 ```python
 provider = settings.tts_provider
@@ -265,13 +265,13 @@ pipeline = TTSPipeline(self.db_path, self.data_dir, legacy_fallback=legacy_fallb
 
 The guard runs after validating the requested book/chapter/text but before constructing `TTSPipeline`, writing TTS rows, or calling any fallback.
 
-- [ ] **Step 4: Run all focused TTS tests**
+- [x] **Step 4: Run all focused TTS tests**
 
 Run: `NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_tts_availability.py tests/test_job_service_logic.py tests/test_mobile_api_tts.py tests/test_mobile_api_db_logic.py -k 'tts or generate_audio'`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the direct-path guard**
+- [x] **Step 5: Commit the direct-path guard**
 
 ```bash
 git add app/mobile_api/services/pipeline_service.py tests/test_mobile_api_db_logic.py
