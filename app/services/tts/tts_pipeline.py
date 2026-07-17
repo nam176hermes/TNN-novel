@@ -36,6 +36,7 @@ from app.services.tts.f5_vietnamese_engine import (
     VoiceConfig,
     stable_audio_cache_key,
 )
+from app.services.tts.availability import is_f5_provider, require_tts_runtime_available
 from app.services.tts.text_normalizer import normalize_text
 from app.translation.idiom_correction import clean_translation_layout
 from app.utils.asyncio_bridge import run_coro_sync
@@ -138,6 +139,8 @@ class TTSPipeline:
         text = self._read_translated_text(chapter)
         if not text.strip():
             raise ValueError("Chapter has no translated text for TTS")
+        if is_f5_provider(settings.tts_provider):
+            require_tts_runtime_available(provider=settings.tts_provider)
 
         normalized = normalize_text(text, backend=settings.tts_normalizer)
         chunks = chunk_text(
