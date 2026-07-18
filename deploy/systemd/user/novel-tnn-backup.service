@@ -1,0 +1,13 @@
+[Unit]
+Description=Novel-TNN encrypted off-site backup
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=%h/Novel-TNN/data %h/.local/share
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Novel-TNN
+EnvironmentFile=%h/.config/novel-tnn/backup.env
+ExecStart=%h/Novel-TNN/scripts/production_backup.sh
+UMask=0077
+TimeoutStartSec=infinity
