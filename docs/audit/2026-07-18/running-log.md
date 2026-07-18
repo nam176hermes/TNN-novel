@@ -76,3 +76,15 @@
   visible paragraph/rich-block inputs. The regression checks 80 initial blocks
   and 160 after a near-edge scroll. Reader plus chapter-text tests pass 105/105
   and TypeScript typecheck passes.
+
+## 2026-07-18 — final non-security validation gate
+
+- `scripts/lint.sh`, the production external-environment check, and four
+  independent local/public `/api/health` and `/api/ready` probes passed.
+- Combined production-mode `scripts/verify.sh` passed with 1,103 backend tests,
+  Vitest 82 files/733 tests, typecheck, and the production build. Playwright
+  workflow coverage also passed 8/8.
+- The only remaining exhaustive-audit gap is AUD-006: deep-security discovery
+  needs explicit operator approval for the global Codex `agents.max_depth`
+  setting. No production change, deploy, or global configuration change was
+  made during this audit pass.
