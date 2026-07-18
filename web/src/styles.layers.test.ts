@@ -204,6 +204,11 @@ describe('ordered stylesheet layers', () => {
     expect(sources).toContain('max-height: min(58dvh, calc(100dvh - 240px), 620px);');
   });
 
+  it('resolves the shared sidebar scenery from styles subdirectories', () => {
+    expect(featureStyles).toContain('url("../assets/reference-ui/sidebar-scenery.png")');
+    expect(shellStyles).toContain('url("../assets/reference-ui/sidebar-scenery.png")');
+  });
+
   it('keeps the login CTA override after the generic action owner', () => {
     const genericMinimum = componentStyles.indexOf('min-height: 38px;');
     const loginOverride = componentStyles.indexOf('.login-panel .primary-action {');

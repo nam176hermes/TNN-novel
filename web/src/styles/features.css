@@ -3993,7 +3993,7 @@
     align-items: center;
     background:
       linear-gradient(90deg, rgb(8 20 24 / 94%) 0%, rgb(8 20 24 / 78%) 58%, rgb(8 20 24 / 64%) 100%),
-      url("./assets/reference-ui/sidebar-scenery.png") right bottom / auto 150% no-repeat,
+      url("../assets/reference-ui/sidebar-scenery.png") right bottom / auto 150% no-repeat,
       rgb(9 20 24 / 86%);
     border-color: rgb(50 76 76 / 30%);
     border-radius: 10px;

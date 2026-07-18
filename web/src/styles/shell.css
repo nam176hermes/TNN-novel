@@ -1500,7 +1500,7 @@
   .workflow-shell[data-active-view="workbench"] .workflow-sidebar::after {
     background:
       linear-gradient(180deg, transparent 0%, rgb(0 18 18 / 24%) 18%, rgb(0 18 18 / 88%) 100%),
-      url("./assets/reference-ui/sidebar-scenery.png") center bottom / 100% auto no-repeat;
+      url("../assets/reference-ui/sidebar-scenery.png") center bottom / 100% auto no-repeat;
     bottom: 270px;
     content: "";
     left: 0;
