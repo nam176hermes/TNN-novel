@@ -324,7 +324,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 prefix = sys.argv[1]
-pattern = re.compile(rf"^{re.escape(prefix)}/(novel-pipeline-backup-[0-9]{{8}}-[0-9]{{6}}(?:-[A-Za-z0-9._-]+)?(?:-[a-f0-9]{{12}})?\\.tar\\.gz\\.enc)$")
+pattern = re.compile(rf"^{re.escape(prefix)}/(novel-pipeline-backup-[0-9]{{8}}-[0-9]{{6}}(?:-[A-Za-z0-9._-]+)?(?:-[a-f0-9]{{12}})?\.tar\.gz\.enc)$")
 try:
     root = ET.fromstring(sys.stdin.read())
 except ET.ParseError as exc:

@@ -108,6 +108,11 @@ def test_backup_runner_creates_and_verifies_an_encrypted_r2_copy(tmp_path: Path)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     docker_log = tmp_path / "docker.log"
+    remote_prefix = remote_dir / "novel-tnn-production"
+    old_archive = "novel-pipeline-backup-20200101-010101.tar.gz.enc"
+    remote_prefix.mkdir(parents=True)
+    for suffix in ("", ".manifest.json", ".sha256"):
+        (remote_prefix / f"{old_archive}{suffix}").write_text("old backup", encoding="utf-8")
 
     (fake_bin / "docker").write_text(
         """#!/usr/bin/env bash
@@ -218,7 +223,7 @@ esac
             "R2_SECRET_ACCESS_KEY": "test-secret-access-key",
             "R2_MULTIPART_THRESHOLD_BYTES": "1",
             "BACKUP_KEEP_LOCAL": "14",
-            "BACKUP_KEEP_OFFSITE": "35",
+            "BACKUP_KEEP_OFFSITE": "1",
         },
         text=True,
         capture_output=True,
@@ -231,5 +236,9 @@ esac
     assert (remote_dir / "novel-tnn-production" / archive.name).is_file()
     assert (remote_dir / "novel-tnn-production" / f"{archive.name}.manifest.json").is_file()
     assert (remote_dir / "novel-tnn-production" / f"{archive.name}.sha256").is_file()
+    assert not (remote_prefix / old_archive).exists()
+    assert not (remote_prefix / f"{old_archive}.manifest.json").exists()
+    assert not (remote_prefix / f"{old_archive}.sha256").exists()
+    assert list(remote_prefix.glob("novel-pipeline-backup-*.tar.gz.enc")) == [remote_prefix / archive.name]
     assert "--network none" in docker_log.read_text(encoding="utf-8")
     assert "--user 0:0" in docker_log.read_text(encoding="utf-8")
