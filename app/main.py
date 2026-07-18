@@ -546,6 +546,8 @@ def dashboard_cmd(
     port: int = typer.Option(8000, "--port", "-p", help="Server port"),
 ) -> None:
     """Start the local web dashboard."""
+    if host not in {"127.0.0.1", "::1", "localhost"} and not host.endswith(".localhost"):
+        raise typer.BadParameter("The legacy dashboard is local-only; use the authenticated Mobile API for remote access")
     console.print(f"[blue]Starting dashboard on http://{host}:{port}[/blue]")
     console.print(f"  API docs: http://{host}:{port}/docs")
     console.print("[dim]Press Ctrl+C to stop.[/dim]")
