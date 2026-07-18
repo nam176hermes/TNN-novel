@@ -2360,6 +2360,7 @@ describe('ReaderView', () => {
       expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
 
       const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(80);
       Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
       Object.defineProperty(main, 'clientHeight', { configurable: true, value: 600 });
       Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
@@ -2367,6 +2368,53 @@ describe('ReaderView', () => {
       fireEvent.scroll(main);
 
       expect(screen.getByText('Đoạn 120. Nội dung luyện khí.')).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(idleWindow, 'requestIdleCallback', {
+        configurable: true,
+        value: originalRequestIdleCallback,
+      });
+      Object.defineProperty(idleWindow, 'cancelIdleCallback', {
+        configurable: true,
+        value: originalCancelIdleCallback,
+      });
+    }
+  });
+
+  it('renders long QA overlay chapters in scroll chunks', async () => {
+    const idleWindow = window as TestIdleWindow;
+    const originalRequestIdleCallback = idleWindow.requestIdleCallback;
+    const originalCancelIdleCallback = idleWindow.cancelIdleCallback;
+    Object.defineProperty(idleWindow, 'requestIdleCallback', {
+      configurable: true,
+      value: vi.fn(() => 1),
+    });
+    Object.defineProperty(idleWindow, 'cancelIdleCallback', {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    try {
+      renderReader({
+        translationText: Array.from(
+          { length: 180 },
+          (_, index) => `Đoạn QA ${index + 1}. Nội dung luyện khí.`,
+        ).join('\n\n'),
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: 'QA' }));
+
+      expect(screen.getByText('Đoạn QA 1. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(screen.queryByText('Đoạn QA 120. Nội dung luyện khí.')).not.toBeInTheDocument();
+      expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
+
+      const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
+      Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
+      Object.defineProperty(main, 'clientHeight', { configurable: true, value: 600 });
+      Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
+      fireEvent.scroll(main);
+
+      expect(screen.getByText('Đoạn QA 120. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(160);
     } finally {
       Object.defineProperty(idleWindow, 'requestIdleCallback', {
         configurable: true,

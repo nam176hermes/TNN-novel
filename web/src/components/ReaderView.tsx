@@ -1777,7 +1777,7 @@ export default function ReaderView({
   );
   const activeViewportPages = isPaginatedMode && viewportPages.length > 0 ? viewportPages : fallbackPages;
   const pageCount = Math.max(1, activeViewportPages.length);
-  const lazyScrollEnabled = readerTextMode === 'translation'
+  const lazyScrollEnabled = (readerTextMode === 'translation' || readerTextMode === 'qa-overlay')
     && !isPaginatedMode
     && !hasRichContent
     && paragraphs.length > LONG_CHAPTER_PARAGRAPH_THRESHOLD;
@@ -4082,8 +4082,8 @@ export default function ReaderView({
               textError={readerTextError}
               textState={readerTextState}
               theme={readerSettings.theme}
-              visibleParagraphs={paragraphs.map((paragraph, index) => ({ index, paragraph }))}
-              visibleRichBlocks={richBlocks}
+              visibleParagraphs={visibleParagraphs}
+              visibleRichBlocks={visibleRichBlocks}
               width={readerSettings.width}
               onCaptureSelection={captureReaderSelection}
               onOpenNote={openNoteEditor}
