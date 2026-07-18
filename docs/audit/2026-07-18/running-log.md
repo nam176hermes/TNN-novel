@@ -63,3 +63,16 @@
   no valid archive names. `4edf3b8` uses literal-dot regex escapes and adds a
   behavioral rotation regression. The production backup scheduler/API/job suite
   passes 40/40; the retention suite passes 23/23.
+
+## 2026-07-18 — Reader long-chapter/QA audit
+
+- The Reader cache-owner check is already covered: `App` delegates cache
+  ownership to Reader in Reader view, and `useChapterText` does not re-read the
+  current cache in that mode.
+- Reproduced AUD-008 before the fix: QA overlay rendered paragraph 120 of a
+  180-paragraph chapter immediately, bypassing the 80-paragraph progressive
+  scroll limit used by normal translation mode.
+- Closed AUD-008 in `cee8872`: non-rich QA overlay now uses the same bounded
+  visible paragraph/rich-block inputs. The regression checks 80 initial blocks
+  and 160 after a near-edge scroll. Reader plus chapter-text tests pass 105/105
+  and TypeScript typecheck passes.

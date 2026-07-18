@@ -48,11 +48,17 @@
 
 ### Reader Request And QA Cost
 
-- Status: WORKING_WITH_LIMITATIONS.
-- Evidence: duplicate loads in P1; QA path 102-599 ms and approximately 5,182 DOM nodes on long fixture.
-- Impact: delayed interaction and avoidable network/render work.
-- Action: establish one request owner and progressive QA rendering; profile before memoization/virtualization.
-- Acceptance: one chapter/content request owner; normal modes under target; long QA has no obvious main-thread freeze.
+- Status: RESOLVED_IN_P1 (verified 2026-07-18).
+- Historical evidence: duplicate cache ownership was reported, and a long QA
+  fixture rendered approximately 5,182 DOM nodes.
+- Resolution: Reader view delegates cache ownership to the Reader controller;
+  `useChapterText` therefore skips its competing current-cache read. In
+  `cee8872`, non-rich QA-overlay mode now reuses Reader's progressive
+  80-paragraph scroll chunks rather than rendering every paragraph at once.
+- Verification: the AUD-008 regression first failed with paragraph 120 present
+  in a 180-paragraph QA overlay; after the fix it proves 80 initial paragraph
+  blocks and 160 after a near-edge scroll. `ReaderView` plus `useChapterText`
+  pass 105/105 and TypeScript typecheck passes.
 
 ### Operational Event Retention
 
