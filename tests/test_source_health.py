@@ -75,6 +75,19 @@ def test_source_health_blocks_private_dns_resolution(monkeypatch: pytest.MonkeyP
     assert result.reason == "private_network_not_allowed"
 
 
+def test_source_health_blocks_cgnat_dns_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 443))],
+    )
+
+    result = check_source_health(_entry("https://www.69shuba.com/book/1"), request_get=lambda *args, **kwargs: FakeResponse())
+
+    assert result.status == "blocked"
+    assert result.reason == "private_network_not_allowed"
+
+
 def test_source_health_returns_unsupported_without_network() -> None:
     called = False
 

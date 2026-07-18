@@ -65,14 +65,7 @@ def _unsafe_ip_reason(value: str) -> str:
         ip = ipaddress.ip_address(value.strip("[]"))
     except ValueError:
         return ""
-    if (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip.is_reserved
-    ):
+    if not ip.is_global:
         return "private_network_not_allowed"
     return ""
 
