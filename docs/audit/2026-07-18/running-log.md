@@ -35,9 +35,10 @@
 - Closed AUD-002 in `541c04e`: added a strict, opt-in production mode to the
   environment checker and `scripts/verify.sh`. Four regression tests pass and
   the live external env file validates without displaying its values.
-- Full backend gate passed: 1,103 tests in 5m48s, with only known `passlib`
-  and `jieba` deprecation warnings. Frontend Vitest passed 82 files/731 tests;
-  Playwright passed 8/8; production build passed.
+- Combined production-mode `scripts/verify.sh` passed: 1,103 backend tests in
+  5m46s, frontend Vitest 82 files/732 tests, and a production build with the
+  scenery asset bundled. Only known `passlib` and `jieba` deprecation warnings
+  remain. The separately rerun Playwright suite passed 8/8.
 - Reconfirmed artifact scan: 1,715 populated artifact paths, zero missing,
   outside-data, or legacy-prefix paths. Production F5 TTS returns the safe
   `tts_unavailable` result on the non-GPU host.
