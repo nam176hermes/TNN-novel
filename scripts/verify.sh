@@ -15,7 +15,11 @@ export NOVEL_PIPELINE_IGNORE_DOTENV="${NOVEL_PIPELINE_IGNORE_DOTENV:-1}"
 for script in scripts/*.sh; do
   bash -n "$script"
 done
-scripts/check-environment.sh
+if [[ -n "${NOVEL_PIPELINE_PRODUCTION_ENV_FILE:-}" ]]; then
+  scripts/check-environment.sh --production --env-file "$NOVEL_PIPELINE_PRODUCTION_ENV_FILE"
+else
+  scripts/check-environment.sh
+fi
 scripts/lint.sh
 "$PYTHON_BIN" -m pytest -q -s
 

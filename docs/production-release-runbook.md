@@ -35,6 +35,16 @@ It must contain production-safe `MOBILE_API_SECRET`,
 `MOBILE_API_ADMIN_USERNAME`, `MOBILE_API_ADMIN_PASSWORD`, `PUBLIC_DEPLOY=1`,
 and HTTPS-only `MOBILE_API_CORS_ORIGINS`. Provider keys stay in this file.
 
+For a full checkout verification on the WSL host, opt into the production-aware
+environment check. It validates the external file's mode and required safe
+configuration shape without sourcing or displaying secret values; container
+health, volume permissions, and SQLite checks remain part of the release
+verification below.
+
+```bash
+NOVEL_PIPELINE_PRODUCTION_ENV_FILE="$PRODUCTION_ENV" scripts/verify.sh
+```
+
 ## Render and deploy
 
 Render syntax without displaying secrets, then render only image references:
