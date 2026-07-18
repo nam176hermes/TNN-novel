@@ -80,6 +80,26 @@
 
 ## P2
 
+### DNS-Rebinding-Safe Outbound Transport
+
+- Status: SECURITY_HARDENING_REQUIRED (2026-07-18).
+- Evidence: a source URL can pass DNS preflight and then be resolved again by a
+  later `requests` transport. DS-002 and DS-006 cover direct import and every
+  source-health caller; no useful internal target was exercised during the
+  audit, so this is P2 rather than P1.
+- Action: introduce one reviewed transport that connects only to the vetted
+  peer address while preserving correct hostname/TLS/redirect behavior; apply
+  it to every direct-import and source-health sink with integration fixtures.
+
+### Browser Fallback Egress Policy
+
+- Status: DESIGN_REQUIRED (2026-07-18).
+- Evidence: browser fallback validates a hostname before Chromium navigation,
+  but no safe peer-pinning implementation or exploit impact has been proven.
+- Action: define the permitted browser egress and redirect model first, then
+  implement and test it in a dedicated workstream. Do not claim direct HTTP
+  controls cover Chromium.
+
 ### Duplicate Glossary Terms
 
 - Status: DATA_QUALITY_REVIEW_REQUIRED.
@@ -123,6 +143,16 @@
 - Action: define a reviewed Python lock/constraints workflow without broad upgrades.
 
 ## P3
+
+### Authenticated Parser and Reader Resource Budgets
+
+- Status: SECURITY_HARDENING_BACKLOG (2026-07-18).
+- Evidence: CSS import recursion/reparse, StarDict gzip and aggregate decode,
+  Reader regex matching, and dictionary parser materialization lack one or more
+  explicit work, decoded-byte, timeout, cache, or record-count ceilings.
+- Action: make small format-specific changes with adversarial fixtures; retain
+  existing upload and product contracts. The deep-security attack-path analysis
+  calibrates these as P3 because no persistent broad outage was demonstrated.
 
 ### Deprecation Plan
 

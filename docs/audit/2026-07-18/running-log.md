@@ -88,3 +88,28 @@
   needs explicit operator approval for the global Codex `agents.max_depth`
   setting. No production change, deploy, or global configuration change was
   made during this audit pass.
+
+## 2026-07-18 — deep-security completion and post-remediation gate
+
+- Re-ran the approved deep-security workflow through seven discovery rounds.
+  The authoritative 356-row worklist was covered to saturation; all sixteen
+  canonical candidates have validation and attack-path receipts in the private
+  scan bundle. No P0 was found.
+- Three P1 source findings were reproduced and fixed as isolated commits:
+  unsafe external API defaults (`28ad489`), externally bindable unauthenticated
+  legacy dashboard (`7723ae7`), and request-controlled translation
+  destination/credential egress (`5188adb`). `c0854d7` also rejects every
+  non-global parser-candidate address; `00f69c3` hardens Host-header public
+  classification.
+- Remaining security work is explicitly bounded: direct/source-health DNS
+  rebinding is P2, browser fallback is deferred pending a safe browser egress
+  design, and authenticated parser/Reader resource ceilings are P3. These are
+  registered as AUD-012 through AUD-014.
+- Fresh current-checkout release gates passed without production mutation:
+  `scripts/verify.sh` with the external production env file (1,112 backend
+  tests, 733 frontend tests, production build), independent TypeScript
+  typecheck, and Playwright 8/8. Both local and public `/api/health` and
+  `/api/ready` returned `status: ok`.
+- The live production containers were not rebuilt, recreated, or deployed in
+  this workstream. The endpoint probes verify current service availability, not
+  release of the new commits.
