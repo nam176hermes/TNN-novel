@@ -14,7 +14,7 @@ Default policy:
 | Location | Retention | Contents |
 |---|---:|---|
 | Local WSL backup directory | 14 encrypted archives | Encrypted archive, READY sidecar, SHA-256 file |
-| Off-site SFTP directory | 35 encrypted archives | The same three files |
+| Private Cloudflare R2 prefix | 35 encrypted archives | The same three files |
 | Restore drill | No automatic deletion | Isolated restored data plus validation evidence |
 
 The runner deletes only expired files whose names match
@@ -24,9 +24,11 @@ approval.
 
 ## One-time secure configuration
 
-The SFTP target must be provisioned before enabling the timer. Use a local SSH
-host alias with a pinned host key; do not put a raw password, private key, or
-unverified host fingerprint in `backup.env`.
+R2 must be enabled in the Cloudflare account before enabling the timer. Create
+a **private** bucket named `novel-tnn-backups` (or another lowercase bucket
+name chosen for this deployment) and an R2 S3 API token with **Object Read &
+Write** permission scoped only to that bucket. Do not attach a public bucket
+domain or a custom domain to backup data.
 
 Create the private configuration from the tracked template:
 
@@ -40,17 +42,22 @@ Set these values in the external file:
 
 - `BACKUP_PASSPHRASE`: a random passphrase retained in the operator password
   manager, not in Git or shell history.
-- `OFFSITE_SFTP_HOST`: an SSH alias from the local SSH configuration.
-- `OFFSITE_SFTP_DIR`: an already-provisioned absolute remote directory. The
-  runner does not create it.
+- `R2_ACCOUNT_ID`: the 32-character Cloudflare account ID.
+- `R2_BUCKET`: the private bucket name.
+- `R2_PREFIX`: a non-public object-key prefix such as
+  `novel-tnn-production`.
+- `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`: the R2 S3 API credential,
+  scoped only to the selected bucket. The secret is displayed only once by
+  Cloudflare; record it directly in `backup.env` without placing it in shell
+  history or chat.
 
 Keep `BACKUP_DATA_DIR=/home/thenam176/Novel-TNN/data`, local output under
 `$HOME/.local/share/novel-tnn-backups`, and the current production image pin.
-Before enabling the timer, confirm the remote SSH key and host verification
-work without a password prompt:
+Before enabling the timer, validate the external configuration; this performs
+no network or Docker operation:
 
 ```bash
-sftp -oBatchMode=yes -oStrictHostKeyChecking=yes your-backup-ssh-alias
+/home/thenam176/Novel-TNN/scripts/production_backup.sh --validate-config
 ```
 
 ## Install and enable the schedule
@@ -84,9 +91,15 @@ Success requires all of the following:
 
 1. An encrypted `.tar.gz.enc` archive with a matching READY `.manifest.json`.
 2. A local `.sha256` file that verifies before upload.
-3. SFTP upload of archive, sidecar, and checksum.
-4. Re-download of the remote checksum and byte-for-byte comparison with the
-   local checksum metadata.
+3. HTTPS-only SigV4 upload to the private R2 bucket of archive, sidecar, and
+   checksum.
+4. Re-download of the R2 checksum and READY sidecar, each compared byte for
+   byte with local metadata.
+
+The current runner uses an R2 single-object upload and deliberately refuses an
+archive larger than 5 GiB. Add a dedicated multipart-upload workstream before
+the encrypted archive can reach that limit; it will fail safely rather than
+silently creating an incomplete off-site backup.
 
 The passphrase is never written to output. The archive itself contains no
 production environment file; encryption protects private application data when
