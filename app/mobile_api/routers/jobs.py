@@ -45,10 +45,15 @@ def provider_params(params: dict | None) -> dict:
     resolved = dict(params or {})
     provider_id = resolved.get("provider_id")
     if not provider_id:
+        if resolved.get("host"):
+            raise HTTPException(
+                status_code=400,
+                detail="Custom provider host must be configured through a registered provider",
+            )
         return {
             "provider_id": None,
             "model": resolved.get("model"),
-            "host": resolved.get("host"),
+            "host": None,
             "api_key": None,
         }
 
