@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from pathlib import Path
 import threading
 import zipfile
@@ -145,6 +146,33 @@ def test_stage_ebook_upload_handles_cross_device_temp_files(tmp_path: Path, temp
     service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
     source = Path("/tmp/novel-stage-cross-device.epub")
     source.write_bytes(b"ebook")
+
+    upload_id = _stage_ebook_upload(service, source, "translated.epub")
+
+    staged = service.data_dir / "import_uploads" / f"{upload_id}.epub"
+    assert staged.read_bytes() == b"ebook"
+    assert not source.exists()
+
+
+def test_stage_ebook_upload_copies_content_when_cross_device_rename_fails(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+    source = tmp_path / "upload-tmp" / "translated.epub"
+    source.parent.mkdir()
+    source.write_bytes(b"ebook")
+
+    def cross_device_rename(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def metadata_copy_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("staging must not copy file metadata across filesystems")
+
+    monkeypatch.setattr(import_routes.os, "replace", cross_device_rename)
+    monkeypatch.setattr(import_routes.shutil, "move", metadata_copy_must_not_run)
+    monkeypatch.setattr(import_routes.shutil, "copystat", metadata_copy_must_not_run)
 
     upload_id = _stage_ebook_upload(service, source, "translated.epub")
 

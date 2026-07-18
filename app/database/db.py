@@ -85,6 +85,26 @@ def get_db_path(data_dir: Path) -> Path:
     return data_dir / "pipeline.db"
 
 
+def _restrict_database_file_permissions(db_path: Path) -> None:
+    """Keep SQLite data files private to the service user and group.
+
+    SQLite may create the main database and its WAL sidecars with the process
+    umask.  That is not a safe production contract for a database containing
+    operator and session data.  Apply the intended POSIX mode after explicit
+    initialization while remaining a no-op on filesystems that do not support
+    chmod (for example, some Windows development mounts).
+    """
+    for path in (db_path, db_path.with_name(f"{db_path.name}-wal"), db_path.with_name(f"{db_path.name}-shm")):
+        try:
+            if path.is_file():
+                path.chmod(0o660)
+        except OSError:
+            # File permissions are enforced by the production Linux volume.
+            # Do not make a developer checkout on a non-POSIX filesystem fail
+            # merely because it cannot represent POSIX modes.
+            continue
+
+
 def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1647,6 +1667,7 @@ def init_db(db_path: Path) -> None:
         _backfill_owner_user_ids(conn, str(operator_user.get("id") or ""))
         _record_schema_migration(conn, CURRENT_SCHEMA_VERSION)
         conn.commit()
+    _restrict_database_file_permissions(db_path)
 
 
 def get_or_seed_operator_user(db_path: Path, username: str | None = None) -> dict[str, Any]:

@@ -44,7 +44,7 @@ RUN playwright install --with-deps chromium \
     && chown -R novel:novel /ms-playwright
 
 USER novel
-CMD ["python", "-m", "app.import_worker"]
+CMD ["sh", "-c", "umask 007 && exec python -m app.import_worker"]
 
 FROM runtime-base AS api
 
@@ -63,4 +63,4 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${MOBILE_API_PORT}/api/ready" >/dev/null || exit 1
 
-CMD ["python", "-m", "app.mobile_api"]
+CMD ["sh", "-c", "umask 007 && exec python -m app.mobile_api"]

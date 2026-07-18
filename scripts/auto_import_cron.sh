@@ -17,6 +17,7 @@ set +a
 export MOBILE_API_ADMIN_PASSWORD="${MOBILE_API_ADMIN_PASSWORD:-}"
 export MOBILE_API_ADMIN_USERNAME="${MOBILE_API_ADMIN_USERNAME:-admin}"
 export NOVEL_PIPELINE_URL="http://localhost:7860"
+export AUTO_IMPORT_WATCH_DIR="${AUTO_IMPORT_WATCH_DIR:-$HOME/Downloads/NovelTNN}"
 
 PYTHON_BIN="$(resolve_python_bin "$ROOT")"
 

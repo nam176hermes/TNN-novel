@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sqlite3
+import stat
+import tempfile
 
 from app.database.db import (
     add_book,
@@ -112,6 +115,51 @@ def test_init_db_seeds_style_profiles_and_glossary_metadata(temp_db_path: Path) 
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(glossary_terms)").fetchall()}
 
     assert {"locked", "genre", "term_type", "priority"}.issubset(columns)
+
+
+def test_init_db_restricts_sqlite_file_permissions(
+    temp_db_path: Path,
+    monkeypatch,
+) -> None:
+    chmod_calls: list[tuple[Path, int]] = []
+
+    def record_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+    init_db(temp_db_path)
+
+    assert (temp_db_path, 0o660) in chmod_calls
+
+
+def test_recreated_sqlite_sidecars_keep_service_only_permissions() -> None:
+    """A later SQLite write must not recreate WAL/SHM with world access."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as root:
+        db_path = Path(root) / "sidecar-permissions.db"
+        wal_path = db_path.with_name(f"{db_path.name}-wal")
+        shm_path = db_path.with_name(f"{db_path.name}-shm")
+
+        original_umask = os.umask(0)
+        try:
+            with get_connection(db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("CREATE TABLE permission_sidecar_probe (id INTEGER PRIMARY KEY)")
+        finally:
+            os.umask(original_umask)
+
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o660
+        assert stat.S_IMODE(wal_path.stat().st_mode) == 0o660
+        assert stat.S_IMODE(shm_path.stat().st_mode) == 0o660
+
+
+def test_get_connection_does_not_change_the_process_umask(tmp_path: Path) -> None:
+    previous_umask = os.umask(0o022)
+    try:
+        get_connection(tmp_path / "process-umask.db").close()
+        observed_umask = os.umask(0o022)
+        assert observed_umask == 0o022
+    finally:
+        os.umask(previous_umask)
 
 
 def test_set_default_style_profile_keeps_single_default(temp_db_path: Path) -> None:

@@ -11,8 +11,8 @@ services:
       - "${MOBILE_API_BIND:-127.0.0.1}:${MOBILE_API_PORT:-7860}:7860"
     environment:
       DATA_DIR: /data
-      # Temporary exact-prefix compatibility for artifact metadata created before Docker.
-      ARTIFACT_LEGACY_ROOT: "${ARTIFACT_LEGACY_ROOT:-}"
+      # The hardened API filesystem is read-only; inbox imports must live in DATA_DIR.
+      EBOOK_INBOX_DIR: /data/inbox/ebooks
       MOBILE_API_HOST: 0.0.0.0
       MOBILE_API_PORT: 7860
       MOBILE_API_SERVE_WEB: "1"
@@ -22,7 +22,7 @@ services:
       MOBILE_API_SECRET: "${MOBILE_API_SECRET:?Set MOBILE_API_SECRET in .env before running docker compose}"
       MOBILE_API_ADMIN_USERNAME: "${MOBILE_API_ADMIN_USERNAME:-admin}"
       MOBILE_API_ADMIN_PASSWORD: "${MOBILE_API_ADMIN_PASSWORD:?Set MOBILE_API_ADMIN_PASSWORD in .env before running docker compose}"
-      MOBILE_API_CORS_ORIGINS: "${MOBILE_API_CORS_ORIGINS:-http://localhost,http://127.0.0.1}"
+      MOBILE_API_CORS_ORIGINS: "${MOBILE_API_CORS_ORIGINS:-http://localhost,http://127.0.0.1,https://novel-tnn.tradingcompanydirect.com}"
       PUBLIC_DEPLOY: "${PUBLIC_DEPLOY:-0}"
       REMOTE_API_KEY: "${REMOTE_API_KEY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
@@ -61,11 +61,9 @@ services:
     image: novel-pipeline-import-worker:local
     restart: unless-stopped
     init: true
-    command: ["python", "-m", "app.import_worker"]
+    command: ["sh", "-c", "umask 007 && exec python -m app.import_worker"]
     environment:
       DATA_DIR: /data
-      # The worker reads existing chapter artifacts too; it needs the same bounded remap.
-      ARTIFACT_LEGACY_ROOT: "${ARTIFACT_LEGACY_ROOT:-}"
       IMPORT_JOB_RUN_IN_API: "0"
       IMPORT_WORKER_POLL_INTERVAL_SECONDS: "1"
       IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS: "45"

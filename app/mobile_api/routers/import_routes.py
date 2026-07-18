@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import errno
 import json
 import logging
 import os
@@ -658,7 +659,19 @@ def _stage_ebook_upload(service: EbookImportService, temp_path: Path, original_n
     upload_id = uuid.uuid4().hex
     upload_dir = _ebook_upload_dir(service)
     staged_path = upload_dir / f"{upload_id}{temp_path.suffix.lower()}"
-    shutil.move(str(temp_path), str(staged_path))
+    try:
+        os.replace(temp_path, staged_path)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # ``copy2`` preserves timestamps and permissions, which is rejected by
+        # some production bind mounts. Staging only needs the ebook bytes.
+        try:
+            shutil.copyfile(temp_path, staged_path)
+            temp_path.unlink()
+        except Exception:
+            staged_path.unlink(missing_ok=True)
+            raise
     meta_path = upload_dir / f"{upload_id}.json"
     meta_path.write_text(json.dumps({"filename": original_name}, ensure_ascii=False), encoding="utf-8")
     return upload_id
