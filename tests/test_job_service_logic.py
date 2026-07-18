@@ -166,14 +166,22 @@ async def test_start_translate_job_book_zero_does_not_target_all_books(
 
 
 def test_job_router_services_share_tracker_between_requests() -> None:
-    first_service = jobs_router.get_job_service()
-    job_id = first_service.start_translate_job(book_id=0)
+    db_path = jobs_router.get_db_path()
+    init_db(db_path)
+    jobs_router._SHARED_JOB_TRACKER = None
+    job_service_module._SHARED_TRACKERS.pop(str(db_path), None)
+    try:
+        first_service = jobs_router.get_job_service()
+        job_id = first_service.start_translate_job(book_id=0)
 
-    second_service = jobs_router.get_job_service()
+        second_service = jobs_router.get_job_service()
 
-    status = second_service.get_job_status(job_id)
-    assert status is not None
-    assert status["job_id"] == job_id
+        status = second_service.get_job_status(job_id)
+        assert status is not None
+        assert status["job_id"] == job_id
+    finally:
+        jobs_router._SHARED_JOB_TRACKER = None
+        job_service_module._SHARED_TRACKERS.pop(str(db_path), None)
 
 
 def test_job_tracker_persists_finished_jobs_between_instances(temp_db_path) -> None:
