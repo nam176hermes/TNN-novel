@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "production_backup.sh"
 SERVICE = ROOT / "deploy" / "systemd" / "user" / "novel-tnn-backup.service"
 TIMER = ROOT / "deploy" / "systemd" / "user" / "novel-tnn-backup.timer"
+RUNBOOK = ROOT / "docs" / "production-backup-restore-runbook.md"
 
 
 def _validate_config(data_dir: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
@@ -87,6 +88,15 @@ def test_backup_runner_creates_encrypted_archive_and_r2_checksum_contract() -> N
     assert "R2_MULTIPART_PART_BYTES" in content
     assert "--upload-existing" in content
     assert "OFFSITE_SFTP" not in content
+
+
+def test_production_backup_runbook_describes_current_multipart_and_resume_contract() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "uses an R2 single-object upload" not in runbook
+    assert "R2 multipart protocol" in runbook
+    assert "10,000-part limit" in runbook
+    assert "--upload-existing ARCHIVE_BASENAME" in runbook
 
 
 def test_backup_runner_creates_and_verifies_an_encrypted_r2_copy(tmp_path: Path) -> None:

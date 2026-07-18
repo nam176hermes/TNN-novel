@@ -96,10 +96,14 @@ Success requires all of the following:
 4. Re-download of the R2 checksum and READY sidecar, each compared byte for
    byte with local metadata.
 
-The current runner uses an R2 single-object upload and deliberately refuses an
-archive larger than 5 GiB. Add a dedicated multipart-upload workstream before
-the encrypted archive can reach that limit; it will fail safely rather than
-silently creating an incomplete off-site backup.
+The runner uploads small archives as one R2 object and automatically switches
+to the R2 multipart protocol at the configured threshold (5 GiB by default).
+Multipart uploads use bounded 256 MiB parts, record the returned ETags in the
+completion request, and abort an incomplete upload on failure.  It refuses an
+archive that would exceed R2's 10,000-part limit rather than publishing a
+partial object.  `--upload-existing ARCHIVE_BASENAME` safely retries only the
+off-site upload of an already verified local archive; it does not create a
+second archive.
 
 The passphrase is never written to output. The archive itself contains no
 production environment file; encryption protects private application data when
