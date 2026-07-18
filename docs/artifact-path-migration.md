@@ -4,10 +4,13 @@
 
 P0A repairs active filesystem metadata after the project moved away from the historical root `/home/thenam176/novel_pipeline`. It changes approved SQLite path values only. It does not move, delete, regenerate, or rewrite private artifacts.
 
-Current operator state (2026-07-12): `P0A_FIX_APPLIED`. The operator apply
-updated 12,151 approved active values; post-apply dry-run and second apply both
-reported zero updates; integrity is `ok`; foreign-key violations are zero; and
-the runtime no longer sets `ARTIFACT_LEGACY_ROOT`.
+Historical operator state (2026-07-12): `P0A_FIX_APPLIED`. That migration
+updated 12,151 approved active values and preserved integrity. A later WSL
+cutover left a separate, bounded set of Windows-root metadata values behind.
+The live cutover run must use this procedure again, then remove
+`ARTIFACT_LEGACY_ROOT` from runtime configuration only after its post-apply
+dry-run reports zero active legacy values and Reader/cover/audio/TTS smoke
+checks pass.
 
 Resolve the active checkout and configured data root before every command:
 

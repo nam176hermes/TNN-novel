@@ -1,0 +1,13 @@
+# Canonical production release pin: runtime-hardening-20260718-r1.
+#
+# Image identities at release time:
+# - API:    sha256:ce54bb498927412d1ed92f7e3d29644d4e08955d3347574a27bd51d88dc40a77
+# - Worker: sha256:dad14a8393c4beaadcd59d9afb20b9e4a504b2f3b3523743e9354d19b5705c2b
+#
+# Apply this after compose.yaml. It supersedes historical external Phase 4 and
+# TTS image overrides; do not add those old files to the canonical command.
+services:
+  api:
+    image: novel-pipeline-api:runtime-hardening-20260718-r1
+  import-worker:
+    image: novel-pipeline-import-worker:runtime-hardening-20260718-r1

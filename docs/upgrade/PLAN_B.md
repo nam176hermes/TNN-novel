@@ -4,6 +4,12 @@ This is the living plan for the Novel-TNN Plan B upgrade. It is intended to let 
 
 ## Current status
 
+- The WSL production-host migration was cut over and then completed its
+  non-destructive Phase 5 preservation work on 2026-07-17. The post-cutover
+  backup, isolated restore drill, and legacy archive inventory are recorded in
+  [`PHASE5_WSL_CLEANUP.md`](PHASE5_WSL_CLEANUP.md). This is an operational
+  migration record only; it does **not** override the P16 application release
+  decision or relax any of Plan B's source-safety boundaries.
 - P16 independent review completed in the worktree. Decision: **NO-GO**. Full
   backend validation passed (`1026 passed, 2 warnings in 1647.85s`), but the
   exact Vitest command stalls before reporting and Docker is unavailable for
