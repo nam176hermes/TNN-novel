@@ -544,6 +544,25 @@ def test_public_deploy_safety_gate_rejects_unsafe_defaults() -> None:
     assert any("MOBILE_API_DISABLE_AUTH" in error for error in errors)
 
 
+def test_external_bind_requires_public_deploy_safety_gate() -> None:
+    from app.mobile_api.config import MobileAPISettings, validate_public_deploy_settings
+
+    errors = validate_public_deploy_settings(
+        MobileAPISettings(
+            host="0.0.0.0",
+            public_deploy=False,
+            secret_key="dev-secret-change-in-production",
+            admin_username="admin",
+            admin_password="change_me",
+        )
+    )
+
+    assert any("PUBLIC_DEPLOY=1" in error for error in errors)
+    assert any("MOBILE_API_SECRET" in error for error in errors)
+    assert any("MOBILE_API_ADMIN_USERNAME" in error for error in errors)
+    assert any("MOBILE_API_ADMIN_PASSWORD" in error for error in errors)
+
+
 def test_public_deploy_auth_bypass_requires_explicit_override() -> None:
     from app.mobile_api.config import MobileAPISettings, auth_bypass_enabled, validate_public_deploy_settings
 

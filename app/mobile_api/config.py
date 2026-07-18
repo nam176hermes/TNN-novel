@@ -27,7 +27,7 @@ class MobileAPISettings(BaseModel):
     model_config = ConfigDict(validate_default=True)
 
     version: str = "0.1.0"
-    host: str = os.getenv("MOBILE_API_HOST", "0.0.0.0")
+    host: str = os.getenv("MOBILE_API_HOST", "127.0.0.1")
     port: int = int(os.getenv("MOBILE_API_PORT", "7860"))
     public_deploy: bool = _parse_bool(os.getenv("PUBLIC_DEPLOY", "0"))
     secret_key: str = os.getenv("MOBILE_API_SECRET", "dev-secret-change-in-production")
@@ -166,13 +166,21 @@ def _is_broad_public_cors_origin(origin: str) -> bool:
     return not value.startswith("https://")
 
 
+def _is_non_loopback_bind(host: str) -> bool:
+    value = host.strip().lower().strip("[]")
+    return value not in {"", "localhost", "127.0.0.1", "::1"} and not value.endswith(".localhost")
+
+
 def validate_public_deploy_settings(settings: MobileAPISettings | None = None) -> list[str]:
     """Return PUBLIC_DEPLOY safety violations for externally exposed instances."""
     resolved = settings or mobile_settings
-    if not resolved.public_deploy:
+    externally_bound = _is_non_loopback_bind(resolved.host)
+    if not resolved.public_deploy and not externally_bound:
         return []
 
     errors: list[str] = []
+    if externally_bound and not resolved.public_deploy:
+        errors.append("PUBLIC_DEPLOY=1 is required when MOBILE_API_HOST is not loopback")
     secret = resolved.secret_key.strip()
     if secret.lower() in _DEV_SECRET_VALUES or len(secret) < 32:
         errors.append("MOBILE_API_SECRET must be a long random secret when PUBLIC_DEPLOY=1")
