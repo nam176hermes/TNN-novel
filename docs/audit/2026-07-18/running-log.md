@@ -113,3 +113,14 @@
 - The live production containers were not rebuilt, recreated, or deployed in
   this workstream. The endpoint probes verify current service availability, not
   release of the new commits.
+
+## 2026-07-18 — security artifact-retention correction
+
+- The deep-security working bundle was stored beneath the system temporary
+  directory and was pruned before its canonical final report could be sealed.
+  No production data, repository source, Git commit, container, or operator
+  configuration was lost or changed.
+- Updated the audit record to avoid claiming the missing per-candidate receipt
+  files are still available. `security-review.md` retains the durable finding,
+  remediation, validation, and deployment-boundary summary. A future formal
+  scan must use an operator-selected durable evidence directory before running.
