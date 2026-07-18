@@ -15,19 +15,29 @@
 
 ### Backup Listing Scans Compressed Archives
 
-- Status: BROKEN at current data size.
-- Evidence: `GET /api/system/backups` exceeded 20 seconds; two archives have no sidecar manifests; list code opens archives to obtain `manifest.json`.
-- Impact: status/settings can block on a read-only list operation.
-- Action: produce/repair bounded sidecar metadata, never scan large archives in the request list path, surface invalid metadata safely.
-- Acceptance: warm list under 250 ms for current backup count; no path/manifest leakage; corrupt archive does not block other entries.
+- Status: RESOLVED_IN_P1A (verified 2026-07-18).
+- Historical evidence: the original list path opened archives to obtain
+  `manifest.json`, which could block a read-only status request.
+- Resolution: `scripts.ops.list_backups` uses archive `lstat` plus bounded
+  sidecar metadata only. Missing, malformed, orphaned, and partial artifacts
+  receive safe metadata statuses; explicit archive inspection remains an
+  operator-only repair action.
+- Verification: `tests/test_benchmark_backup_listing.py`,
+  `tests/test_mobile_api_backups.py`, and `tests/test_backup_job_service.py`
+  pass in the current checkout (34 tests total); the list regression includes
+  missing and malformed sidecars.
 
 ### Backup Creation Is Synchronous
 
-- Status: WORKING_WITH_LIMITATIONS.
-- Evidence: isolated creation took 11.4-17.5 seconds and runs inside the async HTTP handler.
-- Impact: timeout risk, no durable progress/cancel/retry, unclear operator state.
-- Action: implement the previously scoped durable job-backed backup with in-memory passphrase lifecycle and staged atomic publication.
-- Acceptance: create returns HTTP 202 quickly; no passphrase persistence; cancel prevents publication; restore drill remains compatible.
+- Status: RESOLVED_IN_P1A (verified 2026-07-18).
+- Resolution: `BackupJobCoordinator` creates a durable backup job and returns
+  HTTP 202; progress, cancellation, failure, and terminal auditing are handled
+  off the request path. Secret-bearing passphrases are held only in the
+  process-local TTL store, and encrypted artifacts publish only after `READY`
+  sidecar validation.
+- Verification: the current backup API/job suite passes 34 tests, including
+  202 response, cancellation, credential-expiry, and encrypted-publication
+  paths.
 
 ### Authenticated Status Exposes Absolute Paths
 
@@ -46,11 +56,14 @@
 
 ### Operational Event Retention
 
-- Status: WORKING_WITH_LIMITATIONS.
-- Evidence: 16,396 rows and approximately 4.16 MB in the current DB; bounded API reads do not prove bounded storage retention.
-- Impact: silent database growth over long private operation.
-- Action: define age/count retention and operator-visible storage summary; preserve security-relevant recent history.
-- Acceptance: documented bound, tested pruning, no request-time mass deletion.
+- Status: RESOLVED_IN_P2C (verified 2026-07-18).
+- Resolution: the app runs a lifecycle-owned background retention loop with
+  bounded batches. Current settings retain operational events for 90 days or
+  50,000 rows, with a 500-row batch and six-hour interval; authenticated
+  sessions and failures have their own tested bounds.
+- Verification: `tests/test_operational_retention.py` and
+  `tests/test_retention_service.py` pass 23/23, covering age/count pruning,
+  contention behavior, lifecycle ownership, and no request-time maintenance.
 
 ### Operational Documentation Path Drift
 

@@ -49,3 +49,17 @@
   configuration; AUD-006 records the exact preflight result. AUD-003 remains
   intentionally open because replacing live Compose provenance needs a separate
   approved release window.
+
+## 2026-07-18 — off-site backup retention audit
+
+- Read-only validation of `~/.config/novel-tnn/backup.env` confirmed strict
+  `0600` permissions, all required values, successful R2 authentication, and
+  an enabled daily systemd timer. No secret values were displayed.
+- R2 contains two encrypted archive sets. Each remote checksum equals the
+  corresponding local checksum and each remote sidecar is encrypted, `READY`,
+  and names its expected archive.
+- Found AUD-007: the upload path was correct, but the raw-string regex used by
+  remote retention escaped the archive extension twice and consequently matched
+  no valid archive names. `4edf3b8` uses literal-dot regex escapes and adds a
+  behavioral rotation regression. The production backup scheduler/API/job suite
+  passes 40/40; the retention suite passes 23/23.
