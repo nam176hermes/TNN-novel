@@ -1347,9 +1347,48 @@ def fetch_public_html(
     ).html
 
 
+@dataclass(frozen=True)
+class SourceAdapterRegistration:
+    adapter_id: str
+    label: str
+    domains: tuple[str, ...]
+    adapter_version: str
+
+
 class SourceAdapterRegistry:
     def __init__(self, adapters: Iterable[GenericHtmlSourceAdapter] | None = None):
         self.adapters = list(adapters or [GenericHtmlSourceAdapter()])
+        registrations: list[SourceAdapterRegistration] = []
+        adapter_ids: set[str] = set()
+        domain_owners: dict[str, str] = {}
+
+        for adapter in self.adapters:
+            domains = tuple(str(domain).strip().casefold() for domain in getattr(adapter, "domains", ()) if domain)
+            if not domains:
+                continue
+            adapter_id = str(getattr(adapter, "adapter_id", "")).strip()
+            label = str(getattr(adapter, "label", "")).strip()
+            adapter_version = str(getattr(adapter, "adapter_version", "")).strip()
+            if not adapter_id or not label or not adapter_version:
+                raise ValueError("Registered source adapters require id, label, domains, and version metadata")
+            if adapter_id in adapter_ids:
+                raise ValueError(f"Duplicate source adapter id: {adapter_id}")
+            adapter_ids.add(adapter_id)
+            for domain in domains:
+                owner = domain_owners.get(domain)
+                if owner is not None:
+                    raise ValueError(f"Duplicate source adapter domain: {domain} ({owner}, {adapter_id})")
+                domain_owners[domain] = adapter_id
+            registrations.append(
+                SourceAdapterRegistration(
+                    adapter_id=adapter_id,
+                    label=label,
+                    domains=domains,
+                    adapter_version=adapter_version,
+                )
+            )
+
+        self.registrations = tuple(registrations)
 
     def get_for_url(self, url: str) -> GenericHtmlSourceAdapter:
         for adapter in self.adapters:
@@ -2770,7 +2809,7 @@ def _adapter_matches_policy(adapter: GenericHtmlSourceAdapter, policy: SourcePol
 
 
 def list_source_capabilities() -> list[dict[str, object]]:
-    adapters = [adapter for adapter in build_default_source_adapters() if _adapter_domains(adapter)]
+    adapters = [adapter for adapter in _DEFAULT_REGISTRY.adapters if _adapter_domains(adapter)]
     capabilities: list[dict[str, object]] = []
 
     for policy in SOURCE_POLICIES:
