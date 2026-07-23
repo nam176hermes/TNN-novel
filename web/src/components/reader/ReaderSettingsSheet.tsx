@@ -10,6 +10,8 @@ import type {
 
 export type ReaderModeAvailability = {
   rawAvailable: boolean;
+  rawCollapsedAvailable: boolean;
+  splitAvailable: boolean;
 };
 
 export type ReaderSettingsSheetProps = Partial<ReaderModeAvailability> & {
@@ -55,6 +57,8 @@ export default function ReaderSettingsSheet({
   autoScrollEnabled = false,
   open,
   rawAvailable = true,
+  rawCollapsedAvailable = true,
+  splitAvailable = true,
   settings,
   textMode = 'translation',
   onAudioAction,
@@ -100,7 +104,9 @@ export default function ReaderSettingsSheet({
               ] as Array<[ReaderTextMode, string]>).map(([mode, label]) => (
                 <button
                   aria-pressed={textMode === mode}
-                  disabled={!onTextModeChange || (mode !== 'translation' && mode !== 'qa-overlay' && !rawAvailable)}
+                  disabled={!onTextModeChange
+                    || (mode === 'split' && !splitAvailable)
+                    || (mode === 'raw-collapsed' && !rawCollapsedAvailable)}
                   key={mode}
                   onClick={() => onTextModeChange?.(mode)}
                   type="button"
@@ -117,7 +123,7 @@ export default function ReaderSettingsSheet({
               type="button"
             >
               <span>Raw tiếng Trung</span>
-              {!rawAvailable ? <small>Truyện này chưa có nội dung raw tiếng Trung.</small> : null}
+              {!rawAvailable ? <small>Chương hiện tại chưa có raw/source tiếng Trung.</small> : null}
             </button>
           </section>
 

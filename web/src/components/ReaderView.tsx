@@ -194,6 +194,7 @@ export type ReaderViewProps = {
   qaError: string;
   qaReport: QaReport | null;
   qaState: LoadState;
+  sourceText: string;
   textError: string;
   textState: LoadState;
   translationText: string;
@@ -436,7 +437,6 @@ type ReaderSelectionState = {
   text: string;
 };
 
-const RAW_READER_TEXT_MODES = new Set<ReaderTextMode>(['raw', 'split', 'raw-collapsed']);
 const FALLBACK_PARAGRAPHS_PER_PAGE = 4;
 const LONG_CHAPTER_PARAGRAPH_THRESHOLD = 120;
 const INITIAL_SCROLL_PARAGRAPH_LIMIT = 80;
@@ -1511,6 +1511,7 @@ export default function ReaderView({
   qaError,
   qaReport,
   qaState,
+  sourceText,
   textError,
   textState,
   translationText,
@@ -1649,7 +1650,7 @@ export default function ReaderView({
     : contentHtml;
   const readerSourceText = useCachedChapterContent
     ? currentCachedChapter?.sourceText ?? ''
-    : '';
+    : sourceText;
   const readerTextState: LoadState = useCachedChapterContent ? 'ready' : textState;
   const readerTextError = useCachedChapterContent ? '' : textError;
   const selectAudioChapter = useCallback((chapterId: number) => {
@@ -1742,19 +1743,14 @@ export default function ReaderView({
   const cacheCurrentChapterOffline = () => cacheCurrentChapter(readerAudio.playback.streamUrl);
   const readerCoverUrl = readerOfflineCache.coverUrl;
   const paragraphs = useMemo(() => splitParagraphs(readerTranslationText), [readerTranslationText]);
-  const rawText = useMemo(
-    () => htmlTextContent(readerContentHtml) || readerSourceText,
-    [readerContentHtml, readerSourceText],
-  );
+  const rawText = readerSourceText.trim();
   const richBlocks = useMemo(() => extractReaderRichBlocks(readerContentHtml), [readerContentHtml]);
-  const rawParagraphs = useMemo(() => {
-    const blockTexts = richBlocks.map((block) => block.text.trim()).filter(Boolean);
-    return blockTexts.length > 0 ? blockTexts : splitParagraphs(rawText);
-  }, [rawText, richBlocks]);
+  const rawParagraphs = useMemo(() => splitParagraphs(rawText), [rawText]);
   const rawContentAvailable = rawParagraphs.length > 0;
   const richContentAvailable = readerContentHtml.trim().length > 0;
-  const contentHtmlLooksRawSource = readerTranslationText.trim().length > 0 && containsHanText(rawText);
-  const hasRichContent = richContentAvailable && !contentHtmlLooksRawSource;
+  const translationContentAvailable = readerTranslationText.trim().length > 0 || richContentAvailable;
+  const splitContentAvailable = rawContentAvailable && translationContentAvailable;
+  const hasRichContent = richContentAvailable;
   const progressTextBlocks = useMemo(
     () => (hasRichContent ? richBlocks.map((block) => block.text) : paragraphs),
     [hasRichContent, paragraphs, richBlocks],
@@ -1830,10 +1826,20 @@ export default function ReaderView({
       && (!hasRichContent || !hasReadableRichText),
   );
   useEffect(() => {
-    if (!rawContentAvailable && RAW_READER_TEXT_MODES.has(readerTextMode)) {
+    if (readerTextMode === 'raw' && !rawContentAvailable) {
       setReaderTextMode('translation');
+      return;
     }
-  }, [rawContentAvailable, readerTextMode, setReaderTextMode]);
+    if ((readerTextMode === 'split' || readerTextMode === 'raw-collapsed') && !splitContentAvailable) {
+      setReaderTextMode(translationContentAvailable ? 'translation' : rawContentAvailable ? 'raw' : 'translation');
+      return;
+    }
+    if ((readerTextMode === 'translation' || readerTextMode === 'qa-overlay')
+      && !translationContentAvailable
+      && rawContentAvailable) {
+      setReaderTextMode('raw');
+    }
+  }, [rawContentAvailable, readerTextMode, setReaderTextMode, splitContentAvailable, translationContentAvailable]);
 
   const readerStyle = {
     '--reader-character-spacing': `${readerSettings.characterSpacing}px`,
@@ -3485,6 +3491,8 @@ export default function ReaderView({
   };
   const quickModes: ReaderQuickModeControls = {
     rawAvailable: rawContentAvailable,
+    rawCollapsedAvailable: splitContentAvailable,
+    splitAvailable: splitContentAvailable,
     value: readerTextMode,
     onChange: setReaderTextMode,
   };

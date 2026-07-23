@@ -45,25 +45,25 @@ export function ReaderTextModeSwitcher({ modes, visible }: ReaderTextModeSwitche
         aria-pressed={modes.value === 'raw'}
         disabled={!modes.rawAvailable}
         onClick={() => modes.onChange('raw')}
-        title={modes.rawAvailable ? 'Đọc raw/source tiếng Trung' : 'Chương này chưa có raw/source text'}
+        title={modes.rawAvailable ? 'Đọc raw/source tiếng Trung' : 'Chương hiện tại chưa có raw/source tiếng Trung'}
         type="button"
       >
         Raw
       </button>
       <button
         aria-pressed={modes.value === 'split'}
-        disabled={!modes.rawAvailable}
+        disabled={!modes.splitAvailable}
         onClick={() => modes.onChange('split')}
-        title={modes.rawAvailable ? 'Đọc song song raw và bản dịch' : 'Chương này chưa có raw/source text'}
+        title={modes.splitAvailable ? 'Đọc song song raw và bản dịch' : 'Cần cả raw/source tiếng Trung và bản dịch tiếng Việt'}
         type="button"
       >
         Song song
       </button>
       <button
         aria-pressed={modes.value === 'raw-collapsed'}
-        disabled={!modes.rawAvailable}
+        disabled={!modes.rawCollapsedAvailable}
         onClick={() => modes.onChange('raw-collapsed')}
-        title={modes.rawAvailable ? 'Đọc bản dịch và mở raw từng đoạn' : 'Chương này chưa có raw/source text'}
+        title={modes.rawCollapsedAvailable ? 'Đọc bản dịch và mở raw từng đoạn' : 'Cần cả raw/source tiếng Trung và bản dịch tiếng Việt'}
         type="button"
       >
         Raw gọn
@@ -134,7 +134,9 @@ export function ReaderQuickSettingsSheet({ modes, settings }: ReaderQuickSetting
       autoScrollEnabled={settings.autoScrollEnabled}
       open={settings.open}
       rawAvailable={modes.rawAvailable}
+      rawCollapsedAvailable={modes.rawCollapsedAvailable}
       settings={settings.value}
+      splitAvailable={modes.splitAvailable}
       textMode={modes.value}
       onAudioAction={() => {
         settings.onClose();
