@@ -315,6 +315,29 @@ async def test_login_cookie_flags_match_local_and_public_requests(
 
 
 @pytest.mark.asyncio
+async def test_browser_security_headers_cover_local_public_and_guard_responses() -> None:
+    from app.mobile_api.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        local = await client.get("/api/health")
+        guarded = await client.get("/api/books")
+        public = await client.get(
+            "/api/health",
+            headers={"Host": "novel.example.com", "X-Forwarded-Proto": "https"},
+        )
+
+    for response in (local, guarded, public):
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+        assert response.headers["permissions-policy"]
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert "strict-transport-security" not in local.headers
+    assert public.headers["strict-transport-security"].startswith("max-age=31536000")
+
+
+@pytest.mark.asyncio
 async def test_login_creates_server_side_session(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, db_path = _build_app_with_data_dir(tmp_path, monkeypatch)
 

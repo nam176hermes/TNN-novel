@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import PROJECT_ROOT
 from app.database.db import init_db
 from app.mobile_api.auth import get_auth_bypass_user
+from app.mobile_api.browser_headers import apply_browser_security_headers
 from app.mobile_api.config import assert_public_deploy_safe, auth_bypass_enabled, mobile_settings
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 from app.mobile_api.private_cache import apply_private_no_store_headers
@@ -284,6 +285,16 @@ def create_app(*, retention_service: RetentionService | None = None) -> FastAPI:
         response = await call_next(request)
         set_asset_access_cookie(response, token, secure=public_request)
         apply_private_no_store_headers(response.headers)
+        return response
+
+    @app.middleware("http")
+    async def browser_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+        public_https = is_public_request(request) and (
+            request.url.scheme == "https" or forwarded_proto == "https"
+        )
+        apply_browser_security_headers(response.headers, public_https=public_https)
         return response
 
     # Mount all routers
