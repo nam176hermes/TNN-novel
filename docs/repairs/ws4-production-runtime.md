@@ -286,3 +286,36 @@ cutover using freshly rebuilt final-commit images.**
 **NO-GO for production restart/deployment in this task, and NO-GO for starting
 Workstream 5 until the operator reviews this report and decides whether to
 deploy/validate WS4 or intentionally defer that deployment.**
+
+## Final verification evidence
+
+Fresh final gates on 2026-07-23:
+
+| Gate | Result |
+| --- | --- |
+| Python compile | pass |
+| Shell syntax for every `scripts/*.sh` | pass |
+| `scripts/lint.sh` | pass |
+| Full backend | 1,181 passed, 2 dependency deprecation warnings |
+| Full frontend | 85 files, 758 tests passed |
+| Frontend typecheck | pass |
+| Frontend production build | pass; 1,855 modules transformed |
+| `scripts/verify.sh` | pass, exit 0; all mandatory child gates passed |
+| `git diff --check` | pass |
+
+The first lint attempt in the isolated worktree failed because its temporary
+`web/node_modules` symlink had been removed before invoking the repository
+script. The dependency symlink was restored, the complete gate was rerun from
+the beginning, and it passed. This was an isolated-worktree setup error, not a
+source regression. The symlink was removed again before the clean-status gate.
+
+Focused evidence completed before the full gates included:
+
+- runtime-contract tests: 7 passed;
+- runtime identity/version tests: 21 passed in the related targeted set;
+- readiness/health tests: 65 passed in the related targeted set;
+- F5/TTS tests: 38 passed, 61 deliberately deselected for the focused run;
+- metrics/auth/redaction tests: 54 passed in the related targeted set;
+- restore freshness and metrics tests: 6 passed;
+- tracked Compose configuration validation: pass;
+- isolated API/worker Docker build and smoke: pass.
