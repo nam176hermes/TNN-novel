@@ -14,7 +14,7 @@ import { chapterMarksKey, loadReaderMarks, saveReaderMarks } from '../state/read
 import { loadReaderProgressSnapshot, saveReaderProgressSnapshot } from '../state/readerProgress';
 import { buildReaderProgressTextAnchor } from '../state/readerProgressAnchor';
 import ReaderView, { type ReaderApiClient } from './ReaderView';
-import { loadReaderSettings, loadReaderTextMode } from './reader/readerSettings';
+import { loadReaderSettings, loadReaderTextMode, saveReaderTextMode } from './reader/readerSettings';
 
 const books: TranslatedBookSummary[] = [
   {
@@ -319,6 +319,7 @@ function renderReader(overrides: Partial<Parameters<typeof ReaderView>[0]> = {})
     qaError: '',
     qaReport: null,
     qaState: 'empty' as const,
+    sourceText: '',
     textError: '',
     textState: 'ready' as const,
     translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
@@ -470,7 +471,7 @@ describe('ReaderView', () => {
 
   it('renders Vietnamese, raw, and split reading modes without duplicating the default text block', async () => {
     renderReader({
-      contentHtml: '<p>原文第一段。</p><p>原文第二段。</p>',
+      sourceText: '原文第一段。\n\n原文第二段。',
       translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
     });
 
@@ -492,9 +493,41 @@ describe('ReaderView', () => {
     expect(screen.getByText('Lục ca, ta cảm tạ huynh.')).toBeInTheDocument();
   });
 
+  it('derives raw and split availability from current source and translation resources', () => {
+    renderReader({ sourceText: '原文只有一段。', translationText: '' });
+
+    expect(screen.getByRole('button', { name: 'Raw' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Song song' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Song song' })).toHaveAttribute(
+      'title',
+      'Cần cả raw/source tiếng Trung và bản dịch tiếng Việt',
+    );
+    expect(screen.getByRole('button', { name: 'Raw gọn' })).toBeDisabled();
+  });
+
+  it('disables source-dependent modes with a truthful current-chapter reason', () => {
+    renderReader({ sourceText: '', translationText: 'Chỉ có bản dịch.' });
+
+    expect(screen.getByRole('button', { name: 'Raw' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Raw' })).toHaveAttribute(
+      'title',
+      'Chương hiện tại chưa có raw/source tiếng Trung',
+    );
+    expect(screen.getByRole('button', { name: 'Song song' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Raw gọn' })).toBeDisabled();
+  });
+
+  it('falls back safely when the persisted mode is unavailable for the current chapter', async () => {
+    saveReaderTextMode('split', window.localStorage);
+    renderReader({ sourceText: '原文只有一段。', translationText: '' });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Raw' })).toHaveAttribute('aria-pressed', 'true'));
+    expect(loadReaderTextMode(window.localStorage)).toBe('raw');
+  });
+
   it('persists the selected reader text mode across reader mounts', async () => {
     renderReader({
-      contentHtml: '<p>原文第一段。</p>',
+      sourceText: '原文第一段。',
       translationText: 'Hàn Lập khẽ gật đầu.',
     });
 
@@ -503,7 +536,7 @@ describe('ReaderView', () => {
 
     cleanup();
     renderReader({
-      contentHtml: '<p>原文第一段。</p>',
+      sourceText: '原文第一段。',
       translationText: 'Hàn Lập khẽ gật đầu.',
     });
 
@@ -513,7 +546,7 @@ describe('ReaderView', () => {
 
   it('renders raw-collapsed mode without exposing raw paragraphs until expanded', async () => {
     renderReader({
-      contentHtml: '<p>原文第一段。</p><p>原文第二段。</p>',
+      sourceText: '原文第一段。\n\n原文第二段。',
       translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
     });
 

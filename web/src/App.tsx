@@ -1858,6 +1858,7 @@ function AuthenticatedApp() {
               qaState={qaState.state}
               selectedChapter={selectedChapter}
               selectedChapterId={selectedChapterId}
+              sourceText={chapterText.sourceText}
               textError={chapterText.error}
               textState={chapterText.state}
               translationText={chapterText.translationText}
