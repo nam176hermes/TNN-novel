@@ -45,7 +45,7 @@ describe('useSession', () => {
       expect(result.current.isAuthenticated).toBe(true);
       expect(result.current.client.token).toBe('offline-access');
       expect(loadToken()).toBe('offline-access');
-      expect(loadRefreshToken()).toBe('offline-refresh');
+      expect(loadRefreshToken()).toBe('');
       expect(result.current.loginError).toBe('');
     } finally {
       vi.unstubAllGlobals();
@@ -64,6 +64,7 @@ describe('useSession', () => {
 
     try {
       const { result } = renderHook(() => useSession('http://127.0.0.1:7860', false));
+      act(() => result.current.expireSession());
 
       await waitFor(() => expect(result.current.isRestoring).toBe(false));
       expect(result.current.isAuthenticated).toBe(false);

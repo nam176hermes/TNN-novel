@@ -231,7 +231,7 @@ async function installApiMock(page: Page, state: MockState) {
     const path = url.pathname;
 
     if (path === '/api/auth/login' && request.method() === 'POST') {
-      return json(route, { access_token: 'access-token', refresh_token: 'refresh-token', token_type: 'bearer' }, 200, {
+      return json(route, { access_token: 'access-token', token_type: 'bearer' }, 200, {
         'set-cookie': 'novel_asset_access=asset-token; HttpOnly; Secure; SameSite=Lax; Path=/',
       });
     }
@@ -381,7 +381,7 @@ async function signIn(page: Page, state: MockState) {
 async function authenticatedPage(page: Page, state: MockState) {
   await installApiMock(page, state);
   await page.addInitScript(() => {
-    localStorage.setItem('novel-operator-token', 'access-token');
+    sessionStorage.setItem('novel-operator-token', 'access-token');
   });
   await page.goto('/');
   const viewport = page.viewportSize();

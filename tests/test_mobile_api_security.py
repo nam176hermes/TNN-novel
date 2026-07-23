@@ -43,6 +43,14 @@ async def _login(client: httpx.AsyncClient) -> dict[str, str]:
     return response.json()
 
 
+def _csrf_header(client: httpx.AsyncClient) -> dict[str, str]:
+    from app.mobile_api.config import mobile_settings
+
+    token = client.cookies.get(mobile_settings.csrf_cookie_name)
+    assert token
+    return {mobile_settings.csrf_header_name: token}
+
+
 def _auth_header(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -218,7 +226,7 @@ async def test_book_and_chapter_metadata_do_not_expose_internal_paths(
 
 
 @pytest.mark.asyncio
-async def test_mobile_api_refresh_accepts_json_body() -> None:
+async def test_mobile_api_refresh_uses_httponly_cookie_and_csrf_header() -> None:
     from app.mobile_api.config import mobile_settings
     from app.mobile_api.main import app
 
@@ -233,12 +241,49 @@ async def test_mobile_api_refresh_accepts_json_body() -> None:
         )
         refresh = await client.post(
             "/api/auth/refresh",
-            json={"refresh_token": login.json()["refresh_token"]},
+            headers=_csrf_header(client),
         )
 
     assert login.status_code == 200
+    assert "refresh_token" not in login.json()
     assert refresh.status_code == 200
     assert "access_token" in refresh.json()
+    assert "refresh_token" not in refresh.json()
+    set_cookie = login.headers.get_list("set-cookie")
+    assert any("novel_refresh_session=" in value and "HttpOnly" in value for value in set_cookie)
+
+
+@pytest.mark.asyncio
+async def test_login_cookie_flags_match_local_and_public_requests(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.config import mobile_settings
+
+    app, _ = _build_app_with_data_dir(tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    credentials = {
+        "username": mobile_settings.admin_username,
+        "password": mobile_settings.admin_password,
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as local_client:
+        local = await local_client.post("/api/auth/login", json=credentials)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://novel.example.com",
+    ) as public_client:
+        public = await public_client.post("/api/auth/login", json=credentials)
+
+    local_refresh = next(
+        value for value in local.headers.get_list("set-cookie") if "novel_refresh_session=" in value
+    )
+    public_refresh = next(
+        value for value in public.headers.get_list("set-cookie") if "novel_refresh_session=" in value
+    )
+    assert "HttpOnly" in local_refresh and "SameSite=lax" in local_refresh
+    assert "Secure" not in local_refresh
+    assert "HttpOnly" in public_refresh and "SameSite=lax" in public_refresh
+    assert "Secure" in public_refresh
 
 
 @pytest.mark.asyncio
@@ -259,7 +304,7 @@ async def test_login_creates_server_side_session(tmp_path, monkeypatch: pytest.M
     assert rows[0]["session_id"]
     assert rows[0]["username"]
     assert rows[0]["refresh_token_hash"]
-    assert token_response["refresh_token"] not in rows[0]["refresh_token_hash"]
+    assert "refresh_token" not in token_response
     assert rows[0]["revoked_at"] in ("", None)
 
 
@@ -347,16 +392,17 @@ async def test_refresh_token_rotation_rejects_old_refresh_token(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         token_response = await _login(client)
-        old_refresh = token_response["refresh_token"]
-        first_refresh = await client.post("/api/auth/refresh", json={"refresh_token": old_refresh})
-        new_refresh = await client.post(
-            "/api/auth/refresh",
-            json={"refresh_token": first_refresh.json()["refresh_token"]},
-        )
-        second_refresh = await client.post("/api/auth/refresh", json={"refresh_token": old_refresh})
+        from app.mobile_api.config import mobile_settings
+        old_refresh = client.cookies.get(mobile_settings.refresh_cookie_name)
+        assert old_refresh
+        first_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
+        new_refresh_token = client.cookies.get(mobile_settings.refresh_cookie_name)
+        assert new_refresh_token and new_refresh_token != old_refresh
+        new_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
+        client.cookies.set(mobile_settings.refresh_cookie_name, old_refresh, path="/api/auth")
+        second_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
 
     assert first_refresh.status_code == 200
-    assert first_refresh.json()["refresh_token"] != old_refresh
     assert new_refresh.status_code == 200
     assert second_refresh.status_code == 401
     events = list_operational_events(db_path, limit=20, severities=())
@@ -416,7 +462,7 @@ async def test_auth_audit_events_do_not_store_raw_tokens_or_passwords(
         token_response = await _login(client)
         refresh_response = await client.post(
             "/api/auth/refresh",
-            json={"refresh_token": token_response["refresh_token"]},
+            headers=_csrf_header(client),
         )
         await client.post(
             "/api/auth/logout",
@@ -429,8 +475,8 @@ async def test_auth_audit_events_do_not_store_raw_tokens_or_passwords(
     assert any(event["event_type"] == "session_refresh_success" for event in events)
     assert any(event["event_type"] == "auth_logout" for event in events)
     assert token_response["access_token"] not in serialized
-    assert token_response["refresh_token"] not in serialized
-    assert refresh_response.json()["refresh_token"] not in serialized
+    assert "refresh_token" not in token_response
+    assert "refresh_token" not in refresh_response.json()
     assert password_marker not in serialized
 
 

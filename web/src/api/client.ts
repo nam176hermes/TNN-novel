@@ -164,6 +164,28 @@ function filenameFromContentDisposition(value: string | null, fallback: string):
 
 const browserFetch: typeof fetch = (input, init) => fetch(input, { credentials: 'include', ...init });
 
+const CSRF_COOKIE_NAME = 'novel_csrf';
+
+function csrfTokenFromCookie(): string {
+  if (typeof document === 'undefined') return '';
+  const prefix = `${CSRF_COOKIE_NAME}=`;
+  const encoded = document.cookie
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix))
+    ?.slice(prefix.length) ?? '';
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return '';
+  }
+}
+
+function csrfHeaders(): Record<string, string> {
+  const token = csrfTokenFromCookie();
+  return token ? { 'X-CSRF-Token': token } : {};
+}
+
 export class ApiClient {
   token = '';
 
@@ -249,11 +271,10 @@ export class ApiClient {
     return data;
   }
 
-  async refresh(refreshToken: string): Promise<TokenResponse> {
+  async refresh(): Promise<TokenResponse> {
     const response = await this.fetcher(`${this.baseUrl}/api/auth/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      headers: csrfHeaders(),
     });
     await this.assertOk(response, 'Refresh failed');
 
@@ -265,7 +286,7 @@ export class ApiClient {
   async logout(): Promise<void> {
     const response = await this.fetcher(`${this.baseUrl}/api/auth/logout`, {
       method: 'POST',
-      headers: this.headers(),
+      headers: { ...this.headers(), ...csrfHeaders() },
     });
     await this.assertOk(response, 'Logout failed');
   }

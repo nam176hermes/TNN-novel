@@ -24,11 +24,11 @@ describe('App', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows login when no session token exists', () => {
+  it('shows login when no refresh cookie can restore a session', async () => {
     render(<App />);
 
     expect(screen.getByRole('heading', { name: 'Novel-TNN Translator' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Login' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Login' })).toBeInTheDocument();
     expect(screen.queryByRole('navigation', { name: 'Primary' })).not.toBeInTheDocument();
   });
 
@@ -106,7 +106,6 @@ describe('App', () => {
           ok: true,
           json: async () => ({
             access_token: 'access',
-            refresh_token: 'refresh',
             token_type: 'bearer',
           }),
         };
@@ -139,12 +138,13 @@ describe('App', () => {
 
     render(<App />);
 
-    await userEvent.type(screen.getByLabelText('Password'), 'password');
+    await userEvent.type(await screen.findByLabelText('Password'), 'password');
     await userEvent.click(screen.getByRole('button', { name: 'Login' }));
 
     expect(await screen.findByRole('heading', { name: 'Novel-TNN' })).toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: 'Quy trình' })).toBeInTheDocument();
-    expect(loadRefreshToken()).toBe('refresh');
+    expect(loadRefreshToken()).toBe('');
+    expect(window.localStorage.getItem('novel-operator-refresh-token')).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/auth/login',
       expect.objectContaining({
@@ -155,7 +155,8 @@ describe('App', () => {
   });
 
   it('restores an existing session with a refresh token instead of showing login', async () => {
-    saveSessionTokens('old-access', 'stored-refresh');
+    clearToken();
+    document.cookie = 'novel_csrf=stored-csrf; path=/';
     const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
       const target = String(url);
 
@@ -164,7 +165,6 @@ describe('App', () => {
           ok: true,
           json: async () => ({
             access_token: 'fresh-access',
-            refresh_token: 'fresh-refresh',
             token_type: 'bearer',
           }),
         };
@@ -199,12 +199,12 @@ describe('App', () => {
 
     expect(screen.queryByRole('button', { name: 'Login' })).not.toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: 'Novel-TNN' })).toBeInTheDocument();
-    expect(loadRefreshToken()).toBe('fresh-refresh');
+    expect(loadRefreshToken()).toBe('');
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/auth/refresh',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ refresh_token: 'stored-refresh' }),
+        headers: expect.objectContaining({ 'X-CSRF-Token': 'stored-csrf' }),
       }),
     );
     await waitFor(() => {
@@ -227,7 +227,6 @@ describe('App', () => {
           ok: true,
           json: async () => ({
             access_token: 'fresh-access',
-            refresh_token: 'fresh-refresh',
             token_type: 'bearer',
           }),
         };
@@ -315,7 +314,6 @@ describe('App', () => {
           ok: true,
           json: async () => ({
             access_token: 'access',
-            refresh_token: 'refresh',
             token_type: 'bearer',
           }),
         };
@@ -352,7 +350,7 @@ describe('App', () => {
 
     render(<App />);
 
-    await userEvent.type(screen.getByLabelText('Password'), 'password');
+    await userEvent.type(await screen.findByLabelText('Password'), 'password');
     await userEvent.click(screen.getByRole('button', { name: 'Login' }));
     expect(await screen.findByRole('button', { name: 'Đăng xuất' })).toBeInTheDocument();
 
@@ -415,7 +413,6 @@ describe('App', () => {
           ok: true,
           json: async () => ({
             access_token: 'access',
-            refresh_token: 'refresh',
             token_type: 'bearer',
           }),
         };
@@ -543,7 +540,7 @@ describe('App', () => {
     vi.spyOn(window, 'prompt').mockReturnValue(passphrase);
 
     render(<App />);
-    await userEvent.type(screen.getByLabelText('Password'), 'password');
+    await userEvent.type(await screen.findByLabelText('Password'), 'password');
     await userEvent.click(screen.getByRole('button', { name: 'Login' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Trạng thái' }));
     expect(await screen.findByRole('heading', { name: 'Trạng thái hệ thống' })).toBeInTheDocument();

@@ -9,7 +9,6 @@ describe('ApiClient', () => {
         ok: true,
         json: async () => ({
           access_token: 'access',
-          refresh_token: 'refresh',
           token_type: 'bearer',
         }),
       });
@@ -32,7 +31,6 @@ describe('ApiClient', () => {
       ok: true,
       json: async () => ({
         access_token: 'access',
-        refresh_token: 'refresh',
         token_type: 'bearer',
       }),
     });
@@ -52,27 +50,26 @@ describe('ApiClient', () => {
     );
   });
 
-  it('rotates refresh tokens and stores the new bearer token after refresh', async () => {
+  it('refreshes through credentials and the double-submit csrf header', async () => {
+    document.cookie = 'novel_csrf=csrf-test; path=/';
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
         access_token: 'new-access',
-        refresh_token: 'new-refresh',
         token_type: 'bearer',
       }),
     });
     const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
 
-    const result = await client.refresh('old-refresh');
+    const result = await client.refresh();
 
-    expect(result.refresh_token).toBe('new-refresh');
+    expect(result.access_token).toBe('new-access');
     expect(client.token).toBe('new-access');
     expect(fetchMock).toHaveBeenCalledWith(
       'http://test/api/auth/refresh',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ refresh_token: 'old-refresh' }),
+        headers: expect.objectContaining({ 'X-CSRF-Token': 'csrf-test' }),
       }),
     );
   });

@@ -14,12 +14,7 @@ class LoginRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
-
-
-class RefreshTokenRequest(BaseModel):
-    refresh_token: str
 
 
 class UserResponse(BaseModel):
@@ -52,6 +47,7 @@ class RetentionRunSummaryResponse(BaseModel):
 
 class RetentionStatusResponse(BaseModel):
     table_counts: dict[str, int] = Field(default_factory=dict)
+    auth_session_counts: dict[str, int] = Field(default_factory=dict)
     last_run: RetentionRunSummaryResponse | None = None
 
 
