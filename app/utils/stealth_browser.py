@@ -51,6 +51,10 @@ from app.security.url_policy import (
 
 logger = logging.getLogger(__name__)
 
+_BLOCKED_BROWSER_RESOURCE_TYPES = frozenset(
+    {"font", "media", "websocket", "beacon", "texttrack", "csp_report"}
+)
+
 from app.utils.stealth_scripts import (
     STEALTH_LAUNCH_ARGS,
     HARMFUL_ARGS,
@@ -260,38 +264,6 @@ class BrowserSessionManager:
 
         page.on("popup", close_popup)
 
-    async def _install_resource_blocking(self, page: Page | Any) -> None:
-        """Block unnecessary resources (fonts, images, media) for faster fetches.
-
-        Ported from Scrapling's EXTRA_RESOURCES approach.
-        Skips blocking for OCR-dependent sites that need image rendering.
-        """
-        if not hasattr(page, "route") or getattr(page, "_novel_resource_blocker", False):
-            return
-
-        blocked_types = {
-            "font",
-            "media",
-            "websocket",
-            "beacon",
-            "texttrack",
-            "csp_report",
-        }
-        # Note: images NOT blocked globally — some OCR sites need screenshots
-
-        try:
-            async def block_handler(route: Any, request: Any) -> None:
-                resource_type = getattr(request, "resource_type", "")
-                if resource_type in blocked_types:
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", block_handler)
-            setattr(page, "_novel_resource_blocker", True)
-        except Exception:
-            pass
-
     async def _install_navigation_guard(self, page: Page | Any) -> None:
         if not hasattr(page, "route") or getattr(page, "_novel_navigation_guard", False):
             return
@@ -306,6 +278,9 @@ class BrowserSessionManager:
             except UrlPolicyViolation as exc:
                 if is_navigation and is_top_level:
                     self._navigation_violation = exc
+                await route.abort("blockedbyclient")
+                return
+            if getattr(request, "resource_type", "") in _BLOCKED_BROWSER_RESOURCE_TYPES:
                 await route.abort("blockedbyclient")
                 return
             await route.continue_()
@@ -323,7 +298,6 @@ class BrowserSessionManager:
             raise RuntimeError("Browser session is not initialized")
         page.set_default_timeout(timeout)
         await self._install_navigation_guard(page)
-        await self._install_resource_blocking(page)
         cookies = load_cookies(url)
         if cookies and hasattr(context, "add_cookies"):
             await context.add_cookies(cookies)

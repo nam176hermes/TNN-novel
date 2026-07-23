@@ -92,6 +92,7 @@ class FakePage:
         self.handlers: dict[str, Any] = {}
         self.main_frame = object()
         self.frames = []  # No child frames by default
+        self.route_install_count = 0
 
     def set_default_timeout(self, timeout: int) -> None:
         self.timeout = timeout
@@ -100,6 +101,7 @@ class FakePage:
         self.handlers[event] = handler
 
     async def route(self, pattern: str, handler) -> None:
+        self.route_install_count += 1
         self.route_handler = handler
 
     async def goto(self, url: str, *, wait_until: str) -> None:
@@ -438,6 +440,190 @@ async def test_browser_session_blocks_private_subresource_at_network_layer(tmp_p
 
     assert route.aborted and not route.continued
     assert manager._navigation_violation is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "private_url",
+    (
+        "http://[::1]/private-script.js",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.8/private-script.js",
+    ),
+)
+async def test_browser_session_guard_blocks_private_ip_variants(tmp_path, private_url: str) -> None:
+    from app.utils.stealth_browser import BrowserSessionManager
+
+    class Request:
+        resource_type = "script"
+
+        def __init__(self, frame) -> None:
+            self.frame = frame
+            self.url = private_url
+
+        def is_navigation_request(self) -> bool:
+            return False
+
+    class Route:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self, reason: str = "") -> None:
+            self.aborted = True
+
+        async def continue_(self) -> None:
+            self.continued = True
+
+    page = FakePage()
+    factory, _contexts, _playwrights, _launch_options = fake_playwright_factory([page])
+    manager = BrowserSessionManager(
+        playwright_factory=factory,
+        profile_dir=tmp_path / "profile",
+        resolver=public_resolver,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    await manager.fetch("https://example.com/chapter/1")
+    route = Route()
+
+    await page.route_handler(route, Request(page.main_frame))
+
+    assert route.aborted and not route.continued
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_guard_blocks_hostname_resolving_private(tmp_path) -> None:
+    from app.utils.stealth_browser import BrowserSessionManager
+
+    def resolver(hostname: str, port: int) -> tuple[str, ...]:
+        if hostname == "internal.example":
+            return ("192.168.1.9",)
+        return public_resolver(hostname, port)
+
+    class Request:
+        url = "https://internal.example/private-script.js"
+        resource_type = "script"
+
+        def __init__(self, frame) -> None:
+            self.frame = frame
+
+        def is_navigation_request(self) -> bool:
+            return False
+
+    class Route:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self, reason: str = "") -> None:
+            self.aborted = True
+
+        async def continue_(self) -> None:
+            self.continued = True
+
+    page = FakePage()
+    factory, _contexts, _playwrights, _launch_options = fake_playwright_factory([page])
+    manager = BrowserSessionManager(
+        playwright_factory=factory,
+        profile_dir=tmp_path / "profile",
+        resolver=resolver,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    await manager.fetch("https://example.com/chapter/1")
+    route = Route()
+
+    await page.route_handler(route, Request(page.main_frame))
+
+    assert route.aborted and not route.continued
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_guard_blocks_private_iframe_without_top_level_failure(tmp_path) -> None:
+    from app.utils.stealth_browser import BrowserSessionManager
+
+    class Request:
+        url = "http://127.0.0.1/private-frame"
+        resource_type = "document"
+
+        def __init__(self, frame) -> None:
+            self.frame = frame
+
+        def is_navigation_request(self) -> bool:
+            return True
+
+    class Route:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self, reason: str = "") -> None:
+            self.aborted = True
+
+        async def continue_(self) -> None:
+            self.continued = True
+
+    page = FakePage()
+    child_frame = object()
+    factory, _contexts, _playwrights, _launch_options = fake_playwright_factory([page])
+    manager = BrowserSessionManager(
+        playwright_factory=factory,
+        profile_dir=tmp_path / "profile",
+        resolver=public_resolver,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    await manager.fetch("https://example.com/chapter/1")
+    route = Route()
+
+    await page.route_handler(route, Request(child_frame))
+
+    assert route.aborted and not route.continued
+    assert manager._navigation_violation is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_session_uses_one_canonical_request_route_for_policy_and_resources(tmp_path) -> None:
+    from app.utils.stealth_browser import BrowserSessionManager
+
+    class Request:
+        url = "https://example.com/font.woff2"
+        resource_type = "font"
+
+        def __init__(self, frame) -> None:
+            self.frame = frame
+
+        def is_navigation_request(self) -> bool:
+            return False
+
+    class Route:
+        def __init__(self) -> None:
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self, reason: str = "") -> None:
+            self.aborted = True
+
+        async def continue_(self) -> None:
+            self.continued = True
+
+    page = FakePage()
+    factory, _contexts, _playwrights, _launch_options = fake_playwright_factory([page])
+    manager = BrowserSessionManager(
+        playwright_factory=factory,
+        profile_dir=tmp_path / "profile",
+        resolver=public_resolver,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    await manager.fetch("https://example.com/chapter/1")
+    route = Route()
+
+    await page.route_handler(route, Request(page.main_frame))
+
+    assert page.route_install_count == 1
+    assert route.aborted and not route.continued
     await manager.close()
 
 
