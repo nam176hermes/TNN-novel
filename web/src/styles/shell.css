@@ -1880,4 +1880,26 @@
       min-height: 44px;
     }
   }
+
+  @media (max-width: 820px) {
+    /*
+     * Enforce one visible-control hit-area policy after feature styles have
+     * loaded. Native range, checkbox, radio and file controls keep their
+     * specialised geometry; their visible labels provide the interaction
+     * area and are intentionally excluded from the automated policy probe.
+     */
+    .workflow-shell :where(
+      button,
+      a[href],
+      select,
+      textarea,
+      input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"])
+    ) {
+      min-height: 44px;
+    }
+
+    .workflow-shell :where(button, a[href]) {
+      min-width: 44px;
+    }
+  }
 }

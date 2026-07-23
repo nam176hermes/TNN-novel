@@ -412,6 +412,29 @@ async function expectActionAboveMobileNavigation(page: Page, actionName: string)
   expect((actionBox?.y ?? 0) + (actionBox?.height ?? 0)).toBeLessThanOrEqual((navigationBox?.y ?? 0) + 1);
 }
 
+async function expectVisibleMobileTouchTargets(page: Page, surface: string) {
+  const undersized = await page.locator([
+    'button:visible',
+    'a[href]:visible',
+    'select:visible',
+    'textarea:visible',
+    'input:visible:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"])',
+  ].join(',')).evaluateAll((elements) => elements
+    .filter((element) => !element.closest('[aria-hidden="true"]'))
+    .map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        label: element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 80) || element.tagName,
+        tag: element.tagName.toLowerCase(),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      };
+    })
+    .filter(({ width, height }) => width < 44 || height < 44));
+
+  expect(undersized, `${surface} has visible controls below the 44px mobile hit-area policy`).toEqual([]);
+}
+
 test('login works and protected shell is blocked without a token', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await installApiMock(page, state);
@@ -681,6 +704,47 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(filePreview).toHaveCSS('padding', '18px');
   await expect(filePreview).toHaveCSS('max-height', 'none');
   await expect(filePreview).toHaveCSS('overflow', 'visible');
+});
+
+test('visible mobile controls use the approved touch-target policy', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  await expectVisibleMobileTouchTargets(page, 'Dashboard');
+
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await mobileNav.getByRole('button', { name: 'Tác vụ' }).click();
+  await expect(page.getByRole('heading', { name: 'Tác vụ', exact: true })).toBeVisible();
+  await expectVisibleMobileTouchTargets(page, 'Jobs');
+
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+  await page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Nguồn truyện' }).click();
+  await expect(page.getByRole('heading', { name: 'Nguồn truyện' })).toBeVisible();
+  await expectVisibleMobileTouchTargets(page, 'Sources');
+
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+  await page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Trạng thái' }).click();
+  await expect(page.getByRole('heading', { name: 'Trạng thái hệ thống' })).toBeVisible();
+  await expectVisibleMobileTouchTargets(page, 'Status and Settings');
+
+  await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await expectVisibleMobileTouchTargets(page, 'Reader More');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
+  await expectVisibleMobileTouchTargets(page, 'Reader font settings');
+
+  for (const viewport of [
+    { width: 360, height: 740 },
+    { width: 390, height: 844 },
+    { width: 412, height: 915 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expectVisibleMobileTouchTargets(page, `Reader font settings at ${viewport.width}x${viewport.height}`);
+    await expectNoHorizontalOverflow(page);
+  }
 });
 
 test('exports a translated book as TXT without calling a live API', async ({ page }) => {
