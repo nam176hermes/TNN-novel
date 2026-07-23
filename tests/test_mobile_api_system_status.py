@@ -251,7 +251,7 @@ async def test_system_status_exposes_only_safe_retention_counts_and_summary(
 
     assert response.status_code == 200
     retention = response.json()["retention"]
-    assert set(retention) == {"table_counts", "last_run"}
+    assert set(retention) == {"table_counts", "auth_session_counts", "last_run"}
     assert set(retention["table_counts"]) == {
         "auth_sessions",
         "auth_login_failures",
@@ -259,6 +259,15 @@ async def test_system_status_exposes_only_safe_retention_counts_and_summary(
     }
     assert all(isinstance(count, int) for count in retention["table_counts"].values())
     assert retention["table_counts"]["auth_sessions"] == 1
+    assert retention["auth_session_counts"] == {
+        "total": 1,
+        "active": 1,
+        "expired": 0,
+        "revoked": 0,
+        "age_eligible": 0,
+        "row_cap_eligible": 0,
+        "would_remove": 0,
+    }
     assert retention["last_run"] == {
         "last_run_at": "2026-07-13T12:00:00+00:00",
         "deleted_counts": {

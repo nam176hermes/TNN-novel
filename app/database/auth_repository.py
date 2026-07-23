@@ -367,3 +367,58 @@ def prune_auth_records(
             raise
 
     return deleted
+
+
+def get_auth_session_retention_report(
+    db_path: Path,
+    *,
+    session_policy: RetentionPolicy,
+    now: str | None = None,
+) -> dict[str, int]:
+    """Return a read-only session classification and eventual prune estimate."""
+    comparison_time = now or _utcnow_text()
+    age_modifier = f"-{session_policy.max_age_days} days"
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE
+                    WHEN COALESCE(revoked_at, '') = ''
+                     AND julianday(expires_at) > julianday(?) THEN 1 ELSE 0 END
+                ) AS active,
+                SUM(CASE
+                    WHEN COALESCE(revoked_at, '') = ''
+                     AND julianday(expires_at) <= julianday(?) THEN 1 ELSE 0 END
+                ) AS expired,
+                SUM(CASE WHEN COALESCE(revoked_at, '') <> '' THEN 1 ELSE 0 END) AS revoked
+            FROM auth_sessions
+            """,
+            (comparison_time, comparison_time),
+        ).fetchone()
+        age_eligible_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS row_count
+            FROM auth_sessions
+            WHERE {_SESSION_RETENTION_ELIGIBLE}
+              AND julianday({_SESSION_RETENTION_TIME}) < julianday(?, ?)
+            """,
+            (comparison_time, comparison_time, age_modifier),
+        ).fetchone()
+
+    total = int(row["total"] if row else 0)
+    active = int((row["active"] if row else 0) or 0)
+    expired = int((row["expired"] if row else 0) or 0)
+    revoked = int((row["revoked"] if row else 0) or 0)
+    age_eligible = int(age_eligible_row["row_count"] if age_eligible_row else 0)
+    inactive_after_age = max(0, expired + revoked - age_eligible)
+    row_cap_eligible = max(0, inactive_after_age - session_policy.max_rows)
+    return {
+        "total": total,
+        "active": active,
+        "expired": expired,
+        "revoked": revoked,
+        "age_eligible": age_eligible,
+        "row_cap_eligible": row_cap_eligible,
+        "would_remove": age_eligible + row_cap_eligible,
+    }

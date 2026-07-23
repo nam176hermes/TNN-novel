@@ -399,6 +399,15 @@ async def test_status_contains_only_table_counts_and_the_last_safe_summary(
             "auth_login_failures": 1,
             "operational_events": 1,
         },
+        "auth_session_counts": {
+            "total": 0,
+            "active": 0,
+            "expired": 0,
+            "revoked": 0,
+            "age_eligible": 0,
+            "row_cap_eligible": 0,
+            "would_remove": 0,
+        },
         "last_run": None,
     }
     assert str(temp_db_path) not in repr(status)

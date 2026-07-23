@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.database.connection import get_connection
-from app.database.auth_repository import prune_auth_records
+from app.database.auth_repository import get_auth_session_retention_report, prune_auth_records
 from app.database.operations_repository import RetentionPolicy, prune_operational_events
 
 
@@ -131,6 +131,51 @@ def test_age_pruning_supports_timestamp_forms_and_preserves_active_sessions(
         "revoked-recent-iso",
     ]
     assert _values(temp_db_path, "auth_login_failures", "username") == ["recent"]
+
+
+def test_auth_session_retention_report_is_read_only_and_classifies_active_rows(
+    temp_db_path: Path,
+) -> None:
+    _insert_session(
+        temp_db_path,
+        session_id="active",
+        created_at="2025-01-01T00:00:00+00:00",
+        expires_at="2026-03-01T00:00:00+00:00",
+    )
+    _insert_session(
+        temp_db_path,
+        session_id="expired-old",
+        created_at="2025-01-01T00:00:00+00:00",
+        expires_at="2026-01-01T00:00:00+00:00",
+    )
+    _insert_session(
+        temp_db_path,
+        session_id="revoked-old",
+        created_at="2025-01-01T00:00:00+00:00",
+        expires_at="2026-03-01T00:00:00+00:00",
+        revoked_at="2026-01-01T00:00:00+00:00",
+    )
+
+    report = get_auth_session_retention_report(
+        temp_db_path,
+        session_policy=_policy(),
+        now=NOW,
+    )
+
+    assert report == {
+        "total": 3,
+        "active": 1,
+        "expired": 1,
+        "revoked": 1,
+        "age_eligible": 2,
+        "row_cap_eligible": 0,
+        "would_remove": 2,
+    }
+    assert _values(temp_db_path, "auth_sessions", "session_id") == [
+        "active",
+        "expired-old",
+        "revoked-old",
+    ]
 
 
 def test_operational_event_age_pruning_supports_timestamp_forms(temp_db_path: Path) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Literal
 
-from app.database.auth_repository import prune_auth_records
+from app.database.auth_repository import get_auth_session_retention_report, prune_auth_records
 from app.database.connection import get_connection
 from app.database.operations_repository import (
     RetentionPolicy,
@@ -317,8 +317,25 @@ class RetentionService:
             table_counts = await asyncio.to_thread(_count_retention_rows, self.db_path)
         except sqlite3.Error:
             table_counts = _empty_counts()
+        try:
+            auth_session_counts = await asyncio.to_thread(
+                get_auth_session_retention_report,
+                self.db_path,
+                session_policy=self._session_policy,
+            )
+        except sqlite3.Error:
+            auth_session_counts = {
+                "total": 0,
+                "active": 0,
+                "expired": 0,
+                "revoked": 0,
+                "age_eligible": 0,
+                "row_cap_eligible": 0,
+                "would_remove": 0,
+            }
         return {
             "table_counts": table_counts,
+            "auth_session_counts": auth_session_counts,
             "last_run": self._last_summary.to_status() if self._last_summary else None,
         }
 
