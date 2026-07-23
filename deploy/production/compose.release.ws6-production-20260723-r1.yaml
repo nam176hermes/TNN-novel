@@ -1,0 +1,7 @@
+# WS6 production release pin. Both images must be built from the same reviewed
+# commit with NOVEL_RELEASE_ID=ws6-production-20260723-r1 before deployment.
+services:
+  api:
+    image: novel-pipeline-api:ws6-production-20260723-r1
+  import-worker:
+    image: novel-pipeline-import-worker:ws6-production-20260723-r1
