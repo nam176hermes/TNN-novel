@@ -4,6 +4,13 @@ services:
       context: .
       dockerfile: Dockerfile
       target: api
+      args: &release-build-args
+        NOVEL_APP_VERSION: "${NOVEL_APP_VERSION:-0.1.0}"
+        NOVEL_FRONTEND_VERSION: "${NOVEL_FRONTEND_VERSION:-0.1.0}"
+        NOVEL_GIT_SHA: "${NOVEL_GIT_SHA:-unknown}"
+        NOVEL_BUILD_TIMESTAMP: "${NOVEL_BUILD_TIMESTAMP:-unknown}"
+        NOVEL_RELEASE_ID: "${NOVEL_RELEASE_ID:-development}"
+        NOVEL_IMAGE_TAG: "${NOVEL_API_IMAGE_TAG:-novel-pipeline-api:local}"
     image: novel-pipeline-api:local
     restart: unless-stopped
     init: true
@@ -24,6 +31,8 @@ services:
       MOBILE_API_ADMIN_PASSWORD: "${MOBILE_API_ADMIN_PASSWORD:?Set MOBILE_API_ADMIN_PASSWORD in .env before running docker compose}"
       MOBILE_API_CORS_ORIGINS: "${MOBILE_API_CORS_ORIGINS:-http://localhost,http://127.0.0.1,https://novel-tnn.tradingcompanydirect.com}"
       PUBLIC_DEPLOY: "${PUBLIC_DEPLOY:-0}"
+      NOVEL_COMPONENT: api
+      NOVEL_IMAGE_DIGEST: "${NOVEL_API_IMAGE_DIGEST:-unknown}"
       REMOTE_API_KEY: "${REMOTE_API_KEY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
@@ -58,6 +67,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: import-worker
+      args:
+        <<: *release-build-args
+        NOVEL_IMAGE_TAG: "${NOVEL_WORKER_IMAGE_TAG:-novel-pipeline-import-worker:local}"
     image: novel-pipeline-import-worker:local
     restart: unless-stopped
     init: true
@@ -65,6 +77,8 @@ services:
     environment:
       DATA_DIR: /data
       IMPORT_JOB_RUN_IN_API: "0"
+      NOVEL_COMPONENT: import-worker
+      NOVEL_IMAGE_DIGEST: "${NOVEL_WORKER_IMAGE_DIGEST:-unknown}"
       IMPORT_WORKER_POLL_INTERVAL_SECONDS: "1"
       IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS: "45"
       IMPORT_JOB_MAX_CHAPTERS: "${IMPORT_JOB_MAX_CHAPTERS:-200}"

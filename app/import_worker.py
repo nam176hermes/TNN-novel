@@ -28,6 +28,7 @@ from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.services.import_job_factory import create_import_job_service
 from app.services.import_job_service import ImportJobService
 from app.utils.stealth_browser import close_stealth_browser
+from app.runtime_identity import get_runtime_identity
 
 
 _TERMINAL_JOB_STATUSES = {
@@ -41,9 +42,16 @@ _TERMINAL_JOB_STATUSES = {
 class WorkerHeartbeat:
     """Atomically update one safe heartbeat timestamp file."""
 
-    def __init__(self, path: Path, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        clock: Callable[[], float] = time.time,
+        worker_id: str = "",
+    ) -> None:
         self.path = Path(path)
         self._clock = clock
+        self.worker_id = str(worker_id or "")[:128]
 
     def touch(self) -> None:
         timestamp = self._clock()
@@ -60,7 +68,18 @@ class WorkerHeartbeat:
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump({"updated_at": int(timestamp)}, handle, separators=(",", ":"))
+                identity = get_runtime_identity(component="import-worker")
+                json.dump(
+                    {
+                        "updated_at": int(timestamp),
+                        "worker_id": self.worker_id,
+                        "release_id": identity.release_id,
+                        "git_sha": identity.git_sha,
+                        "component": identity.component,
+                    },
+                    handle,
+                    separators=(",", ":"),
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
@@ -113,7 +132,11 @@ class DurableImportWorker:
         close_browser: Callable[[], None] | None = None,
     ) -> None:
         self.service = service
-        self.heartbeat = WorkerHeartbeat(heartbeat_path, clock=clock)
+        self.heartbeat = WorkerHeartbeat(
+            heartbeat_path,
+            clock=clock,
+            worker_id=str(getattr(service, "worker_id", "")),
+        )
         self.poll_interval_seconds = max(0.05, poll_interval_seconds)
         self._close_browser = close_browser or _close_browser_sync
 

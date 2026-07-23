@@ -36,6 +36,14 @@ class ReadinessResponse(BaseModel):
 
 class VersionResponse(BaseModel):
     version: str
+    frontend_version: str = ""
+    git_sha: str = "unknown"
+    build_timestamp: str = "unknown"
+    release_id: str = "development"
+    image_tag: str = "unknown"
+    image_digest: str = "unknown"
+    schema_revision: str = ""
+    component: str = "api"
     build: str = ""
 
 

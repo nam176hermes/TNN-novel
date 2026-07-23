@@ -16,6 +16,7 @@ from app.mobile_api.public_mode import is_public_request, sanitize_public_payloa
 from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStatusResponse, VersionResponse
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 from app.mobile_api.services.retention_service import RetentionService
+from app.runtime_identity import get_runtime_identity
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -157,7 +158,8 @@ async def readiness_check(request: Request, response: Response):
 
 @router.get("/version", response_model=VersionResponse)
 async def version_info():
-    return VersionResponse(version=mobile_settings.version, build="phase1")
+    identity = get_runtime_identity(component="api")
+    return VersionResponse(**identity.safe_dict(), build=identity.release_id)
 
 
 @router.get("/system/status", response_model=SystemStatusResponse)
@@ -234,6 +236,7 @@ async def system_status(request: Request):
         data_size_bytes += db_size
     storage_health = "healthy" if api_ready else "degraded"
 
+    identity = get_runtime_identity(component="api")
     return SystemStatusResponse(
         db_size_bytes=db_size,
         cache_count=cache.get("count", 0),
@@ -261,7 +264,7 @@ async def system_status(request: Request):
         recent_operational_events=recent_events[:20],
         recent_backup_events=recent_backup_events,
         retention=retention_status,
-        app_version=mobile_settings.version,
-        build="phase1",
+        app_version=identity.version,
+        build=identity.release_id,
         backup_recommendation="System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.",
     )
