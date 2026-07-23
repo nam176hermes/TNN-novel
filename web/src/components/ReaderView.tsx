@@ -121,6 +121,10 @@ import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichB
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
 import { useReaderAudio } from './reader/useReaderAudio';
 import {
+  deriveReaderTextModeCapabilities,
+  resolveReaderTextMode,
+} from './reader/readerTextModeCapabilities';
+import {
   loadReaderSettings,
   loadReaderTextMode,
   saveReaderSettings,
@@ -1749,10 +1753,12 @@ export default function ReaderView({
   const rawText = readerSourceText.trim();
   const richBlocks = useMemo(() => extractReaderRichBlocks(readerContentHtml), [readerContentHtml]);
   const rawParagraphs = useMemo(() => splitParagraphs(rawText), [rawText]);
-  const rawContentAvailable = rawParagraphs.length > 0;
+  const textModeCapabilities = deriveReaderTextModeCapabilities({
+    contentHtml: readerContentHtml,
+    sourceText: readerSourceText,
+    translationText: readerTranslationText,
+  });
   const richContentAvailable = readerContentHtml.trim().length > 0;
-  const translationContentAvailable = readerTranslationText.trim().length > 0 || richContentAvailable;
-  const splitContentAvailable = rawContentAvailable && translationContentAvailable;
   const hasRichContent = richContentAvailable;
   const progressTextBlocks = useMemo(
     () => (hasRichContent ? richBlocks.map((block) => block.text) : paragraphs),
@@ -1828,21 +1834,10 @@ export default function ReaderView({
       && translationLooksTitleOnly(readerTranslationText, selectedChapter)
       && (!hasRichContent || !hasReadableRichText),
   );
+  const compatibleReaderTextMode = resolveReaderTextMode(readerTextMode, textModeCapabilities);
   useEffect(() => {
-    if (readerTextMode === 'raw' && !rawContentAvailable) {
-      setReaderTextMode('translation');
-      return;
-    }
-    if ((readerTextMode === 'split' || readerTextMode === 'raw-collapsed') && !splitContentAvailable) {
-      setReaderTextMode(translationContentAvailable ? 'translation' : rawContentAvailable ? 'raw' : 'translation');
-      return;
-    }
-    if ((readerTextMode === 'translation' || readerTextMode === 'qa-overlay')
-      && !translationContentAvailable
-      && rawContentAvailable) {
-      setReaderTextMode('raw');
-    }
-  }, [rawContentAvailable, readerTextMode, setReaderTextMode, splitContentAvailable, translationContentAvailable]);
+    if (compatibleReaderTextMode !== readerTextMode) setReaderTextMode(compatibleReaderTextMode);
+  }, [compatibleReaderTextMode, readerTextMode, setReaderTextMode]);
 
   const readerStyle = {
     '--reader-character-spacing': `${readerSettings.characterSpacing}px`,
@@ -3493,9 +3488,9 @@ export default function ReaderView({
     onToggleMore: () => setMoreOpen((current) => !current),
   };
   const quickModes: ReaderQuickModeControls = {
-    rawAvailable: rawContentAvailable,
-    rawCollapsedAvailable: splitContentAvailable,
-    splitAvailable: splitContentAvailable,
+    rawAvailable: textModeCapabilities.rawAvailable,
+    rawCollapsedAvailable: textModeCapabilities.rawCollapsedAvailable,
+    splitAvailable: textModeCapabilities.splitAvailable,
     value: readerTextMode,
     onChange: setReaderTextMode,
   };
