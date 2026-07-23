@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from app.ingestion.source_adapters import (
     DomSourceAdapter,
     FetchErrorCode,
     SourceAdapterError,
+    SourceAdapterRegistry,
     build_default_source_adapters,
     get_source_registry,
 )
@@ -153,28 +155,23 @@ CASES = (
     ),
 )
 
-EXPECTED_DEDICATED_DOMAINS = {
-    "69shuba.com",
-    "69shuba.cx",
-    "69shux.com",
-    "69shumi.com",
-    "69shumi.net",
-    "biquge.tw",
-    "22biqu.com",
-    "uukanshu.cc",
-    "17k.com",
-    "52shuku.net",
-    "fanqienovel.com",
-    "jjwxc.net",
-    "qidian.com",
-    "novel543.com",
-    "hetushu.com",
-    "ixdzs.com",
-    "ixdzs8.com",
-    "xbanxia.cc",
-    "xbanxia.com",
-    "book.qq.com",
+REQUIRED_ACTIVE_DOMAINS = {
+    "xbiquge.info",
+    "xbiquge.so",
+    "meionovels.com",
+    "scribblehub.com",
+    "lnmtl.com",
 }
+
+
+def _registered_dedicated_domains() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            domain
+            for registration in get_source_registry().registrations
+            for domain in registration.domains
+        )
+    )
 
 
 def _fixture(name: str) -> str:
@@ -182,15 +179,72 @@ def _fixture(name: str) -> str:
 
 
 def test_every_dedicated_registry_adapter_uses_the_dom_contract() -> None:
-    adapters = [adapter for adapter in build_default_source_adapters() if getattr(adapter, "domains", ())]
+    registry = get_source_registry()
+    adapters = [adapter for adapter in registry.adapters if getattr(adapter, "domains", ())]
 
     assert all(isinstance(adapter, DomSourceAdapter) for adapter in adapters)
-    assert {domain for adapter in adapters for domain in adapter.domains} == EXPECTED_DEDICATED_DOMAINS
+    assert REQUIRED_ACTIVE_DOMAINS <= set(_registered_dedicated_domains())
+    assert {adapter.adapter_id for adapter in adapters} == {
+        registration.adapter_id for registration in registry.registrations
+    }
+    assert all(registration.label for registration in registry.registrations)
+    assert all(registration.adapter_version.endswith("-dom-v1") for registration in registry.registrations)
     fallback_ids = {adapter.adapter_id for adapter in adapters if adapter._regex_fallback is not None}
     assert fallback_ids == {"69shuba", "69shumi"}
 
 
-@pytest.mark.parametrize("domain", sorted(EXPECTED_DEDICATED_DOMAINS))
+def test_default_registry_rejects_duplicate_adapter_registration() -> None:
+    adapter = next(adapter for adapter in build_default_source_adapters() if getattr(adapter, "domains", ()))
+
+    with pytest.raises(ValueError, match="Duplicate source adapter id"):
+        SourceAdapterRegistry([adapter, adapter])
+
+
+def test_default_registry_rejects_duplicate_domain_registration() -> None:
+    first = SimpleNamespace(
+        adapter_id="first",
+        label="First",
+        domains=("duplicate.example",),
+        adapter_version="first-dom-v1",
+    )
+    second = SimpleNamespace(
+        adapter_id="second",
+        label="Second",
+        domains=("duplicate.example",),
+        adapter_version="second-dom-v1",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate source adapter domain"):
+        SourceAdapterRegistry([first, second])  # type: ignore[list-item]
+
+
+def test_default_registry_rejects_missing_registration_metadata() -> None:
+    incomplete = SimpleNamespace(
+        adapter_id="",
+        label="Incomplete",
+        domains=("missing.example",),
+        adapter_version="",
+    )
+
+    with pytest.raises(ValueError, match="require id, label, domains, and version metadata"):
+        SourceAdapterRegistry([incomplete])  # type: ignore[list-item]
+
+
+def test_factory_and_default_registry_have_no_unregistered_adapters() -> None:
+    factory_contract = {
+        (adapter.adapter_id, adapter.label, tuple(adapter.domains), adapter.adapter_version)
+        for adapter in build_default_source_adapters()
+        if getattr(adapter, "domains", ())
+    }
+    registry_contract = {
+        (registration.adapter_id, registration.label, registration.domains, registration.adapter_version)
+        for registration in get_source_registry().registrations
+    }
+
+    assert factory_contract == registry_contract
+
+
+@pytest.mark.parametrize("domain", _registered_dedicated_domains())
 def test_every_dedicated_domain_resolves_to_a_versioned_dom_adapter(domain: str) -> None:
     adapter = get_source_registry().get_for_url(f"https://www.{domain}/book/1/")
 
