@@ -390,6 +390,8 @@ async def test_logout_revokes_current_server_side_session(
 
     assert logout.status_code == 200
     assert after_logout.status_code == 401
+    assert not client.cookies.get("novel_refresh_session")
+    assert not client.cookies.get("novel_csrf")
     with sqlite3.connect(db_path) as conn:
         revoked_at = conn.execute("SELECT revoked_at FROM auth_sessions").fetchone()[0]
     assert revoked_at

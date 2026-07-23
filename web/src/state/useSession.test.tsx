@@ -4,6 +4,39 @@ import { clearToken, loadRefreshToken, loadToken, saveSessionTokens } from './se
 import { useSession } from './useSession';
 
 describe('useSession', () => {
+  it('serializes cookie refresh through the browser cross-tab lock', async () => {
+    clearToken();
+    document.cookie = 'novel_csrf=csrf-test; path=/';
+    const request = vi.fn(async (
+      _name: string,
+      _options: LockOptions,
+      callback: () => Promise<unknown>,
+    ) => callback());
+    Object.defineProperty(window.navigator, 'locks', {
+      configurable: true,
+      value: { request },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ access_token: 'restored-access', token_type: 'bearer' }),
+      { headers: { 'content-type': 'application/json' }, status: 200 },
+    )));
+
+    try {
+      const { result } = renderHook(() => useSession('http://127.0.0.1:7860', false));
+
+      await waitFor(() => expect(result.current.isAuthenticated).toBe(true));
+      expect(request).toHaveBeenCalledWith(
+        'novel-tnn-auth-refresh',
+        { mode: 'exclusive' },
+        expect.any(Function),
+      );
+      expect(loadToken()).toBe('restored-access');
+    } finally {
+      vi.unstubAllGlobals();
+      Reflect.deleteProperty(window.navigator, 'locks');
+    }
+  });
+
   it('treats no-login mode as authenticated without bearer tokens', async () => {
     saveSessionTokens('stale-access', 'stale-refresh');
 
