@@ -17,6 +17,8 @@ from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStat
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 from app.mobile_api.services.retention_service import RetentionService
 from app.runtime_identity import get_runtime_identity
+from app.runtime_status import inspect_worker_runtime
+from app.services.tts.availability import inspect_tts_capability
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -146,13 +148,57 @@ async def readiness_check(request: Request, response: Response):
         checks["public_deploy"] = True
         public_details["public_deploy"] = "enabled" if mobile_settings.public_deploy else "disabled"
 
-    status = "ok" if all(checks.values()) else "degraded"
-    if status != "ok":
+    identity = get_runtime_identity(component="api")
+    worker = inspect_worker_runtime(
+        data_dir=data_dir,
+        db_path=get_db_path(),
+        api_identity=identity,
+        required=not mobile_settings.import_job_run_in_api,
+        max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
+    )
+    checks["worker"] = worker.queue_claim_capable
+    public_details["worker"] = worker.status
+    if not public_request and not mobile_settings.public_deploy:
+        details["worker"] = worker.status
+
+    tts = inspect_tts_capability()
+    required_checks = {
+        name: value
+        for name, value in checks.items()
+        if name != "public_deploy" or public_request
+    }
+    core_ready = all(
+        required_checks.get(name, False)
+        for name in ("storage", "data_dir_writable", "database", "disk_space", "jobs")
+    ) and required_checks.get("public_config", True) and required_checks.get("public_deploy", True)
+    jobs_ready = worker.queue_claim_capable
+    if not core_ready or not jobs_ready:
+        status = "not_ready"
+    elif not tts.available:
+        status = "ready_with_degraded_capabilities"
+    else:
+        status = "ready"
+    if status == "not_ready":
         response.status_code = 503
     return ReadinessResponse(
         status=status,
         checks=checks,
         details=public_details if (public_request or mobile_settings.public_deploy) else details,
+        core={
+            "api": "ready",
+            "database": "ready" if checks.get("database") else "not_ready",
+            "storage": "ready" if checks.get("storage") else "not_ready",
+            "disk": "ready" if checks.get("disk_space") else "not_ready",
+            "configuration": "ready" if checks.get("public_config", True) else "not_ready",
+        },
+        job_processing=worker.safe_dict(),
+        capabilities={"tts": tts.safe_dict()},
+        release={
+            "release_id": identity.release_id,
+            "git_sha": identity.git_sha,
+            "worker_release": worker.release_id,
+            "match": "true" if worker.release_match else "false",
+        },
     )
 
 

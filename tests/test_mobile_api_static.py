@@ -226,7 +226,7 @@ async def test_public_host_readiness_fails_safe_and_hides_paths_when_public_depl
 
     assert response.status_code == 503
     data = response.json()
-    assert data["status"] == "degraded"
+    assert data["status"] == "not_ready"
     assert data["checks"]["public_deploy"] is False
     assert data["details"]["public_deploy"] == "disabled"
     body = response.text

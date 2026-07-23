@@ -32,6 +32,10 @@ class ReadinessResponse(BaseModel):
     status: str
     checks: dict[str, bool]
     details: dict[str, str] = {}
+    core: dict[str, str] = Field(default_factory=dict)
+    job_processing: dict[str, Any] = Field(default_factory=dict)
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    release: dict[str, str] = Field(default_factory=dict)
 
 
 class VersionResponse(BaseModel):

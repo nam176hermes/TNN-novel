@@ -121,7 +121,7 @@ async def test_public_ready_sanitizes_internal_diagnostics(
     payload = ready.model_dump()
 
     assert response.status_code == 200
-    assert payload["status"] == "ok"
+    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
     assert payload["checks"]["database"] is True
     assert payload["checks"]["storage"] is True
     assert payload["checks"]["jobs"] is True
@@ -153,7 +153,7 @@ async def test_local_ready_keeps_useful_internal_diagnostics(
     ready = await health_router.readiness_check(_request_for_url("http://test/api/ready"), Response())
     payload = ready.model_dump()
 
-    assert payload["status"] == "ok"
+    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
     assert payload["details"]["data_dir"] == str(data_dir)
     assert payload["details"]["database"] == str(db_path)
 
