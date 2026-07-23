@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import PROJECT_ROOT, settings
+from app.services.tts.availability import require_tts_runtime_available
 
 logger = logging.getLogger(__name__)
 
@@ -116,17 +117,8 @@ def stable_audio_cache_key(
 
 
 def _resolve_device(requested: str) -> str:
-    requested = (requested or "cpu").lower()
-    if requested != "cuda":
-        return requested
-    try:
-        import torch  # type: ignore
-    except ImportError:
-        logger.warning("TTS_DEVICE=cuda requested but torch is unavailable; falling back to CPU")
-        return "cpu"
-    if not torch.cuda.is_available():
-        logger.warning("TTS_DEVICE=cuda requested but CUDA is unavailable; falling back to CPU")
-        return "cpu"
+    requested = (requested or "").strip().lower()
+    require_tts_runtime_available(provider="f5_vietnamese", device=requested)
     return "cuda"
 
 
@@ -158,11 +150,11 @@ class F5VietnameseEngine:
     def _load(self):
         if self._engine is not None:
             return self._engine
+        device = _resolve_device(self.config.device)
         try:
             from f5_tts.api import F5TTS  # type: ignore
         except ImportError as exc:
             raise TTSDependencyError("F5-TTS is not installed. Install f5-tts and configure ViVoice before using local Vietnamese TTS.") from exc
-        device = _resolve_device(self.config.device)
         model_name, ckpt_file, vocab_file = self._resolve_model_files()
         try:
             with _capture_upstream_output("load"):

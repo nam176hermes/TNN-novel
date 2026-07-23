@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 from app.config import PROJECT_ROOT
 from app.services.tts.f5_vietnamese_engine import (
     F5VietnameseConfig,
@@ -9,6 +11,7 @@ from app.services.tts.f5_vietnamese_engine import (
     VoiceConfig,
     stable_audio_cache_key,
 )
+from app.services.tts.availability import TTSUnavailableError
 
 
 def test_stable_audio_cache_hash_changes_only_when_inputs_change(tmp_path: Path) -> None:
@@ -41,6 +44,10 @@ def test_f5_engine_captures_upstream_console_output(
     api_module.F5TTS = FakeF5TTS
     monkeypatch.setitem(sys.modules, "f5_tts", types.ModuleType("f5_tts"))
     monkeypatch.setitem(sys.modules, "f5_tts.api", api_module)
+    monkeypatch.setattr(
+        "app.services.tts.f5_vietnamese_engine.require_tts_runtime_available",
+        lambda **_: None,
+    )
 
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"reference")
@@ -50,7 +57,7 @@ def test_f5_engine_captures_upstream_console_output(
             model="F5TTS_Base",
             ckpt_file=str(tmp_path / "model.pt"),
             vocab_file=str(tmp_path / "vocab.txt"),
-            device="cpu",
+            device="cuda",
             cache_enabled=False,
             cache_dir=tmp_path,
         )
@@ -66,6 +73,32 @@ def test_f5_engine_captures_upstream_console_output(
     assert "noisy f5" not in captured.out
     assert "noisy f5" not in captured.err
     assert output.read_bytes() == b"fake wav"
+
+
+def test_f5_engine_rejects_cpu_without_loading_runtime(tmp_path: Path, monkeypatch) -> None:
+    engine = F5VietnameseEngine(
+        F5VietnameseConfig(
+            model="vivioice",
+            device="cpu",
+            cache_enabled=False,
+            cache_dir=tmp_path,
+        )
+    )
+    model_resolution_called = False
+
+    def unexpected_model_resolution():
+        nonlocal model_resolution_called
+        model_resolution_called = True
+        raise AssertionError("model files must not be resolved without a supported GPU")
+
+    monkeypatch.setattr(engine, "_resolve_model_files", unexpected_model_resolution)
+
+    with pytest.raises(TTSUnavailableError) as exc_info:
+        engine._load()
+
+    assert exc_info.value.detail()["code"] == "tts_unavailable"
+    assert "CUDA GPU is required" in str(exc_info.value)
+    assert model_resolution_called is False
 
 
 def test_f5_engine_resolves_relative_checkpoint_paths_from_project_root(tmp_path: Path) -> None:
