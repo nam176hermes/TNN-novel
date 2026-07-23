@@ -444,7 +444,7 @@ async def test_refresh_token_rotation_rejects_old_refresh_token(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        token_response = await _login(client)
+        await _login(client)
         from app.mobile_api.config import mobile_settings
         old_refresh = client.cookies.get(mobile_settings.refresh_cookie_name)
         assert old_refresh
