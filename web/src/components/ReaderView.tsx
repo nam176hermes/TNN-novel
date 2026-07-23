@@ -166,7 +166,6 @@ export type ReaderApiClient = Pick<
   | 'getChapterTranslation'
   | 'getBookAudioPlaylist'
   | 'getJobStatus'
-  | 'getQaReport'
   | 'getReaderDictionaryPack'
   | 'getReaderXray'
   | 'getReaderState'
@@ -192,6 +191,9 @@ export type ReaderViewProps = {
   selectedChapter: Chapter | null;
   selectedChapterId: number | null;
   contentHtml: string;
+  qaError: string;
+  qaReport: QaReport | null;
+  qaState: LoadState;
   textError: string;
   textState: LoadState;
   translationText: string;
@@ -1506,6 +1508,9 @@ export default function ReaderView({
   selectedChapter,
   selectedChapterId,
   contentHtml,
+  qaError,
+  qaReport,
+  qaState,
   textError,
   textState,
   translationText,
@@ -1598,9 +1603,7 @@ export default function ReaderView({
   const [xrayEnriching, setXrayEnriching] = useState(false);
   const [xrayEnrichingScope, setXrayEnrichingScope] = useState<'chapter' | 'book' | null>(null);
   const [xrayError, setXrayError] = useState('');
-  const [readerQaReport, setReaderQaReport] = useState<QaReport | null>(null);
-  const [readerQaState, setReaderQaState] = useState<LoadState>('idle');
-  const [readerQaError, setReaderQaError] = useState('');
+
   const translatedChapters = useMemo(
     () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
     [chapters],
@@ -1670,7 +1673,7 @@ export default function ReaderView({
     onDownload: triggerBrowserDownload,
     onError: setMarksError,
     onSelectChapter: selectAudioChapter,
-    qaReport: readerQaReport,
+    qaReport,
     selectedChapter,
     selectedChapterId,
     translationText: readerTranslationText,
@@ -1831,35 +1834,7 @@ export default function ReaderView({
       setReaderTextMode('translation');
     }
   }, [rawContentAvailable, readerTextMode, setReaderTextMode]);
-  useEffect(() => {
-    if (!apiClient || !activeBookId || !selectedChapterId) {
-      setReaderQaReport(null);
-      setReaderQaState('idle');
-      setReaderQaError('');
-      return undefined;
-    }
 
-    let cancelled = false;
-    setReaderQaState('loading');
-    setReaderQaError('');
-
-    void apiClient.getQaReport(activeBookId, selectedChapterId)
-      .then((report) => {
-        if (cancelled) return;
-        setReaderQaReport(report);
-        setReaderQaState(report ? 'ready' : 'empty');
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setReaderQaReport(null);
-        setReaderQaState('error');
-        setReaderQaError(formatError(error));
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, apiClient, selectedChapterId]);
   const readerStyle = {
     '--reader-character-spacing': `${readerSettings.characterSpacing}px`,
     '--reader-font-size': `${readerSettings.fontSize}px`,
@@ -1874,8 +1849,8 @@ export default function ReaderView({
   const highlightedParagraphs = new Set(chapterMarks.highlights.map((highlight) => highlight.paragraphIndex));
   const notesByParagraph = new Map(chapterMarks.notes.map((note) => [note.paragraphIndex, note]));
   const qaBadgesByParagraph = useMemo(
-    () => buildReaderQaBadges(readerQaReport, paragraphs, rawParagraphs),
-    [paragraphs, rawParagraphs, readerQaReport],
+    () => buildReaderQaBadges(qaReport, paragraphs, rawParagraphs),
+    [paragraphs, qaReport, rawParagraphs],
   );
   const markPanelItems = buildReaderMarkPanelItems(marksStore, chapters, activeBookId);
   const readerSearchScopes = readerSearchOptions.scopes ?? DEFAULT_READER_SEARCH_SCOPES;
@@ -4060,9 +4035,9 @@ export default function ReaderView({
         {readerTextMode === 'qa-overlay' ? (
           <div className="reader-qa-overlay-stack">
             <ReaderQaSummaryPanel
-              error={readerQaError}
-              report={readerQaReport}
-              state={readerQaState}
+              error={qaError}
+              report={qaReport}
+              state={qaState}
             />
             <ReaderTextSurface
               ariaLabel="Bản dịch tiếng Việt với QA overlay"
