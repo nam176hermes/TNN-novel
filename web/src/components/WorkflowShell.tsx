@@ -19,6 +19,7 @@ import brandBook from '../assets/reference-ui/brand-sidebar-book.png';
 import brandCube from '../assets/reference-ui/brand-sidebar-cube.png';
 import brandExport from '../assets/reference-ui/brand-sidebar-export.png';
 import brandJobs from '../assets/reference-ui/brand-sidebar-jobs.png';
+import { useDialogFocusLifecycle } from '../hooks/useDialogFocusLifecycle';
 import ShellNav from './ShellNav';
 
 export type WorkflowView =
@@ -70,6 +71,10 @@ export default function WorkflowShell({
 }: WorkflowShellProps) {
   const mainRef = useRef<HTMLElement | null>(null);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
+  const mobileMoreRef = useDialogFocusLifecycle<HTMLElement>(
+    mobileMoreOpen,
+    () => setMobileMoreOpen(false),
+  );
   const apiStatusLabel = apiStatus === 'ready'
     ? 'Hoạt động tốt'
     : apiStatus === 'offline'
@@ -168,12 +173,19 @@ export default function WorkflowShell({
             aria-modal="true"
             className="mobile-more-sheet"
             onClick={(event) => event.stopPropagation()}
+            ref={mobileMoreRef}
             role="dialog"
+            tabIndex={-1}
           >
             <span aria-hidden="true" className="mobile-sheet-handle" />
             <header>
               <h2>Thêm</h2>
-              <button aria-label="Đóng menu Thêm" onClick={() => setMobileMoreOpen(false)} type="button">
+              <button
+                aria-label="Đóng menu Thêm"
+                data-dialog-initial-focus
+                onClick={() => setMobileMoreOpen(false)}
+                type="button"
+              >
                 <X aria-hidden="true" size={22} />
               </button>
             </header>

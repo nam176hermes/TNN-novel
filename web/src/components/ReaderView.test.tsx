@@ -4752,6 +4752,38 @@ describe('ReaderView', () => {
     expect(props.onOpenWorkbench).toHaveBeenCalledTimes(1);
   });
 
+  it('contains keyboard focus in Reader options and restores the trigger on Escape', async () => {
+    renderReader();
+    const user = userEvent.setup();
+    const trigger = screen.getByRole('button', { name: 'Thêm tùy chọn' });
+
+    trigger.focus();
+    await user.keyboard('{Enter}');
+
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    const bookSelect = within(menu).getByLabelText('Chọn truyện');
+    expect(bookSelect).toHaveFocus();
+    expect(document.body.style.overflow).toBe('hidden');
+
+    const enabledButtons = within(menu).getAllByRole('button')
+      .filter((button) => !button.hasAttribute('disabled'));
+    enabledButtons[enabledButtons.length - 1]?.focus();
+    await user.keyboard('{Tab}');
+    expect(bookSelect).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Tùy chọn đọc' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(document.body.style.overflow).toBe('');
+
+    await user.click(trigger);
+    const backdrop = document.querySelector<HTMLElement>('.reader-more-backdrop');
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+    expect(screen.queryByRole('dialog', { name: 'Tùy chọn đọc' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it('opens X-Ray with no-spoiler data for the current chapter', async () => {
     const apiClient = mockReaderApiClient();
     renderReader({ apiClient });

@@ -70,6 +70,41 @@ describe('WorkflowShell', () => {
     expect(onOpenImport).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps keyboard focus inside the mobile More dialog and restores it on close', async () => {
+    renderShell('workbench');
+    const user = userEvent.setup();
+    const mobileNav = screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+    const trigger = within(mobileNav).getByRole('button', { name: 'Thêm' });
+
+    trigger.focus();
+    await user.keyboard('{Enter}');
+
+    const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    const closeButton = within(moreSheet).getByRole('button', { name: 'Đóng menu Thêm' });
+    const logoutButton = within(moreSheet).getByRole('button', { name: 'Đăng xuất' });
+    expect(closeButton).toHaveFocus();
+    expect(document.body.style.overflow).toBe('hidden');
+
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(logoutButton).toHaveFocus();
+
+    logoutButton.focus();
+    await user.keyboard('{Tab}');
+    expect(closeButton).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Thêm' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(document.body.style.overflow).toBe('');
+
+    await user.click(trigger);
+    const backdrop = document.querySelector<HTMLElement>('.mobile-more-backdrop');
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+    expect(screen.queryByRole('dialog', { name: 'Thêm' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it('marks the active workflow view for immersive reader layout', () => {
     renderShell('reader');
 

@@ -512,9 +512,21 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
   await expect(mobileNav).toBeVisible();
   await expect(mobileNav.getByRole('button')).toHaveCount(5);
-  await expect(mobileNav.getByRole('button', { name: 'Thêm' })).toBeVisible();
-  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
-  const moreSheet = page.getByRole('dialog', { name: 'Thêm' });
+  const mobileMoreTrigger = mobileNav.getByRole('button', { name: 'Thêm' });
+  await expect(mobileMoreTrigger).toBeVisible();
+  await mobileMoreTrigger.focus();
+  await page.keyboard.press('Enter');
+  let moreSheet = page.getByRole('dialog', { name: 'Thêm' });
+  const closeMore = moreSheet.getByRole('button', { name: 'Đóng menu Thêm' });
+  await expect(closeMore).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(moreSheet.getByRole('button', { name: 'Đăng xuất' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(moreSheet).toBeHidden();
+  await expect(mobileMoreTrigger).toBeFocused();
+
+  await mobileMoreTrigger.click();
+  moreSheet = page.getByRole('dialog', { name: 'Thêm' });
   await expect(moreSheet).toContainText('Quản lý');
   await expect(moreSheet).toContainText('Hệ thống');
   await expect(moreSheet).toContainText('Tài khoản');
@@ -529,6 +541,16 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   await expect(page.getByRole('button', { name: 'Chương trước' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Mục lục' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Chương sau' })).toBeVisible();
+
+  const readerMoreTrigger = page.getByRole('button', { name: 'Thêm tùy chọn' });
+  await readerMoreTrigger.focus();
+  await page.keyboard.press('Enter');
+  const readerMore = page.getByRole('dialog', { name: 'Tùy chọn đọc' });
+  await expect(readerMore.getByLabel('Chọn truyện')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(readerMore).toBeHidden();
+  await expect(readerMoreTrigger).toBeFocused();
+
   const undersizedReaderButtons = await page.locator('button:visible').evaluateAll((buttons) => (
     buttons
       .map((button) => {

@@ -1668,6 +1668,15 @@
 .mobile-more-backdrop {
   display: none;
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-more-backdrop,
+  .mobile-more-sheet {
+    animation: none;
+    scroll-behavior: auto;
+    transition: none;
+  }
+}
 @media (max-width: 820px) {
   .workflow-shell:not([data-active-view="reader"]) {
     display: block;

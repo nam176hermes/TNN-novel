@@ -30,6 +30,7 @@ import type {
 } from '../api/types';
 import coverDocTu from '../assets/reference-ui/cover-doc-tu-clean.png';
 import coverThanhSon from '../assets/reference-ui/cover-thanh-son-clean.png';
+import { useDialogFocusLifecycle } from '../hooks/useDialogFocusLifecycle';
 import {
   absoluteCharOffsetForParagraph,
   bookProgressPercent,
@@ -1547,6 +1548,7 @@ export default function ReaderView({
   const [bookSearchLoading, setBookSearchLoading] = useState(false);
   const [bookSearchError, setBookSearchError] = useState('');
   const [moreOpen, setMoreOpen] = useState(false);
+  const moreDialogRef = useDialogFocusLifecycle<HTMLDivElement>(moreOpen, () => setMoreOpen(false));
   const [marksPanelOpen, setMarksPanelOpen] = useState(false);
   const [marksError, setMarksError] = useState('');
   const [readerSyncStatus, setReaderSyncStatus] = useState('');
@@ -1707,6 +1709,7 @@ export default function ReaderView({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
       if (event.key !== 'Escape') return;
       if (tocOpen) {
         setTocOpen(false);
@@ -3548,10 +3551,25 @@ export default function ReaderView({
       <ReaderAudioSummary audio={readerAudio} visible={chromeVisible} />
 
       {moreOpen ? (
-        <div aria-label="Tùy chọn đọc" className="reader-more-popover" role="dialog">
+        <div
+          className="reader-more-backdrop"
+          onClick={(event) => {
+            if (event.currentTarget === event.target) setMoreOpen(false);
+          }}
+          role="presentation"
+        >
+        <div
+          aria-label="Tùy chọn đọc"
+          aria-modal="true"
+          className="reader-more-popover"
+          ref={moreDialogRef}
+          role="dialog"
+          tabIndex={-1}
+        >
           <label>
             <span>Chọn truyện</span>
             <select
+              data-dialog-initial-focus
               disabled={books.length === 0}
               onChange={(event) => {
                 onSelectBook(Number(event.target.value));
@@ -3887,6 +3905,7 @@ export default function ReaderView({
             </div>
           ) : null}
           {marksError ? <p className="reader-sync-error">{marksError}</p> : null}
+        </div>
         </div>
       ) : null}
 

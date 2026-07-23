@@ -539,6 +539,12 @@
   overflow-wrap: anywhere;
 }
 
+.reader-more-backdrop {
+  inset: 0;
+  position: absolute;
+  z-index: 27;
+}
+
 .reader-more-popover {
   background: var(--reader-drawer-bg);
   border: 1px solid var(--reader-drawer-border);
@@ -552,7 +558,7 @@
   position: absolute;
   right: clamp(14px, 3vw, 28px);
   top: 86px;
-  z-index: 28;
+  z-index: 1;
 }
 
 .reader-more-popover label,
@@ -3290,8 +3296,19 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .reader-loading-skeleton > span {
+  .reader-loading-skeleton > span,
+  .reader-more-popover {
     animation: none;
+  }
+
+  .reader-audio-panel,
+  .reader-bottom-bar,
+  .reader-icon-button,
+  .reader-more-popover,
+  .reader-text-mode-switcher,
+  .reader-top-bar {
+    scroll-behavior: auto;
+    transition: none;
   }
 }
 }
