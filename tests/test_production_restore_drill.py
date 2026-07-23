@@ -18,6 +18,7 @@ def _validate_config(backup_dir: Path, **overrides: str) -> subprocess.Completed
         "BACKUP_PASSPHRASE": "test-only-passphrase",
         "PRODUCTION_ENV": "/tmp/novel-tnn-production.env",
         "RESTORE_ARTIFACT_SOURCE_ROOT": "/home/thenam176/Novel-TNN",
+        "RESTORE_STATUS_FILE": str(backup_dir.parent / "restore-drill.status.json"),
         **overrides,
     }
     return subprocess.run(
@@ -53,7 +54,22 @@ def test_restore_runner_declares_isolated_db_artifact_and_api_validation() -> No
     assert '--env "ARTIFACT_LEGACY_ROOT=${RESTORE_ARTIFACT_SOURCE_ROOT}"' in content
     assert "/api/ready" in content
     assert "smoke_reader_authenticated.py" in content
+    assert "record_restore_drill_status.py --output \"$RESTORE_STATUS_FILE\"" in content
     assert "http://127.0.0.1:7860/api/health >/dev/null 2>&1" in content
     assert "trap 'docker rm -f \"${container_name:-}\"" in content
     assert "2>&1 || true' EXIT" in content
     assert "rm -rf" not in content
+
+
+def test_restore_status_publisher_writes_only_bounded_operational_metadata(tmp_path: Path) -> None:
+    from scripts.record_restore_drill_status import record_success
+
+    status_path = tmp_path / "runtime" / "restore-drill.status.json"
+    record_success(status_path)
+
+    payload = status_path.read_text(encoding="utf-8")
+    assert '"status": "passed"' in payload
+    assert '"completed_at":' in payload
+    assert "archive" not in payload
+    assert "path" not in payload
+    assert status_path.stat().st_mode & 0o777 == 0o600

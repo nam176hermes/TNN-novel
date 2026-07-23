@@ -29,10 +29,12 @@ validate_config() {
   require_value BACKUP_DRILL_ROOT
   require_value PRODUCTION_ENV
   require_value RESTORE_ARTIFACT_SOURCE_ROOT
+  require_value RESTORE_STATUS_FILE
   require_absolute_path BACKUP_LOCAL_DIR
   require_absolute_path BACKUP_DRILL_ROOT
   require_absolute_path PRODUCTION_ENV
   require_absolute_path RESTORE_ARTIFACT_SOURCE_ROOT
+  require_absolute_path RESTORE_STATUS_FILE
   [[ -d "$BACKUP_LOCAL_DIR" ]] || fail "BACKUP_LOCAL_DIR does not exist"
   [[ "$BACKUP_IMAGE" != *[[:space:]]* ]] || fail "BACKUP_IMAGE must not contain whitespace"
 }
@@ -232,6 +234,7 @@ main() {
   BACKUP_IMAGE="${BACKUP_IMAGE:-novel-pipeline-api:runtime-hardening-20260718-r1}"
   PRODUCTION_ENV="${PRODUCTION_ENV:-$HOME/.config/novel-tnn/production.env}"
   RESTORE_ARTIFACT_SOURCE_ROOT="${RESTORE_ARTIFACT_SOURCE_ROOT:-$HOME/Novel-TNN}"
+  RESTORE_STATUS_FILE="${RESTORE_STATUS_FILE:-${RESTORE_ARTIFACT_SOURCE_ROOT}/data/logs/runtime/restore-drill.status.json}"
 
   validate_config
   if [[ "${1:-}" == "--validate-config" ]]; then
@@ -251,6 +254,7 @@ main() {
   report_path="${BACKUP_DRILL_ROOT}/$(basename "$(dirname "$restored_dir")")-validation.json"
   validate_restored_db_and_artifacts "$restored_dir" "$report_path"
   validate_restored_api "$restored_dir"
+  .venv/bin/python scripts/record_restore_drill_status.py --output "$RESTORE_STATUS_FILE"
   printf 'restore drill complete: %s\n' "$restored_dir"
   printf 'validation report: %s\n' "$report_path"
 }
