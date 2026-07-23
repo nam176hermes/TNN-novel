@@ -254,6 +254,34 @@ async def test_mobile_api_refresh_uses_httponly_cookie_and_csrf_header() -> None
 
 
 @pytest.mark.asyncio
+async def test_refresh_rejects_missing_or_mismatched_csrf_without_rotating_session(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, db_path = _build_app_with_data_dir(tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await _login(client)
+        missing = await client.post("/api/auth/refresh")
+        mismatched = await client.post(
+            "/api/auth/refresh",
+            headers={"X-CSRF-Token": "not-the-cookie-value"},
+        )
+
+    assert missing.status_code == 403
+    assert mismatched.status_code == 403
+    assert missing.json()["detail"] == {
+        "code": "csrf_rejected",
+        "message": "Request verification failed",
+    }
+    with sqlite3.connect(db_path) as conn:
+        session = conn.execute(
+            "SELECT revoked_at, reuse_detected_at FROM auth_sessions"
+        ).fetchone()
+    assert session == ("", "")
+
+
+@pytest.mark.asyncio
 async def test_login_cookie_flags_match_local_and_public_requests(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

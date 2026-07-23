@@ -39,6 +39,7 @@ from app.mobile_api.session_cookies import (
     clear_refresh_session_cookies,
     new_csrf_token,
     refresh_token_from_request,
+    require_csrf,
     set_refresh_session_cookies,
 )
 
@@ -276,6 +277,7 @@ async def refresh_token(request: Request, response: Response):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "refresh_required", "message": "Session refresh is unavailable"},
         )
+    require_csrf(request)
     try:
         payload = decode_token(current_refresh_token)
     except ValueError:
