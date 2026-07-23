@@ -86,6 +86,30 @@ describe('useLibrary', () => {
     expect(result.current.chapters.data[0]?.book_id).toBe(43);
   });
 
+  it('dedupes concurrent chapter refreshes for the same book', async () => {
+    const chapters = deferred<Array<typeof fixtureChapter>>();
+    const client = {
+      getBooks: vi.fn().mockResolvedValue([fixtureBook]),
+      getChapters: vi.fn().mockReturnValue(chapters.promise),
+    } as unknown as ApiClient;
+
+    const { result } = renderHook(() => useLibrary(client, true));
+
+    await waitFor(() => expect(result.current.selectedBookId).toBe(42));
+    await waitFor(() => expect(client.getChapters).toHaveBeenCalledTimes(1));
+
+    void act(() => {
+      void result.current.refreshChapters(42);
+      void result.current.refreshChapters(42);
+    });
+
+    expect(client.getChapters).toHaveBeenCalledTimes(1);
+    chapters.resolve([fixtureChapter]);
+
+    await waitFor(() => expect(result.current.chapters.state).toBe('ready'));
+    expect(result.current.chapters.data).toHaveLength(1);
+  });
+
   it('calls onAuthError when books load returns 401', async () => {
     const onAuthError = vi.fn();
     const client = {

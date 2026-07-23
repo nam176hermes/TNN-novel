@@ -540,14 +540,14 @@ function ReaderRawTextSurface({
         </header>
       ) : null}
 
-      {textState === 'loading' ? <p>Đang tải raw/source...</p> : null}
+      {textState === 'loading' ? <p className="reader-empty-state">Đang tải raw/source...</p> : null}
       {textError ? (
         <p className="status-error" role="alert">
           {textError}
         </p>
       ) : null}
       {selectedChapter && textState !== 'loading' && paragraphs.length === 0 && !textError ? (
-        <p>Chưa có raw/source text cho chương này.</p>
+        <p className="reader-empty-state">Chưa có raw/source text cho chương này.</p>
       ) : null}
       {paragraphs.map((paragraph, index) => (
         <div className="reader-paragraph-block" data-paragraph-index={index} key={`raw-${index}-${paragraph.slice(0, 24)}`}>
@@ -655,14 +655,14 @@ function ReaderCollapsedRawSurface({
         </header>
       ) : null}
 
-      {textState === 'loading' ? <p>Đang tải bản đọc...</p> : null}
+      {textState === 'loading' ? <p className="reader-empty-state">Đang tải bản đọc...</p> : null}
       {textError ? (
         <p className="status-error" role="alert">
           {textError}
         </p>
       ) : null}
       {selectedChapter && textState !== 'loading' && translatedParagraphs.length === 0 && !textError ? (
-        <p>Chưa có bản dịch tiếng Việt.</p>
+        <p className="reader-empty-state">Chưa có bản dịch tiếng Việt.</p>
       ) : null}
       {translatedParagraphs.map((paragraph, index) => {
         const rawParagraph = rawParagraphs[index] ?? '';

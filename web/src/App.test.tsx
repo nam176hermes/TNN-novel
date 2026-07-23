@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { clearToken, loadRefreshToken, saveSessionTokens } from './state/session';
-import { fixtureUsage } from './test/fixtures';
+import { fixtureBook, fixtureChapter, fixtureUsage } from './test/fixtures';
 
 describe('App', () => {
   beforeEach(() => {
@@ -212,6 +212,93 @@ describe('App', () => {
         }),
       );
     });
+  });
+
+  it('does not fetch hidden-view heavy resources on initial workbench restore', async () => {
+    saveSessionTokens('old-access', 'stored-refresh');
+    const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const target = String(url);
+
+      if (target.endsWith('/api/auth/refresh') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            access_token: 'fresh-access',
+            refresh_token: 'fresh-refresh',
+            token_type: 'bearer',
+          }),
+        };
+      }
+      if (target.endsWith('/api/providers')) {
+        return { ok: true, json: async () => ({ providers: [] }) };
+      }
+      if (target.endsWith('/api/style-profiles')) {
+        return { ok: true, json: async () => ({ profiles: [] }) };
+      }
+      if (target.endsWith('/api/books')) {
+        return { ok: true, json: async () => [fixtureBook] };
+      }
+      if (target.endsWith('/api/books/42/chapters')) {
+        return { ok: true, json: async () => [fixtureChapter] };
+      }
+      if (target.endsWith('/api/providers/usage')) {
+        return { ok: true, json: async () => ({ usage: fixtureUsage }) };
+      }
+      if (target.endsWith('/api/system/status')) {
+        return {
+          ok: true,
+          json: async () => ({
+            active_jobs: 0,
+            active_provider: '',
+            api_ready: true,
+            app_version: '0.1.0',
+            asset_protection_enabled: true,
+            backup_recommendation: '',
+            build: 'test',
+            cache_count: 0,
+            cache_size_bytes: 0,
+            data_directory_available: true,
+            data_size_bytes: 0,
+            database_available: true,
+            db_size_bytes: 0,
+            failed_jobs: 0,
+            interrupted_jobs: 0,
+            last_failed_job: null,
+            ollama_host: '',
+            ollama_model: '',
+            public_deploy: false,
+            queued_jobs: 0,
+            recent_operational_errors: [],
+            retrying_jobs: 0,
+            running_jobs: 0,
+            storage_health: 'healthy',
+            storage_label: 'Test storage',
+            upload_max_bytes: 1024,
+          }),
+        };
+      }
+
+      throw new Error(`Unexpected URL: ${target}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Novel-TNN' })).toBeInTheDocument();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:7860/api/books/42/chapters',
+      expect.any(Object),
+    ));
+
+    const requestedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(requestedUrls.filter((url) => url.endsWith('/api/books/42/chapters'))).toHaveLength(1);
+    expect(requestedUrls.some((url) => url.includes('/api/import/ebook/history'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/glossary'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/system/backups'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/books/42/chapters/4201/source'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/books/42/chapters/4201/translation'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/books/42/chapters/4201/qa'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/books/42/reader/state'))).toBe(false);
   });
 
   it('logs out locally and returns to the login screen', async () => {

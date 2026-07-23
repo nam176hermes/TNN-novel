@@ -94,7 +94,8 @@ class TestStealthScripts:
 
     def test_launch_args_include_webrtc_flag(self):
         """BUG fix: WebRTC leak prevention flag must be in launch args."""
-        assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in STEALTH_LAUNCH_ARGS
+        assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in STEALTH_LAUNCH_ARGS
+        assert "--force-webrtc-ip-handling-policy" in STEALTH_LAUNCH_ARGS
 
     def test_launch_args_disable_automation_controlled(self):
         assert "--disable-blink-features=AutomationControlled" in STEALTH_LAUNCH_ARGS

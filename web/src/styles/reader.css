@@ -2890,6 +2890,30 @@
   padding-block: 12px;
 }
 
+.reader-empty-state {
+  align-content: center;
+  background: color-mix(in srgb, var(--reader-text) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--reader-text) 12%, transparent);
+  border-radius: 14px;
+  color: color-mix(in srgb, var(--reader-text) 72%, transparent);
+  display: grid;
+  font-family: "Segoe UI Variable", Aptos, sans-serif;
+  font-size: clamp(15px, 4vw, 18px);
+  font-weight: 720;
+  line-height: 1.45;
+  margin: 0 auto;
+  max-width: 34rem;
+  min-height: min(360px, calc(100dvh - 220px));
+  padding: 28px;
+  text-align: center;
+}
+
+.reader-empty-state.status-warning {
+  background: color-mix(in srgb, #f2ba64 14%, transparent);
+  border-color: color-mix(in srgb, #f2ba64 28%, transparent);
+  color: #f4d58d;
+}
+
 .reader-loading-skeleton > span {
   animation: reader-skeleton-pulse 1.4s ease-in-out infinite alternate;
   background: color-mix(in srgb, var(--reader-text) 13%, transparent);
@@ -3055,6 +3079,25 @@
     grid-template-columns: minmax(72px, 1fr) minmax(112px, 1.25fr) minmax(72px, 1fr);
     min-height: calc(64px + env(safe-area-inset-bottom));
     padding: 6px 8px env(safe-area-inset-bottom);
+  }
+
+  .workflow-shell[data-active-view="reader"] .reader-page-content:has(.reader-empty-state) {
+    align-content: center;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    min-height: 100%;
+    padding-bottom: calc(110px + env(safe-area-inset-bottom));
+    padding-top: 22px;
+  }
+
+  .workflow-shell[data-active-view="reader"] .reader-page-content:has(.reader-empty-state) .reader-chapter-title {
+    margin-bottom: 14px;
+  }
+
+  .workflow-shell[data-active-view="reader"] .reader-empty-state {
+    margin-inline: auto;
+    width: min(100%, 34rem);
   }
 
   .reader-chapter-nav-button,

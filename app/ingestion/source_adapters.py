@@ -1623,6 +1623,959 @@ def build_default_source_adapters() -> list[GenericHtmlSourceAdapter]:
             chapter_link_patterns=(r'<a[^>]+href="([^"]+/chapter/[^"]+)"[^>]*>([^<]+)',),
             content_patterns=(r'<div[^>]+class="[^"]*read-content[^"]*"[^>]*>(.*?)</div>',),
         ),
+
+        # ── P14: New sources ported from Excerpo ──────────────────────────────
+        DomSourceAdapter(
+            adapter_id="royalroad",
+            label="Royal Road",
+            domains=("royalroad.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector('h1[property="name"]'),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                    DomSelector("title"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector('a[property="author"]'),
+                    DomSelector(".profile-name a"),
+                    DomSelector("h4 a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".fiction-description"),
+                    DomSelector(".description"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector(".thumbnail.inline-block", "src"),
+                    DomSelector(".fiction-cover img", "src"),
+                    DomSelector('meta[property="og:image"]', "content"),
+                ),
+                chapter_links=(
+                    DomSelector("tr.chapter-row a[href*='/chapter/']", "href"),
+                    DomSelector("a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("div.chapter-inner.chapter-content"),
+                    DomSelector(".chapter-content"),
+                ),
+            ),
+            adapter_version="royalroad-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="scribblehub",
+            label="Scribble Hub",
+            domains=("scribblehub.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector('div.fic_title[property="name"]'),
+                    DomSelector(".fic_title"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                    DomSelector("title"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector('div.auth_name[property="name"]'),
+                    DomSelector(".auth_name a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector('div.wi_fic_desc[property="description"]'),
+                    DomSelector(".wi_fic_desc"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector('div.novel-cover img[property="image"]', "src"),
+                    DomSelector("img.thumbnail.inline-block", "src"),
+                    DomSelector('meta[property="og:image"]', "content"),
+                ),
+                chapter_links=(
+                    DomSelector(".catalog a", "href"),
+                    DomSelector("a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".chp_raw"),
+                    DomSelector(".chapter-content"),
+                ),
+            ),
+            adapter_version="scribblehub-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="ao3",
+            label="Archive of Our Own",
+            domains=("archiveofourown.org",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h2.title.heading"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                    DomSelector("title"),
+                ),
+                chapter_title=(DomSelector("h2.title"), DomSelector("h3.title"), DomSelector("title")),
+                author=(
+                    DomSelector('h3.byline.heading a[rel="author"]'),
+                    DomSelector(".byline a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("div.summary.module blockquote"),
+                    DomSelector("div.summary.module"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector('meta[property="og:image"]', "content"),),
+                chapter_links=(
+                    DomSelector("li.chapter a[href*='/works/'][href*='/chapters/']", "href"),
+                    DomSelector("a[href*='/chapters/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("div.userstuff.module"),
+                    DomSelector(".userstuff"),
+                ),
+            ),
+            adapter_version="ao3-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="lnmtl",
+            label="LNMTL",
+            domains=("lnmtl.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".novel-name"),
+                    DomSelector(".novel-title h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".chapter-title"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".novel-author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".novel-description"),
+                    DomSelector(".description"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector(".novel-cover img", "src"),
+                    DomSelector('meta[property="og:image"]', "content"),
+                ),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".chapter-body"),
+                    DomSelector(".translated-chapter"),
+                    DomSelector("#chapter-content"),
+                ),
+            ),
+            adapter_version="lnmtl-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="foxaholic",
+            label="Foxaholic",
+            domains=("foxaholic.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector(".post-title h3"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector(".author-content"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector(".summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector(".summary_image img", "src"),
+                    DomSelector('meta[property="og:image"]', "content"),
+                ),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".reading-content"),
+                    DomSelector(".text-left"),
+                    DomSelector(".entry-content"),
+                ),
+            ),
+            adapter_version="foxaholic-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="shubaow",
+            label="Shubaow",
+            domains=("shubaow.org",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("div.info h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".info .fix p"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".desc"),
+                    DomSelector(".xdesc"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".imgbox img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#section-list li a", "href"),
+                    DomSelector(".chapter-list a", "href"),
+                ),
+                chapter_content=(DomSelector(".content"), DomSelector("#content")),
+            ),
+            adapter_version="shubaow-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="wbnovel",
+            label="WBNovel",
+            domains=("wbnovel.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".rate-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".summary__content"),
+                    DomSelector(".post-content"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(DomSelector("div.text-left"), DomSelector(".reading-content")),
+            ),
+            adapter_version="wbnovel-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="kakuyomu",
+            label="Kakuyomu",
+            domains=("kakuyomu.jp",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("#workTitle"),
+                    DomSelector(".work-title"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".chapter-title"), DomSelector(".widget-episodeTitle"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-name"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#introduction"),
+                    DomSelector(".introduction"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector('meta[property="og:image"]', "content"),),
+                chapter_links=(
+                    DomSelector(".widget-toc-items a", "href"),
+                    DomSelector(".episodeList a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".widget-episodeBody"),
+                    DomSelector(".scene"),
+                ),
+            ),
+            adapter_version="kakuyomu-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="syosetu",
+            label="Syosetu",
+            domains=("syosetu.com", "ncode.syosetu.com", "novel18.syosetu.com"),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".p-novel__title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".p-novel__title"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".p-novel__author a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#novel_ex"),
+                    DomSelector(".p-novel__ex"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector('meta[property="og:image"]', "content"),),
+                chapter_links=(
+                    DomSelector(".p-eplist a", "href"),
+                    DomSelector(".index_box a", "href"),
+                    DomSelector("a[href*='/n']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".p-novel__text"),
+                    DomSelector("#novel_honbun"),
+                    DomSelector(".novel_view"),
+                ),
+            ),
+            adapter_version="syosetu-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="meionovel",
+            label="Meionovel",
+            domains=("meionovel.id", "meionovels.com"),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector(".post-title h3"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector(".summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".reading-content"),
+                    DomSelector(".text-left"),
+                ),
+            ),
+            adapter_version="meionovel-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="centralnovel",
+            label="Central Novel",
+            domains=("centralnovel.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector(".post-title h3"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector(".summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".reading-content"),
+                    DomSelector(".text-left"),
+                ),
+            ),
+            adapter_version="centralnovel-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="ranobelib",
+            label="RanobeLib",
+            domains=("ranobelib.me",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".book-name"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".chapter-title"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".book-author a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".book-description"),
+                    DomSelector(".description"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(
+                    DomSelector(".book-cover img", "src"),
+                    DomSelector('meta[property="og:image"]', "content"),
+                ),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector(".menu a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".chapter-content"),
+                    DomSelector(".reader-text"),
+                    DomSelector("#content"),
+                ),
+            ),
+            adapter_version="ranobelib-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="syosetu_org",
+            label="Syosetu.org",
+            domains=("syosetu.org",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("#title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector("#author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#ex"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector('meta[property="og:image"]', "content"),),
+                chapter_links=(
+                    DomSelector(".menu a", "href"),
+                    DomSelector("a[href*='/novel/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#novel"),
+                    DomSelector(".novel_view"),
+                ),
+            ),
+            adapter_version="syosetu_org-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="novelgo",
+            label="NovelGo",
+            domains=("novelgo.id",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".summary__content"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(DomSelector(".reading-content"), DomSelector(".text-left")),
+            ),
+            adapter_version="novelgo-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="novellunar",
+            label="NovelLunar",
+            domains=("novellunar.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(DomSelector(".reading-content"), DomSelector(".text-left")),
+            ),
+            adapter_version="novellunar-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="phoenixnovels",
+            label="Phoenix Novels",
+            domains=("phoenixnovels.com.br",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(DomSelector(".reading-content"), DomSelector(".text-left")),
+            ),
+            adapter_version="phoenixnovels-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="chireads",
+            label="Chireads",
+            domains=("chireads.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".summary__content"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector("li.wp-manga-chapter a", "href"),
+                ),
+                chapter_content=(DomSelector(".reading-content"), DomSelector(".text-left")),
+            ),
+            adapter_version="chireads-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="fenrirscans",
+            label="Fenrir Scans",
+            domains=("fenrirscans.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".post-title h1"),
+                    DomSelector(".post-title h3"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector(".post-title h1"), DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".author-content a"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".description-summary"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".summary_image img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".wp-manga-chapter a", "href"),
+                    DomSelector(".listing-chapters a", "href"),
+                ),
+                chapter_content=(DomSelector(".reading-content"), DomSelector(".text-left")),
+            ),
+            adapter_version="fenrirscans-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="pixiv",
+            label="Pixiv",
+            domains=("pixiv.net",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector('h1[class*="title"]'),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector('a[data-gtm-user-id]'),
+                    DomSelector(".author-name"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector('meta[property="og:description"]', "content"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector('meta[property="og:image"]', "content"),),
+                chapter_links=(
+                    DomSelector('a[href*="/novel/series/"]', "href"),
+                    DomSelector('a[href*="/novel/"]', "href"),
+                ),
+                chapter_content=(
+                    DomSelector('[class*="content"]'),
+                    DomSelector("pre"),
+                ),
+            ),
+            adapter_version="pixiv-dom-v1",
+        ),
+
+        DomSourceAdapter(
+            adapter_id="23qb",
+            label="23qb",
+            domains=("23qb.net",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.bookTitle"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".booktag"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#bookIntro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".col-sm-2 img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#newlist dd a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#booktxt"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="23qb-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="ihuaben",
+            label="ihuaben",
+            domains=("ihuaben.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".book-info .author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".book-intro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".book-img img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("#chapterList a", "href"),
+                    DomSelector("a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".chapter-content"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="ihuaben-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="shuhaige",
+            label="shuhaige",
+            domains=("shuhaige.net",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1"),
+                    DomSelector("#info h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector("#info p"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#intro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector("#fmimg img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#list dd a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#content"),
+                    DomSelector("#booktxt"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="shuhaige-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="sto55",
+            label="sto55",
+            domains=("sto55.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".book-info .author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".book-intro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".book-img img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("#list a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                    DomSelector("#booktxt"),
+                ),
+            ),
+            adapter_version="sto55-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="sto9",
+            label="sto9",
+            domains=("sto9.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".booktag"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#bookIntro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".col-sm-2 img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#newlist dd a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#booktxt"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="sto9-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="ttkan",
+            label="ttkan",
+            domains=("ttkan.co",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".book-info .author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".book-intro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".book-img img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("#chapter-list a", "href"),
+                    DomSelector("a[href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                    DomSelector(".chapter-content"),
+                ),
+            ),
+            adapter_version="ttkan-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="twkan",
+            label="twkan",
+            domains=("twkan.com",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("h1.book-title"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".booktag"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#bookIntro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".col-sm-2 img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#newlist dd a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#booktxt"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="twkan-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="xbiquge",
+            label="xbiquge",
+            domains=("xbiquge.bz", "xbiquge.co", "xbiquge.info", "xbiquge.so", "xbiquge.la", "xbiquge.me"),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector("#info h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector("#info p"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector("#intro"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector("#fmimg img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector("#list dd a", "href"),
+                    DomSelector("dd a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="xbiquge-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="powanjuan",
+            label="powanjuan",
+            domains=("powanjuan.cc",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".desc h1"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".descTip span"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".desc .content"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[name="description"]', "content"),
+                ),
+                cover=(DomSelector(".desc img", "src"), DomSelector(".book img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".catalog ul.clearfix li a", "href"),
+                    DomSelector(".chapter-list a", "href"),
+                ),
+                chapter_content=(
+                    DomSelector("#mycontent"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="powanjuan-dom-v1",
+        ),
+        DomSourceAdapter(
+            adapter_id="po18",
+            label="PO18",
+            domains=("po18.tw",),
+            selectors=DomSelectorConfig(
+                title=(
+                    DomSelector(".book-name"),
+                    DomSelector("h1"),
+                    DomSelector('meta[property="og:title"]', "content"),
+                ),
+                chapter_title=(DomSelector("h1"), DomSelector("title")),
+                author=(
+                    DomSelector(".book-author"),
+                    DomSelector('meta[name="author"]', "content"),
+                ),
+                description=(
+                    DomSelector(".book-description"),
+                    DomSelector(".intro"),
+                    DomSelector('meta[property="og:description"]', "content"),
+                ),
+                cover=(DomSelector(".book-cover img", "src"), DomSelector('meta[property="og:image"]', "content")),
+                chapter_links=(
+                    DomSelector(".chapter-list a", "href"),
+                    DomSelector("a[href*='/books/'][href*='/chapter/']", "href"),
+                ),
+                chapter_content=(
+                    DomSelector(".book-content"),
+                    DomSelector("#content"),
+                    DomSelector(".content"),
+                ),
+            ),
+            adapter_version="po18-dom-v1",
+        ),
+
+        # ── End P14 new sources ─────────────────────────────────────────────────
+
         GenericHtmlSourceAdapter(),
     ]
 
