@@ -11,8 +11,8 @@ Run from the WSL repository:
 REPO=/home/thenam176/Novel-TNN
 PROJECT_NAME=novel-tnn-wsl
 PRODUCTION_ENV="${HOME}/.config/novel-tnn/production.env"
-RELEASE_OVERLAY=deploy/production/compose.release.runtime-hardening-20260718-r1.yaml
-ROLLBACK_OVERLAY=deploy/production/compose.rollback.pre-runtime-hardening-20260718-r1.yaml
+RELEASE_OVERLAY=deploy/production/compose.release.ws4-production-20260723-r1.yaml
+ROLLBACK_OVERLAY=deploy/production/compose.rollback.pre-ws4-production-20260723-r1.yaml
 PUBLIC_BASE_URL=https://novel-tnn.tradingcompanydirect.com
 cd "$REPO"
 ```
@@ -63,19 +63,19 @@ docker compose -p "$PROJECT_NAME" \
   config --images
 ```
 
-For `runtime-hardening-20260718-r1`, expected images are:
+For `ws4-production-20260723-r1`, expected images are:
 
 ```text
-novel-pipeline-api:runtime-hardening-20260718-r1
-novel-pipeline-import-worker:runtime-hardening-20260718-r1
+novel-pipeline-api:ws4-production-20260723-r1
+novel-pipeline-import-worker:ws4-production-20260723-r1
 ```
 
 The overlay comments record image IDs. Confirm them before deployment:
 
 ```bash
 docker image inspect \
-  novel-pipeline-api:runtime-hardening-20260718-r1 \
-  novel-pipeline-import-worker:runtime-hardening-20260718-r1 \
+  novel-pipeline-api:ws4-production-20260723-r1 \
+  novel-pipeline-import-worker:ws4-production-20260723-r1 \
   --format '{{index .RepoTags 0}} {{.Id}}'
 ```
 
