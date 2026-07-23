@@ -110,3 +110,17 @@ def test_pytest_session_uses_an_isolated_data_directory() -> None:
 
     assert configured_data_dir != (ROOT / "data").resolve()
     assert configured_data_dir.name.startswith("novel-tnn-pytest-")
+
+
+def test_verify_script_propagates_an_injected_mandatory_gate_failure() -> None:
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "verify.sh"), "--self-test-failure"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FAIL: injected mandatory gate" in result.stdout
+    assert "compileall" not in result.stdout
