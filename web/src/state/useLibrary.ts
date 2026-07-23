@@ -222,6 +222,16 @@ export function useLibrary(client: ApiClient, enabled: boolean, onAuthError?: ()
     chaptersRequestIdRef.current += 1;
     setSelectedBookId(bookId);
   }, []);
+  const restoreReaderSelection = useCallback((chapter: Chapter) => {
+    chaptersRequestIdRef.current += 1;
+    setChapters((current) => ({
+      data: [...current.data.filter((item) => item.book_id !== chapter.book_id), chapter],
+      error: '',
+      state: 'ready',
+    }));
+    setSelectedBookId(chapter.book_id);
+    setSelectedChapterId(chapter.id);
+  }, []);
 
   return {
     activeChapters,
@@ -230,6 +240,7 @@ export function useLibrary(client: ApiClient, enabled: boolean, onAuthError?: ()
     refreshBooks,
     refreshChapters,
     renameBook,
+    restoreReaderSelection,
     selectedBookId,
     selectedChapter,
     selectedChapterId,

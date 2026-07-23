@@ -2,6 +2,9 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { putCachedChapterAsync } from './state/readerCache';
+import { clearReaderPrivateData } from './state/readerPrivateData';
+import { saveReaderResume } from './state/readerResume';
 import { clearToken, loadRefreshToken, saveSessionTokens } from './state/session';
 import { fixtureBook, fixtureChapter, fixtureUsage } from './test/fixtures';
 
@@ -302,6 +305,8 @@ describe('App', () => {
   });
 
   it('logs out locally and returns to the login screen', async () => {
+    window.localStorage.setItem('novel-reader-resume-v1', '{"private":true}');
+    window.localStorage.setItem('novel-reader-progress-v1', '{"private":true}');
     const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
       const target = String(url);
 
@@ -356,6 +361,8 @@ describe('App', () => {
     expect(await screen.findByRole('button', { name: 'Login' })).toBeInTheDocument();
     expect(window.localStorage.getItem('novel-operator-token')).toBeNull();
     expect(window.localStorage.getItem('novel-operator-refresh-token')).toBeNull();
+    expect(window.localStorage.getItem('novel-reader-resume-v1')).toBeNull();
+    expect(window.localStorage.getItem('novel-reader-progress-v1')).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/auth/logout',
       expect.objectContaining({
@@ -363,6 +370,37 @@ describe('App', () => {
         headers: expect.objectContaining({ Authorization: 'Bearer access' }),
       }),
     );
+  });
+
+  it('reloads the last cached chapter directly into Reader while offline', async () => {
+    saveSessionTokens('offline-access', 'offline-refresh');
+    saveReaderResume({
+      bookId: 42,
+      bookTitle: 'Offline Book',
+      chapterId: 4201,
+      chapterNumber: 1,
+      chapterTitle: 'Offline Chapter',
+      contentRevision: '',
+    });
+    await putCachedChapterAsync({
+      bookId: 42,
+      chapterId: 4201,
+      html: '',
+      sourceText: '离线原文。',
+      text: 'Bản dịch đọc được khi offline.',
+    });
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    try {
+      render(<App />);
+
+      expect(await screen.findByRole('status', { name: 'Trạng thái offline' })).toHaveTextContent('Bạn đang offline');
+      expect(await screen.findByText('Bản dịch đọc được khi offline.')).toBeInTheDocument();
+      expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toBeInTheDocument();
+    } finally {
+      await clearReaderPrivateData();
+    }
   });
 
   it('reloads backups once after polled completion without retaining the passphrase', async () => {

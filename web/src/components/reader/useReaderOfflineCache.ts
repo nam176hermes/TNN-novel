@@ -222,6 +222,8 @@ export function useReaderOfflineCache({
     }).catch(() => null);
     const chapterRequest = dependencies.getCachedChapter(bookId, selectedChapterId)
       .then(async (chapter) => {
+        const currentRevision = selectedChapter?.content_html_path?.trim() ?? '';
+        if (chapter?.contentRevision && chapter.contentRevision !== currentRevision) return null;
         if (!chapter?.html.trim()) return chapter;
         const hydratedHtml = await dependencies.hydrateCachedChapterHtml(
           bookId,

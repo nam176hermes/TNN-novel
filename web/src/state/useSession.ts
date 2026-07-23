@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClient } from '../api/client';
+import { ApiClient, ApiError } from '../api/client';
 import {
   clearToken,
   loadRefreshToken,
@@ -35,6 +35,13 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
         setLoginError('');
         return true;
       } catch (error) {
+        if (!(error instanceof ApiError)
+          && typeof navigator !== 'undefined'
+          && navigator.onLine === false
+          && loadToken()) {
+          setLoginError('');
+          return true;
+        }
         clearToken();
         setToken('');
         setLoginError('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');

@@ -32,6 +32,7 @@ describe('readerOfflineCache', () => {
           ? { text: 'Rich chapter', html: '<p>Rich chapter</p><img src="/book-assets/42/sword.png" alt="Sword"/>' }
           : null
       )),
+      getChapterSource: vi.fn(async (_bookId: number, chapterId: number) => `Raw chapter ${chapterId}`),
       getChapterTranslation: vi.fn(async (_bookId: number, chapterId: number) => (
         chapterId === 101 ? 'Plain chapter' : null
       )),
@@ -64,8 +65,11 @@ describe('readerOfflineCache', () => {
       chaptersTotal: 2,
       dictionaryCached: true,
     });
-    await expect(getCachedChapterAsync(42, 101)).resolves.toMatchObject({ text: 'Plain chapter' });
-    await expect(getCachedChapterAsync(42, 102)).resolves.toMatchObject({ html: expect.stringContaining('sword.png') });
+    await expect(getCachedChapterAsync(42, 101)).resolves.toMatchObject({ sourceText: 'Raw chapter 101', text: 'Plain chapter' });
+    await expect(getCachedChapterAsync(42, 102)).resolves.toMatchObject({
+      html: expect.stringContaining('sword.png'),
+      sourceText: 'Raw chapter 102',
+    });
     expect(loadCachedReaderDictionaryPack(42, null)).toMatchObject({ source_count: 1 });
     expect(cacheAssets).toHaveBeenCalledWith(42, 102, expect.stringContaining('sword.png'));
     expect(cacheAudio).toHaveBeenCalledWith(42, 101, '/api/books/42/chapters/101/audio');
@@ -87,6 +91,7 @@ describe('readerOfflineCache', () => {
         html: '<p>Hàn Lập khẽ gật đầu.</p><img src="/book-assets/42/cover.png" alt="cover">',
         text: 'Hàn Lập khẽ gật đầu.',
       })),
+      getChapterSource: vi.fn(async () => '韓立微微點頭。'),
       getChapterTranslation: vi.fn(async () => 'fallback translation'),
       getReaderDictionaryPack: vi.fn(async () => chapterPack),
     };
@@ -116,6 +121,7 @@ describe('readerOfflineCache', () => {
     });
     await expect(getCachedChapterAsync(42, 102)).resolves.toMatchObject({
       html: expect.stringContaining('cover.png'),
+      sourceText: '韓立微微點頭。',
       text: 'Hàn Lập khẽ gật đầu.',
     });
     expect(loadCachedReaderDictionaryPack(42, 102)).toMatchObject({ source_count: 1 });
@@ -143,6 +149,29 @@ describe('readerOfflineCache', () => {
         chaptersTotal: 1,
         dictionaryCached: true,
       },
+    });
+  });
+
+  it('keeps translated offline content available when optional source loading fails', async () => {
+    const client = {
+      chapterAudioUrl: vi.fn(),
+      getChapterContent: vi.fn(async () => null),
+      getChapterSource: vi.fn(async () => { throw new TypeError('offline'); }),
+      getChapterTranslation: vi.fn(async () => 'Bản dịch vẫn được lưu.'),
+      getReaderDictionaryPack: vi.fn(async () => { throw new TypeError('offline'); }),
+    };
+
+    const summary = await cacheChapterForOffline({
+      bookId: 42,
+      chapter: { book_id: 42, has_translation: true, id: 104 },
+      client,
+    });
+
+    expect(summary.chaptersCached).toBe(1);
+    expect(summary.chaptersFailed).toBe(0);
+    await expect(getCachedChapterAsync(42, 104)).resolves.toMatchObject({
+      sourceText: '',
+      text: 'Bản dịch vẫn được lưu.',
     });
   });
 

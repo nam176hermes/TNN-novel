@@ -34,6 +34,7 @@ const rawChapter = {
   audio_path: null,
   translated_at: null,
   audio_created_at: null,
+  has_translation: false,
 };
 
 const translatedChapter = {
@@ -41,6 +42,7 @@ const translatedChapter = {
   status: 'translated',
   translated_text_path: '/tmp/audit-translated.txt',
   translated_at: '2026-06-30T00:00:00Z',
+  has_translation: true,
 };
 
 const importedChapter = {
@@ -331,7 +333,15 @@ async function installApiMock(page: Page, state: MockState) {
     }
     if (path === `/api/books/${book.id}/audio/playlist`) return json(route, { book_id: book.id, book_title: book.title, chapters: [] });
     if (path === `/api/books/${book.id}/dictionary/pack`) {
-      return json(route, { book_id: book.id, chapter_id: null, entries: [], source_count: 0, generated_at: '2026-06-30T00:00:00Z' });
+      return json(route, {
+        book_id: book.id,
+        chapter_id: url.searchParams.get('chapter_id') ? Number(url.searchParams.get('chapter_id')) : null,
+        sources: [],
+        source_count: 0,
+        counts: { builtin: 0, glossary: 0, offline_dictionary: 0, xray: 0 },
+        online: { status: 'skipped', error: '', count: 0 },
+        generated_at: '2026-06-30T00:00:00Z',
+      });
     }
     if (path === `/api/books/${book.id}/reader/xray`) {
       return json(route, { book_id: book.id, chapter_id: rawChapter.id, entities: [], relationships: [], timeline: [] });
@@ -543,9 +553,70 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.setViewportSize({ width: 360, height: 740 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.setViewportSize({ width: 412, height: 915 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
   await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+});
+
+test('mobile Reader exposes raw and split only for the current chapter resources', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
+    .getByRole('button', { name: 'Thư viện' })
+    .click();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+
+  await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
+  let settings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
+  await expect(settings.getByRole('button', { name: /Raw tiếng Trung/ })).toBeEnabled();
+  await expect(settings.getByRole('button', { name: 'Song song' })).toBeEnabled();
+  await settings.getByRole('button', { name: /Raw tiếng Trung/ }).click();
+  await settings.getByRole('button', { name: 'Đóng cài đặt đọc' }).click();
+  await expect(page.getByRole('article', { name: 'Nội dung raw tiếng Trung' })).toContainText('天逐渐转凉');
+
+  await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
+  settings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
+  await settings.getByRole('button', { name: 'Song song' }).click();
+  await settings.getByRole('button', { name: 'Đóng cài đặt đọc' }).click();
+  await expect(page.getByRole('article', { name: 'Nội dung raw tiếng Trung' })).toContainText('天逐渐转凉');
+  await expect(page.getByRole('article', { name: 'Nội dung bản dịch tiếng Việt' })).toContainText('Trời dần trở lạnh');
+  await expectNoHorizontalOverflow(page);
+});
+
+test('mobile Reader reloads cached content offline without caching protected API responses', async ({ page, context }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
+    .getByRole('button', { name: 'Thư viện' })
+    .click();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await page.getByRole('dialog', { name: 'Tùy chọn đọc' })
+    .getByRole('button', { name: 'Tải chương hiện tại offline' })
+    .click();
+  await expect(page.getByText(/Đã tải Chương 10 offline/)).toBeVisible();
+
+  await page.evaluate(async () => {
+    await navigator.serviceWorker.ready;
+    const privateApiCached = await caches.match('/api/books/42/chapters/4201/translation');
+    if (privateApiCached) throw new Error('Protected API response was stored in Cache Storage');
+  });
+
+  await context.setOffline(true);
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByRole('status', { name: 'Trạng thái offline' })).toContainText('Bạn đang offline');
+    await expect(page.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toContainText('Trời dần trở lạnh');
+    await expectNoHorizontalOverflow(page);
+  } finally {
+    await context.setOffline(false);
+  }
 });
 
 test('mobile feature pages keep actions clear and status backup states usable at 390px and 360px', async ({ page }) => {

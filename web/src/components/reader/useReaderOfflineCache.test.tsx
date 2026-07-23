@@ -170,6 +170,28 @@ describe('useReaderOfflineCache', () => {
     expect(result.current.currentAvailable).toBe(true);
   });
 
+  it('rejects cached chapter content when its revision differs from the selected chapter', async () => {
+    const hydrateCachedChapterHtml = vi.fn(async (_bookId: number, _chapterId: number, html: string) => html);
+    const deps = dependencies({
+      getCachedChapter: vi.fn().mockResolvedValue({
+        ...cachedChapter(),
+        contentRevision: '/book-assets/42/revision-old/chapter.xhtml',
+      }),
+      hydrateCachedChapterHtml,
+    });
+
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps, {
+      selectedChapter: {
+        ...chapters[1],
+        content_html_path: '/book-assets/42/revision-current/chapter.xhtml',
+      },
+    })));
+
+    await waitFor(() => expect(result.current.metadataLoading).toBe(false));
+    expect(result.current.cachedChapter).toBeNull();
+    expect(hydrateCachedChapterHtml).not.toHaveBeenCalled();
+  });
+
   it('reloads metadata after the existing reader-cache update event', async () => {
     const deps = dependencies();
     const { result } = renderHook(() => useReaderOfflineCache(options(deps)));
