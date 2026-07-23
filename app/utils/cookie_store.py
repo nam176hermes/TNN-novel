@@ -22,6 +22,11 @@ _COOKIE_DIR = Path(
 )
 
 
+
+# Cookies expiring within this window are treated as stale and refreshed.
+CF_CLEARANCE_REFRESH_SECONDS = 300  # 5 minutes
+
+
 def _domain_key(url: str) -> str:
     parsed = urlparse(url)
     return parsed.hostname or parsed.netloc or "unknown"
@@ -84,7 +89,13 @@ def _is_expired(cookie: dict[str, Any], now: float) -> bool:
     if expires in (None, "", 0, -1):
         return False
     try:
-        return float(expires) <= now
+        remaining = float(expires) - now
+        if remaining <= 0:
+            return True
+        # Proactive refresh: cf_clearance treated as stale within 5-min window
+        if cookie.get("name") == "cf_clearance" and remaining < CF_CLEARANCE_REFRESH_SECONDS:
+            return True
+        return False
     except (TypeError, ValueError):
         return True
 

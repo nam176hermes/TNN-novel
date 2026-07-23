@@ -158,7 +158,7 @@
 @media (max-width: 640px) {
   .pwa-install-prompt {
     grid-template-columns: auto minmax(0, 1fr);
-    inset: auto 14px calc(76px + env(safe-area-inset-bottom)) 14px;
+    inset: auto 14px calc(var(--mobile-nav-height) + 16px + env(safe-area-inset-bottom)) 14px;
   }
 
   .pwa-network-status {
@@ -172,13 +172,17 @@
   }
 
   .pwa-install-actions {
+    flex-wrap: wrap;
     grid-column: 1 / -1;
     justify-content: stretch;
   }
 
-  .pwa-install-actions button {
-    flex: 1;
+  .pwa-install-actions button,
+  .pwa-install-actions .primary-action,
+  .pwa-install-actions .secondary-action {
+    flex: 1 1 min(100%, 9rem);
     justify-content: center;
+    min-height: 44px;
   }
 }
 
@@ -1677,6 +1681,7 @@
     overflow-x: hidden;
     overflow-y: auto;
     padding: 16px 16px calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 20px);
+    scroll-padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 32px);
   }
 
   .workflow-mobile-bar {
@@ -1731,7 +1736,7 @@
     align-items: flex-end;
     background: rgb(0 0 0 / 64%);
     display: flex;
-    inset: 0;
+    inset: 0 0 calc(var(--mobile-nav-height) + env(safe-area-inset-bottom)) 0;
     position: fixed;
     z-index: 90;
   }
@@ -1744,9 +1749,11 @@
     color: #eef2ee;
     display: grid;
     gap: 18px;
-    max-height: 80dvh;
+    max-height: calc(100dvh - var(--mobile-nav-height) - env(safe-area-inset-bottom) - 24px);
+    overscroll-behavior: contain;
     overflow-y: auto;
-    padding: 10px 16px calc(18px + env(safe-area-inset-bottom));
+    padding: 10px 16px 0;
+    padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom));
     width: 100%;
   }
 
@@ -1838,7 +1845,7 @@
 
   .workflow-main > .pwa-install-prompt {
     inset: auto;
-    margin: 18px auto 0;
+    margin: 18px auto calc(16px + env(safe-area-inset-bottom));
     max-width: 720px;
     pointer-events: auto;
     position: relative;
@@ -1854,4 +1861,14 @@
     font-size: 10px;
   }
 }
+}
+
+@layer overrides {
+  @media (max-width: 640px) {
+    .pwa-install-actions button,
+    .pwa-install-actions .primary-action,
+    .pwa-install-actions .secondary-action {
+      min-height: 44px;
+    }
+  }
 }

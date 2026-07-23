@@ -24,13 +24,22 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 try:
-    from playwright.async_api import async_playwright, BrowserContext, Page
+    # Try patchright first (undetected Playwright fork — fixes Runtime.enable leak)
+    from patchright.async_api import async_playwright, BrowserContext, Page
     PLAYWRIGHT_AVAILABLE = True
+    PATCHRIGHT_AVAILABLE = True
 except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
+    try:
+        from playwright.async_api import async_playwright, BrowserContext, Page
+        PLAYWRIGHT_AVAILABLE = True
+        PATCHRIGHT_AVAILABLE = False
+    except ImportError:
+        PLAYWRIGHT_AVAILABLE = False
+        PATCHRIGHT_AVAILABLE = False
 
 from app.utils.cookie_store import load_cookies, save_cookies
 from app.utils.captcha_solver import get_captcha_solver
+from app.utils.proxy_pool import proxy_pool
 from app.observability import Observability, default_observability
 from app.security.url_policy import (
     UrlPolicyViolation,
@@ -44,13 +53,20 @@ logger = logging.getLogger(__name__)
 
 from app.utils.stealth_scripts import (
     STEALTH_LAUNCH_ARGS,
+    HARMFUL_ARGS,
     build_stealth_script,
+    filter_harmful_args,
     pick_user_agent,
     pick_viewport,
 )
 
 
 async def _start_playwright() -> Any:
+    """Start playwright/patchright with patchright preferred if available."""
+    if PATCHRIGHT_AVAILABLE:
+        logger.info("Using patchright (undetected Playwright)")
+    else:
+        logger.info("Using vanilla Playwright (patchright not installed)")
     return await async_playwright().start()
 
 
@@ -205,6 +221,19 @@ class BrowserSessionManager:
         display = _detect_display()
         ua = pick_user_agent()
         viewport = pick_viewport()
+        proxy = proxy_pool.get_next() if proxy_pool.proxies else None
+        # Build args: our stealth flags minus any harmful defaults Playwright adds
+        final_args = STEALTH_LAUNCH_ARGS
+        if not PATCHRIGHT_AVAILABLE:
+            # Patchright already filters harmful args internally.
+            # For vanilla Playwright, we need to explicitly ignore them.
+            final_args = filter_harmful_args(STEALTH_LAUNCH_ARGS) + [
+                arg for arg in STEALTH_LAUNCH_ARGS if arg not in HARMFUL_ARGS
+            ]
+            # Deduplicate while preserving order
+            seen = set()
+            final_args = [a for a in final_args if not (a in seen or seen.add(a))]
+
         self._context = await self._playwright.chromium.launch_persistent_context(
             str(self.profile_dir),
             headless=not bool(display),
@@ -212,7 +241,9 @@ class BrowserSessionManager:
             user_agent=ua,
             java_script_enabled=True,
             accept_downloads=False,
-            args=STEALTH_LAUNCH_ARGS,
+            args=final_args,
+            proxy=({"server": proxy.url} if proxy else None),
+            ignore_default_args=list(HARMFUL_ARGS),  # Remove Playwright's harmful defaults
         )
         await self._context.add_init_script(build_stealth_script(ua))
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -228,6 +259,38 @@ class BrowserSessionManager:
             asyncio.create_task(popup.close())
 
         page.on("popup", close_popup)
+
+    async def _install_resource_blocking(self, page: Page | Any) -> None:
+        """Block unnecessary resources (fonts, images, media) for faster fetches.
+
+        Ported from Scrapling's EXTRA_RESOURCES approach.
+        Skips blocking for OCR-dependent sites that need image rendering.
+        """
+        if not hasattr(page, "route") or getattr(page, "_novel_resource_blocker", False):
+            return
+
+        blocked_types = {
+            "font",
+            "media",
+            "websocket",
+            "beacon",
+            "texttrack",
+            "csp_report",
+        }
+        # Note: images NOT blocked globally — some OCR sites need screenshots
+
+        try:
+            async def block_handler(route: Any, request: Any) -> None:
+                resource_type = getattr(request, "resource_type", "")
+                if resource_type in blocked_types:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", block_handler)
+            setattr(page, "_novel_resource_blocker", True)
+        except Exception:
+            pass
 
     async def _install_navigation_guard(self, page: Page | Any) -> None:
         if not hasattr(page, "route") or getattr(page, "_novel_navigation_guard", False):
@@ -260,6 +323,7 @@ class BrowserSessionManager:
             raise RuntimeError("Browser session is not initialized")
         page.set_default_timeout(timeout)
         await self._install_navigation_guard(page)
+        await self._install_resource_blocking(page)
         cookies = load_cookies(url)
         if cookies and hasattr(context, "add_cookies"):
             await context.add_cookies(cookies)
@@ -382,6 +446,91 @@ class BrowserSessionManager:
                 safe_url,
                 type(nav_error).__name__,
             )
+
+        # Strategy 3.5: Free Turnstile checkbox clicking (no API cost)
+        try:
+            clicked = await self._try_turnstile_click(page, safe_url)
+            if clicked:
+                title_after_click = await page.title()
+                if not is_challenge(title_after_click):
+                    logger.info("Cloudflare resolved via free Turnstile click for %s", safe_url)
+                    return
+        except Exception as click_error:
+            logger.warning(
+                "Turnstile click failed for %s (%s)",
+                safe_url,
+                type(click_error).__name__,
+            )
+
+        # Strategy 4: API captcha solver for embedded Turnstile widgets
+        try:
+            solved = await StealthBrowser._detect_and_solve_captcha(page, url)
+            if solved:
+                logger.info("Captcha solved via API for %s (strategy 4)", safe_url)
+                return
+        except Exception as solver_error:
+            logger.warning(
+                "API captcha solver failed for %s (%s)",
+                safe_url,
+                type(solver_error).__name__,
+            )
+
+    async def _try_turnstile_click(self, page: Page | Any, safe_url: str) -> bool:
+        """Attempt to solve Cloudflare Turnstile by clicking the checkbox widget.
+
+        Ported from Scrapling's _cloudflare_solver approach.
+        Detects the Turnstile iframe, calculates checkbox coordinates, and clicks.
+        Returns True if a click was attempted, False if no widget found.
+        """
+        import random
+
+        # Pattern for Cloudflare challenge iframe URL
+        cf_iframe = None
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in (frame.url or ""):
+                cf_iframe = frame
+                break
+
+        if cf_iframe is None:
+            # Try CSS selectors for embedded Turnstile
+            box_selectors = [
+                "#cf_turnstile div",
+                "#cf-turnstile div",
+                ".turnstile > div > div",
+                ".main-content p + div > div > div",
+            ]
+            for selector in box_selectors:
+                try:
+                    locator = page.locator(selector).last
+                    box = await locator.bounding_box()
+                    if box and box.get("width", 0) > 10:
+                        # Calculate checkbox coordinates (offset from top-left of widget)
+                        click_x = box["x"] + random.randint(26, 28)
+                        click_y = box["y"] + random.randint(25, 27)
+                        await page.mouse.click(click_x, click_y, delay=random.randint(100, 200))
+                        logger.info("Clicked embedded Turnstile at %s for %s", selector, safe_url)
+                        await self._sleep(3)
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        # Found CF iframe — click the checkbox inside it
+        try:
+            await self._sleep(1)  # Let iframe stabilize
+            frame_element = await cf_iframe.frame_element()
+            box = await frame_element.bounding_box()
+            if not box:
+                return False
+
+            click_x = box["x"] + random.randint(26, 28)
+            click_y = box["y"] + random.randint(25, 27)
+            await page.mouse.click(click_x, click_y, delay=random.randint(100, 200))
+            logger.info("Clicked Turnstile iframe checkbox for %s", safe_url)
+            await self._sleep(3)
+            return True
+        except Exception:
+            return False
 
     async def _restart_session(self) -> None:
         self._observability.record_browser_lifecycle("restart")

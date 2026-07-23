@@ -113,8 +113,8 @@ def test_source_capabilities_map_policies_to_available_adapters() -> None:
     assert capabilities["69shuba"]["extraction"] == "selector"
     assert capabilities["22biqu"]["adapter_id"] == "biquge"
     assert capabilities["22biqu"]["domains"] == ["22biqu.com"]
-    assert capabilities["kakuyomu"]["adapter_id"] == "generic_html"
-    assert capabilities["kakuyomu"]["extraction"] == "generic"
+    assert capabilities["kakuyomu"]["adapter_id"] == "kakuyomu"
+    assert capabilities["kakuyomu"]["extraction"] == "selector"
 
 
 def test_validate_public_http_url_rejects_non_allowlisted_domains() -> None:

@@ -300,9 +300,28 @@ if (navigator.permissions && navigator.permissions.query) {
 })();
 
 // ================================================================
-// Canvas — inject noise into toDataURL / getImageData
+// Canvas — inject noise into toDataURL / getImageData / toBlob
+// Upgraded: multi-pixel random noise (ported from Scrapling/patchright approach)
 // ================================================================
 (function() {
+    // Deterministic per-session noise seed
+    const noiseSeed = Math.floor(Math.random() * 1000) + 1;
+
+    function addNoiseToImageData(imageData) {
+        const data = imageData.data;
+        // Add subtle noise to multiple random pixels (not just 1)
+        const pixelCount = data.length / 4;
+        const noisePixels = Math.min(10, Math.max(1, Math.floor(pixelCount / 100)));
+        for (let i = 0; i < noisePixels; i++) {
+            const idx = (Math.floor(Math.random() * pixelCount)) * 4;
+            // XOR each channel with a small random value (1-3)
+            data[idx]     = (data[idx]     ^ ((noiseSeed + i) % 3 + 1)) & 0xFF;
+            data[idx + 1] = (data[idx + 1] ^ ((noiseSeed + i * 2) % 3 + 1)) & 0xFF;
+            data[idx + 2] = (data[idx + 2] ^ ((noiseSeed + i * 3) % 3 + 1)) & 0xFF;
+        }
+    }
+
+    // Patch toDataURL
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = function() {
         const ctx = this.getContext('2d');
@@ -311,16 +330,43 @@ if (navigator.permissions && navigator.permissions.query) {
             const height = this.height;
             if (width > 0 && height > 0) {
                 try {
-                    const imageData = ctx.getImageData(0, 0, Math.min(width, 16), Math.min(height, 16));
-                    // Add imperceptible noise to one pixel
-                    if (imageData.data.length >= 4) {
-                        imageData.data[0] = imageData.data[0] ^ 1;
-                        ctx.putImageData(imageData, 0, 0);
-                    }
+                    const imageData = ctx.getImageData(0, 0, Math.min(width, 100), Math.min(height, 100));
+                    addNoiseToImageData(imageData);
+                    ctx.putImageData(imageData, 0, 0);
                 } catch(e) { /* CORS or small canvas */ }
             }
         }
         return origToDataURL.apply(this, arguments);
+    };
+
+    // Patch toBlob (used by some fingerprinters)
+    const origToBlob = HTMLCanvasElement.prototype.toBlob;
+    if (origToBlob) {
+        HTMLCanvasElement.prototype.toBlob = function() {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                const width = this.width;
+                const height = this.height;
+                if (width > 0 && height > 0) {
+                    try {
+                        const imageData = ctx.getImageData(0, 0, Math.min(width, 100), Math.min(height, 100));
+                        addNoiseToImageData(imageData);
+                        ctx.putImageData(imageData, 0, 0);
+                    } catch(e) { /* CORS or small canvas */ }
+                }
+            }
+            return origToBlob.apply(this, arguments);
+        };
+    }
+
+    // Patch getImageData (used directly by fingerprinters)
+    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function() {
+        const imageData = origGetImageData.apply(this, arguments);
+        try {
+            addNoiseToImageData(imageData);
+        } catch(e) { /* read-only */ }
+        return imageData;
     };
 })();
 
@@ -361,14 +407,64 @@ if (window.Notification) {
 # ---------------------------------------------------------------------------
 
 STEALTH_LAUNCH_ARGS = [
+    # Core anti-detection (from patchright)
     "--disable-blink-features=AutomationControlled",
-    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    # WebRTC leak prevention (from Scrapling)
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy",
+    # Canvas fingerprint noise (from Scrapling)
+    "--fingerprinting-canvas-image-data-noise",
+    # Speed + stability
     "--no-sandbox",
-    "--disable-dev-shm-usage",
     "--no-first-run",
-    "--no-zygote",
-    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-pings",
+    "--no-default-browser-check",
+    "--no-service-autorun",
+    "--disable-dev-shm-usage",
     "--disable-infobars",
+    "--disable-breakpad",
+    "--disable-hang-monitor",
+    "--disable-search-engine-choice-screen",
+    "--disable-session-crashed-bubble",
+    # Anti-detection stealth flags (from Scrapling STEALTH_ARGS)
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--start-maximized",
     "--window-position=0,0",
-    "--disable-extensions",
+    "--mute-audio",
+    "--disable-sync",
+    "--disable-translate",
+    "--disable-logging",
+    "--disable-crash-reporter",
+    "--disable-domain-reliability",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-ipc-flooding-protection",
+    "--disable-client-side-phishing-detection",
+    "--disable-threaded-animation",
+    "--disable-threaded-scrolling",
+    "--metrics-recording-only",
+    "--force-color-profile=srgb",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--autoplay-policy=user-gesture-required",
+    "--homepage=about:blank",
 ]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HARMFUL_ARGS — Chromium flags that leak automation (from Scrapling/patchright)
+# These must be REMOVED from Playwright's default args before launch.
+# ──────────────────────────────────────────────────────────────────────────────
+HARMFUL_ARGS = (
+    "--enable-automation",              # Sets navigator.webdriver = true
+    "--disable-popup-blocking",         # Popup crashing abuse detection
+    "--disable-component-update",       # Detected as stealth driver
+    "--disable-default-apps",           # Enables default apps check
+    "--disable-extensions",             # Enables extensions (needed for stealth)
+)
+
+
+def filter_harmful_args(default_args: list[str]) -> list[str]:
+    """Remove harmful automation flags from Playwright's default launch args."""
+    return [arg for arg in default_args if not any(harmful in arg for harmful in HARMFUL_ARGS)]

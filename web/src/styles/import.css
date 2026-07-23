@@ -1122,7 +1122,7 @@
 
   .import-mode-tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    margin-bottom: 16px;
+    margin-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 24px);
   }
 
   .import-mode-tabs .secondary-action {
@@ -1155,6 +1155,10 @@
 
   .ebook-dry-run {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .import-reference-view {
+    padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 24px);
   }
 
   .import-reference-view .topbar-actions {

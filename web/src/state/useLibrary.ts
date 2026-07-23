@@ -15,6 +15,7 @@ export function useLibrary(client: ApiClient, enabled: boolean, onAuthError?: ()
   const booksRef = useRef<BookSummary[]>([]);
   const booksRequestIdRef = useRef(0);
   const chaptersRequestIdRef = useRef(0);
+  const chaptersInFlightRef = useRef<Map<number, Promise<Chapter[]>>>(new Map());
 
   useEffect(() => {
     booksRef.current = books.data;
@@ -87,40 +88,51 @@ export function useLibrary(client: ApiClient, enabled: boolean, onAuthError?: ()
         return [];
       }
 
+      const inFlight = chaptersInFlightRef.current.get(bookId);
+      if (inFlight) return inFlight;
+
       const requestId = chaptersRequestIdRef.current + 1;
       chaptersRequestIdRef.current = requestId;
       setChapters((current) => ({ data: current.data, error: '', state: 'loading' }));
 
-      try {
-        const liveChapters = await client.getChapters(bookId);
-        if (requestId !== chaptersRequestIdRef.current) return liveChapters.map((chapter) => mapChapter(chapter, ''));
-        const bookTitle = booksRef.current.find((book) => book.id === bookId)?.title ?? '';
-        const mappedChapters = liveChapters.map((chapter) => mapChapter(chapter, bookTitle));
+      let request: Promise<Chapter[]>;
+      request = (async () => {
+        try {
+          const liveChapters = await client.getChapters(bookId);
+          if (requestId !== chaptersRequestIdRef.current) return liveChapters.map((chapter) => mapChapter(chapter, ''));
+          const bookTitle = booksRef.current.find((book) => book.id === bookId)?.title ?? '';
+          const mappedChapters = liveChapters.map((chapter) => mapChapter(chapter, bookTitle));
 
-        setChapters({
-          data: mappedChapters,
-          error: '',
-          state: mappedChapters.length > 0 ? 'ready' : 'empty',
-        });
-        setBooks((current) => ({
-          ...current,
-          data: current.data.map((book) => (book.id === bookId ? mergeChapterSummary(book, liveChapters) : book)),
-        }));
-        setSelectedChapterId((current) => {
-          if (current !== null && mappedChapters.some((chapter) => chapter.id === current)) return current;
-          return mappedChapters[0]?.id ?? null;
-        });
+          setChapters({
+            data: mappedChapters,
+            error: '',
+            state: mappedChapters.length > 0 ? 'ready' : 'empty',
+          });
+          setBooks((current) => ({
+            ...current,
+            data: current.data.map((book) => (book.id === bookId ? mergeChapterSummary(book, liveChapters) : book)),
+          }));
+          setSelectedChapterId((current) => {
+            if (current !== null && mappedChapters.some((chapter) => chapter.id === current)) return current;
+            return mappedChapters[0]?.id ?? null;
+          });
 
-        return mappedChapters;
-      } catch (error) {
-        if (requestId !== chaptersRequestIdRef.current) throw error;
-        if (error instanceof ApiError && error.status === 401) {
-          onAuthError?.();
+          return mappedChapters;
+        } catch (error) {
+          if (requestId !== chaptersRequestIdRef.current) throw error;
+          if (error instanceof ApiError && error.status === 401) {
+            onAuthError?.();
+          }
+          const message = formatError(error);
+          setChapters((current) => ({ data: current.data, error: message, state: 'error' }));
+          throw error;
+        } finally {
+          chaptersInFlightRef.current.delete(bookId);
         }
-        const message = formatError(error);
-        setChapters((current) => ({ data: current.data, error: message, state: 'error' }));
-        throw error;
-      }
+      })();
+
+      chaptersInFlightRef.current.set(bookId, request);
+      return request;
     },
     [client, enabled, onAuthError, selectedBookId],
   );

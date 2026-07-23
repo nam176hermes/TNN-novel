@@ -12,6 +12,7 @@ from app.database.db import init_db
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.routers import backups as backups_router
+from app.mobile_api.services import backup_service as backup_service_module
 from app.mobile_api.services.backup_service import BackupService
 from scripts import ops
 
@@ -30,6 +31,20 @@ async def auth_headers(client: httpx.AsyncClient) -> dict[str, str]:
 
 def test_backup_route_exposes_coordinator_dependency() -> None:
     assert callable(backups_router.get_backup_job_coordinator)
+
+
+def test_backup_service_defaults_to_data_dir_backups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(backup_service_module, "get_data_dir", lambda: data_dir)
+
+    service = BackupService()
+
+    assert service.backup_dir == (data_dir / "backups").resolve()
+    assert service.backup_dir.is_dir()
 
 
 class RecordingBackupJobCoordinator:

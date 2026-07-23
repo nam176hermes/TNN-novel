@@ -10,9 +10,9 @@ from scripts import ops
 
 class BackupService:
     def __init__(self, backup_dir: Path | None = None, data_dir: Path | None = None):
-        self.backup_dir = (backup_dir or ops.DEFAULT_BACKUP_DIR).resolve()
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = (data_dir or get_data_dir()).resolve()
+        self.backup_dir = (backup_dir or self.data_dir / "backups").resolve()
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     def list_backups(self) -> list[dict]:
         items = ops.list_backups(self.backup_dir)

@@ -224,21 +224,30 @@ function AuthenticatedApp() {
       translatedChapters[selectedIndex - 1],
     ].filter((target): target is Chapter => Boolean(target));
   }, [chapters, selectedChapter?.book_id, selectedChapterId]);
+  const workbenchChapterSelected = selectedChapter?.id === workbenchChapterId;
+  const chapterTextEnabled = session.isAuthenticated && Boolean(
+    selectedChapter && (activeView === 'reader' || (activeView === 'workbench' && workbenchChapterSelected)),
+  );
+  const glossaryEnabled = session.isAuthenticated && Boolean(
+    activeView === 'glossary' || (activeView === 'workbench' && workbenchChapterSelected),
+  );
+  const qaEnabled = session.isAuthenticated && Boolean(activeView === 'workbench' && workbenchChapterSelected);
+  const readerPrefetchTargets = activeView === 'reader' ? chapterTextPrefetchTargets : [];
   const chapterText = useChapterText(
     session.client,
-    session.isAuthenticated,
+    chapterTextEnabled,
     selectedChapter,
     expireSession,
-    chapterTextPrefetchTargets,
+    readerPrefetchTargets,
     { cacheOwnership: activeView === 'reader' ? 'external' : 'internal' },
   );
   const providersState = useProviders(session.client, session.isAuthenticated, expireSession);
   const styleState = useStyleProfiles(session.client, session.isAuthenticated, expireSession);
   const assistBookId = selectedChapter?.book_id ?? library.selectedBookId;
-  const qaState = useQa(session.client, session.isAuthenticated, selectedChapter, expireSession);
+  const qaState = useQa(session.client, qaEnabled, selectedChapter, expireSession);
   const glossaryState = useGlossary(
     session.client,
-    session.isAuthenticated,
+    glossaryEnabled,
     assistBookId,
     chapterText.sourceText,
     expireSession,
@@ -280,8 +289,9 @@ function AuthenticatedApp() {
   }, [expireSession, session.client, session.isAuthenticated]);
 
   useEffect(() => {
+    if (activeView !== 'import') return;
     void loadEbookImportHistory();
-  }, [loadEbookImportHistory]);
+  }, [activeView, loadEbookImportHistory]);
 
   const loadEbookInbox = useCallback(async (): Promise<void> => {
     if (!session.isAuthenticated) {
@@ -310,7 +320,7 @@ function AuthenticatedApp() {
 
   const activeBookId = library.selectedBookId;
   const textLoading = chapterText.state === 'loading';
-  const workbenchChapter = selectedChapter?.id === workbenchChapterId ? selectedChapter : null;
+  const workbenchChapter = workbenchChapterSelected ? selectedChapter : null;
 
   const loadRawBacklog = useCallback(async (): Promise<Chapter[]> => {
     if (!session.isAuthenticated) {
@@ -576,7 +586,7 @@ function AuthenticatedApp() {
   }, [activeView, loadTranslatedBooks, session.isAuthenticated, translatedBooks.state]);
 
   useEffect(() => {
-    if (activeView !== 'workbench' && activeView !== 'raw') return;
+    if (activeView !== 'raw') return;
     void loadRawBacklog().catch(() => {});
   }, [activeView, loadRawBacklog]);
 
@@ -620,7 +630,13 @@ function AuthenticatedApp() {
   }, [activeView, loadSystemStatus, session.isAuthenticated, statusRefreshSeconds]);
 
   useEffect(() => {
-    if (!session.isAuthenticated || !selectedChapter || !chapterText.sourceText || !providersState.selectedProviderId) {
+    if (
+      activeView !== 'workbench'
+      || !session.isAuthenticated
+      || !workbenchChapter
+      || !chapterText.sourceText
+      || !providersState.selectedProviderId
+    ) {
       void providersState.estimateForSource(0, 0).catch(() => {});
       return;
     }
@@ -629,11 +645,12 @@ function AuthenticatedApp() {
       .estimateForSource(chapterText.sourceText.length, 1)
       .catch(() => {});
   }, [
+    activeView,
     chapterText.sourceText,
     providersState.estimateForSource,
     providersState.selectedProviderId,
-    selectedChapter,
     session.isAuthenticated,
+    workbenchChapter,
   ]);
 
   function handleJobError(error: unknown, label: string): void {

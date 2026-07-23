@@ -2776,7 +2776,13 @@
   }
 
   .export-format-grid {
+    margin-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 24px);
     grid-template-columns: 1fr;
+  }
+
+  .export-options-panel,
+  .export-action-panel {
+    padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 24px);
   }
 
   .export-format-button {
@@ -3694,6 +3700,189 @@
 
   .glossary-management-table {
     font-size: 9px;
+  }
+}
+
+@media (max-width: 559px) {
+  .providers-view,
+  .glossary-style-view {
+    max-width: none;
+  }
+
+  .providers-view > .panel,
+  .glossary-style-view > .panel {
+    overflow-x: visible;
+  }
+
+  .providers-management-table,
+  .glossary-management-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    display: block;
+    font-size: 13px;
+    min-width: 0;
+    table-layout: auto;
+    width: 100%;
+  }
+
+  .workflow-management-view .providers-management-table,
+  .workflow-management-view .glossary-management-table {
+    min-width: 0;
+  }
+
+  .providers-management-table thead,
+  .glossary-management-table thead,
+  .glossary-filter-tabs span:not(.status-chip-success) {
+    display: none;
+  }
+
+  .providers-management-table tbody,
+  .glossary-management-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .providers-management-table tr,
+  .glossary-management-table tr {
+    background: rgb(255 255 255 / 3%);
+    border: 1px solid rgb(255 255 255 / 8%);
+    border-radius: 10px;
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .providers-management-table th,
+  .providers-management-table td,
+  .glossary-management-table th,
+  .glossary-management-table td {
+    align-items: start;
+    border-bottom: 0;
+    display: grid;
+    gap: 8px;
+    grid-template-columns: minmax(84px, 0.36fr) minmax(0, 1fr);
+    min-width: 0;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    padding: 0;
+    text-overflow: clip;
+    white-space: normal;
+    width: auto;
+  }
+
+  .providers-management-table th::before,
+  .providers-management-table td::before,
+  .glossary-management-table th::before,
+  .glossary-management-table td::before {
+    color: var(--text-soft);
+    content: "";
+    font-size: 11px;
+    font-weight: 760;
+    text-transform: uppercase;
+  }
+
+  .providers-management-table th:nth-child(1)::before { content: "Provider"; }
+  .providers-management-table td:nth-child(2)::before { content: "Model"; }
+  .providers-management-table td:nth-child(3)::before { content: "Key"; }
+  .providers-management-table td:nth-child(4)::before { content: "Env var"; }
+  .providers-management-table td:nth-child(5)::before { content: "Base URL"; }
+  .providers-management-table td:nth-child(6)::before { content: "Giá"; }
+  .providers-management-table td:nth-child(7)::before { content: "Thao tác"; }
+
+  .providers-management-table th:nth-child(n),
+  .providers-management-table td:nth-child(n),
+  .glossary-management-table th:nth-child(n),
+  .glossary-management-table td:nth-child(n) {
+    width: auto;
+  }
+
+  .provider-key-form {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .provider-key-form input,
+  .provider-key-form button,
+  .provider-row-test {
+    min-height: 44px;
+  }
+
+  .provider-row-test {
+    width: 44px;
+  }
+
+  .provider-url,
+  .providers-management-table code {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  .provider-pricing-cell {
+    gap: 4px;
+  }
+
+  .provider-test-controls,
+  .glossary-table-header,
+  .glossary-toolbar {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .glossary-filter-tabs {
+    overflow-x: visible;
+  }
+
+  .glossary-filter-tabs .status-chip-success {
+    justify-self: start;
+  }
+
+  .glossary-management-table th:nth-child(1)::before { content: "Gốc"; }
+  .glossary-management-table td:nth-child(2)::before { content: "Bản dịch"; }
+  .glossary-management-table td:nth-child(3)::before { content: "Loại"; }
+  .glossary-management-table td:nth-child(4)::before { content: "Thể loại"; }
+  .glossary-management-table td:nth-child(5)::before { content: "Ưu tiên"; }
+  .glossary-management-table td:nth-child(6)::before { content: "Duyệt"; }
+  .glossary-management-table td:nth-child(7)::before { content: "Khóa"; }
+  .glossary-management-table td:nth-child(8)::before { content: "Thao tác"; }
+
+  .glossary-management-table input,
+  .glossary-management-table select {
+    background: rgb(255 255 255 / 5%);
+    border-color: rgb(255 255 255 / 10%);
+    font-size: 13px;
+    min-height: 44px;
+    padding: 8px 10px;
+  }
+
+  .glossary-management-table .status-chip {
+    font-size: 12px;
+    justify-self: start;
+    min-height: 28px;
+    padding: 5px 8px;
+  }
+
+  .glossary-management-table .dialog-actions {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: 1fr;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .glossary-management-table .primary-action,
+  .glossary-management-table .secondary-action,
+  .glossary-management-table .danger-action,
+  .glossary-row-menu {
+    font-size: 12px;
+    justify-content: center;
+    min-height: 44px;
+    padding: 8px 10px;
+    width: 100%;
+  }
+
+  .glossary-row-context {
+    overflow-wrap: anywhere;
   }
 }
 .provider-logo-image {

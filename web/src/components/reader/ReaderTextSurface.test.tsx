@@ -252,4 +252,32 @@ describe('ReaderTextSurface', () => {
     expect(screen.getByText('Chưa có bản dịch tiếng Việt.')).toBeInTheDocument();
     expect(screen.getByText(/File import của chương này chỉ có tiêu đề/)).toBeInTheDocument();
   });
+
+  it('marks empty reader states so mobile can render them as centered cards', () => {
+    const { rerender } = render(
+      <ReaderTextSurface
+        {...buildSurfaceProps({
+          paragraphs: [],
+          richBlocks: [],
+          selectedChapter: null,
+          visibleParagraphs: [],
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Chọn một truyện đã dịch để bắt đầu đọc.')).toHaveClass('reader-empty-state');
+
+    rerender(
+      <ReaderTextSurface
+        {...buildSurfaceProps({
+          paragraphs: [],
+          richBlocks: [],
+          selectedChapter: { ...chapter, title: 'Man Khải' },
+          visibleParagraphs: [],
+        })}
+      />,
+    );
+
+    expect(screen.getByText('Chưa có bản dịch tiếng Việt.')).toHaveClass('reader-empty-state');
+  });
 });

@@ -197,12 +197,14 @@ export default function ReaderTextSurface({
           {textError}
         </p>
       ) : null}
-      {!selectedChapter && textState !== 'loading' ? <p>Chọn một truyện đã dịch để bắt đầu đọc.</p> : null}
+      {!selectedChapter && textState !== 'loading' ? (
+        <p className="reader-empty-state">Chọn một truyện đã dịch để bắt đầu đọc.</p>
+      ) : null}
       {selectedChapter && textState !== 'loading' && paragraphs.length === 0 && richBlocks.length === 0 && !hasRichContent && !textError ? (
-        <p>Chưa có bản dịch tiếng Việt.</p>
+        <p className="reader-empty-state">Chưa có bản dịch tiếng Việt.</p>
       ) : null}
       {selectedChapter && textState !== 'loading' && hasTitleOnlyImportContent && !textError ? (
-        <p className="status-warning">File import của chương này chỉ có tiêu đề/ảnh, chưa có nội dung chữ để đọc.</p>
+        <p className="reader-empty-state status-warning">File import của chương này chỉ có tiêu đề/ảnh, chưa có nội dung chữ để đọc.</p>
       ) : null}
       {selectedChapter && textState !== 'loading' && hasRichContent && !textError ? (
         <div className={isPaginatedMode ? 'chapter-rich-page' : 'chapter-rich-content'}>
