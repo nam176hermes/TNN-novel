@@ -155,7 +155,6 @@ function mockReaderApiClient(overrides: Partial<ReaderApiClient> = {}): ReaderAp
     getChapterTranslation: vi.fn((bookId: number, chapterId: number) => Promise.resolve(
       `Bản dịch ${bookId}:${chapterId}`,
     )),
-    getQaReport: vi.fn().mockResolvedValue(null),
     getReaderXray: vi.fn().mockResolvedValue({
       book_id: 42,
       current_chapter_number: 2,
@@ -317,6 +316,9 @@ function renderReader(overrides: Partial<Parameters<typeof ReaderView>[0]> = {})
     selectedChapter: chapters[1],
     selectedChapterId: 102,
     contentHtml: '',
+    qaError: '',
+    qaReport: null,
+    qaState: 'empty' as const,
     textError: '',
     textState: 'ready' as const,
     translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
@@ -528,8 +530,10 @@ describe('ReaderView', () => {
   });
 
   it('renders QA overlay summary and paragraph badges from the chapter QA report', async () => {
-    const apiClient = mockReaderApiClient({
-      getQaReport: vi.fn().mockResolvedValue({
+    renderReader({
+      contentHtml: '<p>青云宗弟子取出灵石。</p><p>他进入筑基境。</p>',
+      qaState: 'ready',
+      qaReport: {
         book_id: 42,
         chapter_id: 102,
         overall_status: 'WARNING',
@@ -548,16 +552,10 @@ describe('ReaderView', () => {
         report_json: {
           internal_debug: '<script>alert(1)</script>',
         },
-      }),
-    });
-
-    renderReader({
-      apiClient,
-      contentHtml: '<p>青云宗弟子取出灵石。</p><p>他进入筑基境。</p>',
+      },
       translationText: 'Đệ tử lấy ra 灵石.\n\nĐệ tử lấy ra 灵石.',
     });
 
-    await waitFor(() => expect(apiClient.getQaReport).toHaveBeenCalledWith(42, 102));
     await userEvent.click(screen.getByRole('button', { name: 'QA' }));
 
     const summary = screen.getByRole('region', { name: 'Tóm tắt QA chương' });
@@ -3606,8 +3604,11 @@ describe('ReaderView', () => {
   });
 
   it('warns about QA FAIL and Chinese leakage before starting reader TTS', async () => {
-    const apiClient = mockReaderApiClient({
-      getQaReport: vi.fn().mockResolvedValue({
+    const apiClient = mockReaderApiClient();
+    renderReader({
+      apiClient,
+      qaState: 'ready',
+      qaReport: {
         book_id: 42,
         chapter_id: 102,
         overall_status: 'FAIL',
@@ -3615,10 +3616,7 @@ describe('ReaderView', () => {
         glossary_violations: [],
         quality_score: 3,
         repetition_warning: false,
-      }),
-    });
-    renderReader({
-      apiClient,
+      },
       translationText: 'Đệ tử lấy ra 灵石.\n\nHắn đi tiếp.',
     });
 

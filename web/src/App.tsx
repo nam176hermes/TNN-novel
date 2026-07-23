@@ -36,14 +36,14 @@ import WorkflowShell, { type WorkflowView } from './components/WorkflowShell';
 import type { WorkbenchDashboardData } from './components/WorkbenchView';
 import { resolveApiBaseUrl } from './api/baseUrl';
 import { formatError, type AsyncState, type LoadState } from './state/types';
-import { useChapterText } from './state/useChapterText';
+import { useReaderChapterData } from './state/useReaderChapterData';
 import { useGlossary } from './state/useGlossary';
 import { useJobAttempts } from './state/useJobAttempts';
 import { useJobLogs } from './state/useJobLogs';
 import { useJobsHistory } from './state/useJobsHistory';
 import { useLibrary } from './state/useLibrary';
 import { useProviders } from './state/useProviders';
-import { useQa, type NormalizedQaIssue } from './state/useQa';
+import type { NormalizedQaIssue } from './state/useQa';
 import { removeCachedBookAsync, removeCachedChapterAsync } from './state/readerCache';
 import {
   chooseLatestReaderProgressSnapshot,
@@ -231,9 +231,8 @@ function AuthenticatedApp() {
   const glossaryEnabled = session.isAuthenticated && Boolean(
     activeView === 'glossary' || (activeView === 'workbench' && workbenchChapterSelected),
   );
-  const qaEnabled = session.isAuthenticated && Boolean(activeView === 'workbench' && workbenchChapterSelected);
   const readerPrefetchTargets = activeView === 'reader' ? chapterTextPrefetchTargets : [];
-  const chapterText = useChapterText(
+  const readerChapterData = useReaderChapterData(
     session.client,
     chapterTextEnabled,
     selectedChapter,
@@ -241,10 +240,11 @@ function AuthenticatedApp() {
     readerPrefetchTargets,
     { cacheOwnership: activeView === 'reader' ? 'external' : 'internal' },
   );
+  const chapterText = readerChapterData.text;
   const providersState = useProviders(session.client, session.isAuthenticated, expireSession);
   const styleState = useStyleProfiles(session.client, session.isAuthenticated, expireSession);
   const assistBookId = selectedChapter?.book_id ?? library.selectedBookId;
-  const qaState = useQa(session.client, qaEnabled, selectedChapter, expireSession);
+  const qaState = readerChapterData.qa;
   const glossaryState = useGlossary(
     session.client,
     glossaryEnabled,
@@ -1853,6 +1853,9 @@ function AuthenticatedApp() {
               books={translatedBooks.data}
               chapters={chapters}
               contentHtml={chapterText.contentHtml}
+              qaError={qaState.error}
+              qaReport={qaState.report}
+              qaState={qaState.state}
               selectedChapter={selectedChapter}
               selectedChapterId={selectedChapterId}
               textError={chapterText.error}
