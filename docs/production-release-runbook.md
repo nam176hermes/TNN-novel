@@ -79,10 +79,21 @@ docker image inspect \
   --format '{{index .RepoTags 0}} {{.Id}}'
 ```
 
-Confirm no durable job has `queued` or `running` status. Recreate API first,
-verify it, then recreate worker with the same exact file chain:
+Confirm no durable job has `queued` or `running` status. Recreate the worker
+first, verify its health, then recreate API with the same exact file chain.
+Worker-first cutover avoids making the new API fail its release-match readiness
+check while an old worker is still reporting a different release ID:
 
 ```bash
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$RELEASE_OVERLAY" \
+  up --detach --no-build --force-recreate import-worker
+
+docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}} {{.State.Health.Status}}' \
+  novel-tnn-wsl-import-worker-1
+
 docker compose -p "$PROJECT_NAME" \
   --env-file "$PRODUCTION_ENV" \
   -f compose.yaml \
@@ -91,12 +102,6 @@ docker compose -p "$PROJECT_NAME" \
 
 curl --fail --silent --show-error http://127.0.0.1:7860/api/health
 curl --fail --silent --show-error http://127.0.0.1:7860/api/ready
-
-docker compose -p "$PROJECT_NAME" \
-  --env-file "$PRODUCTION_ENV" \
-  -f compose.yaml \
-  -f "$RELEASE_OVERLAY" \
-  up --detach --no-build --force-recreate import-worker
 ```
 
 `--no-build` is required for an image-pinned release. It prevents an accidental
@@ -121,8 +126,9 @@ For runtime hardening, inspect the application process rather than
 `docker-init` PID 1. It must have `Umask: 0007`; database, WAL, and SHM must
 be `0660`. Do not delete healthy production sidecars to test recreation.
 
-To roll back, render the tracked rollback overlay first and then recreate API
-followed by worker with the same project and environment file:
+To roll back, render the tracked rollback overlay first and then recreate the
+worker followed by API with the same project and environment file. This keeps
+the readiness/release-match ordering consistent with forward deployment:
 
 ```bash
 docker compose -p "$PROJECT_NAME" \
@@ -135,7 +141,13 @@ docker compose -p "$PROJECT_NAME" \
   --env-file "$PRODUCTION_ENV" \
   -f compose.yaml \
   -f "$ROLLBACK_OVERLAY" \
-  up --detach --no-build --force-recreate api import-worker
+  up --detach --no-build --force-recreate import-worker
+
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$ROLLBACK_OVERLAY" \
+  up --detach --no-build --force-recreate api
 ```
 
 Keep release and rollback tags until an explicitly approved retention cleanup.
