@@ -46,6 +46,7 @@ from app.mobile_api.routers import (
     style_profiles_router,
     source_catalog_router,
     source_adapter_candidates_router,
+    operations_router,
 )
 
 PUBLIC_API_PATHS = {
@@ -315,6 +316,7 @@ def create_app(*, retention_service: RetentionService | None = None) -> FastAPI:
     app.include_router(style_profiles_router)
     app.include_router(source_catalog_router)
     app.include_router(source_adapter_candidates_router)
+    app.include_router(operations_router)
     _mount_private_asset_routes(app)
     _mount_web_app(app)
 

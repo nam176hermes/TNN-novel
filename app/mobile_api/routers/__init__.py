@@ -16,6 +16,7 @@ from app.mobile_api.routers.style_profiles import router as style_profiles_route
 from app.mobile_api.routers.sources import router as sources_router
 from app.mobile_api.routers.source_catalog import router as source_catalog_router
 from app.mobile_api.routers.source_adapter_candidates import router as source_adapter_candidates_router
+from app.mobile_api.routers.operations import router as operations_router
 
 __all__ = [
     "auth_router",
@@ -34,4 +35,5 @@ __all__ = [
     "sources_router",
     "source_catalog_router",
     "source_adapter_candidates_router",
+    "operations_router",
 ]
