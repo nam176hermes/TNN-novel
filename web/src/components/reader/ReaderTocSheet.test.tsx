@@ -182,4 +182,34 @@ describe('ReaderTocSheet', () => {
       }
     }
   });
+
+  it('keeps a production-scale TOC bounded and brings the current chapter into the window', async () => {
+    const manyChapters = Array.from({ length: 700 }, (_, index): Chapter => ({
+      id: 1000 + index,
+      book_id: 1,
+      chapter_number: index + 1,
+      title: `Chương dài ${index + 1}`,
+      status: 'translated',
+      audio_path: null,
+      has_translation: true,
+    }));
+
+    renderToc({
+      chapters: manyChapters,
+      currentChapterId: manyChapters[649].id,
+      previews: new Map(),
+    });
+
+    expect(chapterButtons().length).toBeLessThan(50);
+    const current = await screen.findByRole('button', { name: 'Ch. 650 Chương dài 650' });
+    await waitFor(() => expect(current).toHaveFocus());
+
+    await userEvent.keyboard('{End}');
+    const lastChapter = await screen.findByRole('button', { name: 'Ch. 700 Chương dài 700' });
+    await waitFor(() => expect(lastChapter).toHaveFocus());
+
+    const search = screen.getByRole('searchbox', { name: 'Tìm trong mục lục' });
+    await userEvent.type(search, 'Chương dài 700');
+    expect(screen.getByRole('button', { name: 'Ch. 700 Chương dài 700' })).toBeVisible();
+  });
 });
