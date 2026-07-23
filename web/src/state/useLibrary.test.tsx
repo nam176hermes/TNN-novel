@@ -184,4 +184,29 @@ describe('useLibrary', () => {
     expect(result.current.books.data).toHaveLength(1);
     expect(result.current.books.data[0]).toMatchObject({ id: 42, title: 'Live Book' });
   });
+
+  it('restores a bounded cached reader selection without requiring a network response', async () => {
+    const client = {
+      getBooks: vi.fn().mockRejectedValue(new TypeError('offline')),
+      getChapters: vi.fn().mockRejectedValue(new TypeError('offline')),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useLibrary(client, true));
+    const cachedChapter = {
+      ...fixtureChapter,
+      book_id: 42,
+      book_title: 'Offline Book',
+      id: 4201,
+      title: 'Offline Chapter',
+    };
+
+    act(() => result.current.restoreReaderSelection(cachedChapter));
+
+    expect(result.current.selectedBookId).toBe(42);
+    expect(result.current.selectedChapterId).toBe(4201);
+    expect(result.current.selectedChapter).toMatchObject(cachedChapter);
+    expect(result.current.chapters.data).toEqual([cachedChapter]);
+
+    await waitFor(() => expect(result.current.chapters.state).toBe('error'));
+    expect(result.current.selectedChapter).toMatchObject(cachedChapter);
+  });
 });

@@ -1996,8 +1996,8 @@ describe('ReaderView', () => {
     const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
 
     await waitFor(() => expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument());
-    expect(within(menu).getByText(/có thể vẫn còn trên thiết bị sau khi đăng xuất/)).toBeInTheDocument();
-    expect(within(menu).getByText(/Dùng các nút xóa cache bên dưới/)).toBeInTheDocument();
+    expect(within(menu).getByText(/xóa nội dung Reader riêng tư/)).toBeInTheDocument();
+    expect(within(menu).getByText(/dùng các nút bên dưới để xóa sớm hơn/)).toBeInTheDocument();
     expect(within(menu).getByText('Chương sau đã cache')).toBeInTheDocument();
     expect(within(menu).getByText(/^Cache \d+ KB$/)).toBeInTheDocument();
     expect(within(menu).getByText('Manifest 2 chương · abc12345')).toBeInTheDocument();

@@ -3766,8 +3766,8 @@ export default function ReaderView({
             <p className="reader-export-status">{annotationExportStatus}</p>
           ) : null}
           <p className="reader-offline-cache-warning">
-            Cache offline chỉ lưu những chương/audio bạn tải thủ công và có thể vẫn còn trên thiết bị sau khi đăng xuất.
-            Dùng các nút xóa cache bên dưới trước khi bàn giao thiết bị.
+            Cache offline chỉ lưu những chương/audio bạn tải thủ công. Novel-TNN sẽ xóa nội dung Reader riêng tư
+            khi bạn đăng xuất; bạn cũng có thể dùng các nút bên dưới để xóa sớm hơn.
           </p>
           <button
             className="reader-menu-action"

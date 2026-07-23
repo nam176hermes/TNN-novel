@@ -14,6 +14,7 @@ export type ReaderCachedChapter = {
   bookId: number;
   cachedAt: string;
   chapterId: number;
+  contentRevision?: string;
   html: string;
   sourceText: string;
   text: string;
@@ -156,6 +157,7 @@ function cachedChapterFromRecord(record: unknown): ReaderCachedChapter | null {
     bookId: record.bookId,
     cachedAt: record.cachedAt,
     chapterId: record.chapterId,
+    contentRevision: typeof record.contentRevision === 'string' ? record.contentRevision : '',
     html: record.html,
     sourceText: typeof record.sourceText === 'string' ? record.sourceText : '',
     text: record.text,
@@ -1683,6 +1685,40 @@ export async function getCachedChapterAsync(bookId: number, chapterId: number): 
   }
 }
 
+export async function clearReaderCacheAsync(
+  storage: Storage | null = getBrowserStorage(),
+): Promise<void> {
+  try {
+    storage?.removeItem(READER_CACHE_STORAGE_KEY);
+    storage?.removeItem(READER_ASSET_CACHE_STORAGE_KEY);
+    storage?.removeItem(READER_AUDIO_CACHE_STORAGE_KEY);
+  } catch {
+    // IndexedDB remains the authoritative cache when localStorage is unavailable.
+  }
+
+  for (const objectUrl of cachedAssetObjectUrls.values()) URL.revokeObjectURL(objectUrl);
+  for (const objectUrl of cachedAudioObjectUrls.values()) URL.revokeObjectURL(objectUrl);
+  cachedAssetObjectUrls.clear();
+  cachedAudioObjectUrls.clear();
+
+  const db = await openReaderCacheDb();
+  if (db) {
+    try {
+      const tx = db.transaction(
+        [READER_CACHE_STORE_NAME, READER_CACHE_ASSET_STORE_NAME, READER_CACHE_AUDIO_STORE_NAME],
+        'readwrite',
+      );
+      tx.objectStore(READER_CACHE_STORE_NAME).clear();
+      tx.objectStore(READER_CACHE_ASSET_STORE_NAME).clear();
+      tx.objectStore(READER_CACHE_AUDIO_STORE_NAME).clear();
+      await transactionDone(tx);
+    } finally {
+      db.close();
+    }
+  }
+  emitReaderCacheUpdated();
+}
+
 export function hasCachedChapter(
   bookId: number,
   chapterId: number,
@@ -1708,6 +1744,7 @@ export function putCachedChapter(
         bookId: chapter.bookId,
         cachedAt: chapter.cachedAt ?? new Date().toISOString(),
         chapterId: chapter.chapterId,
+        contentRevision: chapter.contentRevision ?? '',
         html: chapter.html,
         sourceText: chapter.sourceText,
         text: chapter.text,
@@ -1724,6 +1761,7 @@ export async function putCachedChapterAsync(
     bookId: chapter.bookId,
     cachedAt: chapter.cachedAt ?? new Date().toISOString(),
     chapterId: chapter.chapterId,
+    contentRevision: chapter.contentRevision ?? '',
     html: chapter.html,
     sourceText: chapter.sourceText,
     text: chapter.text,

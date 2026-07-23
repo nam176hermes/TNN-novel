@@ -45,6 +45,8 @@ import { useLibrary } from './state/useLibrary';
 import { useProviders } from './state/useProviders';
 import type { NormalizedQaIssue } from './state/useQa';
 import { removeCachedBookAsync, removeCachedChapterAsync } from './state/readerCache';
+import { clearReaderPrivateData } from './state/readerPrivateData';
+import { loadReaderResume, saveReaderResume } from './state/readerResume';
 import {
   chooseLatestReaderProgressSnapshot,
   loadReaderProgressSnapshot,
@@ -164,9 +166,14 @@ function reviewModeRequested(): boolean {
 
 function AuthenticatedApp() {
   const session = useSession(API_BASE_URL, AUTH_DISABLED);
+  const initialReaderResumeRef = useRef(loadReaderResume());
+  const restoreOfflineReader = initialReaderResumeRef.current !== null
+    && typeof navigator !== 'undefined'
+    && navigator.onLine === false;
+  const readerResumeRestoredRef = useRef(false);
   const [backendError, setBackendError] = useState('');
   const [backendSuccess, setBackendSuccess] = useState('');
-  const [activeView, setActiveView] = useState<WorkflowView>('workbench');
+  const [activeView, setActiveView] = useState<WorkflowView>(restoreOfflineReader ? 'reader' : 'workbench');
   const [workbenchChapterId, setWorkbenchChapterId] = useState<number | null>(null);
   const [backendLoading, setBackendLoading] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
@@ -208,6 +215,34 @@ function AuthenticatedApp() {
   const chapters = library.chapters.data;
   const selectedChapter = library.selectedChapter;
   const selectedChapterId = library.selectedChapterId;
+  useEffect(() => {
+    const resume = initialReaderResumeRef.current;
+    if (!restoreOfflineReader || !session.isAuthenticated || !resume || readerResumeRestoredRef.current) return;
+    readerResumeRestoredRef.current = true;
+    library.restoreReaderSelection({
+      audio_path: null,
+      book_id: resume.bookId,
+      book_title: resume.bookTitle,
+      chapter_number: resume.chapterNumber,
+      content_html_path: resume.contentRevision || null,
+      has_translation: true,
+      id: resume.chapterId,
+      status: 'translated',
+      title: resume.chapterTitle,
+    });
+  }, [library.restoreReaderSelection, restoreOfflineReader, session.isAuthenticated]);
+
+  useEffect(() => {
+    if (activeView !== 'reader' || !selectedChapter) return;
+    saveReaderResume({
+      bookId: selectedChapter.book_id,
+      bookTitle: selectedChapter.book_title ?? '',
+      chapterId: selectedChapter.id,
+      chapterNumber: selectedChapter.chapter_number,
+      chapterTitle: selectedChapter.title,
+      contentRevision: selectedChapter.content_html_path ?? '',
+    });
+  }, [activeView, selectedChapter]);
   const chapterTextPrefetchTargets = useMemo(() => {
     if (!selectedChapterId) return [];
     const translatedChapters = chapters
@@ -1558,7 +1593,10 @@ function AuthenticatedApp() {
   }
 
   async function handleLogout(): Promise<void> {
-    await session.logout();
+    await Promise.all([
+      clearReaderPrivateData().catch(() => undefined),
+      session.logout(),
+    ]);
     setBackendError('');
     setBackendSuccess('');
   }
