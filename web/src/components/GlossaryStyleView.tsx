@@ -266,6 +266,7 @@ export default function GlossaryStyleView({
   const glossaryWindow = useWindowedList({
     count: visibleTerms.length,
     estimateSize: 118,
+    measureItems: true,
     resetKey: `${statusFilter}:${normalizedSearch}:${visibleTerms.length}`,
   });
   const windowedTerms = visibleTerms.slice(glossaryWindow.startIndex, glossaryWindow.endIndex);

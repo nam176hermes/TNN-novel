@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GlossaryTerm, StyleProfile } from '../api/types';
@@ -239,5 +239,52 @@ describe('GlossaryStyleView', () => {
 
     expect(screen.getByText('术语-600')).toBeVisible();
     expect(screen.getByText('1 / 600')).toBeVisible();
+  });
+
+  it('measures dynamic glossary cards without materializing the complete list', async () => {
+    const originalRect = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'getBoundingClientRect');
+    Object.defineProperty(HTMLElement.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value() {
+        const height = this.hasAttribute('data-virtual-index') ? 320 : 0;
+        return { bottom: height, height, left: 0, right: 0, top: 0, width: 0, x: 0, y: 0, toJSON: () => ({}) };
+      },
+    });
+    const largeGlossary = Array.from({ length: 600 }, (_, index): GlossaryTerm => ({
+      ...approvedUnlockedTerm,
+      id: 2000 + index,
+      source_term: `动态-${index + 1}`,
+      target_term: `Động ${index + 1}`,
+    }));
+
+    try {
+      const { container } = render(
+        <GlossaryStyleView
+          glossaryTerms={largeGlossary}
+          onApproveTerm={vi.fn()}
+          onLockToggle={vi.fn()}
+          onProfileChange={vi.fn()}
+          onRejectTerm={vi.fn()}
+          onSaveAndApproveTerm={vi.fn()}
+          onUpdateTerm={vi.fn()}
+          profiles={[fixtureStyleProfile]}
+          selectedProfileId={fixtureStyleProfile.id}
+        />,
+      );
+
+      await waitFor(() => {
+        const spacerHeights = Array.from(container.querySelectorAll<HTMLElement>('.glossary-virtual-spacer td'))
+          .map((element) => Number.parseFloat(element.style.height));
+        expect(Math.max(...spacerHeights)).toBeGreaterThan(100_000);
+      });
+      expect(screen.getAllByRole('row').length).toBeLessThan(50);
+    } finally {
+      cleanup();
+      if (originalRect) {
+        Object.defineProperty(HTMLElement.prototype, 'getBoundingClientRect', originalRect);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'getBoundingClientRect');
+      }
+    }
   });
 });
