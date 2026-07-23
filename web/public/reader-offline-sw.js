@@ -1,5 +1,5 @@
-const SHELL_CACHE = 'reader-offline-shell-v4';
-const RUNTIME_CACHE = 'reader-offline-runtime-v4';
+const SHELL_CACHE = 'reader-offline-shell-v5';
+const RUNTIME_CACHE = 'reader-offline-runtime-v5';
 const CACHE_PREFIX = 'reader-offline-';
 const APP_SHELL_URLS = [
   '/',
@@ -21,13 +21,24 @@ const PRIVATE_PATH_PREFIXES = [
   '/data/',
 ];
 
+async function cacheAppShell() {
+  const cache = await caches.open(SHELL_CACHE);
+  await cache.addAll(APP_SHELL_URLS);
+
+  const cachedIndex = await cache.match('/index.html');
+  if (!cachedIndex) return;
+  const html = await cachedIndex.text();
+  const assetUrls = new Set();
+  const attributePattern = /(?:src|href)=["']([^"']+)["']/g;
+  for (const match of html.matchAll(attributePattern)) {
+    const url = new URL(match[1], self.location.origin);
+    if (sameOrigin(url) && url.pathname.startsWith('/assets/')) assetUrls.add(url.href);
+  }
+  await Promise.all(Array.from(assetUrls, (url) => cache.add(url)));
+}
+
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches
-      .open(SHELL_CACHE)
-      .then((cache) => cache.addAll(APP_SHELL_URLS))
-      .then(() => self.skipWaiting()),
-  );
+  event.waitUntil(cacheAppShell().then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {

@@ -575,13 +575,11 @@ test('mobile Reader exposes raw and split only for the current chapter resources
   await expect(settings.getByRole('button', { name: /Raw tiếng Trung/ })).toBeEnabled();
   await expect(settings.getByRole('button', { name: 'Song song' })).toBeEnabled();
   await settings.getByRole('button', { name: /Raw tiếng Trung/ }).click();
-  await settings.getByRole('button', { name: 'Đóng cài đặt đọc' }).click();
   await expect(page.getByRole('article', { name: 'Nội dung raw tiếng Trung' })).toContainText('天逐渐转凉');
 
   await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
   settings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
   await settings.getByRole('button', { name: 'Song song' }).click();
-  await settings.getByRole('button', { name: 'Đóng cài đặt đọc' }).click();
   await expect(page.getByRole('article', { name: 'Nội dung raw tiếng Trung' })).toContainText('天逐渐转凉');
   await expect(page.getByRole('article', { name: 'Nội dung bản dịch tiếng Việt' })).toContainText('Trời dần trở lạnh');
   await expectNoHorizontalOverflow(page);
@@ -607,6 +605,8 @@ test('mobile Reader reloads cached content offline without caching protected API
     const privateApiCached = await caches.match('/api/books/42/chapters/4201/translation');
     if (privateApiCached) throw new Error('Protected API response was stored in Cache Storage');
   });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
 
   await context.setOffline(true);
   try {
