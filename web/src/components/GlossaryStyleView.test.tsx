@@ -209,4 +209,35 @@ describe('GlossaryStyleView', () => {
     expect(screen.getByText('Chưa có thuật ngữ nào')).toBeVisible();
     expect(screen.queryByText('筑基')).not.toBeInTheDocument();
   });
+
+  it('keeps production-scale glossary DOM bounded while search can reach every term', async () => {
+    const largeGlossary = Array.from({ length: 600 }, (_, index): GlossaryTerm => ({
+      ...approvedUnlockedTerm,
+      id: 1000 + index,
+      source_term: `术语-${index + 1}`,
+      target_term: `Thuật ngữ ${index + 1}`,
+    }));
+
+    render(
+      <GlossaryStyleView
+        glossaryTerms={largeGlossary}
+        onApproveTerm={vi.fn()}
+        onLockToggle={vi.fn()}
+        onProfileChange={vi.fn()}
+        onRejectTerm={vi.fn()}
+        onSaveAndApproveTerm={vi.fn()}
+        onUpdateTerm={vi.fn()}
+        profiles={[fixtureStyleProfile]}
+        selectedProfileId={fixtureStyleProfile.id}
+      />,
+    );
+
+    expect(screen.getAllByRole('row').length).toBeLessThan(50);
+    expect(screen.getByText('600 / 600')).toBeVisible();
+
+    await userEvent.type(screen.getByPlaceholderText('Tìm thuật ngữ...'), 'Thuật ngữ 600');
+
+    expect(screen.getByText('术语-600')).toBeVisible();
+    expect(screen.getByText('1 / 600')).toBeVisible();
+  });
 });

@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { GlossaryTerm, GlossaryTermUpdate, StyleProfile } from '../api/types';
+import { useWindowedList } from '../hooks/useWindowedList';
 
 export type GlossaryStyleViewProps = {
   profiles: StyleProfile[];
@@ -23,6 +24,7 @@ export type GlossaryStyleViewProps = {
 };
 
 type GlossaryRowProps = {
+  rowIndex: number;
   term: GlossaryTerm;
   onApproveTerm(termId: number): void;
   onRejectTerm(termId: number): void;
@@ -71,6 +73,7 @@ const literaryRuleSummary =
   'Dịch theo nghĩa và khí văn; giữ nhịp thơ/đối liên; ưu tiên thành ngữ Việt cổ phong khi có.';
 
 function GlossaryRow({
+  rowIndex,
   term,
   onApproveTerm,
   onRejectTerm,
@@ -105,7 +108,7 @@ function GlossaryRow({
   }
 
   return (
-    <tr>
+    <tr aria-rowindex={rowIndex + 2} data-virtual-index={rowIndex}>
       <th scope="row">
         <span>{term.source_term}</span>
         {term.first_seen_chapter_number ? (
@@ -260,6 +263,12 @@ export default function GlossaryStyleView({
       term.source_context,
     ].some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch));
   });
+  const glossaryWindow = useWindowedList({
+    count: visibleTerms.length,
+    estimateSize: 118,
+    resetKey: `${statusFilter}:${normalizedSearch}:${visibleTerms.length}`,
+  });
+  const windowedTerms = visibleTerms.slice(glossaryWindow.startIndex, glossaryWindow.endIndex);
 
   return (
     <section aria-labelledby="glossary-style-title" className="workflow-management-view glossary-style-view">
@@ -390,8 +399,14 @@ export default function GlossaryStyleView({
               <span>Thao tác</span>
             </div>
             {visibleTerms.length > 0 ? (
-              <div className="glossary-table-wrap">
-              <table className="provider-table glossary-management-table">
+              <div
+                aria-label="Danh sách thuật ngữ"
+                className="glossary-table-wrap"
+                onScroll={glossaryWindow.onScroll}
+                ref={glossaryWindow.containerRef}
+                tabIndex={0}
+              >
+              <table aria-rowcount={visibleTerms.length + 1} className="provider-table glossary-management-table">
                 <thead>
                   <tr>
                     <th>Gốc</th>
@@ -405,7 +420,12 @@ export default function GlossaryStyleView({
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleTerms.map((term) => (
+                  {glossaryWindow.paddingTop > 0 ? (
+                    <tr aria-hidden="true" className="glossary-virtual-spacer">
+                      <td colSpan={8} style={{ height: glossaryWindow.paddingTop }} />
+                    </tr>
+                  ) : null}
+                  {windowedTerms.map((term, offset) => (
                     <GlossaryRow
                       key={term.id}
                       onApproveTerm={onApproveTerm}
@@ -413,9 +433,15 @@ export default function GlossaryStyleView({
                       onRejectTerm={onRejectTerm}
                       onSaveAndApproveTerm={onSaveAndApproveTerm}
                       onUpdateTerm={onUpdateTerm}
+                      rowIndex={glossaryWindow.startIndex + offset}
                       term={term}
                     />
                   ))}
+                  {glossaryWindow.paddingBottom > 0 ? (
+                    <tr aria-hidden="true" className="glossary-virtual-spacer">
+                      <td colSpan={8} style={{ height: glossaryWindow.paddingBottom }} />
+                    </tr>
+                  ) : null}
                 </tbody>
               </table>
               </div>
