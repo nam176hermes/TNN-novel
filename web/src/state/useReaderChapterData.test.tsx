@@ -33,4 +33,50 @@ describe('useReaderChapterData', () => {
     expect(client.getChapterContent).toHaveBeenCalledTimes(1);
     expect(client.getQaReport).toHaveBeenCalledTimes(1);
   });
+
+  it('uses 15 canonical resource requests for four rapid chapter transitions without duplicates', async () => {
+    const getChapterSource = vi.fn((_bookId: number, chapterId: number) => Promise.resolve(`source-${chapterId}`));
+    const getChapterTranslation = vi.fn((_bookId: number, chapterId: number) => Promise.resolve(`translation-${chapterId}`));
+    const getQaReport = vi.fn((_bookId: number, chapterId: number) => Promise.resolve({
+      book_id: 42,
+      chapter_id: chapterId,
+      issues: [],
+    }));
+    const client = {
+      getChapterSource,
+      getChapterTranslation,
+      getChapterContent: vi.fn(),
+      getQaReport,
+      saveChapterTranslation: vi.fn(),
+      startQaJob: vi.fn(),
+    } as unknown as ApiClient;
+    const chapterIds = [4201, 4202, 4203, 4204, 4205];
+    const { rerender } = renderHook(
+      ({ chapterId }) => useReaderChapterData(
+        client,
+        true,
+        { ...fixtureChapter, id: chapterId, content_html_path: null },
+        undefined,
+        [],
+        { cacheOwnership: 'external' },
+      ),
+      { initialProps: { chapterId: chapterIds[0] } },
+    );
+
+    await waitFor(() => expect(client.getQaReport).toHaveBeenCalledTimes(1));
+    for (const [index, chapterId] of chapterIds.slice(1).entries()) {
+      rerender({ chapterId });
+      await waitFor(() => expect(client.getQaReport).toHaveBeenCalledTimes(index + 2));
+    }
+
+    expect(getChapterSource).toHaveBeenCalledTimes(5);
+    expect(getChapterTranslation).toHaveBeenCalledTimes(5);
+    expect(getQaReport).toHaveBeenCalledTimes(5);
+    expect(client.getChapterContent).not.toHaveBeenCalled();
+    expect(
+      getChapterSource.mock.calls.length
+      + getChapterTranslation.mock.calls.length
+      + getQaReport.mock.calls.length,
+    ).toBe(15);
+  });
 });

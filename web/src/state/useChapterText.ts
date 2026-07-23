@@ -24,6 +24,10 @@ function readerHtmlAssetBase(contentHtmlPath?: string | null): string | undefine
   return undefined;
 }
 
+function chapterRequestKey(chapter: ChapterTextPrefetchTarget): string {
+  return `${chapter.book_id}:${chapter.id}:${chapter.content_html_path?.trim() ?? ''}`;
+}
+
 export function useChapterText(
   client: ApiClient,
   enabled: boolean,
@@ -35,7 +39,7 @@ export function useChapterText(
   const chapterId = chapter?.id ?? null;
   const bookId = chapter?.book_id ?? null;
   const contentHtmlPath = chapter?.content_html_path ?? null;
-  const hasRichContent = Boolean(contentHtmlPath);
+
   const [sourceText, setSourceText] = useState('');
   const [translationText, setTranslationText] = useState('');
   const [savedTranslationText, setSavedTranslationText] = useState('');
@@ -43,6 +47,12 @@ export function useChapterText(
   const [state, setState] = useState<LoadState>('idle');
   const [error, setError] = useState('');
   const loadRequestIdRef = useRef(0);
+  const activeLoadRef = useRef<{
+    controller: AbortController;
+    key: string;
+    promise: Promise<void>;
+  } | null>(null);
+  const prefetchControllersRef = useRef(new Map<string, AbortController>());
 
   const cacheChapter = useCallback((
     targetChapter: { book_id: number; id: number },
@@ -82,10 +92,20 @@ export function useChapterText(
       });
 
       if (!enabled || !nextChapter) {
+        activeLoadRef.current?.controller.abort();
+        activeLoadRef.current = null;
         reset();
         return;
       }
 
+      const requestKey = chapterRequestKey(nextChapter);
+      if (activeLoadRef.current?.key === requestKey) return activeLoadRef.current.promise;
+      activeLoadRef.current?.controller.abort();
+      prefetchControllersRef.current.get(requestKey)?.abort();
+      prefetchControllersRef.current.delete(requestKey);
+      const controller = new AbortController();
+      const nextHasRichContent = Boolean(nextChapter.content_html_path);
+      const performLoad = async () => {
       const requestId = loadRequestIdRef.current + 1;
       loadRequestIdRef.current = requestId;
       const cachedChapter = cacheOwnership === 'internal'
@@ -120,11 +140,11 @@ export function useChapterText(
 
       try {
         const [source, translation] = await Promise.all([
-          client.getChapterSource(nextChapter.book_id, nextChapter.id),
-          client.getChapterTranslation(nextChapter.book_id, nextChapter.id),
+          client.getChapterSource(nextChapter.book_id, nextChapter.id, { signal: controller.signal }),
+          client.getChapterTranslation(nextChapter.book_id, nextChapter.id, { signal: controller.signal }),
         ]);
-        const richContent = hasRichContent
-          ? await client.getChapterContent(nextChapter.book_id, nextChapter.id)
+        const richContent = nextHasRichContent
+          ? await client.getChapterContent(nextChapter.book_id, nextChapter.id, { signal: controller.signal })
           : null;
         if (requestId !== loadRequestIdRef.current) return;
         const nextTranslation = richContent?.text ?? translation ?? '';
@@ -149,6 +169,7 @@ export function useChapterText(
           })();
         }
       } catch (nextError) {
+        if (controller.signal.aborted || (nextError instanceof DOMException && nextError.name === 'AbortError')) return;
         if (requestId !== loadRequestIdRef.current) throw nextError;
         if (nextError instanceof ApiError && nextError.status === 401) {
           onAuthError?.();
@@ -166,8 +187,16 @@ export function useChapterText(
         setState('error');
         throw nextError;
       }
+      };
+      const promise = performLoad();
+      activeLoadRef.current = { controller, key: requestKey, promise };
+      try {
+        await promise;
+      } finally {
+        if (activeLoadRef.current?.promise === promise) activeLoadRef.current = null;
+      }
     },
-    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, enabled, hasRichContent, onAuthError, reset],
+    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, enabled, onAuthError, reset],
   );
 
   const save = useCallback(
@@ -196,6 +225,8 @@ export function useChapterText(
 
   useEffect(() => {
     if (!enabled || bookId === null || chapterId === null) {
+      activeLoadRef.current?.controller.abort();
+      activeLoadRef.current = null;
       reset();
       return;
     }
@@ -212,6 +243,7 @@ export function useChapterText(
     if (targets.length === 0) return;
 
     let cancelled = false;
+    const effectControllers: AbortController[] = [];
     const timeout = window.setTimeout(() => {
       void (async () => {
         const uncachedTargets: ChapterTextPrefetchTarget[] = [];
@@ -222,11 +254,16 @@ export function useChapterText(
           }
         }
         for (const target of uncachedTargets) {
+          const requestKey = chapterRequestKey(target);
+          if (prefetchControllersRef.current.has(requestKey)) continue;
+          const controller = new AbortController();
+          prefetchControllersRef.current.set(requestKey, controller);
+          effectControllers.push(controller);
           try {
             const [translation, richContent] = await Promise.all([
-              client.getChapterTranslation(target.book_id, target.id),
+              client.getChapterTranslation(target.book_id, target.id, { signal: controller.signal }),
               target.content_html_path
-                ? client.getChapterContent(target.book_id, target.id)
+                ? client.getChapterContent(target.book_id, target.id, { signal: controller.signal })
                 : Promise.resolve(null),
             ]);
             if (cancelled) return;
@@ -243,6 +280,10 @@ export function useChapterText(
             }
           } catch {
             // Prefetch is opportunistic; live chapter loading remains the source of truth.
+          } finally {
+            if (prefetchControllersRef.current.get(requestKey) === controller) {
+              prefetchControllersRef.current.delete(requestKey);
+            }
           }
         }
       })();
@@ -251,8 +292,17 @@ export function useChapterText(
     return () => {
       cancelled = true;
       window.clearTimeout(timeout);
+      effectControllers.forEach((controller) => controller.abort());
     };
   }, [bookId, cacheChapter, chapterId, client, enabled, prefetchTargets]);
+
+  useEffect(() => () => {
+    loadRequestIdRef.current += 1;
+    activeLoadRef.current?.controller.abort();
+    activeLoadRef.current = null;
+    prefetchControllersRef.current.forEach((controller) => controller.abort());
+    prefetchControllersRef.current.clear();
+  }, []);
 
   return {
     error,

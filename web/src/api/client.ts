@@ -101,6 +101,10 @@ export type ReaderBookSearchOptions = {
   wholeWord?: boolean;
 };
 
+export type ApiRequestOptions = {
+  signal?: AbortSignal;
+};
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -793,9 +797,10 @@ export class ApiClient {
     return (await response.json()) as JobStartResponse;
   }
 
-  async getChapterSource(bookId: number, chapterId: number): Promise<string> {
+  async getChapterSource(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<string> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/source`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (!response.ok && response.status === 404) {
       const detail = await this.errorDetail(response);
@@ -811,9 +816,10 @@ export class ApiClient {
     return data.text;
   }
 
-  async getChapterTranslation(bookId: number, chapterId: number): Promise<string | null> {
+  async getChapterTranslation(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<string | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/translation`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 404) return null;
     await this.assertOk(response, 'Failed to load chapter translation');
@@ -822,9 +828,10 @@ export class ApiClient {
     return data.text;
   }
 
-  async getChapterContent(bookId: number, chapterId: number): Promise<{ text: string; html: string } | null> {
+  async getChapterContent(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<{ text: string; html: string } | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/content`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 404) return null;
     await this.assertOk(response, 'Failed to load chapter content');
@@ -1542,9 +1549,10 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to cancel job');
   }
 
-  async getQaReport(bookId: number, chapterId: number): Promise<QaReport | null> {
+  async getQaReport(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<QaReport | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/qa`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 204 || response.status === 404) return null;
     await this.assertOk(response, 'Failed to load QA report');

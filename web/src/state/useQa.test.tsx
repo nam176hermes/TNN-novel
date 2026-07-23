@@ -106,8 +106,10 @@ describe('useQa', () => {
   it('resets when disabled and ignores stale out-of-order QA report responses', async () => {
     const slowReport = deferred<QaReport | null>();
     const fastReport = deferred<QaReport | null>();
+    const signals = new Map<number, AbortSignal | undefined>();
     const client = {
-      getQaReport: vi.fn((bookId: number, chapterId: number) => {
+      getQaReport: vi.fn((bookId: number, chapterId: number, options?: { signal?: AbortSignal }) => {
+        signals.set(chapterId, options?.signal);
         if (bookId === 42 && chapterId === 4201) return slowReport.promise;
         if (bookId === 42 && chapterId === 4202) return fastReport.promise;
         throw new Error(`Unexpected QA request ${bookId}/${chapterId}`);
@@ -120,10 +122,16 @@ describe('useQa', () => {
       { initialProps: { enabled: true, chapter: fixtureChapter } },
     );
 
+    await waitFor(() => expect(client.getQaReport).toHaveBeenCalledTimes(1));
+    void result.current.refresh();
+    expect(client.getQaReport).toHaveBeenCalledTimes(1);
+
     rerender({
       enabled: true,
       chapter: { ...fixtureChapter, id: 4202, title: 'Fresh Chapter' },
     });
+    await waitFor(() => expect(client.getQaReport).toHaveBeenCalledTimes(2));
+    expect(signals.get(4201)?.aborted).toBe(true);
 
     fastReport.resolve({ ...fixtureQaReport, chapter_id: 4202, quality_score: 9.4 });
 

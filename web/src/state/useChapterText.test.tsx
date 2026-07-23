@@ -227,6 +227,53 @@ describe('useChapterText', () => {
     expect(result.current.translationText).toBe('Bản dịch mới');
   });
 
+  it('deduplicates current chapter loads and aborts superseded requests', async () => {
+    const requests = new Map<number, ReturnType<typeof deferred<string>>>();
+    const translations = new Map<number, ReturnType<typeof deferred<string | null>>>();
+    const signals = new Map<number, AbortSignal | undefined>();
+    const client = {
+      getChapterSource: vi.fn((_bookId: number, chapterId: number, options?: { signal?: AbortSignal }) => {
+        const request = deferred<string>();
+        requests.set(chapterId, request);
+        signals.set(chapterId, options?.signal);
+        return request.promise;
+      }),
+      getChapterTranslation: vi.fn((_bookId: number, chapterId: number) => {
+        const request = deferred<string | null>();
+        translations.set(chapterId, request);
+        return request.promise;
+      }),
+      getChapterContent: vi.fn(),
+      saveChapterTranslation: vi.fn(),
+    } as unknown as ApiClient;
+
+    const { result, rerender } = renderHook(
+      ({ chapter }) => useChapterText(
+        client,
+        true,
+        chapter,
+        undefined,
+        [],
+        { cacheOwnership: 'external' },
+      ),
+      { initialProps: { chapter: { ...fixtureChapter, audio_path: '' } } },
+    );
+
+    await waitFor(() => expect(client.getChapterSource).toHaveBeenCalledTimes(1));
+    void result.current.load();
+    void result.current.load();
+    expect(client.getChapterSource).toHaveBeenCalledTimes(1);
+    expect(signals.get(4201)).toBeInstanceOf(AbortSignal);
+
+    rerender({ chapter: { ...fixtureChapter, id: 4301, title: 'New Chapter', audio_path: '' } });
+    await waitFor(() => expect(client.getChapterSource).toHaveBeenCalledTimes(2));
+    expect(signals.get(4201)?.aborted).toBe(true);
+
+    requests.get(4301)?.resolve('Nguồn mới');
+    translations.get(4301)?.resolve('Bản dịch mới');
+    await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
+  });
+
   it('calls onAuthError when chapter text load returns 401', async () => {
     const onAuthError = vi.fn();
     const client = {
