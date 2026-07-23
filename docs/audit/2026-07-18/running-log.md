@@ -124,3 +124,11 @@
   files are still available. `security-review.md` retains the durable finding,
   remediation, validation, and deployment-boundary summary. A future formal
   scan must use an operator-selected durable evidence directory before running.
+# WS4 repair follow-up (2026-07-23)
+
+The WS4 implementation branch added executable runtime-policy validation,
+release provenance, worker/capability-aware readiness, a fail-closed GPU-only
+F5 boundary, authenticated operational metrics/alerts, and atomic restore-drill
+freshness publication. Pinned API/worker images passed isolated staging on an
+alternate loopback port and disposable data volume. Production was not
+restarted or modified; cutover remains operator-approved work.
