@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import importlib
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -836,3 +838,46 @@ async def test_remote_api_key_does_not_block_bearer_authenticated_dashboard() ->
         from app.mobile_api import main as main_mod
 
         importlib.reload(main_mod)
+
+
+def _jwt_header(token: str) -> dict[str, object]:
+    encoded = token.split(".", 1)[0]
+    padding = "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded + padding))
+
+
+def test_auth_tokens_are_signed_with_hs256() -> None:
+    from app.mobile_api.security import create_access_token, create_refresh_token
+
+    access = create_access_token({"sub": "operator"})
+    refresh = create_refresh_token({"sub": "operator"})
+
+    assert _jwt_header(access)["alg"] == "HS256"
+    assert _jwt_header(refresh)["alg"] == "HS256"
+
+
+def test_token_boundaries_reject_accidental_ecdsa_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.mobile_api import security as security_mod
+
+    valid_hs256_token = security_mod.create_access_token({"sub": "operator"})
+    monkeypatch.setattr(security_mod.mobile_settings, "algorithm", "ES256")
+
+    with pytest.raises(RuntimeError, match="HS256"):
+        security_mod.create_access_token({"sub": "operator"})
+    with pytest.raises(RuntimeError, match="HS256"):
+        security_mod.decode_token(valid_hs256_token)
+
+
+def test_public_deploy_rejects_non_hs256_jwt_algorithm() -> None:
+    from app.mobile_api.config import MobileAPISettings, validate_public_deploy_settings
+
+    settings = MobileAPISettings(
+        public_deploy=True,
+        secret_key="0123456789abcdef0123456789abcdef",
+        algorithm="ES256",
+        admin_username="private_operator",
+        admin_password="correct horse battery staple 2026",
+        cors_origins=["https://novel.example.com"],
+    )
+
+    assert any("HS256" in error for error in validate_public_deploy_settings(settings))

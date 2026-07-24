@@ -117,7 +117,7 @@ required = (
     "starlette",
     "pydantic",
     "uvicorn",
-    "jose",
+    "jwt",
     "pyperclip",
     "pytest",
     "pyflakes",

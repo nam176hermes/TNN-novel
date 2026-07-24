@@ -184,6 +184,8 @@ def validate_public_deploy_settings(settings: MobileAPISettings | None = None) -
     errors: list[str] = []
     if externally_bound and not resolved.public_deploy:
         errors.append("PUBLIC_DEPLOY=1 is required when MOBILE_API_HOST is not loopback")
+    if resolved.algorithm.strip().upper() != "HS256":
+        errors.append("JWT signing algorithm must remain HS256; ECDSA algorithms are not supported")
     secret = resolved.secret_key.strip()
     if secret.lower() in _DEV_SECRET_VALUES or len(secret) < 32:
         errors.append("MOBILE_API_SECRET must be a long random secret when PUBLIC_DEPLOY=1")
