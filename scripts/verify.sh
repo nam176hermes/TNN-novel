@@ -16,16 +16,45 @@ run_mandatory_gate() {
   fi
 }
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WITH_E2E=0
+
+check_playwright_chromium() {
+  (
+    cd "$ROOT/web"
+    node --input-type=module <<'NODE'
+import { accessSync, constants } from 'node:fs';
+import { chromium } from '@playwright/test';
+
+const executable = chromium.executablePath();
+try {
+  accessSync(executable, constants.X_OK);
+} catch {
+  console.error(`Playwright Chromium binary is missing or not executable: ${executable}`);
+  process.exit(1);
+}
+NODE
+  )
+}
+
 if [[ "${1:-}" == "--self-test-failure" ]]; then
   run_mandatory_gate "injected mandatory gate" bash -c 'exit 97'
   exit 0
 fi
+if [[ "${1:-}" == "--self-test-missing-browser" ]]; then
+  export PLAYWRIGHT_BROWSERS_PATH="/nonexistent/novel-tnn-playwright-browsers"
+  run_mandatory_gate "browser E2E browser availability" check_playwright_chromium
+  exit 0
+fi
+if [[ "${1:-}" == "--with-e2e" ]]; then
+  WITH_E2E=1
+  shift
+fi
 if [[ $# -gt 0 ]]; then
-  printf 'Usage: %s [--self-test-failure]\n' "$0" >&2
+  printf 'Usage: %s [--with-e2e|--self-test-failure|--self-test-missing-browser]\n' "$0" >&2
   exit 2
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # shellcheck disable=SC1091
@@ -58,3 +87,7 @@ run_mandatory_gate "backend tests" "$PYTHON_BIN" -m pytest -q -s
 run_mandatory_gate "python dependency consistency" "$PYTHON_BIN" -m pip check
 run_mandatory_gate "frontend tests" npm --prefix web test
 run_mandatory_gate "frontend build" npm --prefix web run build
+if [[ "$WITH_E2E" -eq 1 ]]; then
+  run_mandatory_gate "browser E2E browser availability" check_playwright_chromium
+  run_mandatory_gate "browser E2E tests" npm --prefix web run test:e2e -- --project=chromium
+fi

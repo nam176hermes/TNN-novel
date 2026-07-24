@@ -49,11 +49,23 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix web ci
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-${{ runner.arch }}-playwright-${{ hashFiles('web/package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        run: npm --prefix web exec -- playwright install --with-deps chromium
+
       - name: Run frontend tests
         run: npm --prefix web test
 
       - name: Build frontend
         run: npm --prefix web run build
+
+      - name: Run browser E2E tests
+        run: npm --prefix web run test:e2e -- --project=chromium
 
   docker:
     name: Docker image smoke

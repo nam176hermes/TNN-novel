@@ -124,3 +124,41 @@ def test_verify_script_propagates_an_injected_mandatory_gate_failure() -> None:
     assert result.returncode != 0
     assert "FAIL: injected mandatory gate" in result.stdout
     assert "compileall" not in result.stdout
+
+
+def test_verify_script_fails_closed_when_chromium_binary_is_missing() -> None:
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "verify.sh"), "--self-test-missing-browser"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "FAIL: browser E2E browser availability" in result.stdout
+    assert "Playwright Chromium binary is missing or not executable" in result.stderr
+    assert "backend tests" not in result.stdout
+
+
+def test_verify_script_keeps_browser_e2e_behind_explicit_opt_in() -> None:
+    content = (ROOT / "scripts" / "verify.sh").read_text(encoding="utf-8")
+
+    assert '"${1:-}" == "--with-e2e"' in content
+    assert 'run_mandatory_gate "browser E2E browser availability"' in content
+    assert 'run_mandatory_gate "browser E2E tests" npm --prefix web run test:e2e -- --project=chromium' in content
+    assert content.index('run_mandatory_gate "frontend tests" npm --prefix web test') < content.index(
+        'run_mandatory_gate "frontend build" npm --prefix web run build'
+    )
+
+
+def test_ci_installs_caches_and_runs_playwright_without_changing_existing_frontend_gates() -> None:
+    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "uses: actions/cache@v4" in content
+    assert "path: ~/.cache/ms-playwright" in content
+    assert "runner.os }}-${{ runner.arch }}-playwright-${{ hashFiles('web/package-lock.json')" in content
+    assert "restore-keys:" not in content
+    assert "npm --prefix web exec -- playwright install --with-deps chromium" in content
+    assert "npm --prefix web run test:e2e -- --project=chromium" in content
+    assert content.index("run: npm --prefix web test") < content.index("run: npm --prefix web run build")
