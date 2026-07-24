@@ -63,6 +63,16 @@ class RetentionStatusResponse(BaseModel):
     last_run: RetentionRunSummaryResponse | None = None
 
 
+class RecoveryFreshnessResponse(BaseModel):
+    state: Literal["missing", "corrupt", "future", "wrong_release", "stale", "fresh"] = "missing"
+    age_seconds: int | None = None
+    completed_at: str | None = None
+    archive_hash_id: str | None = None
+    validation_counts: dict[str, int] = Field(default_factory=dict)
+    producer_version: str | None = None
+    threshold_seconds: int
+
+
 class SystemStatusResponse(BaseModel):
     db_size_bytes: int = 0
     data_size_bytes: int = 0
@@ -93,6 +103,12 @@ class SystemStatusResponse(BaseModel):
     app_version: str = ""
     build: str = ""
     backup_recommendation: str = ""
+    external_backup: RecoveryFreshnessResponse = Field(
+        default_factory=lambda: RecoveryFreshnessResponse(threshold_seconds=172800)
+    )
+    restore_drill: RecoveryFreshnessResponse = Field(
+        default_factory=lambda: RecoveryFreshnessResponse(threshold_seconds=691200)
+    )
 
 
 # ── Books ────────────────────────────────────────────────────────────────

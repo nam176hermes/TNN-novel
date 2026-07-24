@@ -52,25 +52,45 @@ validate_config() {
   require_value R2_PREFIX
   require_value R2_ACCESS_KEY_ID
   require_value R2_SECRET_ACCESS_KEY
+  require_value RECOVERY_PRODUCER_VERSION
   require_positive_integer BACKUP_KEEP_LOCAL
   require_positive_integer BACKUP_KEEP_OFFSITE
   require_positive_integer R2_MULTIPART_THRESHOLD_BYTES
   require_positive_integer R2_MULTIPART_PART_BYTES
   require_absolute_path BACKUP_DATA_DIR
   require_absolute_path BACKUP_LOCAL_DIR
+  require_absolute_path RECOVERY_RECEIPT_DIR
   [[ -d "$BACKUP_DATA_DIR" ]] || fail "BACKUP_DATA_DIR does not exist"
-  [[ "$BACKUP_IMAGE" != *[[:space:]]* ]] || fail "BACKUP_IMAGE must not contain whitespace"
+  [[ -d "$RECOVERY_RECEIPT_DIR" && ! -L "$RECOVERY_RECEIPT_DIR" ]] \
+    || fail "RECOVERY_RECEIPT_DIR must be a real existing directory"
+  [[ "$BACKUP_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
+    || fail "BACKUP_IMAGE must be pinned by sha256 digest"
+  [[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+    || fail "RECOVERY_PRODUCER_VERSION must be a safe release identifier"
   ((R2_MULTIPART_THRESHOLD_BYTES <= R2_SINGLE_PUT_MAX_BYTES)) \
     || fail "R2_MULTIPART_THRESHOLD_BYTES must not exceed the R2 single-upload limit"
   ((R2_MULTIPART_PART_BYTES >= R2_MIN_MULTIPART_PART_BYTES && R2_MULTIPART_PART_BYTES <= R2_SINGLE_PUT_MAX_BYTES)) \
     || fail "R2_MULTIPART_PART_BYTES must be between 5 MiB and 5 GiB"
   validate_r2_destination
 
-  local data_root backup_root
+  local data_root backup_root receipt_root
   data_root="$(realpath -m "$BACKUP_DATA_DIR")"
   backup_root="$(realpath -m "$BACKUP_LOCAL_DIR")"
+  receipt_root="$(realpath -e "$RECOVERY_RECEIPT_DIR")"
+  [[ "$receipt_root" == "$data_root/logs/runtime" ]] \
+    || fail "RECOVERY_RECEIPT_DIR must be the fixed data/logs/runtime directory"
   [[ "$backup_root" != "$data_root" && "$backup_root" != "$data_root"/* ]] \
     || fail "BACKUP_LOCAL_DIR must not be inside BACKUP_DATA_DIR"
+}
+
+verify_publisher_image_release() {
+  local image_release
+  image_release="$(
+    docker run --rm --network none "$BACKUP_IMAGE" \
+      python -c 'import os; import scripts.record_restore_drill_status; print(os.environ.get("NOVEL_RELEASE_ID", ""))'
+  )"
+  [[ "$image_release" == "$RECOVERY_PRODUCER_VERSION" ]] \
+    || fail "BACKUP_IMAGE release does not match RECOVERY_PRODUCER_VERSION"
 }
 
 run_container_backup() {
@@ -102,6 +122,22 @@ print(archive.name)
   )"
   [[ "$archive_name" =~ $BACKUP_NAME_PATTERN ]] || fail "container returned an unexpected archive name"
   printf '%s\n' "$archive_name"
+}
+
+publish_recovery_receipt() {
+  local archive_hash_id="$1"
+  docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
+    "$BACKUP_IMAGE" \
+    python -m scripts.record_restore_drill_status \
+    --output /receipts/external-backup.receipt.json \
+    --archive-hash-id "$archive_hash_id" \
+    --producer-version "$RECOVERY_PRODUCER_VERSION" \
+    --validation-count archive_verified=1 \
+    --validation-count metadata_verified=1 \
+    --validation-count checksum_verified=1 \
+    --validation-count remote_uploads_verified=3 \
+    --validation-count remote_metadata_verified=2
 }
 
 verify_local_backup() {
@@ -138,6 +174,21 @@ write_and_verify_checksum() {
   printf '%s\n' "$checksum_name"
 }
 
+read_verified_checksum_hash() {
+  local archive_name="$1"
+  .venv/bin/python - "${BACKUP_LOCAL_DIR}/${archive_name}.sha256" "$archive_name" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+raw = Path(sys.argv[1]).read_text(encoding="ascii")
+match = re.fullmatch(r"([a-f0-9]{64})  ([^\r\n]+)\n", raw)
+if match is None or match.group(2) != sys.argv[2]:
+    raise SystemExit("checksum file must contain exactly the selected archive")
+print(match.group(1))
+PY
+}
+
 verify_existing_checksum() {
   local archive_name="$1"
   local checksum_name="${archive_name}.sha256"
@@ -148,6 +199,8 @@ verify_existing_checksum() {
     cd "$BACKUP_LOCAL_DIR"
     sha256sum --check --status "$checksum_name"
   ) || fail "backup checksum does not match archive"
+  read_verified_checksum_hash "$archive_name" >/dev/null \
+    || fail "backup checksum metadata does not identify the selected archive"
   printf '%s\n' "$checksum_name"
 }
 
@@ -301,12 +354,16 @@ upload_and_verify_remote() {
   r2_put "${BACKUP_LOCAL_DIR}/${checksum_name}" "$checksum_name"
 
   (
-    local downloaded_checksum downloaded_sidecar
+    local downloaded_archive downloaded_checksum downloaded_sidecar
+    downloaded_archive="$(mktemp "${BACKUP_LOCAL_DIR}/.remote-archive.XXXXXX")"
     downloaded_checksum="$(mktemp "${BACKUP_LOCAL_DIR}/.remote-checksum.XXXXXX")"
     downloaded_sidecar="$(mktemp "${BACKUP_LOCAL_DIR}/.remote-sidecar.XXXXXX")"
-    trap 'rm -f "${downloaded_checksum:-}" "${downloaded_sidecar:-}"' EXIT
+    trap 'rm -f "${downloaded_archive:-}" "${downloaded_checksum:-}" "${downloaded_sidecar:-}"' EXIT
+    r2_get "$archive_name" "$downloaded_archive"
     r2_get "$checksum_name" "$downloaded_checksum"
     r2_get "$sidecar_name" "$downloaded_sidecar"
+    cmp --silent "${BACKUP_LOCAL_DIR}/${archive_name}" "$downloaded_archive" \
+      || fail "remote archive does not match the verified local archive"
     cmp --silent "${BACKUP_LOCAL_DIR}/${checksum_name}" "$downloaded_checksum" \
       || fail "remote checksum metadata does not match the local checksum"
     cmp --silent "${BACKUP_LOCAL_DIR}/${sidecar_name}" "$downloaded_sidecar" \
@@ -340,7 +397,11 @@ for element in root.iter():
 
 rotate_remote_backups() {
   local -a archive_names=()
-  mapfile -t archive_names < <(r2_list_archive_names)
+  local listing
+  listing="$(r2_list_archive_names)" || fail "failed to list remote backups for rotation"
+  if [[ -n "$listing" ]]; then
+    mapfile -t archive_names <<<"$listing"
+  fi
   ((${#archive_names[@]} > BACKUP_KEEP_OFFSITE)) || return 0
 
   mapfile -t archive_names < <(
@@ -367,6 +428,8 @@ main() {
   R2_MULTIPART_PART_BYTES="${R2_MULTIPART_PART_BYTES:-$((256 * 1024 * 1024))}"
   BACKUP_KEEP_LOCAL="${BACKUP_KEEP_LOCAL:-14}"
   BACKUP_KEEP_OFFSITE="${BACKUP_KEEP_OFFSITE:-35}"
+  RECOVERY_PRODUCER_VERSION="${RECOVERY_PRODUCER_VERSION:-}"
+  RECOVERY_RECEIPT_DIR="${BACKUP_DATA_DIR}/logs/runtime"
 
   validate_config
   if [[ "${1:-}" == "--validate-config" ]]; then
@@ -376,18 +439,19 @@ main() {
   [[ $# -eq 0 || ( "$1" == "--upload-existing" && $# -eq 2 ) ]] \
     || fail "usage: $0 [--validate-config|--upload-existing archive-basename]"
   command -v curl >/dev/null || fail "curl is required"
+  command -v docker >/dev/null || fail "docker is required"
   command -v sha256sum >/dev/null || fail "sha256sum is required"
   curl --help all | grep --quiet -- '--aws-sigv4' || fail "curl with --aws-sigv4 support is required"
+  verify_publisher_image_release
 
   umask 077
   install -d -m 0700 "$BACKUP_LOCAL_DIR"
-  local archive_name archive_path checksum_name
+  local archive_name archive_path checksum_name checksum_hash
   if [[ "${1:-}" == "--upload-existing" ]]; then
     archive_name="$2"
     [[ "$archive_name" == "$(basename "$archive_name")" && "$archive_name" =~ $BACKUP_NAME_PATTERN ]] \
       || fail "archive must be a supported encrypted backup basename"
   else
-    command -v docker >/dev/null || fail "docker is required"
     archive_name="$(run_container_backup)"
   fi
   archive_path="${BACKUP_LOCAL_DIR}/${archive_name}"
@@ -398,8 +462,13 @@ main() {
     checksum_name="$(write_and_verify_checksum "$archive_name")"
   fi
   upload_and_verify_remote "$archive_name" "$checksum_name"
+  checksum_hash="$(read_verified_checksum_hash "$archive_name")"
+  [[ "$checksum_hash" =~ ^[a-f0-9]{64}$ ]] || fail "verified checksum is not a SHA-256 identifier"
   rotate_remote_backups
+  publish_recovery_receipt "sha256:${checksum_hash}"
   printf 'backup complete: %s\n' "$archive_name"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

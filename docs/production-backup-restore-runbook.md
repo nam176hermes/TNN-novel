@@ -50,9 +50,24 @@ Set these values in the external file:
   scoped only to the selected bucket. The secret is displayed only once by
   Cloudflare; record it directly in `backup.env` without placing it in shell
   history or chat.
+- `BACKUP_IMAGE`: the immutable image pin reviewed for the production release.
+- `RECOVERY_PRODUCER_VERSION`: the exact release ID embedded in that image and
+  intended for the running API. Do not infer it from an image tag.
 
 Keep `BACKUP_DATA_DIR=/home/thenam176/Novel-TNN/data`, local output under
 `$HOME/.local/share/novel-tnn-backups`, and the current production image pin.
+Provision the dedicated receipt directory without granting the API access to
+the archive tree:
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 0700 \
+  /home/thenam176/Novel-TNN/data/logs/runtime
+```
+
+Before every release, verify that `BACKUP_IMAGE`, its embedded
+`NOVEL_RELEASE_ID`, `RECOVERY_PRODUCER_VERSION`, and the intended API release ID
+are identical. A receipt from a different release is deliberately classified
+as `wrong_release` by the authenticated runtime status endpoints.
 Before enabling the timer, validate the external configuration; this performs
 no network or Docker operation:
 
@@ -93,8 +108,8 @@ Success requires all of the following:
 2. A local `.sha256` file that verifies before upload.
 3. HTTPS-only SigV4 upload to the private R2 bucket of archive, sidecar, and
    checksum.
-4. Re-download of the R2 checksum and READY sidecar, each compared byte for
-   byte with local metadata.
+4. Re-download of the R2 archive, checksum, and READY sidecar, each compared
+   byte for byte with the verified local objects.
 
 The runner uploads small archives as one R2 object and automatically switches
 to the R2 multipart protocol at the configured threshold (5 GiB by default).

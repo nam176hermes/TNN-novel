@@ -1,4 +1,4 @@
-import type { JobStatus, SystemBackupItem, SystemStatus } from '../api/types';
+import type { JobStatus, RecoveryFreshness, SystemBackupItem, SystemStatus } from '../api/types';
 import { formatError } from '../state/types';
 import { useState } from 'react';
 import {
@@ -56,6 +56,54 @@ function backupStatusLabel(status: SystemBackupItem['metadata_status']): string 
     ARTIFACT_INVALID: 'Archive không hợp lệ',
     UNSUPPORTED_FORMAT: 'Định dạng không hỗ trợ',
   }[status];
+}
+
+function recoveryStateLabel(state: RecoveryFreshness['state']): string {
+  return {
+    fresh: 'Fresh',
+    stale: 'Stale',
+    missing: 'Missing',
+    corrupt: 'Invalid',
+    future: 'Future',
+    wrong_release: 'Wrong release',
+  }[state];
+}
+
+function RecoveryReceipt({
+  label,
+  receipt,
+  refreshFailed,
+  refreshing,
+}: {
+  label: string;
+  receipt: RecoveryFreshness;
+  refreshFailed: boolean;
+  refreshing: boolean;
+}) {
+  return (
+    <article aria-label={label}>
+      <div className="section-heading-row">
+        <strong>{label}</strong>
+        <span className={`status-chip ${receipt.state === 'fresh' && !refreshFailed && !refreshing ? 'status-chip-success' : 'status-chip-warning'}`}>
+          {refreshFailed ? 'Refresh failed' : refreshing ? 'Refreshing' : recoveryStateLabel(receipt.state)}
+        </span>
+      </div>
+      <dl>
+        <dt>Completed</dt><dd>{receipt.completed_at ?? '-'}</dd>
+        <dt>Producer</dt><dd>{receipt.producer_version ?? '-'}</dd>
+        <dt>Age</dt><dd>{receipt.age_seconds === null ? '-' : `${receipt.age_seconds.toLocaleString()} seconds`}</dd>
+        <dt>Hash ID</dt><dd>{receipt.archive_hash_id ?? '-'}</dd>
+        <dt>Threshold</dt><dd>{receipt.threshold_seconds.toLocaleString()} seconds</dd>
+      </dl>
+      {Object.keys(receipt.validation_counts).length ? (
+        <ul className="compact-list">
+          {Object.entries(receipt.validation_counts).map(([name, count]) => (
+            <li key={name}><span>{name}</span><strong>{count.toLocaleString()}</strong></li>
+          ))}
+        </ul>
+      ) : null}
+    </article>
+  );
 }
 
 function statusRows(status: SystemStatus) {
@@ -200,6 +248,30 @@ export default function StatusSettingsView({
                 <strong>{status.asset_protection_enabled ? 'Bảo vệ' : 'Mở'}</strong>
                 <small>{status.asset_protection_enabled ? 'Protected' : 'Open'}</small>
               </article>
+            </div>
+          </section>
+
+          <section aria-label="Recovery freshness" className="panel status-detail-panel">
+            <div className="panel-header"><h3>Recovery freshness</h3></div>
+            <div className="status-runtime-grid">
+              <RecoveryReceipt
+                label="External backup"
+                refreshFailed={Boolean(error)}
+                refreshing={loading}
+                receipt={status.external_backup ?? {
+                  state: 'missing', age_seconds: null, completed_at: null, archive_hash_id: null,
+                  validation_counts: {}, producer_version: null, threshold_seconds: 172800,
+                }}
+              />
+              <RecoveryReceipt
+                label="Restore drill"
+                refreshFailed={Boolean(error)}
+                refreshing={loading}
+                receipt={status.restore_drill ?? {
+                  state: 'missing', age_seconds: null, completed_at: null, archive_hash_id: null,
+                  validation_counts: {}, producer_version: null, threshold_seconds: 691200,
+                }}
+              />
             </div>
           </section>
 

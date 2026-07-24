@@ -167,6 +167,16 @@ export type TtsJobStatus = {
   chunks: TtsChunkStatus[];
 };
 
+export type RecoveryFreshness = {
+  state: 'missing' | 'corrupt' | 'future' | 'wrong_release' | 'stale' | 'fresh';
+  age_seconds: number | null;
+  completed_at: string | null;
+  archive_hash_id: string | null;
+  validation_counts: Record<string, number>;
+  producer_version: string | null;
+  threshold_seconds: number;
+};
+
 export type SystemStatus = {
   public_deploy: boolean;
   api_ready: boolean;
@@ -213,6 +223,8 @@ export type SystemStatus = {
   cache_size_bytes: number;
   ollama_host: string;
   ollama_model: string;
+  external_backup?: RecoveryFreshness;
+  restore_drill?: RecoveryFreshness;
 };
 
 export type ExportFormat = 'txt' | 'docx' | 'epub';

@@ -40,6 +40,16 @@ const status: SystemStatus = {
   upload_max_bytes: 104857600,
   storage_health: 'healthy',
   storage_label: 'Configured data storage',
+  external_backup: {
+    state: 'fresh', age_seconds: 60, completed_at: '2026-07-24T12:00:00+00:00',
+    archive_hash_id: `sha256:${'a'.repeat(64)}`, validation_counts: { checksum_verified: 1 },
+    producer_version: 'release-a', threshold_seconds: 172800,
+  },
+  restore_drill: {
+    state: 'wrong_release', age_seconds: 120, completed_at: '2026-07-24T11:59:00+00:00',
+    archive_hash_id: `sha256:${'b'.repeat(64)}`, validation_counts: { authenticated_reader_smokes: 1 },
+    producer_version: 'release-b', threshold_seconds: 691200,
+  },
 };
 
 const latestBackup: SystemBackupItem = {
@@ -85,6 +95,10 @@ describe('StatusSettingsView', () => {
     );
 
     expect(screen.getByRole('heading', { name: 'Trạng thái hệ thống' })).toBeVisible();
+    expect(within(screen.getByRole('article', { name: 'External backup' })).getByText('Fresh')).toBeVisible();
+    expect(within(screen.getByRole('article', { name: 'Restore drill' })).getByText('Wrong release')).toBeVisible();
+    expect(screen.getByText('checksum_verified')).toBeVisible();
+    expect(screen.queryByText(/receipt\.json|\/home\/|\/mnt\/|[A-Z]:\\/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByText('Thông tin Runtime'));
     expect(screen.getByText('Public deploy')).toBeVisible();
     expect(screen.getByText('Bật')).toBeVisible();
@@ -109,6 +123,63 @@ describe('StatusSettingsView', () => {
     expect(screen.getByText(/System backup is separate from book export/)).toBeVisible();
     expect(screen.queryByText(/api[_-]?key/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/sk-test|top-secret|provider-secret/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['stale', 'Stale'],
+    ['missing', 'Missing'],
+  ] as const)('labels %s recovery receipts explicitly', (state, expectedLabel) => {
+    render(
+      <StatusSettingsView
+        error=""
+        loading={false}
+        onRefresh={() => undefined}
+        status={{
+          ...status,
+          external_backup: {
+            state,
+            age_seconds: state === 'stale' ? 172801 : null,
+            completed_at: state === 'stale' ? '2026-07-22T12:00:00+00:00' : null,
+            archive_hash_id: state === 'stale' ? `sha256:${'c'.repeat(64)}` : null,
+            validation_counts: state === 'stale' ? { checksum_verified: 1 } : {},
+            producer_version: state === 'stale' ? 'release-a' : null,
+            threshold_seconds: 172800,
+          },
+        }}
+      />,
+    );
+
+    expect(within(screen.getByRole('article', { name: 'External backup' })).getByText(expectedLabel)).toBeVisible();
+  });
+
+  it('does not present cached recovery freshness as current after refresh failure', () => {
+    render(
+      <StatusSettingsView
+        error="Status refresh failed"
+        loading={false}
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    const externalBackup = within(screen.getByRole('article', { name: 'External backup' }));
+    expect(externalBackup.getByText('Refresh failed')).toBeVisible();
+    expect(externalBackup.queryByText('Fresh')).not.toBeInTheDocument();
+  });
+
+  it('labels cached recovery freshness as refreshing while the request is unresolved', () => {
+    render(
+      <StatusSettingsView
+        error=""
+        loading
+        onRefresh={() => undefined}
+        status={status}
+      />,
+    );
+
+    const externalBackup = within(screen.getByRole('article', { name: 'External backup' }));
+    expect(externalBackup.getByText('Refreshing')).toBeVisible();
+    expect(externalBackup.queryByText('Fresh')).not.toBeInTheDocument();
   });
 
   it('shows durable job and operational error visibility', async () => {

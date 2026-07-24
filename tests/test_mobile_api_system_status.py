@@ -16,6 +16,7 @@ from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api import dependencies as mobile_dependencies
 from app.mobile_api.routers import health as health_router
 from app.mobile_api.services.job_service import JobTracker
+from app.recovery_receipts import publish_recovery_receipt
 
 
 def test_db_operational_event_exports_are_repository_function_objects() -> None:
@@ -101,6 +102,19 @@ async def test_system_status_reports_runtime_without_secrets(
     loaded_running.message = "Translating"
     failed = tracker.create_job("translate", [11], 1, {"provider_id": "deepseek"})
     tracker.update_job(failed.job_id, status="failed", message="Provider failed", error="quota exhausted")
+    monkeypatch.setenv("NOVEL_RELEASE_ID", "status-release")
+    publish_recovery_receipt(
+        data_dir / "logs/runtime/external-backup.receipt.json",
+        archive_hash_id="sha256:" + "b" * 64,
+        validation_counts={
+            "archive_verified": 1,
+            "metadata_verified": 1,
+            "checksum_verified": 1,
+            "remote_uploads_verified": 3,
+            "remote_metadata_verified": 2,
+        },
+        producer_version="status-release",
+    )
 
     monkeypatch.setattr(mobile_dependencies, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(mobile_dependencies, "get_data_dir", lambda: data_dir)
@@ -140,6 +154,10 @@ async def test_system_status_reports_runtime_without_secrets(
     assert str(data_dir) not in response.text
     assert "secret" not in response.text.lower()
     assert "api_key" not in response.text.lower()
+    assert payload["external_backup"]["state"] == "fresh"
+    assert payload["external_backup"]["archive_hash_id"] == "sha256:" + "b" * 64
+    assert payload["restore_drill"]["state"] == "missing"
+    assert "receipt.json" not in response.text
 
 
 @pytest.mark.asyncio

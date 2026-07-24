@@ -29,14 +29,35 @@ validate_config() {
   require_value BACKUP_DRILL_ROOT
   require_value PRODUCTION_ENV
   require_value RESTORE_ARTIFACT_SOURCE_ROOT
-  require_value RESTORE_STATUS_FILE
+  require_value RESTORE_DATA_DIR
+  require_value RECOVERY_PRODUCER_VERSION
+  require_value RECOVERY_RECEIPT_DIR
   require_absolute_path BACKUP_LOCAL_DIR
   require_absolute_path BACKUP_DRILL_ROOT
   require_absolute_path PRODUCTION_ENV
   require_absolute_path RESTORE_ARTIFACT_SOURCE_ROOT
-  require_absolute_path RESTORE_STATUS_FILE
+  require_absolute_path RESTORE_DATA_DIR
+  require_absolute_path RECOVERY_RECEIPT_DIR
   [[ -d "$BACKUP_LOCAL_DIR" ]] || fail "BACKUP_LOCAL_DIR does not exist"
-  [[ "$BACKUP_IMAGE" != *[[:space:]]* ]] || fail "BACKUP_IMAGE must not contain whitespace"
+  [[ -d "$RESTORE_DATA_DIR" ]] || fail "RESTORE_DATA_DIR does not exist"
+  [[ -d "$RECOVERY_RECEIPT_DIR" && ! -L "$RECOVERY_RECEIPT_DIR" ]] \
+    || fail "RECOVERY_RECEIPT_DIR must be a real existing directory"
+  [[ "$BACKUP_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
+    || fail "BACKUP_IMAGE must be pinned by sha256 digest"
+  [[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+    || fail "RECOVERY_PRODUCER_VERSION must be a safe release identifier"
+  [[ "$(realpath -e "$RECOVERY_RECEIPT_DIR")" == "$(realpath -m "$RESTORE_DATA_DIR")/logs/runtime" ]] \
+    || fail "RECOVERY_RECEIPT_DIR must be the fixed data/logs/runtime directory"
+}
+
+verify_publisher_image_release() {
+  local image_release
+  image_release="$(
+    docker run --rm --network none "$BACKUP_IMAGE" \
+      python -c 'import os; import scripts.record_restore_drill_status; print(os.environ.get("NOVEL_RELEASE_ID", ""))'
+  )"
+  [[ "$image_release" == "$RECOVERY_PRODUCER_VERSION" ]] \
+    || fail "BACKUP_IMAGE release does not match RECOVERY_PRODUCER_VERSION"
 }
 
 select_archive() {
@@ -55,6 +76,21 @@ select_archive() {
   printf '%s\n' "$newest"
 }
 
+read_verified_checksum_hash() {
+  local archive_name="$1"
+  .venv/bin/python - "${BACKUP_LOCAL_DIR}/${archive_name}.sha256" "$archive_name" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+raw = Path(sys.argv[1]).read_text(encoding="ascii")
+match = re.fullmatch(r"([a-f0-9]{64})  ([^\r\n]+)\n", raw)
+if match is None or match.group(2) != sys.argv[2]:
+    raise SystemExit("checksum file must contain exactly the selected archive")
+print(match.group(1))
+PY
+}
+
 verify_backup_input() {
   local archive_name="$1"
   local archive_path="${BACKUP_LOCAL_DIR}/${archive_name}"
@@ -67,6 +103,8 @@ verify_backup_input() {
     cd "$BACKUP_LOCAL_DIR"
     sha256sum --check --status "${archive_name}.sha256"
   ) || fail "backup checksum does not match archive"
+  read_verified_checksum_hash "$archive_name" >/dev/null \
+    || fail "backup checksum metadata does not identify the selected archive"
 
   .venv/bin/python - "$archive_path" <<'PY'
 from pathlib import Path
@@ -192,6 +230,24 @@ PY
   chmod 0600 "$report_path"
 }
 
+publish_recovery_receipt() {
+  local archive_hash_id="$1"
+  local artifact_paths_scanned="$2"
+  docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
+    "$BACKUP_IMAGE" \
+    python -m scripts.record_restore_drill_status \
+    --output /receipts/restore-drill.receipt.json \
+    --archive-hash-id "$archive_hash_id" \
+    --producer-version "$RECOVERY_PRODUCER_VERSION" \
+    --validation-count checksum_verified=1 \
+    --validation-count sqlite_integrity_checks=1 \
+    --validation-count foreign_key_violations=0 \
+    --validation-count "artifact_paths_scanned=${artifact_paths_scanned}" \
+    --validation-count api_readiness_checks=1 \
+    --validation-count authenticated_reader_smokes=1
+}
+
 validate_restored_api() {
   local restored_dir="$1"
   local container_name="novel-tnn-restore-drill-$(date +%s)-$$"
@@ -204,15 +260,16 @@ validate_restored_api() {
     "$BACKUP_IMAGE" >/dev/null
   trap 'docker rm -f "${container_name:-}" >/dev/null 2>&1 || true' EXIT
 
-  local attempt
+  local attempt readiness_succeeded=0
   for attempt in $(seq 1 40); do
     if docker exec "$container_name" curl --fail --silent --show-error http://127.0.0.1:7860/api/health >/dev/null 2>&1 \
       && docker exec "$container_name" curl --fail --silent --show-error http://127.0.0.1:7860/api/ready >/dev/null 2>&1; then
+      readiness_succeeded=1
       break
     fi
     sleep 1
   done
-  ((attempt <= 40)) || fail "restored API did not become healthy and ready"
+  ((readiness_succeeded == 1)) || fail "restored API did not become healthy and ready"
 
   docker exec "$container_name" sh -ec '
 password_file=$(mktemp)
@@ -234,7 +291,9 @@ main() {
   BACKUP_IMAGE="${BACKUP_IMAGE:-novel-pipeline-api:runtime-hardening-20260718-r1}"
   PRODUCTION_ENV="${PRODUCTION_ENV:-$HOME/.config/novel-tnn/production.env}"
   RESTORE_ARTIFACT_SOURCE_ROOT="${RESTORE_ARTIFACT_SOURCE_ROOT:-$HOME/Novel-TNN}"
-  RESTORE_STATUS_FILE="${RESTORE_STATUS_FILE:-${RESTORE_ARTIFACT_SOURCE_ROOT}/data/logs/runtime/restore-drill.status.json}"
+  RESTORE_DATA_DIR="${RESTORE_ARTIFACT_SOURCE_ROOT}/data"
+  RECOVERY_PRODUCER_VERSION="${RECOVERY_PRODUCER_VERSION:-}"
+  RECOVERY_RECEIPT_DIR="${RESTORE_DATA_DIR}/logs/runtime"
 
   validate_config
   if [[ "${1:-}" == "--validate-config" ]]; then
@@ -245,6 +304,7 @@ main() {
   [[ -f "$PRODUCTION_ENV" ]] || fail "PRODUCTION_ENV does not exist"
   command -v docker >/dev/null || fail "docker is required"
   command -v sha256sum >/dev/null || fail "sha256sum is required"
+  verify_publisher_image_release
 
   umask 077
   local archive_name restored_dir report_path
@@ -254,9 +314,15 @@ main() {
   report_path="${BACKUP_DRILL_ROOT}/$(basename "$(dirname "$restored_dir")")-validation.json"
   validate_restored_db_and_artifacts "$restored_dir" "$report_path"
   validate_restored_api "$restored_dir"
-  .venv/bin/python scripts/record_restore_drill_status.py --output "$RESTORE_STATUS_FILE"
+  local checksum_hash artifact_paths_scanned
+  checksum_hash="$(read_verified_checksum_hash "$archive_name")"
+  [[ "$checksum_hash" =~ ^[a-f0-9]{64}$ ]] || fail "verified checksum is not a SHA-256 identifier"
+  artifact_paths_scanned="$(.venv/bin/python -c 'import json,sys; print(int(json.load(open(sys.argv[1], encoding="utf-8"))["artifact_paths_scanned"]))' "$report_path")"
+  publish_recovery_receipt "sha256:${checksum_hash}" "$artifact_paths_scanned"
   printf 'restore drill complete: %s\n' "$restored_dir"
   printf 'validation report: %s\n' "$report_path"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

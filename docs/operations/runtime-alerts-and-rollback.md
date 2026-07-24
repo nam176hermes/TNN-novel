@@ -35,8 +35,12 @@ session identifiers.
 | `disk_low` | warning | Free space below 1 GiB |
 | `queue_stale` | warning | Oldest queued work exceeds one hour |
 | `jobs_failed` | warning | Failed or interrupted work exists |
-| `backup_stale` | warning | No validated backup newer than two days |
-| `restore_drill_stale` | warning | No successful restore drill newer than eight days |
+| `external_backup_missing`, `restore_drill_missing` | warning | Required receipt is absent |
+| `external_backup_stale`, `restore_drill_stale` | warning | Receipt exceeds its configured maximum age |
+| `external_backup_invalid`, `restore_drill_invalid` | warning | Receipt JSON, schema, size, or file type is invalid |
+| `external_backup_future`, `restore_drill_future` | warning | Completion time exceeds allowed clock skew |
+| `external_backup_wrong_release`, `restore_drill_wrong_release` | warning | Producer version differs from the running release |
+| `backup_stale`, `restore_drill_stale` | warning | Compatibility aliases emitted with every non-fresh recovery state |
 | `artifact_integrity` | critical | Active artifact scan finds unavailable files |
 
 Container restart count is reported only when an external orchestrator provides
@@ -128,10 +132,64 @@ database errors.
 Never delete the current database, artifact tree, backup, or image during an
 application rollback. Retain the failed images until the incident is reviewed.
 
-## Restore-drill freshness
+## Recovery receipt contract
 
-`scripts/production_restore_drill.sh` publishes a bounded status file only after
-database integrity, artifact availability, restored API readiness, and the
-authenticated Reader smoke test all pass. The status contains only `status` and
-`completed_at`, is atomically replaced, and is mode `0600`. A failed or absent
-drill never overwrites the last successful timestamp with a false success.
+Runtime reads only these fixed paths below `DATA_DIR`:
+
+- `logs/runtime/external-backup.receipt.json`
+- `logs/runtime/restore-drill.receipt.json`
+
+Each receipt has exactly `status`, `completed_at`, `archive_hash_id`,
+`validation_counts`, and `producer_version`. Status is `passed`, completion time
+is UTC, and the hash identifier is a lowercase SHA-256 identifier. Validation
+counts use a bounded allowlist and describe checks that were actually executed.
+The runtime requires an exact successful contract per receipt kind before it can
+classify a receipt as fresh:
+
+- External backup: `archive_verified=1`, `metadata_verified=1`,
+  `checksum_verified=1`, `remote_uploads_verified=3`, and
+  `remote_metadata_verified=2`.
+- Restore drill: `checksum_verified=1`, `sqlite_integrity_checks=1`,
+  `foreign_key_violations=0`, `artifact_paths_scanned` present and non-negative,
+  `api_readiness_checks=1`, and `authenticated_reader_smokes=1`.
+
+Missing, unsuccessful, or cross-kind counters make the receipt `corrupt`.
+The producer version must match `NOVEL_RELEASE_ID` for a fresh state.
+
+The maximum ages are configured with
+`NOVEL_EXTERNAL_BACKUP_MAX_AGE_SECONDS` (default `172800`) and
+`NOVEL_RESTORE_DRILL_MAX_AGE_SECONDS` (default `691200`). Future timestamps use
+`NOVEL_RECOVERY_RECEIPT_FUTURE_SKEW_SECONDS` (default `300`). Invalid overrides
+fall back to these safe defaults.
+
+`scripts/production_backup.sh` publishes only after local metadata and checksum
+verification, off-site upload, remote archive and metadata re-download
+comparison, and remote retention rotation succeed. A verification or rotation
+failure leaves the previous receipt unchanged.
+`scripts/production_restore_drill.sh` publishes only after SQLite integrity,
+foreign-key, artifact, API readiness, and authenticated Reader checks succeed.
+Both producers publish through the pinned `BACKUP_IMAGE` as UID/GID
+`10001:10001`, with networking disabled and only the dedicated
+`DATA_DIR/logs/runtime` receipt directory mounted at `/receipts`. The directory
+must already exist, resolve to that fixed location, and be owned for UID 10001
+access. `RECOVERY_PRODUCER_VERSION` is mandatory and is verified against the
+image's embedded `NOVEL_RELEASE_ID`; operators must set both to the intended API
+release ID. The producer does not receive API credentials or query the running
+service. If the running API uses another release, its bounded receipt reader
+classifies the result as `wrong_release` and emits the stable recovery alert.
+The publisher
+receives only the archive hash identifier, validation counts, producer version,
+and its fixed in-container output path. Backup secrets,
+R2 credentials, archive and report paths, and `production.env` are never passed
+to the publisher container.
+
+Publication uses a mode `0700` parent, a mode `0600` temporary file, file fsync,
+atomic replacement, and directory fsync. Runtime rejects symlinks, non-regular
+files, oversized payloads, unknown keys, and malformed values.
+
+The API never reads or returns backup archives, checksum sidecars, backup
+directories, archive names, remote object keys, report paths, passphrases, R2
+configuration, credentials, parser exceptions, or arbitrary receipt fields.
+Only authenticated metrics and system status expose the bounded derived state,
+age, safe completion timestamp, hash identifier, allowlisted counts, producer
+version, and threshold.

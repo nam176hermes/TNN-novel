@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import shutil
@@ -18,10 +17,7 @@ from app.runtime_identity import get_runtime_identity
 from app.runtime_status import inspect_worker_runtime
 from app.services.tts.availability import inspect_tts_capability
 from app.storage.artifact_paths import APPROVED_PATH_FIELDS, ResolutionStatus, resolve_artifact_path
-from scripts import ops
-
-
-RESTORE_STATUS_RELATIVE_PATH = Path("logs/runtime/restore-drill.status.json")
+from app.recovery_receipts import read_recovery_receipt
 
 
 def _age_seconds(value: str, *, now: datetime) -> float | None:
@@ -72,20 +68,6 @@ def _artifact_snapshot(connection: sqlite3.Connection, data_dir: Path) -> dict[s
     }
 
 
-def _restore_snapshot(data_dir: Path, *, now: datetime) -> dict[str, Any]:
-    path = data_dir / RESTORE_STATUS_RELATIVE_PATH
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        status = str(payload.get("status") or "unknown")
-        completed_at = str(payload.get("completed_at") or "")
-        age = _age_seconds(completed_at, now=now)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return {"status": "not_recorded", "age_seconds": None}
-    if status not in {"passed", "failed"}:
-        status = "unknown"
-    return {"status": status, "age_seconds": age}
-
-
 def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]]:
     """Evaluate deterministic, low-cardinality alert rules."""
 
@@ -108,12 +90,21 @@ def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]
         add("queue_stale", "warning", "Oldest queued work exceeds one hour")
     if snapshot["jobs"]["failed_or_interrupted"] > 0:
         add("jobs_failed", "warning", "Failed or interrupted jobs require review")
-    backup_age = snapshot["backup"]["latest_age_seconds"]
-    if backup_age is None or backup_age > 2 * 86400:
-        add("backup_stale", "warning", "No recent validated system backup is recorded")
-    drill_age = snapshot["restore_drill"]["age_seconds"]
-    if snapshot["restore_drill"]["status"] != "passed" or drill_age is None or drill_age > 8 * 86400:
-        add("restore_drill_stale", "warning", "No recent successful restore drill is recorded")
+    recovery_alerts = {
+        "missing": ("missing", "No verified recovery receipt is recorded"),
+        "corrupt": ("invalid", "Recovery receipt is invalid"),
+        "future": ("future", "Recovery receipt timestamp exceeds allowed clock skew"),
+        "wrong_release": ("wrong_release", "Recovery receipt was produced by another release"),
+        "stale": ("stale", "Recovery receipt exceeds its freshness threshold"),
+    }
+    for key, prefix in (("backup", "external_backup"), ("restore_drill", "restore_drill")):
+        state = snapshot[key]["state"]
+        if state in recovery_alerts:
+            suffix, message = recovery_alerts[state]
+            add(f"{prefix}_{suffix}", "warning", message)
+            legacy_code = "backup_stale" if key == "backup" else "restore_drill_stale"
+            if legacy_code != f"{prefix}_{suffix}":
+                add(legacy_code, "warning", message)
     if snapshot["artifacts"]["error_count"] > 0:
         add("artifact_integrity", "critical", "Artifact integrity scan found unavailable files")
     return alerts
@@ -181,11 +172,6 @@ class OperationalMetricsService:
             artifacts = _artifact_snapshot(connection, self.data_dir)
 
         oldest_age = _age_seconds(oldest_row[0], now=resolved_now) if oldest_row and oldest_row[0] else None
-        backups = [item for item in ops.list_backups(self.data_dir / "backups") if item.get("metadata_status") == "READY"]
-        backup_ages = [
-            age for age in (_age_seconds(str(item.get("created_at") or ""), now=resolved_now) for item in backups)
-            if age is not None
-        ]
         tts = inspect_tts_capability().safe_dict()
         disk_free = shutil.disk_usage(self.data_dir).free
         worker_payload = worker.safe_dict()
@@ -201,11 +187,18 @@ class OperationalMetricsService:
             "worker": worker_payload,
             "queue": {"depth": int(queued), "oldest_age_seconds": oldest_age},
             "jobs": {"failed_or_interrupted": int(failed)},
-            "backup": {
-                "ready_count": len(backups),
-                "latest_age_seconds": min(backup_ages) if backup_ages else None,
-            },
-            "restore_drill": _restore_snapshot(self.data_dir, now=resolved_now),
+            "backup": read_recovery_receipt(
+                self.data_dir,
+                "external_backup",
+                expected_release=identity.release_id,
+                now=resolved_now,
+            ),
+            "restore_drill": read_recovery_receipt(
+                self.data_dir,
+                "restore_drill",
+                expected_release=identity.release_id,
+                now=resolved_now,
+            ),
             "storage": {
                 "disk_free_bytes": int(disk_free),
                 "database_size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,

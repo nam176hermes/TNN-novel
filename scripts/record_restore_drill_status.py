@@ -1,42 +1,57 @@
 #!/usr/bin/env python3
-"""Atomically publish the last successful isolated restore-drill timestamp."""
+"""Publish a strict recovery receipt without embedding operational paths."""
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import json
-import os
 from pathlib import Path
-import tempfile
+
+from app.recovery_receipts import publish_recovery_receipt
 
 
-def record_success(output: Path, *, completed_at: datetime | None = None) -> None:
+def record_success(
+    output: Path,
+    *,
+    archive_hash_id: str,
+    validation_counts: dict[str, int],
+    producer_version: str,
+    completed_at: datetime | None = None,
+) -> None:
     output = Path(output)
     if not output.is_absolute():
         raise ValueError("restore-drill status path must be absolute")
-    timestamp = (completed_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    payload = {"status": "passed", "completed_at": timestamp.isoformat()}
-    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_name, 0o600)
-        os.replace(temporary_name, output)
-    except BaseException:
-        Path(temporary_name).unlink(missing_ok=True)
-        raise
+    publish_recovery_receipt(
+        output,
+        archive_hash_id=archive_hash_id,
+        validation_counts=validation_counts,
+        producer_version=producer_version,
+        completed_at=(completed_at or datetime.now(timezone.utc)).astimezone(timezone.utc),
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--archive-hash-id", required=True)
+    parser.add_argument("--producer-version", required=True)
+    parser.add_argument("--validation-count", action="append", required=True, metavar="KEY=INTEGER")
     args = parser.parse_args()
-    record_success(args.output)
+    counts: dict[str, int] = {}
+    for item in args.validation_count:
+        key, separator, value = item.partition("=")
+        if not separator:
+            parser.error("--validation-count must use KEY=INTEGER")
+        try:
+            counts[key] = int(value)
+        except ValueError:
+            parser.error("--validation-count value must be an integer")
+    record_success(
+        args.output,
+        archive_hash_id=args.archive_hash_id,
+        validation_counts=counts,
+        producer_version=args.producer_version,
+    )
     return 0
 
 

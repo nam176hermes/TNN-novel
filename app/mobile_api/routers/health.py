@@ -13,10 +13,11 @@ from app.config import settings
 from app.database.db import count_mobile_jobs_by_status, list_operational_events
 from app.mobile_api.config import auth_bypass_enabled, mobile_settings, validate_public_deploy_settings
 from app.mobile_api.public_mode import is_public_request, sanitize_public_payload
-from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStatusResponse, VersionResponse
+from app.mobile_api.schemas import HealthResponse, ReadinessResponse, RecoveryFreshnessResponse, SystemStatusResponse, VersionResponse
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 from app.mobile_api.services.retention_service import RetentionService
 from app.runtime_identity import get_runtime_identity
+from app.recovery_receipts import read_recovery_receipt
 from app.runtime_status import inspect_worker_runtime
 from app.services.tts.availability import inspect_tts_capability
 
@@ -283,6 +284,12 @@ async def system_status(request: Request):
     storage_health = "healthy" if api_ready else "degraded"
 
     identity = get_runtime_identity(component="api")
+    external_backup = read_recovery_receipt(
+        data_dir, "external_backup", expected_release=identity.release_id
+    )
+    restore_drill = read_recovery_receipt(
+        data_dir, "restore_drill", expected_release=identity.release_id
+    )
     return SystemStatusResponse(
         db_size_bytes=db_size,
         cache_count=cache.get("count", 0),
@@ -313,4 +320,6 @@ async def system_status(request: Request):
         app_version=identity.version,
         build=identity.release_id,
         backup_recommendation="System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.",
+        external_backup=RecoveryFreshnessResponse(**external_backup),
+        restore_drill=RecoveryFreshnessResponse(**restore_drill),
     )
