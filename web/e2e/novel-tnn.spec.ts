@@ -630,7 +630,7 @@ test('mobile Reader exposes raw and split only for the current chapter resources
   await expectNoHorizontalOverflow(page);
 });
 
-test('mobile Reader reloads cached content offline without caching protected API responses', async ({ page, context }) => {
+test('mobile Reader reloads cached content offline on the first service-worker session', async ({ page, context }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await page.setViewportSize({ width: 390, height: 844 });
   await authenticatedPage(page, state);
@@ -645,11 +645,51 @@ test('mobile Reader reloads cached content offline without caching protected API
     .click();
   await expect(page.getByText(/Đã tải Chương 10 offline/)).toBeVisible();
 
-  await page.evaluate(async () => {
+  const firstSessionShell = await page.evaluate(async () => {
     await navigator.serviceWorker.ready;
     const privateApiCached = await caches.match('/api/books/42/chapters/4201/translation');
     if (privateApiCached) throw new Error('Protected API response was stored in Cache Storage');
+    const requiredAssets = Array.from(document.querySelectorAll<HTMLScriptElement | HTMLLinkElement>('script[src], link[href]'))
+      .map((element) => element instanceof HTMLScriptElement ? element.src : element.href)
+      .filter((url) => new URL(url).pathname.startsWith('/assets/'));
+    const missingAssets = [];
+    for (const url of requiredAssets) {
+      if (!await caches.match(url)) missingAssets.push(url);
+    }
+    return {
+      controllerUrl: navigator.serviceWorker.controller?.scriptURL ?? '',
+      missingAssets,
+    };
   });
+  expect(firstSessionShell.controllerUrl).toContain('/reader-offline-sw.js?v=20260724-ws1');
+  expect(firstSessionShell.missingAssets).toEqual([]);
+
+  await context.setOffline(true);
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await expect(page.getByRole('status', { name: 'Trạng thái offline' })).toContainText('Bạn đang offline');
+    await expect(page.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toContainText('Trời dần trở lạnh');
+    await expectNoHorizontalOverflow(page);
+  } finally {
+    await context.setOffline(false);
+  }
+});
+
+test('mobile Reader reloads cached content offline on a warmed service-worker session', async ({ page, context }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
+    .getByRole('button', { name: 'Thư viện' })
+    .click();
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await page.getByRole('dialog', { name: 'Tùy chọn đọc' })
+    .getByRole('button', { name: 'Tải chương hiện tại offline' })
+    .click();
+  await expect(page.getByText(/Đã tải Chương 10 offline/)).toBeVisible();
+
   await page.reload({ waitUntil: 'domcontentloaded' });
   await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
 

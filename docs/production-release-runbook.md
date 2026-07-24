@@ -11,8 +11,8 @@ Run from the WSL repository:
 REPO=/home/thenam176/Novel-TNN
 PROJECT_NAME=novel-tnn-wsl
 PRODUCTION_ENV="${HOME}/.config/novel-tnn/production.env"
-RELEASE_OVERLAY=deploy/production/compose.release.ws7-production-20260723-r1.yaml
-ROLLBACK_OVERLAY=deploy/production/compose.rollback.pre-ws7-production-20260723-r1.yaml
+RELEASE_OVERLAY=deploy/production/compose.release.ux-pwa-001-production-20260724-r1.yaml
+ROLLBACK_OVERLAY=deploy/production/compose.rollback.pre-ux-pwa-001-production-20260724-r1.yaml
 PUBLIC_BASE_URL=https://novel-tnn.tradingcompanydirect.com
 cd "$REPO"
 ```
@@ -63,19 +63,19 @@ docker compose -p "$PROJECT_NAME" \
   config --images
 ```
 
-For `ws7-production-20260723-r1`, expected images are:
+For `ux-pwa-001-production-20260724-r1`, expected images are:
 
 ```text
-novel-pipeline-api:ws7-production-20260723-r1
-novel-pipeline-import-worker:ws7-production-20260723-r1
+novel-pipeline-api:ux-pwa-001-production-20260724-r1
+novel-pipeline-import-worker:ux-pwa-001-production-20260724-r1
 ```
 
 The overlay comments record image IDs. Confirm them before deployment:
 
 ```bash
 docker image inspect \
-  novel-pipeline-api:ws7-production-20260723-r1 \
-  novel-pipeline-import-worker:ws7-production-20260723-r1 \
+  novel-pipeline-api:ux-pwa-001-production-20260724-r1 \
+  novel-pipeline-import-worker:ux-pwa-001-production-20260724-r1 \
   --format '{{index .RepoTags 0}} {{.Id}}'
 ```
 

@@ -25,6 +25,7 @@ import {
   type ReaderOfflineCacheSummary,
   type ReaderOfflineManifest,
 } from '../../state/readerOfflineCache';
+import { verifyReaderOfflineAppShellReady } from '../../state/serviceWorker';
 
 export type ReaderOfflineState = 'online' | 'offline-with-cache' | 'offline-without-cache';
 
@@ -56,6 +57,7 @@ export type ReaderOfflineCacheDependencies = {
   removeChapter(bookId: number, chapterId: number): Promise<void>;
   removeManifest(bookId: number): void;
   removeManifestChapter(bookId: number, chapterId: number): void;
+  verifyAppShellReady(): Promise<void>;
 };
 
 export type UseReaderOfflineCacheOptions = {
@@ -86,6 +88,7 @@ const defaultDependencies: ReaderOfflineCacheDependencies = {
   removeChapter: removeCachedChapterAsync,
   removeManifest: removeReaderOfflineManifest,
   removeManifestChapter: removeReaderOfflineManifestChapter,
+  verifyAppShellReady: verifyReaderOfflineAppShellReady,
 };
 
 function onlineNow(): boolean {
@@ -463,6 +466,7 @@ export function useReaderOfflineCache({
         chapter: selectedChapter,
         client: apiClient,
       });
+      await dependencies.verifyAppShellReady();
       if (!operationIsCurrent(operation)) return;
       setMessage([
         `Đã tải Chương ${selectedChapter.chapter_number} offline`,
@@ -560,6 +564,7 @@ export function useReaderOfflineCache({
           setMessage(`Đang cache offline ${progress.chaptersCached}/${progress.chaptersTotal} chương...`);
         },
       });
+      await dependencies.verifyAppShellReady();
       if (!operationIsCurrent(operation)) return;
       setMessage([
         `Đã cache offline ${summary.chaptersCached}/${summary.chaptersTotal} chương`,

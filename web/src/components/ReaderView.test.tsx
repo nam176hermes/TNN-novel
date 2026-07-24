@@ -16,6 +16,10 @@ import { buildReaderProgressTextAnchor } from '../state/readerProgressAnchor';
 import ReaderView, { type ReaderApiClient } from './ReaderView';
 import { loadReaderSettings, loadReaderTextMode, saveReaderTextMode } from './reader/readerSettings';
 
+vi.mock('../state/serviceWorker', () => ({
+  verifyReaderOfflineAppShellReady: vi.fn().mockResolvedValue(undefined),
+}));
+
 const books: TranslatedBookSummary[] = [
   {
     id: 42,

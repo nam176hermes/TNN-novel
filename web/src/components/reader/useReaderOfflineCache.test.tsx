@@ -111,6 +111,7 @@ function dependencies(overrides: Partial<ReaderOfflineCacheDependencies> = {}): 
     removeChapter: vi.fn().mockResolvedValue(undefined),
     removeManifest: vi.fn(),
     removeManifestChapter: vi.fn(),
+    verifyAppShellReady: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -296,6 +297,10 @@ describe('useReaderOfflineCache', () => {
       bookId: 42,
       chapter: chapters[1],
     }));
+    expect(deps.verifyAppShellReady).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.cacheChapter).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(deps.verifyAppShellReady).mock.invocationCallOrder[0],
+    );
     expect(result.current.message).toBe('Đã tải Chương 2 offline · 1/1 asset · 1/1 audio');
 
     await act(async () => result.current.removeCurrentChapter());
@@ -303,6 +308,21 @@ describe('useReaderOfflineCache', () => {
     expect(deps.removeManifestChapter).toHaveBeenCalledWith(42, 102);
     expect(result.current.message).toBe('Đã xóa cache offline Chương 2.');
     expect(onError).toHaveBeenLastCalledWith('');
+  });
+
+  it('does not report chapter cache success when the app shell is not ready', async () => {
+    const deps = dependencies({
+      verifyAppShellReady: vi.fn().mockRejectedValue(new Error('Offline app shell is not ready')),
+    });
+    const onError = vi.fn();
+    const { result } = renderHook(() => useReaderOfflineCache(options(deps, { onError })));
+    await waitFor(() => expect(result.current.cacheStatus).toEqual(cacheStatus));
+
+    await act(async () => result.current.cacheCurrentChapter());
+
+    expect(deps.cacheChapter).toHaveBeenCalledTimes(1);
+    expect(result.current.message).toBe('');
+    expect(onError).toHaveBeenCalledWith('Offline app shell is not ready');
   });
 
   it('suppresses automatic audio caching after chapter removal until explicit cache or navigation', async () => {
@@ -604,6 +624,7 @@ describe('useReaderOfflineCache', () => {
       await cachePromise;
     });
     expect(deps.cacheBook).toHaveBeenCalledWith(expect.objectContaining({ bookId: 42, chapters }));
+    expect(deps.verifyAppShellReady).toHaveBeenCalledTimes(1);
     expect(result.current.message).toBe('Đã cache offline 3/3 chương · 1/1 asset · 1/1 audio · đã cache từ điển');
 
     await act(async () => result.current.removeCurrentBook());

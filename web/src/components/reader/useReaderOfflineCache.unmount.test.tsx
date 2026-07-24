@@ -84,6 +84,7 @@ it('finishes a deferred privacy cleanup after unmount without refreshing hook st
     removeChapter,
     removeManifest: vi.fn(),
     removeManifestChapter: vi.fn(),
+    verifyAppShellReady: vi.fn().mockResolvedValue(undefined),
   };
   const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
   const { result, unmount } = renderHook(() => useReaderOfflineCache({

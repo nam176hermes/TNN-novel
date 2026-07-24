@@ -1,6 +1,7 @@
-const SHELL_CACHE = 'reader-offline-shell-v5';
-const RUNTIME_CACHE = 'reader-offline-runtime-v5';
+const SHELL_CACHE = 'reader-offline-shell-v6';
+const RUNTIME_CACHE = 'reader-offline-runtime-v6';
 const CACHE_PREFIX = 'reader-offline-';
+const VERIFY_APP_SHELL_MESSAGE = 'VERIFY_READER_OFFLINE_APP_SHELL';
 const APP_SHELL_URLS = [
   '/',
   '/index.html',
@@ -37,6 +38,44 @@ async function cacheAppShell() {
   await Promise.all(Array.from(assetUrls, (url) => cache.add(url)));
 }
 
+function allowedAppShellAssetUrls(assetUrls = []) {
+  const allowed = new Set();
+  for (const candidate of assetUrls) {
+    try {
+      const url = new URL(candidate, self.location.origin);
+      if (sameOrigin(url) && url.pathname.startsWith('/assets/')) allowed.add(url.href);
+    } catch {
+      // Ignore malformed or non-URL message data.
+    }
+  }
+  return allowed;
+}
+
+async function verifyAppShellReady(currentAssetUrls = []) {
+  const cache = await caches.open(SHELL_CACHE);
+  const requiredUrls = new Set(APP_SHELL_URLS);
+  const cachedIndex = await cache.match('/index.html');
+  if (cachedIndex) {
+    const html = await cachedIndex.text();
+    const attributePattern = /(?:src|href)=["']([^"']+)["']/g;
+    for (const match of html.matchAll(attributePattern)) {
+      const url = new URL(match[1], self.location.origin);
+      if (sameOrigin(url) && url.pathname.startsWith('/assets/')) requiredUrls.add(url.href);
+    }
+  }
+
+  for (const url of allowedAppShellAssetUrls(currentAssetUrls)) {
+    requiredUrls.add(url);
+    if (!await cache.match(url)) await cache.add(url);
+  }
+
+  const missing = [];
+  for (const url of requiredUrls) {
+    if (!await cache.match(url)) missing.push(url);
+  }
+  return { missing, ready: missing.length === 0 };
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(cacheAppShell().then(() => self.skipWaiting()));
 });
@@ -51,6 +90,16 @@ self.addEventListener('activate', (event) => {
           .map((key) => caches.delete(key)),
       ))
       .then(() => self.clients.claim()),
+  );
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data?.type !== VERIFY_APP_SHELL_MESSAGE || !event.ports[0]) return;
+  const responsePort = event.ports[0];
+  event.waitUntil(
+    verifyAppShellReady(event.data.assetUrls)
+      .then((result) => responsePort.postMessage(result))
+      .catch(() => responsePort.postMessage({ missing: [], ready: false })),
   );
 });
 
@@ -88,12 +137,13 @@ async function networkFirstNavigation(request) {
 }
 
 async function staleWhileRevalidate(request) {
-  const cache = await caches.open(RUNTIME_CACHE);
-  const cached = await cache.match(request);
+  const runtimeCache = await caches.open(RUNTIME_CACHE);
+  const shellCache = await caches.open(SHELL_CACHE);
+  const cached = await runtimeCache.match(request) || await shellCache.match(request, { ignoreVary: true });
   const networkResponse = fetch(request)
     .then((response) => {
       if (response.ok) {
-        cache.put(request, response.clone());
+        runtimeCache.put(request, response.clone());
       }
       return response;
     })
