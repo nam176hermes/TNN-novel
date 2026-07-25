@@ -99,11 +99,14 @@ jobs:
 
       - name: Run container
         run: |
-          docker run -d --rm \
+          docker run -d \
             --name novel-pipeline-ci \
             -p 127.0.0.1:7860:7860 \
-            -e MOBILE_API_SECRET=ci-secret-not-for-production \
-            -e MOBILE_API_ADMIN_PASSWORD=ci-password \
+            -e PUBLIC_DEPLOY=1 \
+            -e MOBILE_API_SECRET=ci-only-not-a-real-secret-000000000000 \
+            -e MOBILE_API_ADMIN_USERNAME=ci-operator \
+            -e MOBILE_API_ADMIN_PASSWORD=ci-only-not-a-real-password \
+            -e MOBILE_API_CORS_ORIGINS=https://ci.example.test \
             novel-pipeline:ci
 
       - name: Smoke container
@@ -119,4 +122,6 @@ jobs:
 
       - name: Stop container
         if: always()
-        run: docker rm -f novel-pipeline-ci || true
+        run: |
+          docker logs novel-pipeline-ci || true
+          docker rm -f novel-pipeline-ci || true
