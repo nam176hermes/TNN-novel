@@ -152,6 +152,18 @@ def test_verify_script_keeps_browser_e2e_behind_explicit_opt_in() -> None:
     )
 
 
+def test_ci_python_job_provisions_project_runtime_dependencies() -> None:
+    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    python_job = content.split("  frontend:", maxsplit=1)[0]
+
+    assert "sudo apt-get install -y ffmpeg" in python_job
+    assert "python -m venv .venv" in python_job
+    assert '.venv/bin/python -m pip install -r requirements.txt' in python_job
+    assert '.venv/bin/python -m pip install -e ".[dev]"' in python_job
+    assert "npm --prefix web ci" in python_job
+    assert ".venv/bin/python -m pytest -q -s" in python_job
+
+
 def test_ci_installs_caches_and_runs_playwright_without_changing_existing_frontend_gates() -> None:
     content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 

@@ -18,19 +18,38 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Set up Node for environment-script tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install system dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Create project Python environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip install -e ".[dev]"
+
+      - name: Install frontend dependencies for environment-script tests
+        run: npm --prefix web ci
 
       - name: Compile Python sources
-        run: python -m compileall -q app scripts tests
+        run: .venv/bin/python -m compileall -q app scripts tests
 
       - name: Check shell scripts
         run: for script in scripts/*.sh; do bash -n "$script"; done
 
       - name: Run Python tests
-        run: python -m pytest -q -s
+        env:
+          NOVEL_PIPELINE_IGNORE_DOTENV: "1"
+        run: .venv/bin/python -m pytest -q -s
 
   frontend:
     name: Frontend tests and build
