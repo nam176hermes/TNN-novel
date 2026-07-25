@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import hashlib
-import io
 import json
 import logging
 import os
 import shutil
 import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import struct
 import time
 import uuid
-import zipfile
 from dataclasses import dataclass, replace
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -64,6 +61,14 @@ from app.database.db import (
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
 from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
 from app.mobile_api.services.content_file_service import ContentFileService
+from app.mobile_api.services.reader_dictionary_service import (
+    MAX_READER_DICTIONARY_ARCHIVE_FILES as _MAX_READER_DICTIONARY_ARCHIVE_FILES,
+    MAX_READER_DICTIONARY_BYTES as _MAX_READER_DICTIONARY_BYTES,
+    READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES as _READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES,
+    READER_OFFLINE_DICTIONARY_DIR,
+    READER_OFFLINE_DICTIONARY_SUFFIXES,
+    ReaderDictionaryService,
+)
 from app.mobile_api.services.reader_service import ReaderService
 from app.translation.ollama_client import call_llm, is_retryable_provider_error, translate_chapter
 from app.translation.idiom_correction import clean_translation_layout, post_process_with_idioms
@@ -82,6 +87,11 @@ from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 
 logger = logging.getLogger(__name__)
+
+# Compatibility aliases retained at the original module import path.
+MAX_READER_DICTIONARY_ARCHIVE_FILES = _MAX_READER_DICTIONARY_ARCHIVE_FILES
+MAX_READER_DICTIONARY_BYTES = _MAX_READER_DICTIONARY_BYTES
+READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES = _READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -162,11 +172,6 @@ MAX_READER_XRAY_ENRICH_CONTEXT_CHARS = 12_000
 MAX_READER_XRAY_ENRICH_CONTEXT_CHARS_PER_CHAPTER = 2_500
 DICTIONARY_LOOKUP_LIMIT = 12
 ONLINE_DICTIONARY_TIMEOUT_SECONDS = 2.0
-READER_OFFLINE_DICTIONARY_DIR = "dictionaries"
-READER_OFFLINE_DICTIONARY_SUFFIXES = {".csv", ".dsl", ".json", ".jsonl", ".tsv", ".u8", ".txt"}
-READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES = {".zip"}
-MAX_READER_DICTIONARY_BYTES = 80 * 1024 * 1024
-MAX_READER_DICTIONARY_ARCHIVE_FILES = 40
 DICTIONARY_SOURCE_PRIORITY = {
     "glossary": 0,
     "offline_dictionary": 1,
@@ -2165,6 +2170,12 @@ class PipelineService:
             db_path=self.db_path,
             content_file_service=self.content_file_service,
         )
+        self.reader_dictionary_service = ReaderDictionaryService(
+            data_dir=self.data_dir,
+            file_rows=_reader_dictionary_file_rows,
+            stardict_rows=_reader_dictionary_rows_from_stardict_bytes,
+            jsonl_bytes=_reader_dictionary_jsonl_bytes,
+        )
 
     def _content_files(self) -> ContentFileService:
         service = getattr(self, "content_file_service", None)
@@ -2203,6 +2214,19 @@ class PipelineService:
                 content_file_service=content_files,
             )
             self.reader_service = service
+        return service
+
+    def _reader_dictionaries(self) -> ReaderDictionaryService:
+        service = getattr(self, "reader_dictionary_service", None)
+        data_dir = Path(self.data_dir)
+        if service is None or service.data_dir != data_dir:
+            service = ReaderDictionaryService(
+                data_dir=data_dir,
+                file_rows=_reader_dictionary_file_rows,
+                stardict_rows=_reader_dictionary_rows_from_stardict_bytes,
+                jsonl_bytes=_reader_dictionary_jsonl_bytes,
+            )
+            self.reader_dictionary_service = service
         return service
 
     @staticmethod
@@ -2246,221 +2270,17 @@ class PipelineService:
         safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._-")
         return safe_title or f"book_{book_id}"
 
-    def _reader_dictionary_dir(self) -> Path:
-        path = self.data_dir / READER_OFFLINE_DICTIONARY_DIR
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _safe_reader_dictionary_filename(self, filename: str) -> str:
-        safe_name = self._safe_filename_part(Path(filename or "").name).strip("._-")
-        if not safe_name:
-            raise ValueError("Dictionary filename is required")
-        suffix = Path(safe_name).suffix.casefold()
-        if suffix not in READER_OFFLINE_DICTIONARY_SUFFIXES:
-            supported = ", ".join(sorted(READER_OFFLINE_DICTIONARY_SUFFIXES))
-            raise ValueError(f"Unsupported dictionary format. Supported: {supported}")
-        return safe_name
-
-    def _safe_reader_dictionary_archive_filename(self, filename: str) -> str:
-        safe_name = self._safe_filename_part(Path(filename or "").name).strip("._-")
-        if not safe_name:
-            raise ValueError("Dictionary filename is required")
-        suffix = Path(safe_name).suffix.casefold()
-        if suffix not in READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES:
-            supported = ", ".join(sorted(READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES))
-            raise ValueError(f"Unsupported dictionary archive format. Supported: {supported}")
-        return safe_name
-
-    def _reader_dictionary_payload(self, path: Path) -> dict:
-        return {
-            "filename": path.name,
-            "entry_count": len(_reader_dictionary_file_rows(path)),
-            "size_bytes": path.stat().st_size,
-        }
-
     def list_reader_dictionaries(self) -> list[dict]:
-        dictionaries_dir = self._reader_dictionary_dir()
-        payloads: list[dict] = []
-        for path in sorted(dictionaries_dir.iterdir(), key=lambda item: item.name.casefold()):
-            if path.is_file() and path.suffix.casefold() in READER_OFFLINE_DICTIONARY_SUFFIXES:
-                payloads.append(self._reader_dictionary_payload(path))
-        return payloads
-
-    def _write_reader_dictionary_file(self, *, safe_name: str, content: bytes) -> dict:
-        if not content:
-            raise ValueError("Dictionary file is empty")
-        if len(content) > MAX_READER_DICTIONARY_BYTES:
-            raise ValueError("Dictionary file is too large")
-
-        target = self._reader_dictionary_dir() / safe_name
-        temp = target.with_name(f".{target.stem}.upload{target.suffix}")
-        temp.write_bytes(content)
-        entry_count = len(_reader_dictionary_file_rows(temp))
-        if entry_count <= 0:
-            temp.unlink(missing_ok=True)
-            raise ValueError("Dictionary file contains no readable entries")
-        temp.replace(target)
-        return {
-            "filename": target.name,
-            "entry_count": entry_count,
-            "size_bytes": target.stat().st_size,
-        }
-
-    @staticmethod
-    def _zip_member_basename(filename: str) -> str | None:
-        member_path = PurePosixPath(filename)
-        if member_path.is_absolute() or any(part == ".." for part in member_path.parts):
-            return None
-        return member_path.name or None
-
-    def _save_reader_dictionary_archive(self, *, filename: str, content: bytes) -> dict:
-        safe_archive_name = self._safe_reader_dictionary_archive_filename(filename)
-        extracted: list[dict] = []
-        seen_names: set[str] = set()
-
-        try:
-            archive = zipfile.ZipFile(io.BytesIO(content))
-        except zipfile.BadZipFile as exc:
-            raise ValueError("Dictionary archive is not a valid ZIP file") from exc
-
-        with archive:
-            file_members = [member for member in archive.infolist() if not member.is_dir()]
-            if len(file_members) > MAX_READER_DICTIONARY_ARCHIVE_FILES:
-                raise ValueError(
-                    f"Dictionary archive contains too many files; max {MAX_READER_DICTIONARY_ARCHIVE_FILES}"
-                )
-
-            stardict_groups: dict[str, dict[str, bytes]] = {}
-            for member in file_members:
-                member_path = PurePosixPath(member.filename)
-                if (
-                    member_path.is_absolute()
-                    or any(part == ".." for part in member_path.parts)
-                    or not member_path.name
-                ):
-                    continue
-                member_name = str(member_path)
-                lowered_name = member_name.casefold()
-                if lowered_name.endswith(".dict.dz"):
-                    suffix = ".dict.dz"
-                    group_key = member_name[: -len(".dict.dz")]
-                    part_key = ".dict"
-                else:
-                    suffix = member_path.suffix.casefold()
-                    group_key = str(member_path.with_suffix(""))
-                    part_key = suffix
-                if suffix not in {".dict", ".dict.dz", ".idx", ".ifo"}:
-                    continue
-                if member.file_size <= 0:
-                    continue
-                if member.file_size > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                content_bytes = archive.read(member)
-                if len(content_bytes) > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                if suffix == ".dict.dz":
-                    try:
-                        content_bytes = gzip.decompress(content_bytes)
-                    except (OSError, EOFError) as exc:
-                        raise ValueError(f"StarDict compressed dictionary is invalid: {member_path.name}") from exc
-                    if len(content_bytes) > MAX_READER_DICTIONARY_BYTES:
-                        raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                stardict_groups.setdefault(group_key, {})[part_key] = content_bytes
-
-            for group_key, parts in stardict_groups.items():
-                if not {".dict", ".idx", ".ifo"}.issubset(parts):
-                    continue
-                safe_stem = self._safe_filename_part(PurePosixPath(group_key).name).strip("._-") or "stardict"
-                safe_member_name = self._safe_reader_dictionary_filename(f"{safe_stem}.stardict.jsonl")
-                if safe_member_name in seen_names:
-                    continue
-                rows = _reader_dictionary_rows_from_stardict_bytes(
-                    ifo_content=parts[".ifo"],
-                    idx_content=parts[".idx"],
-                    dict_content=parts[".dict"],
-                )
-                if not rows:
-                    continue
-                try:
-                    extracted.append(
-                        self._write_reader_dictionary_file(
-                            safe_name=safe_member_name,
-                            content=_reader_dictionary_jsonl_bytes(rows),
-                        )
-                    )
-                    seen_names.add(safe_member_name)
-                except ValueError:
-                    continue
-
-            for member in file_members:
-                basename = self._zip_member_basename(member.filename)
-                if not basename:
-                    continue
-                try:
-                    safe_member_name = self._safe_reader_dictionary_filename(basename)
-                except ValueError:
-                    continue
-                if safe_member_name in seen_names:
-                    continue
-                if member.file_size <= 0:
-                    continue
-                if member.file_size > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"Dictionary file inside archive is too large: {safe_member_name}")
-
-                member_content = archive.read(member)
-                if len(member_content) > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"Dictionary file inside archive is too large: {safe_member_name}")
-                try:
-                    extracted.append(
-                        self._write_reader_dictionary_file(
-                            safe_name=safe_member_name,
-                            content=member_content,
-                        )
-                    )
-                    seen_names.add(safe_member_name)
-                except ValueError:
-                    continue
-
-        extracted = sorted(extracted, key=lambda item: item["filename"].casefold())
-        if not extracted:
-            raise ValueError("Dictionary archive contains no readable dictionary files")
-        return {
-            "filename": safe_archive_name,
-            "entry_count": sum(int(item["entry_count"]) for item in extracted),
-            "file_count": len(extracted),
-            "files": extracted,
-            "size_bytes": len(content),
-        }
+        return self._reader_dictionaries().list_reader_dictionaries()
 
     def save_reader_dictionary(self, *, filename: str, content: bytes) -> dict:
-        if not content:
-            raise ValueError("Dictionary file is empty")
-        if len(content) > MAX_READER_DICTIONARY_BYTES:
-            raise ValueError("Dictionary file is too large")
-
-        if Path(filename or "").suffix.casefold() in READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES:
-            return self._save_reader_dictionary_archive(filename=filename, content=content)
-
-        safe_name = self._safe_reader_dictionary_filename(filename)
-        return self._write_reader_dictionary_file(safe_name=safe_name, content=content)
+        return self._reader_dictionaries().save_reader_dictionary(filename=filename, content=content)
 
     def delete_reader_dictionary(self, filename: str) -> bool:
-        safe_name = self._safe_reader_dictionary_filename(filename)
-        target = self._reader_dictionary_dir() / safe_name
-        if not target.exists() or not target.is_file():
-            return False
-        target.unlink()
-        return True
+        return self._reader_dictionaries().delete_reader_dictionary(filename)
 
     def get_reader_dictionary_path(self, filename: str) -> Path | None:
-        raw_name = (filename or "").strip()
-        if not raw_name or "/" in raw_name or "\\" in raw_name:
-            raise ValueError("Dictionary filename must not include paths")
-        safe_name = self._safe_reader_dictionary_filename(raw_name)
-        target = self._reader_dictionary_dir() / safe_name
-        if not target.exists() or not target.is_file():
-            return None
-        return target
+        return self._reader_dictionaries().get_reader_dictionary_path(filename)
 
     def _book_payload(self, book: dict | None) -> dict | None:
         if not book:
