@@ -152,6 +152,30 @@ def test_verify_script_keeps_browser_e2e_behind_explicit_opt_in() -> None:
     )
 
 
+def test_ci_python_job_provisions_project_runtime_dependencies() -> None:
+    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    python_job = content.split("  frontend:", maxsplit=1)[0]
+
+    assert "sudo apt-get install -y ffmpeg" in python_job
+    assert "python -m venv .venv" in python_job
+    assert '.venv/bin/python -m pip install -r requirements.txt' in python_job
+    assert '.venv/bin/python -m pip install -e ".[dev]"' in python_job
+    assert "npm --prefix web ci" in python_job
+    assert ".venv/bin/python -m pytest -q -s" in python_job
+
+
+def test_ci_docker_smoke_uses_safe_public_runtime_configuration() -> None:
+    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    docker_job = content.split("  docker:", maxsplit=1)[1]
+
+    assert "-e PUBLIC_DEPLOY=1" in docker_job
+    assert "-e MOBILE_API_ADMIN_USERNAME=ci-operator" in docker_job
+    assert "-e MOBILE_API_CORS_ORIGINS=https://ci.example.test" in docker_job
+    assert "-e MOBILE_API_SECRET=ci-only-not-a-real-secret-000000000000" in docker_job
+    assert "-e MOBILE_API_ADMIN_PASSWORD=ci-only-not-a-real-password" in docker_job
+    assert "docker logs novel-pipeline-ci || true" in docker_job
+
+
 def test_ci_installs_caches_and_runs_playwright_without_changing_existing_frontend_gates() -> None:
     content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
