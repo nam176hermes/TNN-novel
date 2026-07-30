@@ -1,0 +1,5 @@
+services:
+  api:
+    image: novel-pipeline-api:reader-ws1-production-20260730-r1
+  import-worker:
+    image: novel-pipeline-import-worker:reader-ws1-production-20260730-r1
