@@ -31,12 +31,12 @@ function readerInlineSegments(text: string): ReaderInlineSegment[] {
 }
 
 function explicitTranslatedHeading(text: string): string {
-  const firstParagraph = text
-    .split(/\n{2,}/u)
-    .map((paragraph) => paragraph.trim())
+  const firstLine = text
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
     .find(Boolean) ?? '';
   for (const pattern of explicitHeadingPatterns) {
-    const match = firstParagraph.match(pattern);
+    const match = firstLine.match(pattern);
     if (match?.[1]) return match[1].trim();
   }
   return '';

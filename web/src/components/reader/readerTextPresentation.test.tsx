@@ -35,7 +35,7 @@ describe('readerTextPresentation', () => {
   it('derives a Vietnamese chapter title from an explicit translated Markdown heading', () => {
     expect(resolveReaderChapterDisplayTitle(
       chapter,
-      '**Chương 12: Gặp lại cố nhân**\n\nMột đoạn dịch.',
+      '**Chương 12: Gặp lại cố nhân**\nMột đoạn dịch.',
     )).toBe('Gặp lại cố nhân');
   });
 

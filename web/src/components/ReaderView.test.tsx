@@ -395,7 +395,7 @@ describe('ReaderView', () => {
       chapters: chapters.map((chapter) => chapter.id === sourceChapter.id ? sourceChapter : chapter),
       selectedChapter: sourceChapter,
       sourceText: '原文段落。',
-      translationText: '**Chương 2: Gặp lại cố nhân**\n\nMột đoạn dịch.',
+      translationText: '**Chương 2: Gặp lại cố nhân**\nMột đoạn dịch.',
     });
 
     const translatedArticle = screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });
