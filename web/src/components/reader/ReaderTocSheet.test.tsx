@@ -47,6 +47,47 @@ describe('ReaderTocSheet', () => {
     vi.restoreAllMocks();
   });
 
+  it('enforces modal focus lifecycle and restores the trigger after Escape', async () => {
+    const onClose = vi.fn();
+    const renderSheet = (open: boolean) => (
+      <>
+        <button type="button">Mở mục lục</button>
+        <ReaderTocSheet
+          author="Vong Ngữ"
+          chapters={chapters}
+          currentChapterId={12}
+          open={open}
+          previews={previews}
+          title="Phàm Nhân Tu Tiên"
+          onClose={onClose}
+          onSelectChapter={vi.fn()}
+        />
+      </>
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(renderSheet(false));
+    const trigger = screen.getByRole('button', { name: 'Mở mục lục' });
+
+    trigger.focus();
+    rerender(renderSheet(true));
+
+    const dialog = screen.getByRole('dialog', { name: 'Mục lục' });
+    const closeButton = screen.getByRole('button', { name: 'Đóng mục lục' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Ch. 2 Thanh Ngưu trấn' })).toHaveFocus());
+
+    closeButton.focus();
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByRole('button', { name: 'Ch. 3 Thất Huyền Môn' })).toHaveFocus();
+    await user.tab();
+    expect(closeButton).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(1);
+    rerender(renderSheet(false));
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it('derives the translated count and list from raw chapter data', () => {
     renderToc();
     const drawer = screen.getByRole('dialog', { name: 'Mục lục' });

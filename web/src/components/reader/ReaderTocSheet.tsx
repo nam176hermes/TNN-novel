@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import type { Chapter } from '../../api/types';
+import { useDialogFocusLifecycle } from '../../hooks/useDialogFocusLifecycle';
 import { useWindowedList } from '../../hooks/useWindowedList';
 import { useReaderToc } from './useReaderToc';
 
@@ -32,6 +33,7 @@ export default function ReaderTocSheet({
   onClose,
   onSelectChapter,
 }: ReaderTocSheetProps) {
+  const dialogRef = useDialogFocusLifecycle<HTMLElement>(open, onClose);
   const currentChapterRef = useRef<HTMLButtonElement | null>(null);
   const anchoredChapterKeyRef = useRef('');
   const [pendingFocusIndex, setPendingFocusIndex] = useState<number | null>(null);
@@ -100,7 +102,14 @@ export default function ReaderTocSheet({
 
   return (
     <div className="reader-drawer-backdrop">
-      <aside aria-label="Mục lục" className="reader-toc-drawer" role="dialog">
+      <aside
+        aria-label="Mục lục"
+        aria-modal="true"
+        className="reader-toc-drawer"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
         <header className="reader-drawer-header">
           <div>
             <p className="section-label">Mục lục</p>

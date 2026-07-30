@@ -121,6 +121,10 @@ import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichB
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
 import { useReaderAudio } from './reader/useReaderAudio';
 import {
+  ReaderInlineMarkdown,
+  resolveReaderChapterDisplayTitle,
+} from './reader/readerTextPresentation';
+import {
   deriveReaderTextModeCapabilities,
   resolveReaderTextMode,
 } from './reader/readerTextModeCapabilities';
@@ -603,6 +607,7 @@ function ReaderQaSummaryPanel({
 }
 
 function ReaderCollapsedRawSurface({
+  chapterTitle,
   fontFamily,
   rawParagraphs,
   readerStyle,
@@ -614,6 +619,7 @@ function ReaderCollapsedRawSurface({
   width,
   onToggleChrome,
 }: {
+  chapterTitle: string;
   fontFamily: ReaderFontFamily;
   rawParagraphs: string[];
   readerStyle: CSSProperties;
@@ -658,7 +664,7 @@ function ReaderCollapsedRawSurface({
       {selectedChapter ? (
         <header className="reader-chapter-title">
           <p className="section-label">Bản dịch tiếng Việt · Raw gọn · Chương {selectedChapter.chapter_number}</p>
-          <h3>{selectedChapter.title}</h3>
+          <h3>{chapterTitle || selectedChapter.title}</h3>
         </header>
       ) : null}
 
@@ -676,7 +682,7 @@ function ReaderCollapsedRawSurface({
         const expanded = expandedParagraphs.has(index);
         return (
           <div className="reader-paragraph-block reader-collapsed-raw-block" data-paragraph-index={index} key={`collapsed-${index}-${paragraph.slice(0, 24)}`}>
-            <p className="reader-paragraph-text">{paragraph}</p>
+            <p className="reader-paragraph-text"><ReaderInlineMarkdown text={paragraph} /></p>
             {rawParagraph ? (
               <button
                 aria-expanded={expanded}
@@ -1753,6 +1759,9 @@ export default function ReaderView({
   const rawText = readerSourceText.trim();
   const richBlocks = useMemo(() => extractReaderRichBlocks(readerContentHtml), [readerContentHtml]);
   const rawParagraphs = useMemo(() => splitParagraphs(rawText), [rawText]);
+  const readerChapterDisplayTitle = selectedChapter
+    ? resolveReaderChapterDisplayTitle(selectedChapter, readerTranslationText)
+    : '';
   const textModeCapabilities = deriveReaderTextModeCapabilities({
     contentHtml: readerContentHtml,
     sourceText: readerSourceText,
@@ -1954,7 +1963,7 @@ export default function ReaderView({
     ? `Chương ${selectedChapter?.chapter_number ?? currentPosition} · ${progressPercent}%`
     : 'Chưa chọn chương';
   const activeChapterTitle = selectedChapter
-    ? `Chương ${selectedChapter.chapter_number} · ${selectedChapter.title}`
+    ? `Chương ${selectedChapter.chapter_number} · ${readerChapterDisplayTitle}`
     : 'Chưa chọn chương';
   const canGoPrevious = isPaginatedMode
     ? currentPage > 0 || Boolean(previousChapter)
@@ -3931,7 +3940,7 @@ export default function ReaderView({
             {selectedChapter ? (
               <header className="reader-chapter-title">
                 <p className="section-label">Chương {selectedChapter.chapter_number}</p>
-                <h3>{selectedChapter.title}</h3>
+                <h3>{readerChapterDisplayTitle}</h3>
               </header>
             ) : null}
             {hasRichContent ? (
@@ -3955,7 +3964,7 @@ export default function ReaderView({
                   data-paragraph-index={index}
                   key={`measure-${index}-${paragraph.slice(0, 24)}`}
                 >
-                  <p className="reader-paragraph-text">{paragraph}</p>
+                  <p className="reader-paragraph-text"><ReaderInlineMarkdown text={paragraph} /></p>
                 </div>
               ))
             )}
@@ -3963,6 +3972,7 @@ export default function ReaderView({
         ) : null}
         {readerTextMode === 'translation' ? (
           <ReaderTextSurface
+            chapterTitle={readerChapterDisplayTitle}
             fontFamily={readerSettings.fontFamily}
             hasRichContent={hasRichContent}
             hasTitleOnlyImportContent={hasTitleOnlyImportContent}
@@ -4015,6 +4025,7 @@ export default function ReaderView({
             />
             <ReaderTextSurface
               ariaLabel="Nội dung bản dịch tiếng Việt"
+              chapterTitle={readerChapterDisplayTitle}
               fontFamily={readerSettings.fontFamily}
               hasRichContent={hasRichContent}
               hasTitleOnlyImportContent={hasTitleOnlyImportContent}
@@ -4042,6 +4053,7 @@ export default function ReaderView({
         ) : null}
         {readerTextMode === 'raw-collapsed' ? (
           <ReaderCollapsedRawSurface
+            chapterTitle={readerChapterDisplayTitle}
             fontFamily={readerSettings.fontFamily}
             rawParagraphs={rawParagraphs}
             readerStyle={readerStyle}
@@ -4063,6 +4075,7 @@ export default function ReaderView({
             />
             <ReaderTextSurface
               ariaLabel="Bản dịch tiếng Việt với QA overlay"
+              chapterTitle={readerChapterDisplayTitle}
               fontFamily={readerSettings.fontFamily}
               hasRichContent={hasRichContent}
               hasTitleOnlyImportContent={hasTitleOnlyImportContent}

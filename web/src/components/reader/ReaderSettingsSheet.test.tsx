@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import ReaderSettingsSheet from './ReaderSettingsSheet';
@@ -20,6 +20,51 @@ const settings: ReaderSettings = {
 };
 
 describe('ReaderSettingsSheet', () => {
+  it('moves focus into the dialog, traps it, closes on Escape, and restores the trigger', async () => {
+    const onClose = vi.fn();
+    const renderSheet = (open: boolean) => (
+      <>
+        <button type="button">Mở cài đặt đọc</button>
+        <ReaderSettingsSheet
+          audioAvailable
+          audioBusy={false}
+          autoScrollEnabled={false}
+          open={open}
+          rawAvailable
+          rawCollapsedAvailable
+          settings={settings}
+          splitAvailable
+          textMode="translation"
+          onAudioAction={vi.fn()}
+          onAutoScrollChange={vi.fn()}
+          onClose={onClose}
+          onTextModeChange={vi.fn()}
+          onUpdate={vi.fn()}
+        />
+      </>
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(renderSheet(false));
+    const trigger = screen.getByRole('button', { name: 'Mở cài đặt đọc' });
+
+    trigger.focus();
+    rerender(renderSheet(true));
+
+    const dialog = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
+    const closeButton = screen.getByRole('button', { name: 'Đóng cài đặt đọc' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    await waitFor(() => expect(closeButton).toHaveFocus());
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(screen.getByLabelText('Toàn màn hình')).toHaveFocus();
+    await user.tab();
+    expect(closeButton).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(1);
+    rerender(renderSheet(false));
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it('does not render when closed', () => {
     render(
       <ReaderSettingsSheet

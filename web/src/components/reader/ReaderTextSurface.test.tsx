@@ -63,6 +63,22 @@ describe('ReaderTextSurface', () => {
     expect(screen.getByText('Lục ca, ta cảm tạ huynh.')).toBeInTheDocument();
   });
 
+  it('uses the translated display title and renders Markdown without visible markers', () => {
+    renderSurface({
+      chapterTitle: 'Gặp lại cố nhân',
+      paragraphs: ['**Chương 2: Gặp lại cố nhân**', 'Một đoạn dịch.'],
+      visibleParagraphs: [
+        { index: 0, paragraph: '**Chương 2: Gặp lại cố nhân**' },
+        { index: 1, paragraph: 'Một đoạn dịch.' },
+      ],
+    });
+
+    const article = screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });
+    expect(within(article).getByRole('heading', { name: 'Gặp lại cố nhân' })).toBeInTheDocument();
+    expect(within(article).getByText('Chương 2: Gặp lại cố nhân').tagName).toBe('STRONG');
+    expect(article).not.toHaveTextContent('**');
+  });
+
   it('renders rich HTML when available outside paginated mode', () => {
     renderSurface({
       hasRichContent: true,

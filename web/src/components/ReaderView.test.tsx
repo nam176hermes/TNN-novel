@@ -386,6 +386,28 @@ describe('ReaderView', () => {
     expect(reader).toHaveAttribute('data-chrome-visible', 'true');
   });
 
+  it('uses an explicit Vietnamese Markdown heading for translated presentation only', async () => {
+    const sourceChapter = {
+      ...chapters[1],
+      title: '第二章 青牛镇',
+    };
+    renderReader({
+      chapters: chapters.map((chapter) => chapter.id === sourceChapter.id ? sourceChapter : chapter),
+      selectedChapter: sourceChapter,
+      sourceText: '原文段落。',
+      translationText: '**Chương 2: Gặp lại cố nhân**\n\nMột đoạn dịch.',
+    });
+
+    const translatedArticle = screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });
+    expect(within(translatedArticle).getByRole('heading', { name: 'Gặp lại cố nhân' })).toBeInTheDocument();
+    expect(translatedArticle).not.toHaveTextContent('**');
+    expect(document.querySelector('.reader-top-title span')).toHaveTextContent('Chương 2 · Gặp lại cố nhân');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    const rawArticle = screen.getByRole('article', { name: 'Nội dung raw tiếng Trung' });
+    expect(within(rawArticle).getByRole('heading', { name: '第二章 青牛镇' })).toBeInTheDocument();
+  });
+
   it('routes the reference chapter navigation to real reader actions', async () => {
     const props = renderReader();
 

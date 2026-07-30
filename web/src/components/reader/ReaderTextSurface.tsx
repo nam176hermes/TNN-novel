@@ -4,6 +4,7 @@ import type { Chapter } from '../../api/types';
 import { richBlockNeedsTextMirror, type ReaderRichBlock } from '../../state/readerRichContent';
 import type { LoadState } from '../../state/types';
 import type { ReaderFontFamily, ReaderTheme, ReaderWidth } from './types';
+import { ReaderInlineMarkdown } from './readerTextPresentation';
 
 export type ReaderVisibleRange = {
   charEnd?: number;
@@ -26,6 +27,7 @@ export type ReaderParagraphQaBadge = {
 
 export type ReaderTextSurfaceProps = {
   ariaLabel?: string;
+  chapterTitle?: string;
   fontFamily: ReaderFontFamily;
   hasRichContent: boolean;
   hasTitleOnlyImportContent?: boolean;
@@ -111,6 +113,7 @@ function ReaderQaBadges({ badges }: { badges: ReaderParagraphQaBadge[] }) {
 
 export default function ReaderTextSurface({
   ariaLabel = 'Nội dung đọc tiếng Việt',
+  chapterTitle,
   fontFamily,
   hasRichContent,
   hasTitleOnlyImportContent = false,
@@ -179,7 +182,7 @@ export default function ReaderTextSurface({
       {selectedChapter ? (
         <header className="reader-chapter-title">
           <p className="section-label">Chương {selectedChapter.chapter_number}</p>
-          <h3>{selectedChapter.title}</h3>
+          <h3>{chapterTitle || selectedChapter.title}</h3>
         </header>
       ) : null}
 
@@ -277,7 +280,7 @@ export default function ReaderTextSurface({
 	            data-paragraph-index={index}
             key={`${paragraph.slice(0, 24)}-${index}`}
           >
-            <p className="reader-paragraph-text">{paragraph}</p>
+            <p className="reader-paragraph-text"><ReaderInlineMarkdown text={paragraph} /></p>
             {instantMode ? (
               <div aria-label={`Tác vụ đoạn ${index + 1}`} className="reader-paragraph-actions" role="group">
                 <button

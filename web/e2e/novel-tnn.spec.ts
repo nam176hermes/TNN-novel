@@ -746,6 +746,37 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(filePreview).toHaveCSS('overflow', 'visible');
 });
 
+test('short desktop login keeps the install prompt outside the login panel', async ({ page }) => {
+  const state: MockState = { imported: false, translated: false, translateRequests: [] };
+  await installApiMock(page, state);
+  await page.setViewportSize({ width: 1280, height: 577 });
+  await page.goto('/');
+  await page.evaluate(() => {
+    const installEvent = new Event('beforeinstallprompt', { cancelable: true });
+    Object.defineProperties(installEvent, {
+      prompt: { value: async () => undefined },
+      userChoice: { value: Promise.resolve({ outcome: 'dismissed', platform: 'web' }) },
+    });
+    window.dispatchEvent(installEvent);
+  });
+
+  const prompt = page.locator('.pwa-install-prompt');
+  const loginPanel = page.locator('.login-panel');
+  await expect(prompt).toBeVisible();
+  await expect(loginPanel).toBeVisible();
+  const promptBox = await prompt.boundingBox();
+  const loginBox = await loginPanel.boundingBox();
+  expect(promptBox).not.toBeNull();
+  expect(loginBox).not.toBeNull();
+  const separated = Boolean(promptBox && loginBox && (
+    promptBox.x + promptBox.width <= loginBox.x
+    || promptBox.x >= loginBox.x + loginBox.width
+    || promptBox.y + promptBox.height <= loginBox.y
+    || promptBox.y >= loginBox.y + loginBox.height
+  ));
+  expect(separated).toBe(true);
+});
+
 test('visible mobile controls use the approved touch-target policy', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await page.setViewportSize({ width: 390, height: 844 });

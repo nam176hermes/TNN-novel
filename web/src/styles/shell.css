@@ -186,6 +186,27 @@
   }
 }
 
+#root:has(> .login-screen):has(> .pwa-install-prompt) {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 100dvh;
+}
+
+#root:has(> .login-screen):has(> .pwa-install-prompt) > .pwa-install-prompt {
+  inset: auto;
+  justify-self: center;
+  margin: 14px auto 0;
+  position: static;
+  width: min(560px, calc(100vw - 28px));
+}
+
+#root:has(> .login-screen):has(> .pwa-install-prompt) > .login-screen {
+  align-items: start;
+  min-height: 0;
+  overflow-y: auto;
+  padding-top: 16px;
+}
+
 .sidebar,
 .translator-sidebar {
   background: var(--surface);
