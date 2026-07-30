@@ -103,7 +103,12 @@ export default function WorkflowShell({
   }
 
   return (
-    <main className="workflow-shell" data-active-view={activeView}>
+    <main
+      className="workflow-shell"
+      data-active-view={activeView}
+      style={activeView === 'reader' ? { gridTemplateColumns: 'minmax(0, 1fr)' } : undefined}
+    >
+      {activeView !== 'reader' ? (
       <aside aria-label="Thanh quy trình" className="workflow-sidebar">
         <div className="brand-lockup workflow-brand">
           <img alt="" aria-hidden="true" className="brand-mark brand-mark-image" src={brandMarkForView(activeView)} />
@@ -150,11 +155,13 @@ export default function WorkflowShell({
           </nav>
         </div>
       </aside>
+      ) : null}
 
       <section aria-label="Không gian làm việc" className="workflow-main" ref={mainRef}>
         {renderView(activeView)}
       </section>
 
+      {activeView !== 'reader' ? (
       <div className="workflow-mobile-bar">
         <ShellNav
           activeView={activeView}
@@ -165,8 +172,9 @@ export default function WorkflowShell({
           onViewChange={onViewChange}
         />
       </div>
+      ) : null}
 
-      {mobileMoreOpen ? (
+      {activeView !== 'reader' && mobileMoreOpen ? (
         <div className="mobile-more-backdrop" onClick={() => setMobileMoreOpen(false)} role="presentation">
           <aside
             aria-label="Thêm"

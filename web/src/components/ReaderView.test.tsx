@@ -369,6 +369,7 @@ describe('ReaderView', () => {
     expect(screen.getByRole('button', { name: 'Tìm kiếm' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Đánh dấu trang' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cài đặt chữ' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Khóa trang đọc' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: 'Thêm tùy chọn' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Điều khiển đọc' })).not.toBeInTheDocument();
     expect(reader.querySelectorAll('.reader-top-bar')).toHaveLength(1);
@@ -384,6 +385,25 @@ describe('ReaderView', () => {
 
     await userEvent.click(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }));
     expect(reader).toHaveAttribute('data-chrome-visible', 'true');
+  });
+
+  it('blocks accidental button, Escape, and browser Back exits while the reader is locked', async () => {
+    const props = renderReader();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Khóa trang đọc' }));
+    expect(screen.getByRole('button', { name: 'Mở khóa trang đọc' })).toHaveAttribute('aria-pressed', 'true');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Quay lại thư viện' }));
+    await userEvent.keyboard('{Escape}');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+
+    expect(props.onBackToLibrary).not.toHaveBeenCalled();
+    expect(screen.getByRole('status')).toHaveTextContent('Trang đọc đang khóa. Mở khóa để quay lại Thư viện.');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Mở khóa trang đọc' }));
+    window.history.replaceState({ novelTnnReader: false }, '');
+    await userEvent.click(screen.getByRole('button', { name: 'Quay lại thư viện' }));
+    expect(props.onBackToLibrary).toHaveBeenCalledOnce();
   });
 
   it('uses an explicit Vietnamese Markdown heading for translated presentation only', async () => {

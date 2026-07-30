@@ -35,7 +35,7 @@ describe('WorkflowShell', () => {
     expect(within(nav).getByRole('button', { name: 'Bàn dịch' })).toHaveAttribute('aria-pressed', 'false');
     expect(within(nav).getByRole('button', { name: 'Raw chưa dịch' })).toHaveAttribute('aria-pressed', 'false');
     expect(within(nav).getByRole('button', { name: 'Thư viện' })).toHaveAttribute('aria-pressed', 'false');
-    expect(within(nav).getByRole('button', { name: 'Đọc truyện' })).toHaveAttribute('aria-pressed', 'false');
+    expect(within(nav).queryByRole('button', { name: 'Đọc truyện' })).not.toBeInTheDocument();
     expect(within(nav).getByRole('button', { name: 'Nhập chương' })).toHaveAttribute('aria-pressed', 'false');
     expect(within(nav).getByRole('button', { name: 'Nguồn truyện' })).toHaveAttribute('aria-pressed', 'false');
     expect(within(nav).getByRole('button', { name: 'Thuật ngữ & Văn phong' })).toHaveAttribute('aria-pressed', 'true');
@@ -58,14 +58,14 @@ describe('WorkflowShell', () => {
     const mobileNav = screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
 
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thư viện' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Đọc truyện' }));
+    expect(within(mobileNav).queryByRole('button', { name: 'Đọc truyện' })).not.toBeInTheDocument();
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Tác vụ' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
     const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
     await userEvent.click(within(moreSheet).getByRole('button', { name: 'Nhập chương' }));
 
     expect(onViewChange).toHaveBeenCalledWith('library');
-    expect(onViewChange).toHaveBeenCalledWith('reader');
+    expect(onViewChange).not.toHaveBeenCalledWith('reader');
     expect(onViewChange).toHaveBeenCalledWith('jobs');
     expect(onOpenImport).toHaveBeenCalledTimes(1);
   });
@@ -109,6 +109,9 @@ describe('WorkflowShell', () => {
     renderShell('reader');
 
     expect(screen.getByRole('main')).toHaveAttribute('data-active-view', 'reader');
+    expect(screen.queryByRole('complementary', { name: 'Thanh quy trình' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Quy trình' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Điều hướng chính trên di động' })).not.toBeInTheDocument();
   });
 
   it('shows real API status labels and wires footer shortcuts', async () => {

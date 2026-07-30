@@ -510,7 +510,7 @@ test('starts a translation job from a raw chapter', async ({ page }) => {
   });
 });
 
-test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls', async ({ page }) => {
+test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls', async ({ page }, testInfo) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await authenticatedPage(page, state);
 
@@ -518,6 +518,7 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
   await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
   await expect(page.getByText('Trời dần trở lạnh')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('reader-desktop-1280.png'), fullPage: true });
 
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
   await page.getByRole('button', { name: 'Mở bàn dịch' }).click();
@@ -527,14 +528,15 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveCount(0);
 });
 
-test('mobile shell and Reader follow the approved handoff at 390px and 360px', async ({ page }) => {
+test('mobile shell and Reader follow the approved handoff at 390px and 360px', async ({ page }, testInfo) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await page.setViewportSize({ width: 390, height: 844 });
   await authenticatedPage(page, state);
 
   const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
   await expect(mobileNav).toBeVisible();
-  await expect(mobileNav.getByRole('button')).toHaveCount(5);
+  await expect(mobileNav.getByRole('button')).toHaveCount(4);
+  await expect(mobileNav.getByRole('button', { name: 'Đọc truyện' })).toHaveCount(0);
   const mobileMoreTrigger = mobileNav.getByRole('button', { name: 'Thêm' });
   await expect(mobileMoreTrigger).toBeVisible();
   await mobileMoreTrigger.focus();
@@ -564,6 +566,7 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   await expect(page.getByRole('button', { name: 'Chương trước' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Mục lục' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Chương sau' })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('reader-mobile-390.png'), fullPage: true });
 
   const readerMoreTrigger = page.getByRole('button', { name: 'Thêm tùy chọn' });
   await readerMoreTrigger.focus();
@@ -598,9 +601,18 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.setViewportSize({ width: 360, height: 740 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('reader-mobile-360.png'), fullPage: true });
   await page.setViewportSize({ width: 412, height: 915 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
+  await page.getByRole('button', { name: 'Khóa trang đọc' }).click();
+  await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toBeVisible();
+  await expect(page.getByRole('status')).toContainText('Trang đọc đang khóa');
+  await page.screenshot({ path: testInfo.outputPath('reader-mobile-412-locked.png'), fullPage: true });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toBeVisible();
+  await page.getByRole('button', { name: 'Mở khóa trang đọc' }).click();
   await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
 });

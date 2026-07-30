@@ -1536,6 +1536,7 @@ export default function ReaderView({
   const restorePendingRef = useRef(false);
   const skipInitialProgressSaveRef = useRef('');
   const readerAiCacheRef = useRef(new Map<string, ReaderExplainResponse>());
+  const exitLockedRef = useRef(false);
   const readerDeviceId = useMemo(() => loadReaderDeviceId(), []);
   const [readerSettings, setReaderSettings] = useState<ReaderSettings>(() => loadReaderSettings());
   const [readerTextMode, setReaderTextModeState] = useState<ReaderTextMode>(() => loadReaderTextMode());
@@ -1547,6 +1548,8 @@ export default function ReaderView({
   });
   const [scrollTextProgress, setScrollTextProgress] = useState<ReaderTextProgress | null>(null);
   const [chromeVisible, setChromeVisible] = useState(true);
+  const [exitLocked, setExitLocked] = useState(false);
+  const [exitLockStatus, setExitLockStatus] = useState('');
   const [tocOpen, setTocOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [readerSearchOpen, setReaderSearchOpen] = useState(false);
@@ -1616,6 +1619,12 @@ export default function ReaderView({
   const [xrayEnriching, setXrayEnriching] = useState(false);
   const [xrayEnrichingScope, setXrayEnrichingScope] = useState<'chapter' | 'book' | null>(null);
   const [xrayError, setXrayError] = useState('');
+
+  useEffect(() => {
+    if (!exitLockStatus) return undefined;
+    const timeout = window.setTimeout(() => setExitLockStatus(''), 2_400);
+    return () => window.clearTimeout(timeout);
+  }, [exitLockStatus]);
 
   const translatedChapters = useMemo(
     () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
@@ -1691,14 +1700,31 @@ export default function ReaderView({
     selectedChapterId,
     translationText: readerTranslationText,
   });
+  const showLockedExitStatus = useCallback(() => {
+    setExitLockStatus('Trang đọc đang khóa. Mở khóa để quay lại Thư viện.');
+    setChromeVisible(true);
+  }, []);
   const exitReader = useCallback(() => {
+    if (exitLockedRef.current) {
+      showLockedExitStatus();
+      return;
+    }
     const state = window.history.state as Record<string, unknown> | null;
     if (state?.novelTnnReader === true) {
       window.history.back();
       return;
     }
     onBackToLibrary();
-  }, [onBackToLibrary]);
+  }, [onBackToLibrary, showLockedExitStatus]);
+  const toggleExitLock = useCallback(() => {
+    setExitLocked((current) => {
+      const next = !current;
+      exitLockedRef.current = next;
+      setExitLockStatus(next ? 'Trang đọc đã khóa.' : 'Trang đọc đã mở khóa.');
+      setChromeVisible(true);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     const currentState = (window.history.state ?? {}) as Record<string, unknown>;
@@ -1706,7 +1732,15 @@ export default function ReaderView({
       window.history.pushState({ ...currentState, novelTnnReader: true }, '');
     }
 
-    const handlePopState = () => onBackToLibrary();
+    const handlePopState = () => {
+      if (exitLockedRef.current) {
+        const state = (window.history.state ?? {}) as Record<string, unknown>;
+        window.history.pushState({ ...state, novelTnnReader: true }, '');
+        showLockedExitStatus();
+        return;
+      }
+      onBackToLibrary();
+    };
     window.addEventListener('popstate', handlePopState);
     return () => {
       window.removeEventListener('popstate', handlePopState);
@@ -1715,7 +1749,7 @@ export default function ReaderView({
         window.history.replaceState({ ...state, novelTnnReader: false }, '');
       }
     };
-  }, [onBackToLibrary]);
+  }, [onBackToLibrary, showLockedExitStatus]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -3482,6 +3516,7 @@ export default function ReaderView({
   };
   const chromeActions: ReaderChromeActions = {
     bookmarked,
+    exitLocked,
     onExit: exitReader,
     onNext: handleNextPageOrChapter,
     onOpenSearch: () => {
@@ -3494,6 +3529,7 @@ export default function ReaderView({
     onOpenToc: () => setTocOpen(true),
     onPrevious: handlePreviousPageOrChapter,
     onToggleBookmark: toggleBookmark,
+    onToggleExitLock: toggleExitLock,
     onToggleMore: () => setMoreOpen((current) => !current),
   };
   const quickModes: ReaderQuickModeControls = {
@@ -3539,6 +3575,7 @@ export default function ReaderView({
       aria-label="Trang đọc truyện"
       className="reader-view reader-immersive-view"
       data-chrome-visible={chromeVisible}
+      data-exit-locked={exitLocked}
       data-fullscreen={readerSettings.fullscreen}
       data-theme={readerSettings.theme}
     >
@@ -3549,6 +3586,12 @@ export default function ReaderView({
         title={chromeTitle}
         visible={chromeVisible}
       />
+
+      {exitLockStatus ? (
+        <p aria-live="polite" className="reader-exit-lock-status" role="status">
+          {exitLockStatus}
+        </p>
+      ) : null}
 
       <ReaderTextModeSwitcher modes={quickModes} visible={chromeVisible} />
 

@@ -709,9 +709,8 @@ describe('App live data wiring', () => {
     await expectReaderPage();
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Hắn bước vào động phủ.');
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Linh khí cuồn cuộn.');
-    expect(
-      within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Đọc truyện' }),
-    ).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.queryByRole('navigation', { name: 'Quy trình' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Điều hướng chính trên di động' })).not.toBeInTheDocument();
     await expectNoGlobalAlert();
   });
 

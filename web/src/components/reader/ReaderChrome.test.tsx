@@ -30,6 +30,7 @@ function chromeProps(overrides: Partial<ReaderChromeProps> = {}): ReaderChromePr
     },
     actions: {
       bookmarked: false,
+      exitLocked: false,
       onExit: vi.fn(),
       onNext: vi.fn(),
       onOpenSearch: vi.fn(),
@@ -37,6 +38,7 @@ function chromeProps(overrides: Partial<ReaderChromeProps> = {}): ReaderChromePr
       onOpenToc: vi.fn(),
       onPrevious: vi.fn(),
       onToggleBookmark: vi.fn(),
+      onToggleExitLock: vi.fn(),
       onToggleMore: vi.fn(),
     },
     ...overrides,
@@ -68,10 +70,12 @@ describe('ReaderChrome', () => {
     const exitButton = screen.getByRole('button', { name: 'Quay lại thư viện' });
     const topTocButton = screen.getByRole('button', { name: 'Mở mục lục từ thanh trên' });
     const settingsButton = screen.getByRole('button', { name: 'Cài đặt chữ' });
+    const lockButton = screen.getByRole('button', { name: 'Khóa trang đọc' });
     expect(exitButton).toHaveTextContent('Thư viện');
     expect(exitButton).toHaveClass('reader-icon-button', 'reader-back-button');
     expect(topTocButton).toHaveClass('reader-icon-button');
     expect(settingsButton).toHaveClass('reader-icon-button', 'reader-type-button');
+    expect(lockButton).toHaveAttribute('aria-pressed', 'false');
 
     const quickPrevious = within(quickNavigation).getByRole('button', { name: '‹ Chương trước' });
     const quickCurrent = within(quickNavigation).getByRole('button', { name: 'Chương 2 / 3' });
@@ -90,6 +94,7 @@ describe('ReaderChrome', () => {
     await userEvent.click(exitButton);
     await userEvent.click(topTocButton);
     await userEvent.click(settingsButton);
+    await userEvent.click(lockButton);
     await userEvent.click(quickPrevious);
     await userEvent.click(quickCurrent);
     await userEvent.click(quickNext);
@@ -100,8 +105,19 @@ describe('ReaderChrome', () => {
     expect(props.actions.onExit).toHaveBeenCalledOnce();
     expect(props.actions.onOpenToc).toHaveBeenCalledTimes(3);
     expect(props.actions.onOpenSettings).toHaveBeenCalledOnce();
+    expect(props.actions.onToggleExitLock).toHaveBeenCalledOnce();
     expect(props.actions.onPrevious).toHaveBeenCalledTimes(2);
     expect(props.actions.onNext).toHaveBeenCalledTimes(2);
+  });
+
+  it('announces the locked state and keeps an explicit unlock control visible', () => {
+    const props = chromeProps();
+    props.actions.exitLocked = true;
+    render(<ReaderChrome {...props} />);
+
+    const lockButton = screen.getByRole('button', { name: 'Mở khóa trang đọc' });
+    expect(lockButton).toHaveAttribute('aria-pressed', 'true');
+    expect(lockButton).toHaveAttribute('title', 'Trang đọc đang khóa');
   });
 
   it('hides immersive chrome and disables chapter boundaries and unavailable chapter actions', () => {

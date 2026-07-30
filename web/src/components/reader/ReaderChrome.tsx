@@ -1,4 +1,4 @@
-import { ArrowLeft, Bookmark, List, MoreVertical, Search, Type } from 'lucide-react';
+import { ArrowLeft, Bookmark, List, LockKeyhole, LockKeyholeOpen, MoreVertical, Search, Type } from 'lucide-react';
 import ReaderProgressBar from './ReaderProgressBar';
 
 export type ReaderChromeTitle = {
@@ -27,6 +27,7 @@ export type ReaderChromeNavigation = {
 
 export type ReaderChromeActions = {
   bookmarked: boolean;
+  exitLocked: boolean;
   onExit(): void;
   onNext(): void;
   onOpenSearch(): void;
@@ -34,6 +35,7 @@ export type ReaderChromeActions = {
   onOpenToc(): void;
   onPrevious(): void;
   onToggleBookmark(): void;
+  onToggleExitLock(): void;
   onToggleMore(): void;
 };
 
@@ -122,6 +124,19 @@ export function ReaderChromeTop({ actions, navigation, title, visible }: ReaderC
         >
           <Type aria-hidden="true" size={18} />
           <span>Aa</span>
+        </button>
+
+        <button
+          aria-label={actions.exitLocked ? 'Mở khóa trang đọc' : 'Khóa trang đọc'}
+          aria-pressed={actions.exitLocked}
+          className="reader-icon-button reader-lock-button"
+          onClick={actions.onToggleExitLock}
+          title={actions.exitLocked ? 'Trang đọc đang khóa' : 'Khóa để tránh thoát nhầm'}
+          type="button"
+        >
+          {actions.exitLocked
+            ? <LockKeyhole aria-hidden="true" size={20} />
+            : <LockKeyholeOpen aria-hidden="true" size={20} />}
         </button>
 
         <button

@@ -1,6 +1,5 @@
 import {
   Activity,
-  BookOpenCheck,
   BookOpenText,
   ClipboardList,
   Download,
@@ -31,7 +30,6 @@ const workflowItems: Array<{
   { view: 'workbench', label: 'Bàn dịch', icon: BookOpenText },
   { view: 'raw', label: 'Raw chưa dịch', icon: FileText },
   { view: 'library', label: 'Thư viện', icon: LibraryBig },
-  { view: 'reader', label: 'Đọc truyện', icon: BookOpenCheck },
   { view: 'import', label: 'Nhập chương', icon: FilePlus2 },
   { view: 'sources', label: 'Nguồn truyện', icon: Globe2 },
   { view: 'glossary', label: 'Thuật ngữ & Văn phong', icon: ClipboardList },
@@ -42,7 +40,7 @@ const workflowItems: Array<{
 ];
 
 const mobileWorkflowItems = workflowItems.filter(({ view }) => (
-  view === 'workbench' || view === 'library' || view === 'reader' || view === 'jobs'
+  view === 'workbench' || view === 'library' || view === 'jobs'
 ));
 
 const moreViews = new Set<WorkflowView>([
