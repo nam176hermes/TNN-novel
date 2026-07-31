@@ -1,7 +1,7 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { TranslatedBookSummary } from '../api/types';
+import type { Chapter, TranslatedBookSummary } from '../api/types';
 import type { AsyncState } from '../state/types';
 import LibraryBooksView from './LibraryBooksView';
 
@@ -66,6 +66,40 @@ const books: AsyncState<TranslatedBookSummary[]> = {
   state: 'ready',
 };
 
+const chapters: AsyncState<Chapter[]> = {
+  data: [
+    {
+      id: 101,
+      book_id: 42,
+      chapter_number: 1,
+      title: 'Luyện khí nhập môn',
+      status: 'translated',
+      audio_path: null,
+      has_translation: true,
+    },
+    {
+      id: 102,
+      book_id: 42,
+      chapter_number: 2,
+      title: 'Bí mật trong núi',
+      status: 'translated',
+      audio_path: null,
+      has_translation: true,
+    },
+    {
+      id: 104,
+      book_id: 42,
+      chapter_number: 4,
+      title: 'Chưa dịch',
+      status: 'cleaned',
+      audio_path: null,
+      has_translation: false,
+    },
+  ],
+  error: '',
+  state: 'ready',
+};
+
 describe('LibraryBooksView', () => {
   afterEach(() => {
     cleanup();
@@ -76,6 +110,7 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -94,6 +129,7 @@ describe('LibraryBooksView', () => {
       <LibraryBooksView
         books={books}
         onDeleteBook={onDeleteBook}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -105,20 +141,29 @@ describe('LibraryBooksView', () => {
     expect(onDeleteBook).toHaveBeenCalledWith(books.data[0]);
   });
 
-  it('opens reader without forcing the first chapter so saved progress can resume', async () => {
+  it('opens the table of contents from card, primary, and menu actions without opening Reader', async () => {
+    const onOpenBookContents = vi.fn();
     const onOpenReader = vi.fn();
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={onOpenBookContents}
         onOpenReader={onOpenReader}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Phàm Nhân Tu Tiên' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem mục lục Phàm Nhân Tu Tiên' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Mở mục lục Phàm Nhân Tu Tiên' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tùy chọn sách Phàm Nhân Tu Tiên' }));
+    const menu = screen.getByRole('menu');
+    await userEvent.click(within(menu).getByRole('menuitem', { name: 'Mở mục lục Phàm Nhân Tu Tiên' }));
 
-    expect(onOpenReader).toHaveBeenCalledWith(42);
+    expect(onOpenBookContents).toHaveBeenNthCalledWith(1, 42);
+    expect(onOpenBookContents).toHaveBeenNthCalledWith(2, 42);
+    expect(onOpenBookContents).toHaveBeenNthCalledWith(3, 42);
+    expect(onOpenReader).not.toHaveBeenCalled();
   });
 
   it('renders a visual cover grid with reader progress badges', () => {
@@ -130,6 +175,7 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -147,6 +193,7 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -168,6 +215,7 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -191,7 +239,8 @@ describe('LibraryBooksView', () => {
     expect(screen.queryByRole('article', { name: 'Sách Thanh Sơn' })).not.toBeInTheDocument();
   });
 
-  it('opens a book card at the last-read chapter when progress exists', async () => {
+  it('opens a book card at its table of contents without auto-opening saved progress', async () => {
+    const onOpenBookContents = vi.fn();
     const onOpenReader = vi.fn();
     window.localStorage.setItem(
       'novel-reader-progress-v1',
@@ -200,15 +249,67 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={onOpenBookContents}
         onOpenReader={onOpenReader}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'Mở sách Phàm Nhân Tu Tiên' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem mục lục Phàm Nhân Tu Tiên' }));
+
+    expect(onOpenBookContents).toHaveBeenCalledWith(42);
+    expect(onOpenReader).not.toHaveBeenCalled();
+  });
+
+  it('renders the selected book TOC and opens Reader only for the exact chosen chapter', async () => {
+    const onBackToShelf = vi.fn();
+    const onOpenReader = vi.fn();
+    window.localStorage.setItem(
+      'novel-reader-progress-v1',
+      JSON.stringify({ 42: { chapterId: 101, position: 1, totalChapters: 5 } }),
+    );
+
+    render(
+      <LibraryBooksView
+        books={books}
+        chapters={chapters}
+        onBackToShelf={onBackToShelf}
+        onOpenBookContents={vi.fn()}
+        onOpenReader={onOpenReader}
+        onOpenWorkbench={vi.fn()}
+        onRefresh={vi.fn()}
+        selectedBookId={42}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Mục lục' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Phàm Nhân Tu Tiên' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Đọc truyện' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc Ch. 2 Bí mật trong núi' }));
 
     expect(onOpenReader).toHaveBeenCalledWith(42, 102);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Tất cả truyện' }));
+    expect(onBackToShelf).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the shelf when the selected TOC book no longer exists', () => {
+    render(
+      <LibraryBooksView
+        books={books}
+        chapters={chapters}
+        onOpenBookContents={vi.fn()}
+        onOpenReader={vi.fn()}
+        onOpenWorkbench={vi.fn()}
+        onRefresh={vi.fn()}
+        selectedBookId={999}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Mục lục' })).not.toBeInTheDocument();
   });
 
   it('adds and changes translated book covers', async () => {
@@ -218,6 +319,7 @@ describe('LibraryBooksView', () => {
     const { rerender } = render(
       <LibraryBooksView
         books={{ ...books, data: [noCoverBook] }}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -232,6 +334,7 @@ describe('LibraryBooksView', () => {
     rerender(
       <LibraryBooksView
         books={books}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -252,6 +355,7 @@ describe('LibraryBooksView', () => {
     render(
       <LibraryBooksView
         books={{ ...books, data: manyBooks }}
+        onOpenBookContents={vi.fn()}
         onOpenReader={vi.fn()}
         onOpenWorkbench={vi.fn()}
         onRefresh={vi.fn()}
@@ -275,6 +379,7 @@ describe('LibraryBooksView', () => {
   });
 
   it('routes translated book overflow menu actions to existing handlers', async () => {
+    const onOpenBookContents = vi.fn();
     const onOpenReader = vi.fn();
     const onOpenWorkbench = vi.fn();
     const onDeleteBook = vi.fn();
@@ -282,6 +387,7 @@ describe('LibraryBooksView', () => {
       <LibraryBooksView
         books={books}
         onDeleteBook={onDeleteBook}
+        onOpenBookContents={onOpenBookContents}
         onOpenReader={onOpenReader}
         onOpenWorkbench={onOpenWorkbench}
         onRefresh={vi.fn()}
@@ -294,9 +400,10 @@ describe('LibraryBooksView', () => {
     expect(onOpenWorkbench).toHaveBeenCalledWith(42, 103);
 
     await userEvent.click(screen.getByRole('button', { name: 'Tùy chọn sách Phàm Nhân Tu Tiên' }));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Đọc tiếp' }));
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Mở mục lục Phàm Nhân Tu Tiên' }));
 
-    expect(onOpenReader).toHaveBeenCalledWith(42);
+    expect(onOpenBookContents).toHaveBeenCalledWith(42);
+    expect(onOpenReader).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: 'Tùy chọn sách Phàm Nhân Tu Tiên' }));
     await userEvent.click(screen.getByRole('menuitem', { name: 'Xóa' }));

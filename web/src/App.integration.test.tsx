@@ -592,11 +592,21 @@ describe('App live data wiring', () => {
     ))).toHaveLength(2);
   });
 
-  it('opens translated library and reader as separate workflow pages', async () => {
+  it('passes from Library through a book TOC before opening the exact chosen Reader chapter', async () => {
     saveToken('access');
     let translatedLibraryRequests = 0;
+    const readerContentRequestUrls: string[] = [];
+    const chosenChapter = {
+      ...fixtureChapter,
+      id: 4202,
+      chapter_number: 2,
+      title: 'Chosen Chapter',
+    };
     const fetchMock = vi.fn(async (url: RequestInfo | URL) => {
       const target = String(url);
+      if (/\/api\/books\/\d+\/chapters\/\d+\/(?:source|translation)$/.test(target)) {
+        readerContentRequestUrls.push(target);
+      }
 
       if (target.endsWith('/api/providers')) {
         return {
@@ -622,18 +632,18 @@ describe('App live data wiring', () => {
       if (target.endsWith('/api/books/42/chapters')) {
         return {
           ok: true,
-          json: async () => [fixtureChapter],
+          json: async () => [fixtureChapter, chosenChapter],
         };
       }
 
-      if (target.endsWith('/api/books/42/chapters/4201/source')) {
-        return { ok: true, json: async () => ({ chapter_id: 4201, text: '原文' }) };
+      if (target.endsWith('/api/books/42/chapters/4202/source')) {
+        return { ok: true, json: async () => ({ chapter_id: 4202, text: '第二章' }) };
       }
 
-      if (target.endsWith('/api/books/42/chapters/4201/translation')) {
+      if (target.endsWith('/api/books/42/chapters/4202/translation')) {
         return {
           ok: true,
-          json: async () => ({ chapter_id: 4201, text: 'Hắn bước vào động phủ.\n\nLinh khí cuồn cuộn.' }),
+          json: async () => ({ chapter_id: 4202, text: 'Bản dịch của chương được chọn chính xác.' }),
         };
       }
 
@@ -649,15 +659,15 @@ describe('App live data wiring', () => {
                 author: '',
                 source: 'manual',
                 source_url: '',
-                total_chapters: 1,
-                translated_chapters: 1,
+                total_chapters: 2,
+                translated_chapters: 2,
                 audio_chapters: 0,
                 failed_chapters: 0,
                 qa_low_chapters: 0,
                 first_translated_chapter_id: 4201,
-                latest_translated_chapter_id: 4201,
-                latest_chapter_number: 1,
-                latest_chapter_title: 'Live Chapter',
+                latest_translated_chapter_id: 4202,
+                latest_chapter_number: 2,
+                latest_chapter_title: 'Chosen Chapter',
                 last_activity: '2026-06-20T00:00:00Z',
               },
             ],
@@ -701,20 +711,178 @@ describe('App live data wiring', () => {
 
     expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
-    expect(screen.getByText('1/1 chương đã dịch')).toBeVisible();
+    expect(screen.getByText('2/2 chương đã dịch')).toBeVisible();
     expect(translatedLibraryRequests).toBe(1);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Mở mục lục Live Book' }));
 
+    expect(await screen.findByRole('heading', { name: 'Mục lục' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Đọc truyện' })).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'Quy trình' })).toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' })).toBeInTheDocument();
+    expect(readerContentRequestUrls).toEqual([]);
+
+    const chapterListRequestsBeforeReader = fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/api/books/42/chapters')).length;
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc Ch. 2 Chosen Chapter' }));
     await expectReaderPage();
-    expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Hắn bước vào động phủ.');
-    expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Linh khí cuồn cuộn.');
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/api/books/42/chapters')))
+      .toHaveLength(chapterListRequestsBeforeReader);
+    expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }))
+      .toHaveTextContent('Bản dịch của chương được chọn chính xác.');
+    expect(screen.getByText('Chosen Chapter')).toBeInTheDocument();
     expect(screen.queryByRole('navigation', { name: 'Quy trình' })).not.toBeInTheDocument();
     expect(screen.queryByRole('navigation', { name: 'Điều hướng chính trên di động' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Quay lại thư viện' }));
+
+    expect(await screen.findByRole('heading', { name: 'Mục lục' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Đọc truyện' })).not.toBeInTheDocument();
     await expectNoGlobalAlert();
+    const chosenChapterContentUrls = [
+      'http://127.0.0.1:7860/api/books/42/chapters/4202/source',
+      'http://127.0.0.1:7860/api/books/42/chapters/4202/translation',
+    ];
+    const allowedReaderContentUrls = new Set([
+      ...chosenChapterContentUrls,
+      'http://127.0.0.1:7860/api/books/42/chapters/4201/translation',
+    ]);
+    expect(readerContentRequestUrls.every((url) => allowedReaderContentUrls.has(url))).toBe(true);
+    expect(new Set(readerContentRequestUrls.filter((url) => url.includes('/chapters/4202/'))))
+      .toEqual(new Set(chosenChapterContentUrls));
+
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc Ch. 2 Chosen Chapter' }));
+    await expectReaderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Mở bàn dịch' }));
+    const translationEditor = await screen.findByLabelText('Bản dịch tiếng Việt');
+    await userEvent.type(translationEditor, ' Chỉnh sửa chưa lưu.');
+    const confirmSwitch = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmSwitch);
+
+    await userEvent.click(
+      within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }),
+    );
+    expect(confirmSwitch).toHaveBeenCalledWith('You have unsaved translation edits. Switch chapter anyway?');
+    expect((screen.getByLabelText('Bản dịch tiếng Việt') as HTMLTextAreaElement).value)
+      .toContain('Chỉnh sửa chưa lưu.');
+
+    confirmSwitch.mockReturnValue(true);
+    await userEvent.click(
+      within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }),
+    );
+    await userEvent.click(await screen.findByRole('button', { name: 'Mở mục lục Live Book' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Đọc Ch. 1 Live Chapter' }));
+
+    await expectReaderPage();
+    expect(screen.getByRole('heading', { name: 'Live Chapter' })).toBeInTheDocument();
   });
 
-  it('opens the newer local reader progress when backend progress is stale', async () => {
+  it('does not flash an empty translated-chapter state while switching TOC books', async () => {
+    saveToken('access');
+    const secondBook = { ...fixtureBook, id: 43, title: 'Second Book' };
+    const secondChapter = {
+      ...fixtureChapter,
+      id: 4301,
+      book_id: 43,
+      book_title: 'Second Book',
+      title: 'Second Chapter',
+    };
+    const pendingSecondChapters = deferred<{
+      ok: true;
+      json(): Promise<typeof secondChapter[]>;
+    }>();
+    const translatedSummary = (id: number, title: string, chapterId: number) => ({
+      id,
+      title,
+      author: '',
+      source: 'manual',
+      source_url: '',
+      total_chapters: 1,
+      translated_chapters: 1,
+      audio_chapters: 0,
+      failed_chapters: 0,
+      qa_low_chapters: 0,
+      first_translated_chapter_id: chapterId,
+      latest_translated_chapter_id: chapterId,
+      latest_chapter_number: 1,
+      latest_chapter_title: 'Live Chapter',
+      last_activity: '2026-06-20T00:00:00Z',
+    });
+    const fetchMock = vi.fn(async (url: RequestInfo | URL) => {
+      const target = String(url);
+      if (target.endsWith('/api/providers')) {
+        return { ok: true, json: async () => ({ providers: [{ ...fixtureProvider, notes: '' }] }) };
+      }
+      if (target.endsWith('/api/style-profiles')) {
+        return { ok: true, json: async () => ({ profiles: [fixtureStyleProfile] }) };
+      }
+      if (target.endsWith('/api/books')) {
+        return { ok: true, json: async () => [fixtureBook, secondBook] };
+      }
+      if (target.endsWith('/api/books/42/chapters')) {
+        return { ok: true, json: async () => [fixtureChapter] };
+      }
+      if (target.endsWith('/api/books/43/chapters')) return pendingSecondChapters.promise;
+      if (target.endsWith('/api/library/books')) {
+        return {
+          ok: true,
+          json: async () => ({
+            books: [translatedSummary(42, 'Live Book', 4201), translatedSummary(43, 'Second Book', 4301)],
+          }),
+        };
+      }
+      if (target.endsWith('/api/providers/usage')) {
+        return { ok: true, json: async () => ({ usage: fixtureUsage }) };
+      }
+      if (target.endsWith('/api/providers/estimate')) {
+        return {
+          ok: true,
+          json: async () => ({
+            provider_id: 'gemini',
+            model: 'gemini-live',
+            chapter_count: 0,
+            estimated_input_tokens: 0,
+            estimated_output_tokens: 0,
+            estimated_cost_usd: 0,
+            within_budget: true,
+          }),
+        };
+      }
+      const assistResponse = defaultAssistAutoLoadResponse(target);
+      if (assistResponse) return assistResponse;
+      throw new Error(`Unexpected URL: ${target}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    await userEvent.click(
+      within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }),
+    );
+    await screen.findByRole('heading', { name: 'Second Book' });
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/books/42/chapters'))).toBe(true);
+    });
+
+    const observedText: string[] = [];
+    const observer = new MutationObserver(() => observedText.push(document.body.textContent ?? ''));
+    observer.observe(document.body, { characterData: true, childList: true, subtree: true });
+    await userEvent.click(screen.getByRole('button', { name: 'Mở mục lục Second Book' }));
+
+    expect(await screen.findByRole('heading', { name: 'Mục lục' })).toBeInTheDocument();
+    expect(screen.getByText('Đang tải mục lục...')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Đọc Ch. 1 Live Chapter' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Truyện này chưa có chương đã dịch.')).not.toBeInTheDocument();
+    observer.disconnect();
+    expect(observedText.some((text) => text.includes('Truyện này chưa có chương đã dịch.'))).toBe(false);
+
+    pendingSecondChapters.resolve({ ok: true, json: async () => [secondChapter] });
+    expect(await screen.findByRole('button', { name: 'Đọc Ch. 1 Second Chapter' })).toBeInTheDocument();
+  });
+
+  it('marks saved progress in the TOC but lets an exact chapter choice win', async () => {
     saveToken('access');
     saveReaderProgressSnapshot(42, 4202, 80, 100, window.localStorage, {
       absoluteCharOffset: 120,
@@ -738,54 +906,33 @@ describe('App live data wiring', () => {
       if (target.endsWith('/api/books')) return { ok: true, json: async () => [fixtureBook] };
       if (target.endsWith('/api/providers/usage')) return { ok: true, json: async () => ({ usage: fixtureUsage }) };
       if (target.endsWith('/api/books/42/chapters')) return { ok: true, json: async () => [fixtureChapter, chapterTwo] };
-      if (target.endsWith('/api/books/42/reader/state')) {
-        return {
-          ok: true,
-          json: async () => ({
-            annotations: [],
-            progress: {
-              book_id: 42,
-              chapter_id: 4201,
-              chapter_number: 1,
-              chapter_title: 'Live Chapter',
-              char_offset: 3,
-              absolute_char_offset: 3,
-              mode: 'scroll',
-              page_index: 0,
-              paragraph_index: 0,
-              percent: 20,
-              updated_at: '2026-06-29T10:00:00Z',
-            },
-          }),
-        };
-      }
       if (target.endsWith('/api/books/42/reader/progress') && init?.method === 'PATCH') {
         return {
           ok: true,
           json: async () => ({
             progress: {
               book_id: 42,
-              chapter_id: 4202,
-              chapter_number: 2,
-              chapter_title: 'Local Progress Chapter',
-              char_offset: 12,
-              absolute_char_offset: 120,
+              chapter_id: 4201,
+              chapter_number: 1,
+              chapter_title: 'Live Chapter',
+              char_offset: 0,
+              absolute_char_offset: 0,
               mode: 'scroll',
               page_index: 0,
-              paragraph_index: 1,
-              percent: 80,
+              paragraph_index: 0,
+              percent: 0,
               updated_at: '2026-06-29T10:11:00Z',
             },
           }),
         };
       }
-      if (target.endsWith('/api/books/42/chapters/4202/source')) {
-        return { ok: true, json: async () => ({ chapter_id: 4202, text: '第二章' }) };
+      if (target.endsWith('/api/books/42/chapters/4201/source')) {
+        return { ok: true, json: async () => ({ chapter_id: 4201, text: '第一章' }) };
       }
-      if (target.endsWith('/api/books/42/chapters/4202/translation')) {
+      if (target.endsWith('/api/books/42/chapters/4201/translation')) {
         return {
           ok: true,
-          json: async () => ({ chapter_id: 4202, text: 'Chương hai từ local progress.' }),
+          json: async () => ({ chapter_id: 4201, text: 'Chương một được chọn thay vì tiến độ đã lưu.' }),
         };
       }
 
@@ -800,17 +947,21 @@ describe('App live data wiring', () => {
 
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Mở mục lục Live Book' }));
+
+    const savedChapter = await screen.findByRole('button', { name: 'Đọc Ch. 2 Local Progress Chapter' });
+    expect(savedChapter).toHaveAttribute('aria-current', 'true');
+    expect(within(savedChapter).getByText('Đọc gần nhất')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Đọc truyện' })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/books/42/reader/state'))).toBe(false);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc Ch. 1 Live Chapter' }));
 
     await expectReaderPage();
-    expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Chương hai từ local progress.');
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
-      'http://127.0.0.1:7860/api/books/42/reader/state',
-      expect.anything(),
-    ));
+    expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }))
+      .toHaveTextContent('Chương một được chọn thay vì tiến độ đã lưu.');
     expect(loadReaderProgressSnapshot(42, window.localStorage)).toMatchObject({
-      chapterId: 4202,
-      updatedAt: '2026-06-29T10:10:00Z',
+      chapterId: 4201,
     });
   });
 

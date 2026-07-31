@@ -1,4 +1,5 @@
 import { expect, type Page, type Route, test } from '@playwright/test';
+import { hasOnlyOptionalQaMiss, type PageDiagnostics } from '../src/test/pageDiagnostics';
 
 const API_ORIGIN = 'http://127.0.0.1:7860';
 const RAW_TEXT = '第10章 螟是苑\n\n天逐渐转凉，刚柔却安而常生，动乎险中，水墨飞。';
@@ -9,6 +10,37 @@ type MockState = {
   translated: boolean;
   translateRequests: unknown[];
 };
+
+function collectPageDiagnostics(page: Page): PageDiagnostics {
+  const diagnostics: PageDiagnostics = {
+    consoleErrors: [],
+    httpFailures: [],
+    pageErrors: [],
+    requestFailures: [],
+  };
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      diagnostics.consoleErrors.push(`${message.location().url} ${message.text()}`);
+    }
+  });
+  page.on('pageerror', (error) => diagnostics.pageErrors.push(error.message));
+  page.on('requestfailed', (request) => {
+    diagnostics.requestFailures.push(
+      `${request.method()} ${request.url()} ${request.failure()?.errorText ?? 'unknown failure'}`,
+    );
+  });
+  page.on('response', (response) => {
+    if (response.status() >= 400) {
+      diagnostics.httpFailures.push(`${response.status()} ${response.request().method()} ${response.url()}`);
+    }
+  });
+  return diagnostics;
+}
+
+function expectOnlyOptionalQaMiss(diagnostics: PageDiagnostics): void {
+  const qaUrl = `${API_ORIGIN}/api/books/${book.id}/chapters/${translatedChapter.id}/qa`;
+  expect(hasOnlyOptionalQaMiss(diagnostics, qaUrl), JSON.stringify(diagnostics, null, 2)).toBe(true);
+}
 
 const book = {
   id: 42,
@@ -391,6 +423,18 @@ async function authenticatedPage(page: Page, state: MockState) {
   await expect(page.getByRole('navigation', { name: navigationName })).toBeVisible();
 }
 
+async function openReaderFromLibraryToc(page: Page) {
+  await page.getByRole('button', { name: `Mở mục lục ${book.title}` }).click();
+  await expect(page.getByRole('heading', { name: 'Mục lục' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toHaveCount(0);
+  await page.getByRole('button', {
+    name: `Đọc Ch. ${translatedChapter.chapter_number} ${translatedChapter.title}`,
+  }).click();
+  const reader = page.getByRole('region', { name: 'Trang đọc truyện' });
+  await expect(reader).toBeVisible();
+  await expect(reader).toContainText('Trời dần trở lạnh');
+}
+
 async function expectNoHorizontalOverflow(page: Page) {
   const widths = await page.evaluate(() => ({
     body: document.body.scrollWidth,
@@ -512,11 +556,24 @@ test('starts a translation job from a raw chapter', async ({ page }) => {
 
 test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls', async ({ page }, testInfo) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  const diagnostics = collectPageDiagnostics(page);
   await authenticatedPage(page, state);
 
   await page.getByRole('navigation', { name: 'Quy trình' }).getByRole('button', { name: 'Thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: `Mở mục lục ${book.title}` }).click();
+  await expect(page.getByRole('heading', { name: 'Mục lục' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toHaveCount(0);
+  const libraryBackBox = await page.getByRole('button', { name: 'Tất cả truyện', exact: true }).boundingBox();
+  expect(libraryBackBox).not.toBeNull();
+  expect(libraryBackBox?.height).toBeLessThanOrEqual(60);
+  const libraryTocListBox = await page.getByRole('list', { name: 'Danh sách chương đã dịch' }).boundingBox();
+  expect(libraryTocListBox).not.toBeNull();
+  expect(libraryTocListBox?.height).toBeLessThanOrEqual(100);
+  await page.screenshot({ path: testInfo.outputPath('library-toc-desktop-1280.png'), fullPage: true });
+  await page.getByRole('button', {
+    name: `Đọc Ch. ${translatedChapter.chapter_number} ${translatedChapter.title}`,
+  }).click();
   await expect(page.getByText('Trời dần trở lạnh')).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('reader-desktop-1280.png'), fullPage: true });
 
@@ -526,10 +583,12 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(VI_TEXT);
   await page.getByRole('button', { name: 'Ẩn bản dịch' }).click();
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveCount(0);
+  expectOnlyOptionalQaMiss(diagnostics);
 });
 
-test('mobile shell and Reader follow the approved handoff at 390px and 360px', async ({ page }, testInfo) => {
+test('mobile shell and Reader follow the approved handoff at 360px, 390px, and 412px', async ({ page }, testInfo) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  const diagnostics = collectPageDiagnostics(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await authenticatedPage(page, state);
 
@@ -559,7 +618,26 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
 
   await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: `Mở mục lục ${book.title}` }).click();
+  await expect(page.getByRole('heading', { name: 'Mục lục' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toHaveCount(0);
+  await expect(mobileNav).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+  await expectVisibleMobileTouchTargets(page, 'Library TOC');
+  await page.screenshot({ path: testInfo.outputPath('library-toc-mobile-390.png'), fullPage: true });
+  await page.setViewportSize({ width: 360, height: 740 });
+  await expectNoHorizontalOverflow(page);
+  await expectVisibleMobileTouchTargets(page, 'Library TOC 360');
+  await page.screenshot({ path: testInfo.outputPath('library-toc-mobile-360.png'), fullPage: true });
+  await page.setViewportSize({ width: 412, height: 915 });
+  await expectNoHorizontalOverflow(page);
+  await expectVisibleMobileTouchTargets(page, 'Library TOC 412');
+  await page.screenshot({ path: testInfo.outputPath('library-toc-mobile-412.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', {
+    name: `Đọc Ch. ${translatedChapter.chapter_number} ${translatedChapter.title}`,
+  }).click();
+  await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toContainText('Trời dần trở lạnh');
 
   await expect(page.getByRole('button', { name: 'Quay lại thư viện' })).toContainText('Thư viện');
   await expect(mobileNav).toBeHidden();
@@ -614,7 +692,10 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   await expect(page.getByRole('region', { name: 'Trang đọc truyện' })).toBeVisible();
   await page.getByRole('button', { name: 'Mở khóa trang đọc' }).click();
   await page.getByRole('button', { name: 'Quay lại thư viện' }).click();
-  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Mục lục' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: book.title })).toBeVisible();
+  await expect(mobileNav).toBeVisible();
+  expectOnlyOptionalQaMiss(diagnostics);
 });
 
 test('mobile Reader exposes raw and split only for the current chapter resources', async ({ page }) => {
@@ -625,7 +706,7 @@ test('mobile Reader exposes raw and split only for the current chapter resources
   await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
     .getByRole('button', { name: 'Thư viện' })
     .click();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await openReaderFromLibraryToc(page);
 
   await page.getByRole('button', { name: 'Cài đặt chữ' }).click();
   let settings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
@@ -650,7 +731,7 @@ test('mobile Reader reloads cached content offline on the first service-worker s
   await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
     .getByRole('button', { name: 'Thư viện' })
     .click();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await openReaderFromLibraryToc(page);
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
   await page.getByRole('dialog', { name: 'Tùy chọn đọc' })
     .getByRole('button', { name: 'Tải chương hiện tại offline' })
@@ -695,7 +776,7 @@ test('mobile Reader reloads cached content offline on a warmed service-worker se
   await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' })
     .getByRole('button', { name: 'Thư viện' })
     .click();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await openReaderFromLibraryToc(page);
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
   await page.getByRole('dialog', { name: 'Tùy chọn đọc' })
     .getByRole('button', { name: 'Tải chương hiện tại offline' })
@@ -724,7 +805,7 @@ test('mobile feature pages keep actions clear and status backup states usable at
   const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
   await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
-  await expectActionAboveMobileNavigation(page, `Đọc tiếp ${book.title}`);
+  await expectActionAboveMobileNavigation(page, `Mở mục lục ${book.title}`);
   await expectNoHorizontalOverflow(page);
 
   await mobileNav.getByRole('button', { name: 'Thêm' }).click();
@@ -812,7 +893,7 @@ test('visible mobile controls use the approved touch-target policy', async ({ pa
   await expectVisibleMobileTouchTargets(page, 'Status and Settings');
 
   await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await openReaderFromLibraryToc(page);
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
   await expectVisibleMobileTouchTargets(page, 'Reader More');
   await page.keyboard.press('Escape');

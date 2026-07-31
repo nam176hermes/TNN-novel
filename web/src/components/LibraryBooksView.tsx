@@ -13,20 +13,26 @@ import {
   Wrench,
 } from 'lucide-react';
 import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
-import type { TranslatedBookSummary } from '../api/types';
+import type { Chapter, TranslatedBookSummary } from '../api/types';
 import coverDocTu from '../assets/reference-ui/cover-doc-tu-clean.png';
 import coverThanhSon from '../assets/reference-ui/cover-thanh-son-clean.png';
 import { loadReaderProgressSnapshot } from '../state/readerProgress';
 import type { AsyncState } from '../state/types';
+import LibraryBookContents from './LibraryBookContents';
 
 export type LibraryBooksViewProps = {
   books: AsyncState<TranslatedBookSummary[]>;
+  chapters?: AsyncState<Chapter[]>;
   onDeleteBook?(book: TranslatedBookSummary): void;
+  onBackToShelf?(): void;
+  onOpenBookContents(bookId: number): void;
   onOpenImport?(): void;
   onOpenReader(bookId: number, chapterId?: number | null): void;
   onOpenWorkbench(bookId: number, chapterId?: number | null): void;
   onRefresh(): void;
+  onRetryBookContents?(bookId: number): void;
   onUpdateCover?(book: TranslatedBookSummary, cover: File): void;
+  selectedBookId?: number | null;
 };
 
 type LibraryFilter = 'all' | 'reading' | 'completed' | 'attention';
@@ -38,6 +44,7 @@ const filterOptions: Array<{ id: LibraryFilter; label: string }> = [
   { id: 'completed', label: 'Hoàn tất' },
   { id: 'attention', label: 'Cần xem' },
 ];
+const emptyChapters: AsyncState<Chapter[]> = { data: [], error: '', state: 'idle' };
 
 function formatLastActivity(value: string): string {
   if (!value) return 'Chưa rõ';
@@ -74,12 +81,17 @@ function lastActivityTime(value: string): number {
 
 export default function LibraryBooksView({
   books,
+  chapters = emptyChapters,
   onDeleteBook,
+  onBackToShelf,
+  onOpenBookContents,
   onOpenImport,
   onOpenReader,
   onOpenWorkbench,
   onRefresh,
+  onRetryBookContents,
   onUpdateCover,
+  selectedBookId = null,
 }: LibraryBooksViewProps) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<LibraryFilter>('all');
@@ -140,13 +152,24 @@ export default function LibraryBooksView({
     onUpdateCover(book, cover);
   }
 
-  function openReader(book: TranslatedBookSummary): void {
-    const readerProgress = loadReaderProgressSnapshot(book.id);
-    if (readerProgress) {
-      onOpenReader(book.id, readerProgress.chapterId);
-      return;
-    }
-    onOpenReader(book.id);
+  const selectedBook = selectedBookId === null
+    ? null
+    : (books.data.find((book) => book.id === selectedBookId) ?? null);
+
+  if (selectedBook) {
+    return (
+      <section className="workflow-management-view translated-library-view translated-library-toc-view">
+        <LibraryBookContents
+          book={selectedBook}
+          chapters={chapters}
+          key={selectedBook.id}
+          lastReadChapterId={loadReaderProgressSnapshot(selectedBook.id)?.chapterId ?? null}
+          onBack={() => onBackToShelf?.()}
+          onOpenReader={(bookId, chapterId) => onOpenReader(bookId, chapterId)}
+          onRetry={() => onRetryBookContents?.(selectedBook.id)}
+        />
+      </section>
+    );
   }
 
   return (
@@ -264,15 +287,14 @@ export default function LibraryBooksView({
                   {menuOpen ? (
                     <div className="translated-book-menu" id={`translated-book-menu-${book.id}`} role="menu">
                       <button
-                        disabled={!book.first_translated_chapter_id}
                         onClick={() => {
-                          openReader(book);
+                          onOpenBookContents(book.id);
                           setOpenMenuBookId(null);
                         }}
                         role="menuitem"
                         type="button"
                       >
-                        Đọc tiếp
+                        Mở mục lục <span className="sr-only">{book.title}</span>
                       </button>
                       <button
                         onClick={() => {
@@ -315,10 +337,9 @@ export default function LibraryBooksView({
                   ) : null}
                   <h3 className="sr-only">{book.title}</h3>
                   <button
-                    aria-label={`Mở sách ${book.title}`}
+                    aria-label={`Xem mục lục ${book.title}`}
                     className="translated-book-card-open"
-                    disabled={!book.first_translated_chapter_id}
-                    onClick={() => openReader(book)}
+                    onClick={() => onOpenBookContents(book.id)}
                     type="button"
                   >
                     <span className="translated-book-cover-frame">
@@ -379,12 +400,11 @@ export default function LibraryBooksView({
                 <div className="translated-book-actions">
                   <button
                     className="primary-action"
-                    disabled={!book.first_translated_chapter_id}
-                    onClick={() => openReader(book)}
+                    onClick={() => onOpenBookContents(book.id)}
                     type="button"
                   >
                     <BookOpenCheck aria-hidden="true" size={16} />
-                    Đọc tiếp <span className="sr-only">{book.title}</span>
+                    Mở mục lục <span className="sr-only">{book.title}</span>
                   </button>
                   <button
                     className="secondary-action"

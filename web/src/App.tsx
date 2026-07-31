@@ -174,6 +174,9 @@ function AuthenticatedApp() {
   const [backendError, setBackendError] = useState('');
   const [backendSuccess, setBackendSuccess] = useState('');
   const [activeView, setActiveView] = useState<WorkflowView>(restoreOfflineReader ? 'reader' : 'workbench');
+  const [libraryTocBookId, setLibraryTocBookId] = useState<number | null>(
+    initialReaderResumeRef.current?.bookId ?? null,
+  );
   const [workbenchChapterId, setWorkbenchChapterId] = useState<number | null>(null);
   const [backendLoading, setBackendLoading] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
@@ -621,6 +624,13 @@ function AuthenticatedApp() {
   }, [activeView, loadTranslatedBooks, session.isAuthenticated, translatedBooks.state]);
 
   useEffect(() => {
+    if (libraryTocBookId === null) return;
+    if (translatedBooks.state !== 'ready' && translatedBooks.state !== 'empty') return;
+    if (translatedBooks.data.some((book) => book.id === libraryTocBookId)) return;
+    setLibraryTocBookId(null);
+  }, [libraryTocBookId, translatedBooks.data, translatedBooks.state]);
+
+  useEffect(() => {
     if (activeView !== 'raw') return;
     void loadRawBacklog().catch(() => {});
   }, [activeView, loadRawBacklog]);
@@ -717,10 +727,18 @@ function AuthenticatedApp() {
   }
 
   async function selectBookChapter(bookId: number, chapterId?: number | null): Promise<Chapter[] | null> {
-    if (bookId !== activeBookId && !canLeaveCurrentChapter()) return null;
+    const willSwitchBook = bookId !== activeBookId;
+    if (willSwitchBook && !canLeaveCurrentChapter()) return null;
 
     library.setSelectedBookId(bookId);
-    const loadedChapters = await library.refreshChapters(bookId);
+    const canReuseLoadedChapters = (
+      !willSwitchBook
+      && (library.chapters.state === 'ready' || library.chapters.state === 'empty')
+      && chapters.every((chapter) => chapter.book_id === bookId)
+    );
+    const loadedChapters = canReuseLoadedChapters
+      ? chapters
+      : await library.refreshChapters(bookId);
     let preferredChapterId = chapterId;
     if (preferredChapterId === null || preferredChapterId === undefined) {
       try {
@@ -754,6 +772,7 @@ function AuthenticatedApp() {
       }
     }
     const nextChapterId = resolveReaderChapterId(loadedChapters, preferredChapterId, bookId);
+    if (!willSwitchBook && nextChapterId !== selectedChapterId && !canLeaveCurrentChapter()) return null;
     library.setSelectedChapterId(nextChapterId);
     if (nextChapterId !== null) {
       saveReaderProgress(bookId, nextChapterId);
@@ -783,12 +802,41 @@ function AuthenticatedApp() {
     setBackendLoading(true);
     try {
       const loadedChapters = await selectBookChapter(bookId, chapterId);
-      if (loadedChapters) setActiveView('reader');
+      if (loadedChapters) {
+        setLibraryTocBookId(bookId);
+        setActiveView('reader');
+      }
     } catch (error) {
       handleJobError(error, 'Open reader failed');
     } finally {
       setBackendLoading(false);
     }
+  }
+
+  function handleOpenLibraryBookContents(bookId: number): void {
+    const willSwitchBook = bookId !== activeBookId;
+    if (willSwitchBook && !canLeaveCurrentChapter()) return;
+
+    setBackendError('');
+    setLibraryTocBookId(bookId);
+    if (willSwitchBook) {
+      library.setSelectedBookId(bookId);
+      void library.refreshChapters(bookId).catch(() => {});
+    }
+  }
+
+  function handleOpenLibraryShelf(): void {
+    if (activeView === 'workbench' && !canLeaveCurrentChapter()) return;
+    setLibraryTocBookId(null);
+    setActiveView('library');
+  }
+
+  function handleWorkflowViewChange(view: WorkflowView): void {
+    if (view === 'library') {
+      handleOpenLibraryShelf();
+      return;
+    }
+    setActiveView(view);
   }
 
   async function handleOpenWorkbenchBook(bookId: number, chapterId?: number | null): Promise<void> {
@@ -1814,7 +1862,7 @@ function AuthenticatedApp() {
           onOpenGlossary={() => setActiveView('glossary')}
           onOpenImport={() => setActiveView('import')}
           onOpenJobs={() => setActiveView('jobs')}
-          onOpenLibrary={() => setActiveView('library')}
+          onOpenLibrary={handleOpenLibraryShelf}
           onOpenStatus={() => setActiveView('status')}
           onPresetChange={setSelectedPresetId}
           onSave={() => handleSaveTranslation(chapterText.translationText)}
@@ -1865,7 +1913,16 @@ function AuthenticatedApp() {
             {statusMessages}
             <LibraryBooksView
               books={translatedBooks}
+              chapters={{
+                data: libraryTocBookId === null
+                  ? []
+                  : library.chapters.data.filter((chapter) => chapter.book_id === libraryTocBookId),
+                error: library.chapters.error,
+                state: library.chapters.state,
+              }}
               onDeleteBook={requestDeleteBook}
+              onBackToShelf={() => setLibraryTocBookId(null)}
+              onOpenBookContents={handleOpenLibraryBookContents}
               onOpenImport={() => setActiveView('import')}
               onUpdateCover={(book, cover) => {
                 void handleUpdateBookCover(book, cover);
@@ -1879,6 +1936,10 @@ function AuthenticatedApp() {
               onRefresh={() => {
                 void loadTranslatedBooks().catch((error) => handleJobError(error, 'Load translated books failed'));
               }}
+              onRetryBookContents={(bookId) => {
+                void library.refreshChapters(bookId).catch(() => {});
+              }}
+              selectedBookId={libraryTocBookId}
             />
           </>
         );
@@ -1934,7 +1995,7 @@ function AuthenticatedApp() {
                 void handleOpenReader(result.book_id, result.chapter_ids[0] ?? null);
               }}
               onOpenJob={() => setActiveView('jobs')}
-              onReturnToLibrary={() => setActiveView('library')}
+              onReturnToLibrary={handleOpenLibraryShelf}
               onPreviewInboxEbook={handlePreviewInboxEbook}
               onPreviewImportUrl={handleImportUrlPreview}
               onPreviewTranslatedEbook={handlePreviewTranslatedEbook}
@@ -2103,7 +2164,7 @@ function AuthenticatedApp() {
         }
         onLogout={handleLogout}
         onOpenImport={() => setActiveView('import')}
-        onViewChange={setActiveView}
+        onViewChange={handleWorkflowViewChange}
         renderView={renderWorkflowView}
       />
       {deleteConfirmation ? (
