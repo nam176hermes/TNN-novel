@@ -23,6 +23,7 @@ import type {
   ReaderExplainSpoilerMode,
   ReaderSyncConflict,
   ReaderSyncProgress,
+  ReaderSyncRequest,
   ReaderSearchResult,
   ReaderXrayResponse,
   ReaderXraySpoilerMode,
@@ -187,6 +188,17 @@ export type ReaderApiClient = Pick<
   | 'updateReaderAnnotation'
   | 'uploadReaderDictionary'
 >;
+
+type PendingReaderProgressSync = {
+  bookId: number;
+  client: ReaderApiClient;
+  key: string;
+  request: ReaderSyncRequest;
+  revision: number;
+  snapshot: ReaderProgressSnapshot;
+};
+
+const READER_PROGRESS_SYNC_DEBOUNCE_MS = 400;
 
 export type ReaderViewProps = {
   apiClient?: ReaderApiClient;
@@ -1529,6 +1541,11 @@ export default function ReaderView({
   const paginationMeasureRef = useRef<HTMLDivElement | null>(null);
   const restorePendingRef = useRef(false);
   const skipInitialProgressSaveRef = useRef('');
+  const progressSyncTimerRef = useRef<number | null>(null);
+  const pendingProgressSyncRef = useRef<PendingReaderProgressSync | null>(null);
+  const progressSyncRevisionRef = useRef(0);
+  const progressSyncMountedRef = useRef(true);
+  const progressSyncStartedRef = useRef(false);
   const readerAiCacheRef = useRef(new Map<string, ReaderExplainResponse>());
   const readerDeviceId = useMemo(() => loadReaderDeviceId(), []);
   const [readerSettings, setReaderSettings] = useState<ReaderSettings>(() => loadReaderSettings());
@@ -2352,6 +2369,90 @@ export default function ReaderView({
     setCurrentPage((page) => Math.min(page, pageCount - 1));
   }, [pageCount]);
 
+  const flushReaderProgressSync = useCallback(() => {
+    if (progressSyncTimerRef.current !== null) {
+      window.clearTimeout(progressSyncTimerRef.current);
+      progressSyncTimerRef.current = null;
+    }
+    const pending = pendingProgressSyncRef.current;
+    pendingProgressSyncRef.current = null;
+    if (!pending) return;
+
+    void pending.client.syncReaderState(pending.bookId, pending.request)
+      .then((syncedState) => {
+        if (!progressSyncMountedRef.current || pending.revision !== progressSyncRevisionRef.current) return;
+        saveReaderLastSyncAt(pending.bookId, syncedState.server_time);
+        const progressConflict = syncedState.conflicts.find((conflict) => conflict.entity === 'progress');
+        if (!progressConflict) return;
+        if (progressConflict.resolution === 'client_won') {
+          setReaderProgressConflict(null);
+        } else if (syncedState.progress) {
+          setReaderProgressConflict({
+            local: pending.snapshot,
+            remote: remoteReaderProgressToSnapshot(syncedState.progress),
+          });
+        }
+        setReaderSyncStatus(
+          progressConflict.resolution === 'client_won'
+            ? 'Sync: đã resolve tiến độ bằng local'
+            : 'Sync: tiến độ server mới hơn local',
+        );
+      })
+      .catch((error: unknown) => {
+        if (progressSyncMountedRef.current && pending.revision === progressSyncRevisionRef.current) {
+          setMarksError(error instanceof Error ? error.message : 'Failed to sync reader progress');
+        }
+      });
+  }, []);
+
+  const scheduleReaderProgressSync = useCallback((
+    bookId: number,
+    snapshot: ReaderProgressSnapshot,
+  ) => {
+    if (!apiClient) return;
+    const key = `${bookId}:${snapshot.chapterId}`;
+    if (pendingProgressSyncRef.current?.key !== key && pendingProgressSyncRef.current) {
+      flushReaderProgressSync();
+    }
+    const revision = progressSyncRevisionRef.current + 1;
+    progressSyncRevisionRef.current = revision;
+    pendingProgressSyncRef.current = {
+      bookId,
+      client: apiClient,
+      key,
+      request: {
+        device_id: readerDeviceId,
+        last_sync_at: loadReaderLastSyncAt(bookId),
+        progress: readerProgressSnapshotToSyncProgress(snapshot),
+      },
+      revision,
+      snapshot,
+    };
+    if (!progressSyncStartedRef.current) {
+      progressSyncStartedRef.current = true;
+      flushReaderProgressSync();
+      return;
+    }
+    if (progressSyncTimerRef.current !== null) {
+      window.clearTimeout(progressSyncTimerRef.current);
+    }
+    progressSyncTimerRef.current = window.setTimeout(
+      flushReaderProgressSync,
+      READER_PROGRESS_SYNC_DEBOUNCE_MS,
+    );
+  }, [apiClient, flushReaderProgressSync, readerDeviceId]);
+
+  useEffect(() => {
+    progressSyncMountedRef.current = true;
+    const handlePageHide = () => flushReaderProgressSync();
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide);
+      flushReaderProgressSync();
+      progressSyncMountedRef.current = false;
+    };
+  }, [flushReaderProgressSync]);
+
   useEffect(() => {
     if (!activeBookId || !selectedChapterId || restorePendingRef.current) return;
 
@@ -2444,38 +2545,9 @@ export default function ReaderView({
       },
     );
 
-    if (apiClient) {
-      void apiClient.syncReaderState(activeBookId, {
-        device_id: readerDeviceId,
-        last_sync_at: loadReaderLastSyncAt(activeBookId),
-        progress: readerProgressSnapshotToSyncProgress(progressSnapshot),
-      })
-        .then((syncedState) => {
-          saveReaderLastSyncAt(activeBookId, syncedState.server_time);
-          const progressConflict = syncedState.conflicts.find((conflict) => conflict.entity === 'progress');
-          if (progressConflict) {
-            if (progressConflict.resolution === 'client_won') {
-              setReaderProgressConflict(null);
-            } else if (syncedState.progress) {
-              setReaderProgressConflict({
-                local: progressSnapshot,
-                remote: remoteReaderProgressToSnapshot(syncedState.progress),
-              });
-            }
-            setReaderSyncStatus(
-              progressConflict.resolution === 'client_won'
-                ? 'Sync: đã resolve tiến độ bằng local'
-                : 'Sync: tiến độ server mới hơn local',
-            );
-          }
-        })
-        .catch((error: unknown) => {
-          setMarksError(error instanceof Error ? error.message : 'Failed to sync reader progress');
-        });
-    }
+    scheduleReaderProgressSync(activeBookId, progressSnapshot);
   }, [
     activeBookId,
-    apiClient,
     currentPage,
     currentViewportPage,
     currentPageStart,
@@ -2486,7 +2558,7 @@ export default function ReaderView({
     pageCount,
     progressTextBlocks,
     progressPercent,
-    readerDeviceId,
+    scheduleReaderProgressSync,
     scrollProgress.canScroll,
     scrollProgress.location,
     scrollProgress.total,

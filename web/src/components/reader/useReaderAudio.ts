@@ -84,7 +84,7 @@ export function friendlyAudioError(
     || cleaned.includes('model') || cleaned.includes('hugging face')
   ) return 'Thiếu model TTS hoặc file cấu hình. Kiểm tra TTS_CKPT_FILE/TTS_VOCAB_FILE trên server.';
   if (cleaned.includes('cuda') || cleaned.includes('gpu') || cleaned.includes('out of memory')) {
-    return 'Thiết bị TTS không sẵn sàng. Kiểm tra CUDA/GPU hoặc chuyển TTS_DEVICE=cpu.';
+    return 'GPU TTS chưa sẵn sàng. Kiểm tra CUDA, driver GPU và bộ nhớ GPU trên server.';
   }
   if (cleaned.includes('already running') || cleaned.includes('job already')) {
     return 'Đã có job audio đang chạy. Đợi job hiện tại xong hoặc mở trang Tác vụ để kiểm tra.';

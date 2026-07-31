@@ -120,6 +120,28 @@ def test_backup_runner_rejects_values_just_above_numeric_maximum(
     assert "must be at most" in result.stderr
 
 
+def test_backup_static_validation_defers_private_receipt_authority_to_image_preflight(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    result = _validate_config(data_dir, prepare_receipt_dir=False)
+
+    assert result.returncode == 0, result.stderr
+    content = RUNNER.read_text(encoding="utf-8")
+    static_validation = content[
+        content.index("validate_config()") : content.index("verify_recovery_publisher_contract()")
+    ]
+    publisher_preflight = content[
+        content.index("verify_recovery_publisher_contract()") : content.index("run_container_backup()")
+    ]
+    assert '[[ -d "$RECOVERY_RECEIPT_DIR"' not in static_validation
+    assert 'realpath -e "$RECOVERY_RECEIPT_DIR"' not in static_validation
+    assert "scripts.verify_recovery_publisher" in publisher_preflight
+    assert "--expected-data-root-identity" in publisher_preflight
+
+
 def test_backup_runner_rejects_mutable_image_tag(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()

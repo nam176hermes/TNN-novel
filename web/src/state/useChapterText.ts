@@ -235,7 +235,13 @@ export function useChapterText(
   }, [bookId, chapterId, contentHtmlPath, enabled, load, reset]);
 
   useEffect(() => {
-    if (!enabled || bookId === null || chapterId === null || prefetchTargets.length === 0) return;
+    if (
+      cacheOwnership === 'external'
+      || !enabled
+      || bookId === null
+      || chapterId === null
+      || prefetchTargets.length === 0
+    ) return;
     const targets = prefetchTargets.filter((target) => (
       target.book_id === bookId
       && target.id !== chapterId
@@ -294,7 +300,7 @@ export function useChapterText(
       window.clearTimeout(timeout);
       effectControllers.forEach((controller) => controller.abort());
     };
-  }, [bookId, cacheChapter, chapterId, client, enabled, prefetchTargets]);
+  }, [bookId, cacheChapter, cacheOwnership, chapterId, client, enabled, prefetchTargets]);
 
   useEffect(() => () => {
     loadRequestIdRef.current += 1;

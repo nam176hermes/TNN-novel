@@ -4905,6 +4905,33 @@ describe('ReaderView', () => {
     expect(screen.queryByRole('dialog', { name: 'Tìm trong truyện' })).not.toBeInTheDocument();
   });
 
+  it('coalesces rapid Reader progress changes into one remote sync', async () => {
+    const apiClient = mockReaderApiClient();
+    renderReader({ apiClient });
+    const readerMain = screen.getByRole('main', { name: 'Vùng đọc chính' });
+    Object.defineProperties(readerMain, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+
+    await waitFor(() => expect(latestProgressSyncPayload(apiClient)).toBeTruthy());
+    vi.mocked(apiClient.syncReaderState).mockClear();
+
+    for (const scrollTop of [120, 240, 360]) {
+      readerMain.scrollTop = scrollTop;
+      fireEvent.scroll(readerMain);
+      await act(async () => Promise.resolve());
+    }
+
+    await waitFor(() => {
+      const progressCalls = vi.mocked(apiClient.syncReaderState).mock.calls
+        .filter(([, request]) => Boolean(request.progress));
+      expect(progressCalls).toHaveLength(1);
+      expect(progressCalls[0]?.[1].progress).toMatchObject({ chapter_id: 102 });
+    }, { timeout: 1_500 });
+  });
+
   it('lets the reader tune theme, type size, line height, width, and hide chrome', async () => {
     renderReader();
     const article = screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });

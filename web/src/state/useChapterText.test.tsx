@@ -160,6 +160,40 @@ describe('useChapterText', () => {
     await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
   });
 
+  it('does not issue opportunistic translation prefetches when the Reader owns cache orchestration', async () => {
+    const client = {
+      getChapterSource: vi.fn().mockResolvedValue('原文'),
+      getChapterTranslation: vi.fn().mockResolvedValue('Bản dịch'),
+      getChapterContent: vi.fn(),
+      saveChapterTranslation: vi.fn(),
+    } as unknown as ApiClient;
+    const nextChapter = {
+      ...fixtureChapter,
+      id: 4301,
+      title: 'Chương kế',
+      audio_path: '',
+      content_html_path: null,
+    };
+    const { rerender } = renderHook(
+      ({ chapter }) => useChapterText(
+        client,
+        true,
+        chapter,
+        undefined,
+        [nextChapter],
+        { cacheOwnership: 'external' },
+      ),
+      { initialProps: { chapter: { ...fixtureChapter, audio_path: '', content_html_path: null } } },
+    );
+
+    await waitFor(() => expect(client.getChapterTranslation).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+    expect(client.getChapterTranslation).toHaveBeenCalledTimes(1);
+
+    rerender({ chapter: nextChapter });
+    await waitFor(() => expect(client.getChapterTranslation).toHaveBeenCalledTimes(2));
+  });
+
   it('removes stale cache when the API no longer has translated text', async () => {
     putCachedChapter({
       bookId: 42,
