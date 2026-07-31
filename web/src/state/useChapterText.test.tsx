@@ -160,6 +160,50 @@ describe('useChapterText', () => {
     await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
   });
 
+  it('preserves an unsaved draft when cache ownership changes for the same chapter', async () => {
+    const savedTranslation = 'Bản dịch đã lưu';
+    const unsavedTranslation = 'Bản nháp chưa lưu — giữ nguyên từng ký tự.';
+    const getCachedChapter = vi.spyOn(readerCacheModule, 'getCachedChapterAsync');
+    getCachedChapter.mockClear();
+    const client = {
+      getChapterSource: vi.fn().mockResolvedValue('原文'),
+      getChapterTranslation: vi.fn().mockResolvedValue(savedTranslation),
+      getChapterContent: vi.fn(),
+      saveChapterTranslation: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+
+    const { result, rerender } = renderHook(
+      ({ cacheOwnership }: { cacheOwnership: 'external' | 'internal' }) => useChapterText(
+        client,
+        true,
+        { ...fixtureChapter, audio_path: '' },
+        undefined,
+        [],
+        { cacheOwnership },
+      ),
+      { initialProps: { cacheOwnership: 'internal' as 'external' | 'internal' } },
+    );
+
+    await waitFor(() => expect(result.current.state).toBe('ready'));
+    expect(client.getChapterSource).toHaveBeenCalledTimes(1);
+    expect(client.getChapterTranslation).toHaveBeenCalledTimes(1);
+    expect(getCachedChapter).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.setTranslationText(unsavedTranslation));
+    rerender({ cacheOwnership: 'external' });
+
+    expect(client.getChapterSource).toHaveBeenCalledTimes(1);
+    expect(client.getChapterTranslation).toHaveBeenCalledTimes(1);
+    expect(result.current.translationText).toBe(unsavedTranslation);
+    expect(result.current.savedTranslationText).toBe(savedTranslation);
+    expect(result.current.isDirty).toBe(true);
+
+    await act(async () => result.current.load());
+    expect(client.getChapterSource).toHaveBeenCalledTimes(2);
+    expect(client.getChapterTranslation).toHaveBeenCalledTimes(2);
+    expect(getCachedChapter).toHaveBeenCalledTimes(1);
+  });
+
   it('removes stale cache when the API no longer has translated text', async () => {
     putCachedChapter({
       bookId: 42,
