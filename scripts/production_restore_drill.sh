@@ -22,6 +22,223 @@ require_absolute_path() {
   [[ "${!variable_name:-}" == /* ]] || fail "${variable_name} must be an absolute path"
 }
 
+require_safe_absolute_path() {
+  local variable_name="$1"
+  local value="${!variable_name:-}"
+  require_absolute_path "$variable_name"
+  [[ "$value" != "/" && "$value" != *"//"* && "$value" != *"/./"* && "$value" != */. \
+    && "$value" != *"/../"* && "$value" != */.. && "$value" != *","* \
+    && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || fail "${variable_name} contains an unsafe path"
+}
+
+require_canonical_real_directory() {
+  local variable_name="$1"
+  local identity_variable_name="$2"
+  local value="${!variable_name}"
+  local normalized_value="${value%/}"
+  local canonical_value identity
+  canonical_value="$(realpath --canonicalize-existing -- "$normalized_value" 2>/dev/null)" \
+    || fail "${variable_name} must be an existing canonical real directory without symlink components"
+  [[ -d "$canonical_value" && "$canonical_value" == "$normalized_value" ]] \
+    || fail "${variable_name} must be an existing canonical real directory without symlink components"
+  identity="$(stat --format='%d:%i' -- "$canonical_value" 2>/dev/null)" \
+    || fail "${variable_name} identity is unavailable"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || fail "${variable_name} identity is invalid"
+  printf -v "$variable_name" '%s' "$canonical_value"
+  printf -v "$identity_variable_name" '%s' "$identity"
+}
+
+require_secure_drill_root() {
+  local normalized_value="${BACKUP_DRILL_ROOT%/}"
+  local identity
+  identity="$(.venv/bin/python - "$normalized_value" <<'PY' 2>/dev/null
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+if os.path.realpath(root, strict=True) != root:
+    raise SystemExit(1)
+root_fd = os.open(root, flags)
+try:
+    held = os.fstat(root_fd)
+    named = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(held.st_mode) or not stat.S_ISDIR(named.st_mode):
+        raise SystemExit(1)
+    if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    if held.st_uid != os.getuid() or stat.S_IMODE(held.st_mode) != 0o700:
+        raise SystemExit(1)
+    if os.path.realpath(root, strict=True) != root:
+        raise SystemExit(1)
+    print(f"{held.st_dev}:{held.st_ino}")
+finally:
+    os.close(root_fd)
+PY
+)" || fail "BACKUP_DRILL_ROOT must be an existing canonical non-symlink directory owned by the invoking UID with mode 0700"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] \
+    || fail "BACKUP_DRILL_ROOT identity is invalid"
+  BACKUP_DRILL_ROOT="$normalized_value"
+  BACKUP_DRILL_ROOT_IDENTITY="$identity"
+}
+
+create_new_drill_directory() {
+  local metadata
+  metadata="$(.venv/bin/python - "$BACKUP_DRILL_ROOT" "$BACKUP_DRILL_ROOT_IDENTITY" <<'PY' 2>/dev/null
+from datetime import datetime, timezone
+import os
+import secrets
+import stat
+import string
+import sys
+
+root = sys.argv[1]
+expected_root_identity = sys.argv[2]
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+alphabet = string.ascii_letters + string.digits
+
+
+def identity(value: os.stat_result) -> str:
+    return f"{value.st_dev}:{value.st_ino}"
+
+
+root_fd = os.open(root, flags)
+created_name: str | None = None
+try:
+    held_root = os.fstat(root_fd)
+    named_root = os.stat(root, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(held_root.st_mode)
+        or identity(held_root) != expected_root_identity
+        or identity(named_root) != expected_root_identity
+        or held_root.st_uid != os.getuid()
+        or stat.S_IMODE(held_root.st_mode) != 0o700
+        or os.path.realpath(root, strict=True) != root
+    ):
+        raise SystemExit(1)
+
+    prefix = f"restore-drill-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-"
+    for _ in range(128):
+        candidate = prefix + "".join(secrets.choice(alphabet) for _ in range(6))
+        try:
+            os.mkdir(candidate, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            continue
+        created_name = candidate
+        break
+    if created_name is None:
+        raise SystemExit(1)
+
+    try:
+        drill_fd = os.open(created_name, flags, dir_fd=root_fd)
+        try:
+            os.fchmod(drill_fd, 0o711)
+            held_drill = os.fstat(drill_fd)
+            relative_drill = os.stat(created_name, dir_fd=root_fd, follow_symlinks=False)
+            named_root = os.stat(root, follow_symlinks=False)
+            named_drill = os.stat(os.path.join(root, created_name), follow_symlinks=False)
+            if (
+                identity(named_root) != expected_root_identity
+                or os.path.realpath(root, strict=True) != root
+                or identity(relative_drill) != identity(held_drill)
+                or identity(named_drill) != identity(held_drill)
+            ):
+                raise SystemExit(1)
+            print(os.path.join(root, created_name))
+            print(identity(held_drill))
+        finally:
+            os.close(drill_fd)
+    except BaseException:
+        try:
+            os.rmdir(created_name, dir_fd=root_fd)
+        except OSError:
+            pass
+        raise
+finally:
+    os.close(root_fd)
+PY
+)" || fail "BACKUP_DRILL_ROOT identity changed while creating the drill directory"
+  [[ "$metadata" == *$'\n'* ]] \
+    || fail "created drill directory identity is unavailable"
+  CREATED_DRILL_DIR="${metadata%%$'\n'*}"
+  CREATED_DRILL_IDENTITY="${metadata#*$'\n'}"
+  [[ "$CREATED_DRILL_DIR" == "$BACKUP_DRILL_ROOT"/restore-drill-* \
+    && "$CREATED_DRILL_IDENTITY" =~ ^[0-9]+:[0-9]+$ ]] \
+    || fail "created drill directory identity is invalid"
+}
+
+verify_drill_directory_identity() {
+  local drill_dir="$1"
+  local expected_drill_identity="$2"
+  .venv/bin/python - \
+    "$BACKUP_DRILL_ROOT" \
+    "$BACKUP_DRILL_ROOT_IDENTITY" \
+    "$drill_dir" \
+    "$expected_drill_identity" <<'PY' 2>/dev/null
+import os
+import stat
+import sys
+
+root, expected_root_identity, drill, expected_drill_identity = sys.argv[1:]
+if os.path.dirname(drill) != root:
+    raise SystemExit(1)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def identity(value: os.stat_result) -> str:
+    return f"{value.st_dev}:{value.st_ino}"
+
+
+root_fd = os.open(root, flags)
+try:
+    held_root = os.fstat(root_fd)
+    named_root = os.stat(root, follow_symlinks=False)
+    if (
+        identity(held_root) != expected_root_identity
+        or identity(named_root) != expected_root_identity
+        or held_root.st_uid != os.getuid()
+        or stat.S_IMODE(held_root.st_mode) != 0o700
+        or os.path.realpath(root, strict=True) != root
+    ):
+        raise SystemExit(1)
+    drill_fd = os.open(os.path.basename(drill), flags, dir_fd=root_fd)
+    try:
+        held_drill = os.fstat(drill_fd)
+        relative_drill = os.stat(os.path.basename(drill), dir_fd=root_fd, follow_symlinks=False)
+        named_drill = os.stat(drill, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(held_drill.st_mode)
+            or identity(held_drill) != expected_drill_identity
+            or identity(relative_drill) != expected_drill_identity
+            or identity(named_drill) != expected_drill_identity
+        ):
+            raise SystemExit(1)
+    finally:
+        os.close(drill_fd)
+finally:
+    os.close(root_fd)
+PY
+}
+
+parse_invocation() {
+  RESTORE_MODE=""
+  REQUESTED_ARCHIVE_NAME=""
+  if [[ $# -eq 0 ]]; then
+    RESTORE_MODE="latest"
+  elif [[ $# -eq 1 && "$1" == "--validate-config" ]]; then
+    RESTORE_MODE="validate"
+  elif [[ $# -eq 1 ]]; then
+    [[ "$1" =~ $BACKUP_NAME_PATTERN ]] \
+      || fail "archive name is not a supported encrypted backup"
+    RESTORE_MODE="requested"
+    REQUESTED_ARCHIVE_NAME="$1"
+  else
+    fail "usage: $0 [--validate-config|archive-basename]"
+  fi
+}
+
 validate_config() {
   require_value BACKUP_PASSPHRASE
   require_value BACKUP_IMAGE
@@ -32,32 +249,41 @@ validate_config() {
   require_value RESTORE_DATA_DIR
   require_value RECOVERY_PRODUCER_VERSION
   require_value RECOVERY_RECEIPT_DIR
-  require_absolute_path BACKUP_LOCAL_DIR
-  require_absolute_path BACKUP_DRILL_ROOT
-  require_absolute_path PRODUCTION_ENV
-  require_absolute_path RESTORE_ARTIFACT_SOURCE_ROOT
-  require_absolute_path RESTORE_DATA_DIR
-  require_absolute_path RECOVERY_RECEIPT_DIR
+  require_safe_absolute_path BACKUP_LOCAL_DIR
+  require_safe_absolute_path BACKUP_DRILL_ROOT
+  require_safe_absolute_path PRODUCTION_ENV
+  require_safe_absolute_path RESTORE_ARTIFACT_SOURCE_ROOT
+  require_safe_absolute_path RESTORE_DATA_DIR
+  require_safe_absolute_path RECOVERY_RECEIPT_DIR
   [[ -d "$BACKUP_LOCAL_DIR" ]] || fail "BACKUP_LOCAL_DIR does not exist"
-  [[ -d "$RESTORE_DATA_DIR" ]] || fail "RESTORE_DATA_DIR does not exist"
-  [[ -d "$RECOVERY_RECEIPT_DIR" && ! -L "$RECOVERY_RECEIPT_DIR" ]] \
-    || fail "RECOVERY_RECEIPT_DIR must be a real existing directory"
-  [[ "$BACKUP_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
-    || fail "BACKUP_IMAGE must be pinned by sha256 digest"
+  require_canonical_real_directory RESTORE_DATA_DIR RESTORE_DATA_ROOT_IDENTITY
+  require_secure_drill_root
+  [[ "$BACKUP_DRILL_ROOT" != "$RESTORE_DATA_DIR" \
+    && "$BACKUP_DRILL_ROOT" != "$RESTORE_DATA_DIR"/* ]] \
+    || fail "BACKUP_DRILL_ROOT must be outside RESTORE_DATA_DIR"
+  [[ "$BACKUP_IMAGE" != -* \
+    && "$BACKUP_IMAGE" =~ ^([a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$ ]] \
+    || fail "BACKUP_IMAGE must be a safe sha256-pinned Docker reference pinned by sha256 digest"
   [[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
     || fail "RECOVERY_PRODUCER_VERSION must be a safe release identifier"
-  [[ "$(realpath -e "$RECOVERY_RECEIPT_DIR")" == "$(realpath -m "$RESTORE_DATA_DIR")/logs/runtime" ]] \
+  [[ "$RESTORE_DATA_DIR" == "${RESTORE_ARTIFACT_SOURCE_ROOT%/}/data" ]] \
+    || fail "RESTORE_DATA_DIR must be the fixed production data directory"
+  [[ "$RECOVERY_RECEIPT_DIR" == "${RESTORE_DATA_DIR%/}/logs/runtime" ]] \
     || fail "RECOVERY_RECEIPT_DIR must be the fixed data/logs/runtime directory"
 }
 
-verify_publisher_image_release() {
-  local image_release
-  image_release="$(
-    docker run --rm --network none "$BACKUP_IMAGE" \
-      python -c 'import os; import scripts.record_restore_drill_status; print(os.environ.get("NOVEL_RELEASE_ID", ""))'
-  )"
-  [[ "$image_release" == "$RECOVERY_PRODUCER_VERSION" ]] \
-    || fail "BACKUP_IMAGE release does not match RECOVERY_PRODUCER_VERSION"
+verify_recovery_publisher_contract() {
+  if ! docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${RESTORE_DATA_DIR},dst=/data-root,readonly" \
+    --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
+    -- "$BACKUP_IMAGE" \
+    python -m scripts.verify_recovery_publisher \
+    --data-root /data-root \
+    --receipt-dir /receipts \
+    --expected-release "$RECOVERY_PRODUCER_VERSION" \
+    --expected-data-root-identity "$RESTORE_DATA_ROOT_IDENTITY" >/dev/null 2>&1; then
+    fail "recovery publisher preflight failed"
+  fi
 }
 
 select_archive() {
@@ -123,12 +349,11 @@ PY
 
 restore_into_new_drill() {
   local archive_name="$1"
-  install -d -m 0700 "$BACKUP_DRILL_ROOT"
-  local drill_dir
-  drill_dir="$(mktemp -d "${BACKUP_DRILL_ROOT}/restore-drill-$(date +%Y%m%dT%H%M%SZ)-XXXXXX")"
-  # Let the production-image service user traverse this one random drill path
-  # without exposing a directory listing to other host users.
-  chmod 0711 "$drill_dir"
+  create_new_drill_directory
+  local drill_dir="$CREATED_DRILL_DIR"
+  local drill_identity="$CREATED_DRILL_IDENTITY"
+  verify_drill_directory_identity "$drill_dir" "$drill_identity" \
+    || fail "created drill directory identity changed before restore"
 
   local restored_name
   restored_name="$(
@@ -139,7 +364,7 @@ restore_into_new_drill() {
       --env "BACKUP_ARCHIVE_NAME=${archive_name}" \
       --env "RESTORE_OWNER_UID=10001" \
       --env "RESTORE_OWNER_GID=10001" \
-      "$BACKUP_IMAGE" \
+      -- "$BACKUP_IMAGE" \
       python -c '
 import json
 import os
@@ -153,15 +378,18 @@ result = restore_drill(
     passphrase=os.environ["BACKUP_PASSPHRASE"],
 )
 restored = Path(result["restored_dir"])
-for current in [drill_root, *drill_root.rglob("*")]:
+for current in drill_root.rglob("*"):
     os.chown(current, int(os.environ["RESTORE_OWNER_UID"]), int(os.environ["RESTORE_OWNER_GID"]))
 Path("/drill/restore-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 os.chown("/drill/restore-result.json", int(os.environ["RESTORE_OWNER_UID"]), int(os.environ["RESTORE_OWNER_GID"]))
 print(restored.name)
 '
   )"
+  verify_drill_directory_identity "$drill_dir" "$drill_identity" \
+    || fail "created drill directory identity changed during restore"
   [[ "$restored_name" =~ ^restored-[0-9]{8}-[0-9]{6}$ ]] || fail "restore returned an unexpected directory name"
   printf '%s\n' "${drill_dir}/${restored_name}"
+  printf '%s\n' "$drill_identity"
 }
 
 validate_restored_db_and_artifacts() {
@@ -170,7 +398,7 @@ validate_restored_db_and_artifacts() {
   docker run --rm --network none --user 0:0 -i \
     --mount "type=bind,src=${restored_dir},dst=/data,readonly" \
     --env "RESTORE_ARTIFACT_SOURCE_ROOT=${RESTORE_ARTIFACT_SOURCE_ROOT}" \
-    "$BACKUP_IMAGE" \
+    -- "$BACKUP_IMAGE" \
     python - <<'PY' >"$report_path"
 from __future__ import annotations
 
@@ -233,10 +461,22 @@ PY
 publish_recovery_receipt() {
   local archive_hash_id="$1"
   local artifact_paths_scanned="$2"
-  docker run --rm --network none --user 10001:10001 \
+  if ! docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${RESTORE_DATA_DIR},dst=/data-root,readonly" \
     --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
-    "$BACKUP_IMAGE" \
-    python -m scripts.record_restore_drill_status \
+    -- "$BACKUP_IMAGE" \
+    sh -ec '
+expected_release="$1"
+expected_data_root_identity="$2"
+shift 2
+python -m scripts.verify_recovery_publisher \
+  --data-root /data-root \
+  --receipt-dir /receipts \
+  --expected-release "$expected_release" \
+  --expected-data-root-identity "$expected_data_root_identity"
+exec python "$@"
+' _ "$RECOVERY_PRODUCER_VERSION" "$RESTORE_DATA_ROOT_IDENTITY" \
+    -m scripts.record_restore_drill_status \
     --output /receipts/restore-drill.receipt.json \
     --archive-hash-id "$archive_hash_id" \
     --producer-version "$RECOVERY_PRODUCER_VERSION" \
@@ -245,7 +485,9 @@ publish_recovery_receipt() {
     --validation-count foreign_key_violations=0 \
     --validation-count "artifact_paths_scanned=${artifact_paths_scanned}" \
     --validation-count api_readiness_checks=1 \
-    --validation-count authenticated_reader_smokes=1
+    --validation-count authenticated_reader_smokes=1 >/dev/null 2>&1; then
+    fail "recovery receipt publication failed"
+  fi
 }
 
 validate_restored_api() {
@@ -257,7 +499,7 @@ validate_restored_api() {
     --env MOBILE_API_PORT=7860 \
     --env "ARTIFACT_LEGACY_ROOT=${RESTORE_ARTIFACT_SOURCE_ROOT}" \
     --mount "type=bind,src=${restored_dir},dst=/data" \
-    "$BACKUP_IMAGE" >/dev/null
+    -- "$BACKUP_IMAGE" >/dev/null
   trap 'docker rm -f "${container_name:-}" >/dev/null 2>&1 || true' EXIT
 
   local attempt readiness_succeeded=0
@@ -288,32 +530,43 @@ python scripts/smoke_reader_authenticated.py \
 main() {
   BACKUP_LOCAL_DIR="${BACKUP_LOCAL_DIR:-$HOME/.local/share/novel-tnn-backups}"
   BACKUP_DRILL_ROOT="${BACKUP_DRILL_ROOT:-$HOME/Novel-TNN-restore-drills}"
-  BACKUP_IMAGE="${BACKUP_IMAGE:-novel-pipeline-api:runtime-hardening-20260718-r1}"
+  BACKUP_IMAGE="${BACKUP_IMAGE:-}"
   PRODUCTION_ENV="${PRODUCTION_ENV:-$HOME/.config/novel-tnn/production.env}"
   RESTORE_ARTIFACT_SOURCE_ROOT="${RESTORE_ARTIFACT_SOURCE_ROOT:-$HOME/Novel-TNN}"
-  RESTORE_DATA_DIR="${RESTORE_ARTIFACT_SOURCE_ROOT}/data"
+  RESTORE_DATA_DIR="${RESTORE_DATA_DIR:-${RESTORE_ARTIFACT_SOURCE_ROOT%/}/data}"
   RECOVERY_PRODUCER_VERSION="${RECOVERY_PRODUCER_VERSION:-}"
-  RECOVERY_RECEIPT_DIR="${RESTORE_DATA_DIR}/logs/runtime"
+  RECOVERY_RECEIPT_DIR="${RECOVERY_RECEIPT_DIR:-${RESTORE_DATA_DIR%/}/logs/runtime}"
 
+  parse_invocation "$@"
   validate_config
-  if [[ "${1:-}" == "--validate-config" ]]; then
+  if [[ "$RESTORE_MODE" == "validate" ]]; then
     printf 'restore drill configuration validated\n'
     return 0
   fi
-  [[ $# -le 1 ]] || fail "usage: $0 [archive-basename]"
   [[ -f "$PRODUCTION_ENV" ]] || fail "PRODUCTION_ENV does not exist"
   command -v docker >/dev/null || fail "docker is required"
   command -v sha256sum >/dev/null || fail "sha256sum is required"
-  verify_publisher_image_release
+  verify_recovery_publisher_contract
 
   umask 077
-  local archive_name restored_dir report_path
-  archive_name="$(select_archive "${1:-}")"
+  local archive_name restored_dir drill_dir drill_identity report_path restore_metadata
+  archive_name="$(select_archive "$REQUESTED_ARCHIVE_NAME")"
   verify_backup_input "$archive_name"
-  restored_dir="$(restore_into_new_drill "$archive_name")"
-  report_path="${BACKUP_DRILL_ROOT}/$(basename "$(dirname "$restored_dir")")-validation.json"
+  restore_metadata="$(restore_into_new_drill "$archive_name")"
+  [[ "$restore_metadata" == *$'\n'* ]] || fail "restore drill identity is unavailable"
+  restored_dir="${restore_metadata%%$'\n'*}"
+  drill_identity="${restore_metadata#*$'\n'}"
+  drill_dir="$(dirname "$restored_dir")"
+  [[ "$drill_identity" =~ ^[0-9]+:[0-9]+$ ]] || fail "restore drill identity is invalid"
+  verify_drill_directory_identity "$drill_dir" "$drill_identity" \
+    || fail "created drill directory identity changed before validation"
+  report_path="${drill_dir}/validation.json"
   validate_restored_db_and_artifacts "$restored_dir" "$report_path"
+  verify_drill_directory_identity "$drill_dir" "$drill_identity" \
+    || fail "created drill directory identity changed during artifact validation"
   validate_restored_api "$restored_dir"
+  verify_drill_directory_identity "$drill_dir" "$drill_identity" \
+    || fail "created drill directory identity changed during API validation"
   local checksum_hash artifact_paths_scanned
   checksum_hash="$(read_verified_checksum_hash "$archive_name")"
   [[ "$checksum_hash" =~ ^[a-f0-9]{64}$ ]] || fail "verified checksum is not a SHA-256 identifier"

@@ -22,14 +22,64 @@ require_value() {
   [[ -n "${!variable_name:-}" ]] || fail "${variable_name} is required"
 }
 
-require_positive_integer() {
+require_bounded_decimal() {
   local variable_name="$1"
-  [[ "${!variable_name:-}" =~ ^[1-9][0-9]*$ ]] || fail "${variable_name} must be a positive integer"
+  local maximum="$2"
+  local value="${!variable_name:-}"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || fail "${variable_name} must be a positive integer"
+  if [[ ${#value} -gt ${#maximum} ]] \
+    || { [[ ${#value} -eq ${#maximum} ]] && [[ "$value" > "$maximum" ]]; }; then
+    fail "${variable_name} must be at most ${maximum}"
+  fi
 }
 
 require_absolute_path() {
   local variable_name="$1"
   [[ "${!variable_name:-}" == /* ]] || fail "${variable_name} must be an absolute path"
+}
+
+require_safe_absolute_path() {
+  local variable_name="$1"
+  local value="${!variable_name:-}"
+  require_absolute_path "$variable_name"
+  [[ "$value" != "/" && "$value" != *"//"* && "$value" != *"/./"* && "$value" != */. \
+    && "$value" != *"/../"* && "$value" != */.. && "$value" != *","* \
+    && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || fail "${variable_name} contains an unsafe path"
+}
+
+require_canonical_real_directory() {
+  local variable_name="$1"
+  local identity_variable_name="$2"
+  local value="${!variable_name}"
+  local normalized_value="${value%/}"
+  local canonical_value identity
+  canonical_value="$(realpath --canonicalize-existing -- "$normalized_value" 2>/dev/null)" \
+    || fail "${variable_name} must be an existing canonical real directory without symlink components"
+  [[ -d "$canonical_value" && "$canonical_value" == "$normalized_value" ]] \
+    || fail "${variable_name} must be an existing canonical real directory without symlink components"
+  identity="$(stat --format='%d:%i' -- "$canonical_value" 2>/dev/null)" \
+    || fail "${variable_name} identity is unavailable"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || fail "${variable_name} identity is invalid"
+  printf -v "$variable_name" '%s' "$canonical_value"
+  printf -v "$identity_variable_name" '%s' "$identity"
+}
+
+parse_invocation() {
+  BACKUP_MODE=""
+  REQUESTED_ARCHIVE_NAME=""
+  if [[ $# -eq 0 ]]; then
+    BACKUP_MODE="create"
+  elif [[ $# -eq 1 && "$1" == "--validate-config" ]]; then
+    BACKUP_MODE="validate"
+  elif [[ $# -eq 2 && "$1" == "--upload-existing" ]]; then
+    [[ "$2" =~ $BACKUP_NAME_PATTERN ]] \
+      || fail "archive must be a supported encrypted backup basename"
+    BACKUP_MODE="upload-existing"
+    REQUESTED_ARCHIVE_NAME="$2"
+  else
+    fail "usage: $0 [--validate-config|--upload-existing archive-basename]"
+  fi
 }
 
 validate_r2_destination() {
@@ -53,18 +103,17 @@ validate_config() {
   require_value R2_ACCESS_KEY_ID
   require_value R2_SECRET_ACCESS_KEY
   require_value RECOVERY_PRODUCER_VERSION
-  require_positive_integer BACKUP_KEEP_LOCAL
-  require_positive_integer BACKUP_KEEP_OFFSITE
-  require_positive_integer R2_MULTIPART_THRESHOLD_BYTES
-  require_positive_integer R2_MULTIPART_PART_BYTES
-  require_absolute_path BACKUP_DATA_DIR
-  require_absolute_path BACKUP_LOCAL_DIR
-  require_absolute_path RECOVERY_RECEIPT_DIR
-  [[ -d "$BACKUP_DATA_DIR" ]] || fail "BACKUP_DATA_DIR does not exist"
-  [[ -d "$RECOVERY_RECEIPT_DIR" && ! -L "$RECOVERY_RECEIPT_DIR" ]] \
-    || fail "RECOVERY_RECEIPT_DIR must be a real existing directory"
-  [[ "$BACKUP_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
-    || fail "BACKUP_IMAGE must be pinned by sha256 digest"
+  require_bounded_decimal BACKUP_KEEP_LOCAL 10000
+  require_bounded_decimal BACKUP_KEEP_OFFSITE 10000
+  require_bounded_decimal R2_MULTIPART_THRESHOLD_BYTES "$R2_SINGLE_PUT_MAX_BYTES"
+  require_bounded_decimal R2_MULTIPART_PART_BYTES "$R2_SINGLE_PUT_MAX_BYTES"
+  require_safe_absolute_path BACKUP_DATA_DIR
+  require_safe_absolute_path BACKUP_LOCAL_DIR
+  require_safe_absolute_path RECOVERY_RECEIPT_DIR
+  require_canonical_real_directory BACKUP_DATA_DIR BACKUP_DATA_ROOT_IDENTITY
+  [[ "$BACKUP_IMAGE" != -* \
+    && "$BACKUP_IMAGE" =~ ^([a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$ ]] \
+    || fail "BACKUP_IMAGE must be a safe sha256-pinned Docker reference pinned by sha256 digest"
   [[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
     || fail "RECOVERY_PRODUCER_VERSION must be a safe release identifier"
   ((R2_MULTIPART_THRESHOLD_BYTES <= R2_SINGLE_PUT_MAX_BYTES)) \
@@ -73,71 +122,124 @@ validate_config() {
     || fail "R2_MULTIPART_PART_BYTES must be between 5 MiB and 5 GiB"
   validate_r2_destination
 
-  local data_root backup_root receipt_root
+  local data_root backup_root
   data_root="$(realpath -m "$BACKUP_DATA_DIR")"
   backup_root="$(realpath -m "$BACKUP_LOCAL_DIR")"
-  receipt_root="$(realpath -e "$RECOVERY_RECEIPT_DIR")"
-  [[ "$receipt_root" == "$data_root/logs/runtime" ]] \
+  [[ "$RECOVERY_RECEIPT_DIR" == "${BACKUP_DATA_DIR%/}/logs/runtime" ]] \
     || fail "RECOVERY_RECEIPT_DIR must be the fixed data/logs/runtime directory"
   [[ "$backup_root" != "$data_root" && "$backup_root" != "$data_root"/* ]] \
     || fail "BACKUP_LOCAL_DIR must not be inside BACKUP_DATA_DIR"
 }
 
-verify_publisher_image_release() {
-  local image_release
-  image_release="$(
-    docker run --rm --network none "$BACKUP_IMAGE" \
-      python -c 'import os; import scripts.record_restore_drill_status; print(os.environ.get("NOVEL_RELEASE_ID", ""))'
-  )"
-  [[ "$image_release" == "$RECOVERY_PRODUCER_VERSION" ]] \
-    || fail "BACKUP_IMAGE release does not match RECOVERY_PRODUCER_VERSION"
+verify_recovery_publisher_contract() {
+  if ! docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data-root,readonly" \
+    --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
+    -- "$BACKUP_IMAGE" \
+    python -m scripts.verify_recovery_publisher \
+    --data-root /data-root \
+    --receipt-dir /receipts \
+    --expected-release "$RECOVERY_PRODUCER_VERSION" \
+    --expected-data-root-identity "$BACKUP_DATA_ROOT_IDENTITY" >/dev/null 2>&1; then
+    fail "recovery publisher preflight failed"
+  fi
 }
 
 run_container_backup() {
   local archive_name
   archive_name="$(
     docker run --rm --network none --user 0:0 \
-      --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data" \
+      --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data,readonly" \
       --mount "type=bind,src=${BACKUP_LOCAL_DIR},dst=/backups" \
       --env BACKUP_PASSPHRASE \
       --env "BACKUP_KEEP_LOCAL=${BACKUP_KEEP_LOCAL}" \
       --env "BACKUP_OWNER_UID=$(id -u)" \
       --env "BACKUP_OWNER_GID=$(id -g)" \
-      "$BACKUP_IMAGE" \
+      -- "$BACKUP_IMAGE" \
       python -c '
 import os
 from pathlib import Path
+import sys
 from scripts.ops import backup_sidecar_path, create_encrypted_backup
 
+data_fd = os.open("/data", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    data_metadata = os.fstat(data_fd)
+finally:
+    os.close(data_fd)
+if f"{data_metadata.st_dev}:{data_metadata.st_ino}" != sys.argv[1]:
+    raise SystemExit("data root identity mismatch")
 archive = create_encrypted_backup(
     data_dir=Path("/data"),
     out_dir=Path("/backups"),
     passphrase=os.environ["BACKUP_PASSPHRASE"],
     keep=int(os.environ["BACKUP_KEEP_LOCAL"]),
+    record_event=False,
+    checkpoint_database=False,
 )
 for path in (archive, backup_sidecar_path(archive)):
     os.chown(path, int(os.environ["BACKUP_OWNER_UID"]), int(os.environ["BACKUP_OWNER_GID"]))
 print(archive.name)
-'
+' "$BACKUP_DATA_ROOT_IDENTITY"
   )"
   [[ "$archive_name" =~ $BACKUP_NAME_PATTERN ]] || fail "container returned an unexpected archive name"
   printf '%s\n' "$archive_name"
 }
 
+archive_completed_at() {
+  local archive_name="$1"
+  .venv/bin/python - "$archive_name" <<'PY'
+from datetime import datetime, timedelta, timezone
+import re
+import sys
+
+match = re.fullmatch(
+    r"novel-pipeline-backup-(?P<stamp>[0-9]{8}-[0-9]{6})"
+    r"(?:-[A-Za-z0-9._-]+)?(?:-[a-f0-9]{12})?\.tar\.gz\.enc",
+    sys.argv[1],
+)
+if match is None:
+    raise SystemExit(1)
+try:
+    completed_at = datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+except ValueError:
+    raise SystemExit(1) from None
+if completed_at > datetime.now(timezone.utc) + timedelta(seconds=300):
+    raise SystemExit(1)
+print(completed_at.isoformat())
+PY
+}
+
 publish_recovery_receipt() {
   local archive_hash_id="$1"
-  docker run --rm --network none --user 10001:10001 \
+  local completed_at="$2"
+  if ! docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data-root,readonly" \
     --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
-    "$BACKUP_IMAGE" \
-    python -m scripts.record_restore_drill_status \
+    -- "$BACKUP_IMAGE" \
+    sh -ec '
+expected_release="$1"
+expected_data_root_identity="$2"
+shift 2
+python -m scripts.verify_recovery_publisher \
+  --data-root /data-root \
+  --receipt-dir /receipts \
+  --expected-release "$expected_release" \
+  --expected-data-root-identity "$expected_data_root_identity"
+exec python "$@"
+' _ "$RECOVERY_PRODUCER_VERSION" "$BACKUP_DATA_ROOT_IDENTITY" \
+    -m scripts.record_restore_drill_status \
     --output /receipts/external-backup.receipt.json \
     --archive-hash-id "$archive_hash_id" \
     --producer-version "$RECOVERY_PRODUCER_VERSION" \
+    --completed-at "$completed_at" \
     --validation-count archive_verified=1 \
     --validation-count metadata_verified=1 \
     --validation-count checksum_verified=1 \
     --validation-count remote_uploads_verified=3 \
-    --validation-count remote_metadata_verified=2
+    --validation-count remote_metadata_verified=2 >/dev/null 2>&1; then
+    fail "recovery receipt publication failed"
+  fi
 }
 
 verify_local_backup() {
@@ -416,7 +518,7 @@ rotate_remote_backups() {
 }
 
 main() {
-  BACKUP_IMAGE="${BACKUP_IMAGE:-novel-pipeline-api:runtime-hardening-20260718-r1}"
+  BACKUP_IMAGE="${BACKUP_IMAGE:-}"
   BACKUP_DATA_DIR="${BACKUP_DATA_DIR:-$HOME/Novel-TNN/data}"
   BACKUP_LOCAL_DIR="${BACKUP_LOCAL_DIR:-$HOME/.local/share/novel-tnn-backups}"
   R2_ACCOUNT_ID="${R2_ACCOUNT_ID:-}"
@@ -429,34 +531,36 @@ main() {
   BACKUP_KEEP_LOCAL="${BACKUP_KEEP_LOCAL:-14}"
   BACKUP_KEEP_OFFSITE="${BACKUP_KEEP_OFFSITE:-35}"
   RECOVERY_PRODUCER_VERSION="${RECOVERY_PRODUCER_VERSION:-}"
-  RECOVERY_RECEIPT_DIR="${BACKUP_DATA_DIR}/logs/runtime"
+  RECOVERY_RECEIPT_DIR="${RECOVERY_RECEIPT_DIR:-${BACKUP_DATA_DIR%/}/logs/runtime}"
 
+  parse_invocation "$@"
   validate_config
-  if [[ "${1:-}" == "--validate-config" ]]; then
+  if [[ "$BACKUP_MODE" == "validate" ]]; then
     printf 'backup configuration validated\n'
     return 0
   fi
-  [[ $# -eq 0 || ( "$1" == "--upload-existing" && $# -eq 2 ) ]] \
-    || fail "usage: $0 [--validate-config|--upload-existing archive-basename]"
+  local archive_name archive_path checksum_name checksum_hash completed_at
+  if [[ "$BACKUP_MODE" == "upload-existing" ]]; then
+    archive_name="$REQUESTED_ARCHIVE_NAME"
+    completed_at="$(archive_completed_at "$archive_name")" \
+      || fail "archive timestamp is invalid or exceeds allowed clock skew"
+  fi
   command -v curl >/dev/null || fail "curl is required"
   command -v docker >/dev/null || fail "docker is required"
   command -v sha256sum >/dev/null || fail "sha256sum is required"
   curl --help all | grep --quiet -- '--aws-sigv4' || fail "curl with --aws-sigv4 support is required"
-  verify_publisher_image_release
+  verify_recovery_publisher_contract
 
   umask 077
   install -d -m 0700 "$BACKUP_LOCAL_DIR"
-  local archive_name archive_path checksum_name checksum_hash
-  if [[ "${1:-}" == "--upload-existing" ]]; then
-    archive_name="$2"
-    [[ "$archive_name" == "$(basename "$archive_name")" && "$archive_name" =~ $BACKUP_NAME_PATTERN ]] \
-      || fail "archive must be a supported encrypted backup basename"
-  else
+  if [[ "$BACKUP_MODE" != "upload-existing" ]]; then
     archive_name="$(run_container_backup)"
+    completed_at="$(archive_completed_at "$archive_name")" \
+      || fail "archive timestamp is invalid or exceeds allowed clock skew"
   fi
   archive_path="${BACKUP_LOCAL_DIR}/${archive_name}"
   verify_local_backup "$archive_path"
-  if [[ "${1:-}" == "--upload-existing" ]]; then
+  if [[ "$BACKUP_MODE" == "upload-existing" ]]; then
     checksum_name="$(verify_existing_checksum "$archive_name")"
   else
     checksum_name="$(write_and_verify_checksum "$archive_name")"
@@ -465,7 +569,7 @@ main() {
   checksum_hash="$(read_verified_checksum_hash "$archive_name")"
   [[ "$checksum_hash" =~ ^[a-f0-9]{64}$ ]] || fail "verified checksum is not a SHA-256 identifier"
   rotate_remote_backups
-  publish_recovery_receipt "sha256:${checksum_hash}"
+  publish_recovery_receipt "sha256:${checksum_hash}" "$completed_at"
   printf 'backup complete: %s\n' "$archive_name"
 }
 
