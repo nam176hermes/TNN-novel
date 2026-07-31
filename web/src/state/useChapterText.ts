@@ -46,6 +46,8 @@ export function useChapterText(
   const [contentHtml, setContentHtml] = useState('');
   const [state, setState] = useState<LoadState>('idle');
   const [error, setError] = useState('');
+  const cacheOwnershipRef = useRef(cacheOwnership);
+  cacheOwnershipRef.current = cacheOwnership;
   const loadRequestIdRef = useRef(0);
   const activeLoadRef = useRef<{
     controller: AbortController;
@@ -108,7 +110,7 @@ export function useChapterText(
       const performLoad = async () => {
       const requestId = loadRequestIdRef.current + 1;
       loadRequestIdRef.current = requestId;
-      const cachedChapter = cacheOwnership === 'internal'
+      const cachedChapter = cacheOwnershipRef.current === 'internal'
         ? await getCachedChapterAsync(nextChapter.book_id, nextChapter.id)
         : null;
       if (requestId !== loadRequestIdRef.current) return;
@@ -196,7 +198,7 @@ export function useChapterText(
         if (activeLoadRef.current?.promise === promise) activeLoadRef.current = null;
       }
     },
-    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, enabled, onAuthError, reset],
+    [bookId, cacheChapter, chapterId, client, contentHtmlPath, enabled, onAuthError, reset],
   );
 
   const save = useCallback(

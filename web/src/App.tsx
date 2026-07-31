@@ -276,6 +276,48 @@ function AuthenticatedApp() {
     { cacheOwnership: activeView === 'reader' ? 'external' : 'internal' },
   );
   const chapterText = readerChapterData.text;
+  const authorizeUnsavedTranslationDeparture = useCallback(({
+    nextView,
+    replacesDraft = false,
+  }: {
+    nextView?: WorkflowView;
+    replacesDraft?: boolean;
+  } = {}): boolean => {
+    if (!chapterText.isDirty) return true;
+
+    const changesView = nextView !== undefined && nextView !== activeView;
+    const leavesWorkbench = activeView === 'workbench' && changesView;
+    const leavesDirtyReader = activeView === 'reader'
+      && changesView
+      && nextView !== 'workbench';
+    if (!replacesDraft && !leavesWorkbench && !leavesDirtyReader) return true;
+
+    return window.confirm('You have unsaved translation edits. Leave without saving?');
+  }, [activeView, chapterText.isDirty]);
+  const requestActiveView = useCallback((
+    nextView: WorkflowView,
+    unsavedDepartureAuthorized = false,
+  ): boolean => {
+    if (nextView === activeView) return true;
+    if (
+      !unsavedDepartureAuthorized
+      && !authorizeUnsavedTranslationDeparture({ nextView })
+    ) return false;
+    setActiveView(nextView);
+    return true;
+  }, [activeView, authorizeUnsavedTranslationDeparture]);
+
+  useEffect(() => {
+    if (!chapterText.isDirty) return undefined;
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [chapterText.isDirty]);
+
   const providersState = useProviders(session.client, session.isAuthenticated, expireSession);
   const styleState = useStyleProfiles(session.client, session.isAuthenticated, expireSession);
   const assistBookId = selectedChapter?.book_id ?? library.selectedBookId;
@@ -697,19 +739,21 @@ function AuthenticatedApp() {
     setBackendError(`${label}: ${formatError(error)}`);
   }
 
-  function canLeaveCurrentChapter(): boolean {
-    if (!chapterText.isDirty) return true;
-    return window.confirm('You have unsaved translation edits. Switch chapter anyway?');
-  }
-
   function handleSelectBook(bookId: number): void {
-    if (bookId !== activeBookId && !canLeaveCurrentChapter()) return;
+    const replacesDraft = bookId !== activeBookId || selectedChapterId !== null;
+    if (
+      replacesDraft
+      && !authorizeUnsavedTranslationDeparture({ replacesDraft: true })
+    ) return;
     library.setSelectedBookId(bookId);
     library.setSelectedChapterId(null);
   }
 
   function handleSelectChapter(chapterId: number): void {
-    if (chapterId !== selectedChapterId && !canLeaveCurrentChapter()) return;
+    if (
+      chapterId !== selectedChapterId
+      && !authorizeUnsavedTranslationDeparture({ replacesDraft: true })
+    ) return;
     library.setSelectedChapterId(chapterId);
     if (activeBookId !== null) {
       saveReaderProgress(activeBookId, chapterId);
@@ -717,8 +761,6 @@ function AuthenticatedApp() {
   }
 
   async function selectBookChapter(bookId: number, chapterId?: number | null): Promise<Chapter[] | null> {
-    if (bookId !== activeBookId && !canLeaveCurrentChapter()) return null;
-
     library.setSelectedBookId(bookId);
     const loadedChapters = await library.refreshChapters(bookId);
     let preferredChapterId = chapterId;
@@ -779,11 +821,15 @@ function AuthenticatedApp() {
   }
 
   async function handleOpenReader(bookId: number, chapterId?: number | null): Promise<void> {
+    const replacesDraft = bookId !== activeBookId
+      || (chapterId !== null && chapterId !== undefined && chapterId !== selectedChapterId);
+    if (!authorizeUnsavedTranslationDeparture({ nextView: 'reader', replacesDraft })) return;
+
     setBackendError('');
     setBackendLoading(true);
     try {
       const loadedChapters = await selectBookChapter(bookId, chapterId);
-      if (loadedChapters) setActiveView('reader');
+      if (loadedChapters) requestActiveView('reader', true);
     } catch (error) {
       handleJobError(error, 'Open reader failed');
     } finally {
@@ -792,21 +838,26 @@ function AuthenticatedApp() {
   }
 
   async function handleOpenWorkbenchBook(bookId: number, chapterId?: number | null): Promise<void> {
+    const willSwitchBook = bookId !== activeBookId;
+    const maySwitchChapter = chapterId === null
+      || chapterId === undefined
+      || chapterId !== selectedChapterId;
+    if (
+      (willSwitchBook || maySwitchChapter)
+      && !authorizeUnsavedTranslationDeparture({ nextView: 'workbench', replacesDraft: true })
+    ) return;
+
     setBackendError('');
     setBackendLoading(true);
     try {
-      const willSwitchBook = bookId !== activeBookId;
-      if (willSwitchBook && !canLeaveCurrentChapter()) return;
-
       library.setSelectedBookId(bookId);
       const loadedChapters = await library.refreshChapters(bookId);
       const nextChapterId = resolveWorkbenchChapterId(loadedChapters, chapterId);
-      if (!willSwitchBook && nextChapterId !== selectedChapterId && !canLeaveCurrentChapter()) return;
 
       library.setSelectedChapterId(nextChapterId);
       setWorkbenchChapterId(nextChapterId);
       setWorkbenchMode('edit');
-      setActiveView('workbench');
+      requestActiveView('workbench', true);
     } catch (error) {
       handleJobError(error, 'Open workbench failed');
     } finally {
@@ -817,7 +868,7 @@ function AuthenticatedApp() {
   function handleOpenSelectedWorkbench(): void {
     setWorkbenchChapterId(selectedChapterId);
     setWorkbenchMode('edit');
-    setActiveView('workbench');
+    requestActiveView('workbench');
   }
 
   async function handleRenameBook(bookId: number, title: string): Promise<void> {
@@ -884,7 +935,7 @@ function AuthenticatedApp() {
       );
       if (response) {
         setBackendSuccess(`Đã bắt đầu dịch hàng loạt: ${response.job_id}`);
-        setActiveView('jobs');
+        requestActiveView('jobs');
       }
     } catch (error) {
       handleJobError(error, 'Batch translate job failed');
@@ -903,7 +954,7 @@ function AuthenticatedApp() {
       );
       if (response) {
         setBackendSuccess(`Đã bắt đầu tạo audio hàng loạt: ${response.job_id}`);
-        setActiveView('jobs');
+        requestActiveView('jobs');
       }
     } catch (error) {
       handleJobError(error, 'Batch audio job failed');
@@ -1258,10 +1309,12 @@ function AuthenticatedApp() {
     if (rawBacklogChapters.state !== 'idle') {
       await loadRawBacklog();
     }
-    setActiveView('workbench');
+    requestActiveView('workbench');
   }
 
   async function handleImportPaste(request: ImportPasteRequest): Promise<void> {
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
     setBackendError('');
     setBackendSuccess('');
     setBackendLoading(true);
@@ -1277,6 +1330,8 @@ function AuthenticatedApp() {
   }
 
   async function handleImportFile(request: ImportFileRequest): Promise<void> {
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
     setBackendError('');
     setBackendSuccess('');
     setBackendLoading(true);
@@ -1308,7 +1363,7 @@ function AuthenticatedApp() {
         library.setSelectedChapterId(result.chapter_ids[0]);
         setWorkbenchChapterId(result.chapter_ids[0]);
         if (options?.finalAction === 'open') {
-          setActiveView('workbench');
+          requestActiveView('workbench');
         }
       }
       if (rawBacklogChapters.state !== 'idle') {
@@ -1430,7 +1485,7 @@ function AuthenticatedApp() {
       jobState.setStartedJob(response, 1);
       await loadEbookImportHistory();
       setBackendSuccess(`Đã bắt đầu import ebook. Theo dõi tác vụ ${response.job_id.slice(0, 8)}.`);
-      setActiveView('jobs');
+      requestActiveView('jobs');
     } catch (error) {
       handleJobError(error, 'Import ebook failed');
       throw error;
@@ -1593,6 +1648,8 @@ function AuthenticatedApp() {
   }
 
   async function handleLogout(): Promise<void> {
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
     await Promise.all([
       clearReaderPrivateData().catch(() => undefined),
       session.logout(),
@@ -1811,11 +1868,11 @@ function AuthenticatedApp() {
           onDeleteChapter={requestDeleteChapter}
           onDeleteTranslation={requestDeleteTranslation}
           onEstimate={handleEstimateSelectedChapter}
-          onOpenGlossary={() => setActiveView('glossary')}
-          onOpenImport={() => setActiveView('import')}
-          onOpenJobs={() => setActiveView('jobs')}
-          onOpenLibrary={() => setActiveView('library')}
-          onOpenStatus={() => setActiveView('status')}
+          onOpenGlossary={() => requestActiveView('glossary')}
+          onOpenImport={() => requestActiveView('import')}
+          onOpenJobs={() => requestActiveView('jobs')}
+          onOpenLibrary={() => requestActiveView('library')}
+          onOpenStatus={() => requestActiveView('status')}
           onPresetChange={setSelectedPresetId}
           onSave={() => handleSaveTranslation(chapterText.translationText)}
           onStyleProfileChange={handleStyleProfileChange}
@@ -1849,7 +1906,7 @@ function AuthenticatedApp() {
               onBatchTranslate={(bookId, rawChapterIds) => {
                 void handleBatchTranslateBook(bookId, rawChapterIds);
               }}
-              onOpenImport={() => setActiveView('import')}
+              onOpenImport={() => requestActiveView('import')}
               onOpenWorkbench={(bookId, chapterId) => {
                 void handleOpenWorkbenchBook(bookId, chapterId);
               }}
@@ -1866,7 +1923,7 @@ function AuthenticatedApp() {
             <LibraryBooksView
               books={translatedBooks}
               onDeleteBook={requestDeleteBook}
-              onOpenImport={() => setActiveView('import')}
+              onOpenImport={() => requestActiveView('import')}
               onUpdateCover={(book, cover) => {
                 void handleUpdateBookCover(book, cover);
               }}
@@ -1900,7 +1957,7 @@ function AuthenticatedApp() {
               textError={chapterText.error}
               textState={chapterText.state}
               translationText={chapterText.translationText}
-              onBackToLibrary={() => setActiveView('library')}
+              onBackToLibrary={() => requestActiveView('library')}
               onOpenWorkbench={handleOpenSelectedWorkbench}
               onSelectBook={(bookId) => {
                 void handleOpenReader(bookId);
@@ -1922,7 +1979,7 @@ function AuthenticatedApp() {
               ebookInboxFiles={ebookInboxFiles}
               ebookImportHistory={ebookImportHistory}
               loading={backendLoading}
-              onCancel={() => setActiveView('workbench')}
+              onCancel={() => requestActiveView('workbench')}
               loadSourceCatalog={loadSourceCatalog}
               onCreateTranslationJob={handleWizardTranslationJob}
               onCreateTtsJob={handleWizardTtsJob}
@@ -1933,8 +1990,8 @@ function AuthenticatedApp() {
               onOpenImportedBook={(result) => {
                 void handleOpenReader(result.book_id, result.chapter_ids[0] ?? null);
               }}
-              onOpenJob={() => setActiveView('jobs')}
-              onReturnToLibrary={() => setActiveView('library')}
+              onOpenJob={() => requestActiveView('jobs')}
+              onReturnToLibrary={() => requestActiveView('library')}
               onPreviewInboxEbook={handlePreviewInboxEbook}
               onPreviewImportUrl={handleImportUrlPreview}
               onPreviewTranslatedEbook={handlePreviewTranslatedEbook}
@@ -2008,7 +2065,7 @@ function AuthenticatedApp() {
               logs={jobLogsState.logs}
               jobs={jobsHistoryState.jobs}
               onCancelJob={handleCancelJob}
-              onOpenProviders={() => setActiveView('providers')}
+              onOpenProviders={() => requestActiveView('providers')}
               onRefresh={handleRefreshJobsView}
               onRetryTtsChunks={handleRetryTtsChunks}
               ttsJob={ttsJobStatus}
@@ -2102,8 +2159,8 @@ function AuthenticatedApp() {
                 : 'checking'
         }
         onLogout={handleLogout}
-        onOpenImport={() => setActiveView('import')}
-        onViewChange={setActiveView}
+        onOpenImport={() => requestActiveView('import')}
+        onViewChange={requestActiveView}
         renderView={renderWorkflowView}
       />
       {deleteConfirmation ? (

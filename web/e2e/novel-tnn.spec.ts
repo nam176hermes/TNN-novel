@@ -3,9 +3,13 @@ import { expect, type Page, type Route, test } from '@playwright/test';
 const API_ORIGIN = 'http://127.0.0.1:7860';
 const RAW_TEXT = '第10章 螟是苑\n\n天逐渐转凉，刚柔却安而常生，动乎险中，水墨飞。';
 const VI_TEXT = 'Chương mười, Minh Thị Uyển.\n\nTrời dần trở lạnh, khí tức trong núi lặng đi.';
+const UNSAVED_TRANSLATION_DRAFT = 'Bản nháp chưa lưu — giữ nguyên từng ký tự.';
 
 type MockState = {
   imported: boolean;
+  includeReplacementBook?: boolean;
+  includeReplacementChapter?: boolean;
+  logoutRequests?: number;
   translated: boolean;
   translateRequests: unknown[];
 };
@@ -51,6 +55,27 @@ const importedChapter = {
   chapter_number: 11,
   title: 'Imported Chapter',
   source_url: '',
+};
+
+const replacementChapter = {
+  ...translatedChapter,
+  id: 4203,
+  chapter_number: 12,
+  title: 'Replacement Chapter',
+};
+
+const replacementBook = {
+  ...book,
+  id: 43,
+  title: 'Replacement Book',
+};
+
+const replacementBookChapter = {
+  ...translatedChapter,
+  id: 4301,
+  book_id: replacementBook.id,
+  chapter_number: 1,
+  title: 'Replacement Book Chapter',
 };
 
 const provider = {
@@ -193,15 +218,19 @@ function eventStream(route: Route, events: unknown[]) {
 function chaptersFor(state: MockState) {
   const chapters = [state.translated ? translatedChapter : rawChapter];
   if (state.imported) chapters.push(importedChapter);
+  if (state.includeReplacementChapter) chapters.push(replacementChapter);
   return chapters;
+}
+
+function booksFor(state: MockState) {
+  return state.includeReplacementBook ? [book, replacementBook] : [book];
 }
 
 function translatedBooksFor(state: MockState) {
   if (!state.translated) {
     return { books: [] };
   }
-  return {
-    books: [
+  const books = [
       {
         id: book.id,
         title: book.title,
@@ -220,8 +249,19 @@ function translatedBooksFor(state: MockState) {
         last_activity: book.updated_at,
         cover_url: '',
       },
-    ],
-  };
+    ];
+  if (state.includeReplacementBook) {
+    books.push({
+      ...books[0],
+      id: replacementBook.id,
+      title: replacementBook.title,
+      first_translated_chapter_id: replacementBookChapter.id,
+      latest_translated_chapter_id: replacementBookChapter.id,
+      latest_chapter_number: replacementBookChapter.chapter_number,
+      latest_chapter_title: replacementBookChapter.title,
+    });
+  }
+  return { books };
 }
 
 async function installApiMock(page: Page, state: MockState) {
@@ -236,7 +276,10 @@ async function installApiMock(page: Page, state: MockState) {
       });
     }
 
-    if (path === '/api/auth/logout' && request.method() === 'POST') return json(route, { ok: true });
+    if (path === '/api/auth/logout' && request.method() === 'POST') {
+      state.logoutRequests = (state.logoutRequests ?? 0) + 1;
+      return json(route, { ok: true });
+    }
     if (path === '/api/providers') return json(route, { providers: [provider] });
     if (path === '/api/system/status') return json(route, systemStatus);
     if (path === '/api/system/backups' && request.method() === 'GET') return json(route, { items: systemBackups });
@@ -262,8 +305,9 @@ async function installApiMock(page: Page, state: MockState) {
       });
     }
     if (path === '/api/style-profiles') return json(route, { profiles: [styleProfile] });
-    if (path === '/api/books') return json(route, [book]);
+    if (path === '/api/books') return json(route, booksFor(state));
     if (path === `/api/books/${book.id}/chapters`) return json(route, chaptersFor(state));
+    if (path === `/api/books/${replacementBook.id}/chapters`) return json(route, [replacementBookChapter]);
     if (path === '/api/library/books') return json(route, translatedBooksFor(state));
     if (path === '/api/import/ebook/history') return json(route, { runs: [] });
     if (path === '/api/import/ebook/inbox') return json(route, { directory: 'inbox/ebooks', files: [] });
@@ -307,6 +351,18 @@ async function installApiMock(page: Page, state: MockState) {
     if (path === `/api/books/${book.id}/chapters/${importedChapter.id}/translation`) {
       return json(route, { detail: 'Not found' }, 404);
     }
+    if (path === `/api/books/${book.id}/chapters/${replacementChapter.id}/source`) {
+      return json(route, { chapter_id: replacementChapter.id, text: 'Replacement source text' });
+    }
+    if (path === `/api/books/${book.id}/chapters/${replacementChapter.id}/translation`) {
+      return json(route, { chapter_id: replacementChapter.id, text: 'Replacement translated text' });
+    }
+    if (path === `/api/books/${replacementBook.id}/chapters/${replacementBookChapter.id}/source`) {
+      return json(route, { chapter_id: replacementBookChapter.id, text: 'Replacement book source text' });
+    }
+    if (path === `/api/books/${replacementBook.id}/chapters/${replacementBookChapter.id}/translation`) {
+      return json(route, { chapter_id: replacementBookChapter.id, text: 'Replacement book translated text' });
+    }
     if (path === `/api/books/${book.id}/chapters/${rawChapter.id}/content`) {
       return json(route, { detail: 'Not found' }, 404);
     }
@@ -328,6 +384,7 @@ async function installApiMock(page: Page, state: MockState) {
     if (path === '/api/jobs/job-translate/attempts') return json(route, { attempts: [] });
     if (path === '/api/jobs') return json(route, { jobs: [] });
     if (path === `/api/books/${book.id}/reader/state`) return json(route, { progress: null, annotations: [] });
+    if (path === `/api/books/${replacementBook.id}/reader/state`) return json(route, { progress: null, annotations: [] });
     if (path === `/api/books/${book.id}/reader/sync`) {
       return json(route, { progress: null, annotations: [], conflicts: [], server_time: '2026-06-30T00:00:00Z' });
     }
@@ -391,6 +448,58 @@ async function authenticatedPage(page: Page, state: MockState) {
   await expect(page.getByRole('navigation', { name: navigationName })).toBeVisible();
 }
 
+async function openDirtyWorkbench(page: Page, state: MockState) {
+  await authenticatedPage(page, state);
+  const mobile = (page.viewportSize()?.width ?? 1280) < 900;
+  const navigationName = mobile
+    ? 'Điều hướng chính trên di động'
+    : 'Quy trình';
+  await page.getByRole('navigation', { name: navigationName })
+    .getByRole('button', { name: 'Thư viện' })
+    .click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  if (mobile) {
+    const bookCard = page.getByRole('article', { name: `Sách ${book.title}` });
+    const bookOptions = bookCard.getByRole('button', { name: `Tùy chọn sách ${book.title}` });
+    await expect(bookOptions).toBeVisible();
+    await bookOptions.click();
+    const openWorkbench = bookCard.getByRole('menuitem', { name: 'Sửa', exact: true });
+    await expect(openWorkbench).toBeVisible();
+    await openWorkbench.click();
+  } else {
+    await page.getByRole('button', { name: 'Sửa' }).first().click();
+  }
+  const translation = page.getByLabel('Bản dịch tiếng Việt');
+  await expect(translation).toHaveValue(VI_TEXT);
+  await translation.fill(UNSAVED_TRANSLATION_DRAFT);
+  await expect(translation).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+}
+
+async function answerNextDialog(
+  page: Page,
+  action: () => Promise<unknown>,
+  answer: 'accept' | 'dismiss',
+) {
+  const dialogPromise = page.waitForEvent('dialog');
+  const actionPromise = action();
+  const dialog = await dialogPromise;
+  expect(dialog.type()).toBe('confirm');
+  expect(dialog.message()).toContain('unsaved translation');
+  if (answer === 'accept') await dialog.accept();
+  else await dialog.dismiss();
+  await actionPromise;
+}
+
+async function returnToDirtyWorkbench(page: Page, navigationName: string) {
+  await page.getByRole('navigation', { name: navigationName })
+    .getByRole('button', { name: 'Bàn dịch' })
+    .click();
+  const translation = page.getByLabel('Bản dịch tiếng Việt');
+  await expect(translation).toHaveValue(VI_TEXT);
+  await translation.fill(UNSAVED_TRANSLATION_DRAFT);
+  await expect(translation).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+}
+
 async function expectNoHorizontalOverflow(page: Page) {
   const widths = await page.evaluate(() => ({
     body: document.body.scrollWidth,
@@ -434,6 +543,229 @@ async function expectVisibleMobileTouchTargets(page: Page, surface: string) {
 
   expect(undersized, `${surface} has visible controls below the 44px mobile hit-area policy`).toEqual([]);
 }
+
+test('PR-2 unsaved translation guard: desktop Raw, Jobs, and Import cancel preserve the exact draft and accept leaves', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await openDirtyWorkbench(page, state);
+  const navigation = page.getByRole('navigation', { name: 'Quy trình' });
+  const translation = page.getByLabel('Bản dịch tiếng Việt');
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Raw chưa dịch' }).click(),
+    'dismiss',
+  );
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(translation).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Raw chưa dịch' }).click(),
+    'accept',
+  );
+  await expect(page.getByRole('heading', { name: 'Raw chưa dịch' })).toBeVisible();
+
+  await returnToDirtyWorkbench(page, 'Quy trình');
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Tác vụ' }).click(),
+    'dismiss',
+  );
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Tác vụ' }).click(),
+    'accept',
+  );
+  await expect(page.getByRole('heading', { name: 'Tác vụ', exact: true })).toBeVisible();
+
+  await returnToDirtyWorkbench(page, 'Quy trình');
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Nhập chương' }).click(),
+    'dismiss',
+  );
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Nhập chương' }).click(),
+    'accept',
+  );
+  await expect(page.getByRole('heading', { name: 'Dán chương nguồn' })).toBeVisible();
+});
+
+test('PR-2 unsaved translation guard: mobile More Import cancel preserves the exact draft and accept opens Import', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openDirtyWorkbench(page, state);
+  const mobileNavigation = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+
+  await mobileNavigation.getByRole('button', { name: 'Thêm' }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Nhập chương' }).click(),
+    'dismiss',
+  );
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await mobileNavigation.getByRole('button', { name: 'Thêm' }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Thêm' }).getByRole('button', { name: 'Nhập chương' }).click(),
+    'accept',
+  );
+  await expect(page.getByRole('heading', { name: 'Dán chương nguồn' })).toBeVisible();
+});
+
+test('PR-2 unsaved translation guard: logout cancel stays authenticated without an API call and accept logs out', async ({ page }) => {
+  const state: MockState = { imported: false, logoutRequests: 0, translated: true, translateRequests: [] };
+  await openDirtyWorkbench(page, state);
+  const logout = page.getByRole('button', { name: 'Đăng xuất' });
+
+  await answerNextDialog(page, () => logout.click(), 'dismiss');
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+  expect(state.logoutRequests).toBe(0);
+  await expect(page.getByRole('button', { name: 'Login' })).toHaveCount(0);
+
+  await answerNextDialog(page, () => logout.click(), 'accept');
+  await expect(page.getByRole('button', { name: 'Login' })).toBeVisible();
+  await expect.poll(() => state.logoutRequests).toBe(1);
+});
+
+test('PR-2 unsaved translation guard: chapter replacement cancel keeps the selected chapter and draft and accept replaces it once', async ({ page }) => {
+  const state: MockState = {
+    imported: false,
+    includeReplacementChapter: true,
+    translated: true,
+    translateRequests: [],
+  };
+  await openDirtyWorkbench(page, state);
+  const navigation = page.getByRole('navigation', { name: 'Quy trình' });
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Đọc truyện' }).click(),
+    'accept',
+  );
+  const reader = page.getByRole('region', { name: 'Trang đọc truyện' });
+  const readerContent = reader.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+
+  await reader.getByRole('button', { name: 'Mục lục', exact: true }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Mục lục' })
+      .getByRole('button', { name: 'Ch. 12 Replacement Chapter' })
+      .click(),
+    'dismiss',
+  );
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+  await expect(readerContent.getByText('Replacement translated text', { exact: true })).toHaveCount(0);
+
+  await reader.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await reader.getByRole('dialog', { name: 'Tùy chọn đọc' })
+    .getByRole('button', { name: 'Mở bàn dịch' })
+    .click();
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Đọc truyện' }).click(),
+    'accept',
+  );
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+
+  await reader.getByRole('button', { name: 'Mục lục', exact: true }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Mục lục' })
+      .getByRole('button', { name: 'Ch. 12 Replacement Chapter' })
+      .click(),
+    'accept',
+  );
+  const replacementContent = readerContent.getByText('Replacement translated text', { exact: true });
+  await expect(replacementContent).toHaveCount(1);
+  await expect(replacementContent).toBeVisible();
+});
+
+test('PR-2 unsaved translation guard: book replacement cancel keeps the selected chapter and draft and accept opens the new book once', async ({ page }) => {
+  const state: MockState = {
+    imported: false,
+    includeReplacementBook: true,
+    translated: true,
+    translateRequests: [],
+  };
+  await openDirtyWorkbench(page, state);
+  const navigation = page.getByRole('navigation', { name: 'Quy trình' });
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Đọc truyện' }).click(),
+    'accept',
+  );
+  const reader = page.getByRole('region', { name: 'Trang đọc truyện' });
+  const readerContent = reader.getByRole('article', { name: 'Nội dung đọc tiếng Việt' });
+  await expect(reader.getByText(book.title, { exact: true })).toBeVisible();
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Tùy chọn đọc' }).getByLabel('Chọn truyện').selectOption('43'),
+    'dismiss',
+  );
+  await expect(reader.getByText(book.title, { exact: true })).toBeVisible();
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+  await expect(readerContent.getByText('Replacement book translated text', { exact: true })).toHaveCount(0);
+
+  await reader.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await reader.getByRole('dialog', { name: 'Tùy chọn đọc' })
+    .getByRole('button', { name: 'Mở bàn dịch' })
+    .click();
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+
+  await answerNextDialog(
+    page,
+    () => navigation.getByRole('button', { name: 'Đọc truyện' }).click(),
+    'accept',
+  );
+  await expect(reader.getByText(book.title, { exact: true })).toBeVisible();
+  await expect(readerContent.getByRole('heading', { name: rawChapter.title, exact: true })).toBeVisible();
+
+  await reader.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  await answerNextDialog(
+    page,
+    () => page.getByRole('dialog', { name: 'Tùy chọn đọc' }).getByLabel('Chọn truyện').selectOption('43'),
+    'accept',
+  );
+  await expect(reader.getByText(replacementBook.title, { exact: true })).toBeVisible();
+  await expect(readerContent.getByRole('heading', { name: replacementBookChapter.title, exact: true })).toBeVisible();
+  const replacementContent = readerContent.getByText('Replacement book translated text', { exact: true });
+  await expect(replacementContent).toHaveCount(1);
+  await expect(replacementContent).toBeVisible();
+});
+
+test('PR-2 unsaved translation guard: canceled browser reload preserves the dirty draft', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await openDirtyWorkbench(page, state);
+
+  const dialogPromise = page.waitForEvent('dialog');
+  void page.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
+  const dialog = await dialogPromise;
+  expect(dialog.type()).toBe('beforeunload');
+  await dialog.dismiss();
+
+  await expect(page.getByRole('region', { name: 'Workbench' })).toBeVisible();
+  await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveValue(UNSAVED_TRANSLATION_DRAFT);
+});
 
 test('login works and protected shell is blocked without a token', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };

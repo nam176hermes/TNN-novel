@@ -134,6 +134,87 @@ async function openTranslatedWorkbench(bookTitle = 'Live Book'): Promise<void> {
   await userEvent.click(within(row as HTMLElement).getByRole('button', { name: 'Sửa' }));
 }
 
+function installDirtyWorkbenchApiMock({ saveUnauthorized = false } = {}) {
+  let logoutCalls = 0;
+  const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+    const target = String(url);
+
+    if (target.endsWith('/api/providers')) {
+      return { ok: true, json: async () => ({ providers: [fixtureProvider] }) };
+    }
+    if (target.endsWith('/api/style-profiles')) {
+      return { ok: true, json: async () => ({ profiles: [fixtureStyleProfile] }) };
+    }
+    if (target.endsWith('/api/books')) {
+      return { ok: true, json: async () => [fixtureBook] };
+    }
+    if (target.endsWith('/api/books/42/chapters')) {
+      return { ok: true, json: async () => [fixtureChapter] };
+    }
+    if (target.endsWith('/api/books/42/chapters/4201/source')) {
+      return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Live source text' }) };
+    }
+    if (target.endsWith('/api/books/42/chapters/4201/translation')) {
+      if (init?.method === 'PATCH') {
+        if (saveUnauthorized) {
+          return {
+            ok: false,
+            status: 401,
+            statusText: 'Unauthorized',
+            json: async () => ({ detail: 'Not authenticated' }),
+          };
+        }
+        return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Dirty draft' }) };
+      }
+      return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Saved translation' }) };
+    }
+    if (target.endsWith('/api/providers/estimate')) {
+      return {
+        ok: true,
+        json: async () => ({
+          provider_id: fixtureProvider.id,
+          model: fixtureProvider.model,
+          chapter_count: 1,
+          estimated_input_tokens: 100,
+          estimated_output_tokens: 100,
+          estimated_cost_usd: 0.0001,
+          within_budget: true,
+        }),
+      };
+    }
+    if (target.endsWith('/api/providers/usage')) {
+      return { ok: true, json: async () => ({ usage: fixtureUsage }) };
+    }
+    if (target.endsWith('/api/system/status')) {
+      return { ok: true, json: async () => ({ api_ready: true, active_jobs: 0, running_jobs: 0 }) };
+    }
+    if (target.endsWith('/api/auth/logout') && init?.method === 'POST') {
+      logoutCalls += 1;
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+
+    const assistResponse = defaultAssistAutoLoadResponse(target);
+    if (assistResponse) return assistResponse;
+
+    throw new Error(`Unexpected URL: ${target}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, getLogoutCalls: () => logoutCalls };
+}
+
+async function renderDirtyWorkbench(options: { saveUnauthorized?: boolean } = {}) {
+  saveToken('access');
+  const api = installDirtyWorkbenchApiMock(options);
+  const rendered = render(<App />);
+  await openTranslatedWorkbench();
+  const translation = await screen.findByLabelText('Bản dịch tiếng Việt');
+  expect(translation).toHaveValue('Saved translation');
+  await userEvent.clear(translation);
+  await userEvent.type(translation, 'Dirty draft');
+  expect(translation).toHaveValue('Dirty draft');
+  return { ...api, ...rendered, translation };
+}
+
 describe('App live data wiring', () => {
   beforeEach(() => {
     clearToken();
@@ -179,6 +260,65 @@ describe('App live data wiring', () => {
     expect(screen.queryByText('Tiên hiệp')).not.toBeInTheDocument();
     expect(screen.queryByText('Estimated cost')).not.toBeInTheDocument();
     await expectNoGlobalAlert();
+  });
+
+  it('PR-2 unsaved translation guard registers beforeunload only while dirty and removes it when clean or unmounted', async () => {
+    saveToken('access');
+    installDirtyWorkbenchApiMock();
+    const rendered = render(<App />);
+    await openTranslatedWorkbench();
+    const translation = await screen.findByLabelText('Bản dịch tiếng Việt');
+    expect(translation).toHaveValue('Saved translation');
+
+    const cleanEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(cleanEvent)).toBe(true);
+    expect(cleanEvent.defaultPrevented).toBe(false);
+
+    await userEvent.clear(translation);
+    await userEvent.type(translation, 'Dirty draft');
+    const dirtyEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(dirtyEvent)).toBe(false);
+    expect(dirtyEvent.defaultPrevented).toBe(true);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Lưu' })).toBeDisabled());
+    const savedEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(savedEvent)).toBe(true);
+    expect(savedEvent.defaultPrevented).toBe(false);
+
+    await userEvent.type(translation, ' changed again');
+    rendered.unmount();
+    const unmountedEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(unmountedEvent)).toBe(true);
+    expect(unmountedEvent.defaultPrevented).toBe(false);
+  });
+
+  it('PR-2 unsaved translation guard skips same-view actions and cancel keeps the Workbench draft unchanged', async () => {
+    const confirmLeave = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmLeave);
+    const { translation } = await renderDirtyWorkbench();
+    const workflowNav = screen.getByRole('navigation', { name: 'Quy trình' });
+
+    await userEvent.click(within(workflowNav).getByRole('button', { name: 'Bàn dịch' }));
+    expect(confirmLeave).not.toHaveBeenCalled();
+    expect(translation).toHaveValue('Dirty draft');
+
+    await userEvent.click(within(workflowNav).getByRole('button', { name: 'Raw chưa dịch' }));
+    expect(confirmLeave).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('region', { name: 'Workbench' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Bản dịch tiếng Việt')).toHaveValue('Dirty draft');
+  });
+
+  it('PR-2 unsaved translation guard never blocks forced 401 expiry while a draft is dirty', async () => {
+    const confirmLeave = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmLeave);
+    await renderDirtyWorkbench({ saveUnauthorized: true });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu' }));
+
+    expect(await screen.findByRole('button', { name: 'Login' })).toBeInTheDocument();
+    expect(await screen.findByText('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.')).toBeInTheDocument();
+    expect(confirmLeave).not.toHaveBeenCalled();
   });
 
   it('retries the last failed job from the status page', async () => {
