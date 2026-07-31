@@ -2,6 +2,11 @@
 
 This app is built for personal use. Treat every imported book, cover, image, audio file, glossary, and provider setting as private data.
 
+Book export and system backup are different workflows:
+
+- `Book export`: EPUB/TXT/DOCX/M4B/glossary/annotation files for reading or review.
+- `System backup`: recovery archive for database and private app data.
+
 ## Required Public Deployment Settings
 
 Set these in the server environment before exposing the app outside localhost:
@@ -14,8 +19,8 @@ MOBILE_API_ADMIN_PASSWORD=<strong-password>
 MOBILE_API_CORS_ORIGINS=https://YOUR_DOMAIN
 MOBILE_API_UPLOAD_MAX_BYTES=104857600
 MOBILE_API_SERVE_WEB=1
-WEB_DIST_DIR=/home/thenam176/novel_pipeline/web/dist
-DATA_DIR=/home/thenam176/novel_pipeline/data
+WEB_DIST_DIR="$REPO_ROOT/web/dist"
+DATA_DIR="$DATA_DIR"
 ```
 
 Generate strong local values instead of reusing examples:
@@ -78,9 +83,9 @@ Do not expose the FastAPI port directly to the public internet unless it is behi
 Never configure nginx, Apache, Cloudflare Pages, or any static file server to serve:
 
 ```text
-/home/thenam176/novel_pipeline/data/
-/home/thenam176/novel_pipeline/data/covers/
-/home/thenam176/novel_pipeline/data/book_assets/
+$DATA_DIR/
+$DATA_DIR/covers/
+$DATA_DIR/book_assets/
 ```
 
 Covers and rich ebook assets must go through FastAPI routes:
@@ -141,7 +146,7 @@ Do not add a `location /data/` block.
 
 ```yaml
 tunnel: <TUNNEL_UUID>
-credentials-file: /home/thenam176/.cloudflared/<UUID>.json
+credentials-file: $HOME/.cloudflared/<UUID>.json
 
 ingress:
   - hostname: novel-tnn.tradingcompanydirect.com
@@ -162,8 +167,30 @@ The authenticated UI has a `Trạng thái` page. Use it to confirm:
 - last failed job
 - database path in local/private mode
 - backup recommendation
+- retention table counts and the last count-only retention summary
 
 It intentionally does not show API keys or secrets.
+
+## Operational Metadata Retention
+
+The FastAPI lifespan owns one metadata-retention task. It runs once after runtime initialization and then every six hours by default; API requests never trigger deletion. Each repository call uses a bounded transaction, and the task uses an initial row-count budget, yields, and checks shutdown between batches so concurrent producers cannot extend one run forever. Shutdown drains the current bounded SQLite worker before task ownership is cleared.
+
+Approved defaults:
+
+```bash
+AUTH_SESSION_RETENTION_DAYS=30
+AUTH_SESSION_RETENTION_MAX_ROWS=5000
+AUTH_LOGIN_FAILURE_RETENTION_DAYS=30
+AUTH_LOGIN_FAILURE_RETENTION_MAX_ROWS=5000
+OPERATIONAL_EVENT_RETENTION_DAYS=90
+OPERATIONAL_EVENT_RETENTION_MAX_ROWS=50000
+OPERATIONAL_RETENTION_BATCH_SIZE=500
+OPERATIONAL_RETENTION_INTERVAL_SECONDS=21600
+```
+
+All values must be positive integers. Invalid or non-positive configuration fails validation instead of silently disabling or clamping retention. Active, unexpired sessions are never eligible; revoked or expired sessions, login failures, and operational events are bounded by both age and row count.
+
+SQLite lock contention safely skips the current run and retries at the next interval. If earlier batches already committed, their exact counts remain pending in memory and the next run finalizes the count-only audit exactly once. Event pruning reserves one row for this audit so the insert cannot leave the table above its configured cap, including a cap of one. Zero-delete runs create no event. Authenticated system status exposes only table labels, row counts, last-run time, deleted counts, and the result—never SQL, database paths, row values, exception text, or secrets.
 
 ## Public Readiness Output
 
@@ -194,6 +221,28 @@ This applies to authenticated API responses and private asset routes such as `/c
 
 Cloudflare, nginx, Caddy, or any other proxy must respect these headers. Do not add Cloudflare Cache Rules that cache `/api/*`, `/covers/*`, or `/book-assets/*`.
 
+Protected export and backup routes must also remain non-cacheable. Do not cache:
+
+- `/api/books/*/exports/*`
+- `/api/books/*/chapters/*/audio*`
+- `/api/system/backups*`
+- `/api/tts/jobs/*/download`
+
+For deployed audio/export validation, use the bounded smoke command rather than blind browser checks:
+
+```bash
+.venv/bin/python scripts/smoke_tts_audio.py \
+  --base-url https://YOUR_DOMAIN \
+  --username YOUR_ADMIN \
+  --password-file /secure/path/novel-tnn-smoke-password \
+  --book-id 12 \
+  --chapter-id 340 \
+  --check-m4b-route
+```
+
+This validates authenticated chapter audio, protected download behavior, optional M4B export download, and unauthenticated denial without exposing raw backend paths.
+The password file must be a regular file with `0600` permissions; do not pass passwords on the command line.
+
 ## Audit and Operational Events
 
 The app records sanitized operational events for high-risk single-operator actions:
@@ -207,9 +256,76 @@ The app records sanitized operational events for high-risk single-operator actio
 - book/chapter/translation/dictionary/glossary/TM deletes
 - job start/retry/cancel/failure
 - reader AI, QA, and TTS-related job activity/failures where applicable
-- backup success/failure
+- backup queue and dedicated terminal outcomes
+- direct operator/CLI backup success
 
 Events intentionally do not store provider keys, submitted passwords, raw prompts, raw book text, translations, stack traces, or full local filesystem paths in public mode. Recent sanitized events are visible through authenticated `/api/system/status`; server logs remain the place for detailed debugging.
+
+Job-backed backup submission records `backup_job_queued`. After the coordinator
+persists a completed, failed, or cancelled job state, it attempts exactly once
+to record one dedicated `backup_job_terminal` event. The event has source
+`backup_job_coordinator`, the constant message `Backup job reached a terminal
+state`, the job id, and severity `info`, `error`, or `warning` respectively.
+Safe details are `result`, `encrypted`, `secrets_included`, a non-negative
+bounded integer `duration_ms`, and, only for completion, an optional
+basename-only `backup_filename`. Completed booleans come from the published
+backup result; failed and cancelled outcomes use request intent because they
+have no completed artifact metadata. Raw exceptions, passphrases, directories,
+and private content are excluded. A terminal-event writer failure is logged
+without raw exception text and is not retried or allowed to undo the durable
+terminal job state.
+
+This dedicated event is separate from generic tracker `job_failure`. The
+job-backed archive path also suppresses the legacy `backup_success` event;
+`backup_success` remains the default only for direct operator/CLI creation.
+
+## Backup Handling
+
+System backup routes are authenticated only:
+
+- `GET /api/system/backups`
+- `POST /api/system/backups`
+- `GET /api/system/backups/{filename}/download`
+
+Backup creation is job-backed. The POST returns `202 Accepted` with a safe job
+id and does not build an archive inside the request. The Status UI polls the
+existing authenticated job endpoint, offers cooperative cancel while the job
+is active, and reloads the sidecar-only list after completion.
+
+The encryption passphrase is process-local, take-once, and never persisted in
+job parameters or logs. Restarting the API deliberately loses it. An
+interrupted encrypted/secrets backup must be queued again with a newly entered
+passphrase; never attempt to recover it from SQLite or server logs. Plain retry
+also creates a new backup job and cannot overwrite an existing archive.
+
+Normal backup listing is metadata-only. It may read safe filename/stat data and a bounded adjacent sidecar, but must not open, decompress, decrypt, checksum, or walk an archive. Missing or invalid sidecars are entry-specific warnings and cannot block the core Status page or other backup entries. Only `READY` entries receive a protected download action.
+
+Rules:
+
+- backup filenames are sanitized
+- path traversal is blocked
+- `.env` and provider secrets are excluded by default
+- secrets backup requires encryption passphrase
+- secrets-included API backups keep plaintext below private mode-`0700`
+  staging and publish only the encrypted READY artifact pair
+- cleanup failure for process-owned hidden staging does not overturn READY
+  success or mask a primary encryption/publication failure
+- protected download requires a supported final filename, regular non-symlink
+  artifact, and valid matching sidecar
+- restore stays a documented CLI workflow, not a one-click public UI action
+- final archive names appear only after staged validation/publication; partial
+  and staging names remain unlistable and undownloadable
+
+Run restore drills regularly and keep backups outside any public static root.
+
+Legacy sidecar repair is never triggered by the browser. Rehearse and invoke the dry-run-first operator command documented in [`docs/backup-metadata-sidecars.md`](backup-metadata-sidecars.md). Do not supply passphrases on the command line, do not overwrite valid sidecars without explicit review, and verify archive hashes before and after repair.
+
+P2C rollback uses the commit boundaries in
+[`docs/backup-restore.md`](backup-restore.md#p2c-rollback-boundaries). Stop the
+app, take a verified rollback backup, revert only the newest affected seam, and
+rerun its focused tests before restart. P2C did not change the backup/restore
+format or database schema, so rollback must not delete archives or run downgrade
+SQL.
 
 ## Sessions, Refresh Tokens, and Password Changes
 
@@ -234,6 +350,20 @@ https://YOUR_DOMAIN/review
 ```
 
 This route renders sanitized sample screens only. It is intended for UI review, screenshots, and layout feedback. It cannot import books, view private book content, update providers, start jobs, download exports, or access private assets.
+
+## Post-deploy smoke checklist
+
+After each deploy, verify:
+
+- login/session works
+- protected exports require auth
+- protected audio requires auth
+- system backup create/download requires auth
+- `/api/ready` stays sanitized in `PUBLIC_DEPLOY=1`
+- `/docs`, `/openapi.json`, `/redoc` stay disabled
+- covers and book assets stay protected
+- `scripts/backup-local.sh` still produces a backup manifest
+- restore drill still succeeds on the newest backup
 
 For local review only, the app can bypass the login page:
 
@@ -306,6 +436,12 @@ This prevents jobs from staying permanently `running`. Failed or interrupted tra
 
 Known limitation: this is a SQLite lease around the existing in-process job runner, not a full durable queue. It improves duplicate protection and stale-job recovery for single-operator use, but it does not resume a partially executed coroutine after process death. A real worker queue is still required for production-grade multi-user reliability.
 
+The same limitation applies to system backups and scheduled metadata retention:
+both run in the API process. Retention retries SQLite busy/locked work at the
+next interval, and its pending count-only audit recovery is process-local; a
+hard process loss can therefore lose that pending audit summary even though
+already committed deletions remain committed.
+
 ## Operational Status
 
 The authenticated Trạng thái page and `/api/system/status` report:
@@ -323,7 +459,8 @@ Operational events intentionally avoid raw provider keys, stack traces, and priv
 Run a backup before upgrades, migrations, large imports, or public deployment changes:
 
 ```bash
-cd /home/thenam176/novel_pipeline
+export REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 scripts/backup-local.sh
 ```
 
@@ -333,7 +470,7 @@ Keep only the newest local backups:
 BACKUP_KEEP=14 scripts/backup-local.sh
 ```
 
-This creates a tarball under `/home/thenam176/novel_pipeline/backups/` unless `BACKUP_DIR` is set. It contains:
+This creates a tarball under `$REPO_ROOT/backups/` unless `BACKUP_DIR` is set. It contains:
 
 - a consistent SQLite backup of `data/pipeline.db`
 - imported raw/cleaned/translated text

@@ -25,6 +25,7 @@ from app.mobile_api.services import job_service as job_service_module
 from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api.services.job_service import JobService, JobTracker
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.services.tts.availability import TTSUnavailableError
 
 
 def test_mobile_jobs_schema_has_durable_step_progress_columns(temp_db_path) -> None:
@@ -165,14 +166,22 @@ async def test_start_translate_job_book_zero_does_not_target_all_books(
 
 
 def test_job_router_services_share_tracker_between_requests() -> None:
-    first_service = jobs_router.get_job_service()
-    job_id = first_service.start_translate_job(book_id=0)
+    db_path = jobs_router.get_db_path()
+    init_db(db_path)
+    jobs_router._SHARED_JOB_TRACKER = None
+    job_service_module._SHARED_TRACKERS.pop(str(db_path), None)
+    try:
+        first_service = jobs_router.get_job_service()
+        job_id = first_service.start_translate_job(book_id=0)
 
-    second_service = jobs_router.get_job_service()
+        second_service = jobs_router.get_job_service()
 
-    status = second_service.get_job_status(job_id)
-    assert status is not None
-    assert status["job_id"] == job_id
+        status = second_service.get_job_status(job_id)
+        assert status is not None
+        assert status["job_id"] == job_id
+    finally:
+        jobs_router._SHARED_JOB_TRACKER = None
+        job_service_module._SHARED_TRACKERS.pop(str(db_path), None)
 
 
 def test_job_tracker_persists_finished_jobs_between_instances(temp_db_path) -> None:
@@ -198,7 +207,7 @@ def test_job_tracker_persists_finished_jobs_between_instances(temp_db_path) -> N
     assert restarted_tracker.list_jobs()[0].job_id == job.job_id
 
 
-def test_start_book_tts_job_targets_translated_chapters_missing_audio(temp_db_path, tmp_path) -> None:
+def test_start_book_tts_job_targets_translated_chapters_missing_audio(temp_db_path, tmp_path, monkeypatch) -> None:
     class RecordingTracker(JobTracker):
         def start_background_task(self, job_id, coro) -> None:  # type: ignore[no-untyped-def]
             coro.close()
@@ -227,6 +236,7 @@ def test_start_book_tts_job_targets_translated_chapters_missing_audio(temp_db_pa
     )
     update_chapter_paths(temp_db_path, untranslated_id, status="cleaned")
     service = JobService(pipeline, tracker=RecordingTracker())
+    monkeypatch.setattr(job_service_module, "require_tts_runtime_available", lambda: None)
 
     job_id = service.start_tts_job(book_id=book_id, chapter_ids=[], limit=200)
 
@@ -234,6 +244,36 @@ def test_start_book_tts_job_targets_translated_chapters_missing_audio(temp_db_pa
     assert status is not None
     assert status["target_ids"] == [missing_audio_id]
     assert status["total"] == 1
+
+
+def test_start_tts_job_rejects_before_tracker_creation(monkeypatch) -> None:
+    class EmptyPipeline:
+        def list_chapters(self, book_id=None):  # type: ignore[no-untyped-def]
+            return []
+
+    class RecordingTracker:
+        def __init__(self) -> None:
+            self.create_calls = 0
+
+        def create_job(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            self.create_calls += 1
+            return type("CreatedJob", (), {"job_id": "unexpected-job"})()
+
+        def update_job(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return True
+
+    tracker = RecordingTracker()
+    service = JobService(EmptyPipeline(), tracker=tracker)
+
+    def reject_unavailable_runtime() -> None:
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+
+    monkeypatch.setattr(job_service_module, "require_tts_runtime_available", reject_unavailable_runtime, raising=False)
+
+    with pytest.raises(TTSUnavailableError):
+        service.start_tts_job(book_id=1)
+
+    assert tracker.create_calls == 0
 
 
 def test_start_book_translate_job_targets_untranslated_chapters_with_source(

@@ -55,25 +55,54 @@ describe('WorkflowShell', () => {
 
   it('keeps mobile workflow navigation wired to the same routes', async () => {
     const { onOpenImport, onViewChange } = renderShell('workbench');
-    const mobileNav = screen.getByRole('navigation', { name: 'Quy trình di động' });
+    const mobileNav = screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
 
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thư viện' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Raw chưa dịch' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Đọc truyện' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Tác vụ' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Trạng thái' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Nguồn truyện' }));
-    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Xuất file' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Nhập' }));
+    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
+    const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    await userEvent.click(within(moreSheet).getByRole('button', { name: 'Nhập chương' }));
 
     expect(onViewChange).toHaveBeenCalledWith('library');
-    expect(onViewChange).toHaveBeenCalledWith('raw');
     expect(onViewChange).toHaveBeenCalledWith('reader');
     expect(onViewChange).toHaveBeenCalledWith('jobs');
-    expect(onViewChange).toHaveBeenCalledWith('status');
-    expect(onViewChange).toHaveBeenCalledWith('sources');
-    expect(onViewChange).toHaveBeenCalledWith('export');
     expect(onOpenImport).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps keyboard focus inside the mobile More dialog and restores it on close', async () => {
+    renderShell('workbench');
+    const user = userEvent.setup();
+    const mobileNav = screen.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+    const trigger = within(mobileNav).getByRole('button', { name: 'Thêm' });
+
+    trigger.focus();
+    await user.keyboard('{Enter}');
+
+    const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    const closeButton = within(moreSheet).getByRole('button', { name: 'Đóng menu Thêm' });
+    const logoutButton = within(moreSheet).getByRole('button', { name: 'Đăng xuất' });
+    expect(closeButton).toHaveFocus();
+    expect(document.body.style.overflow).toBe('hidden');
+
+    await user.keyboard('{Shift>}{Tab}{/Shift}');
+    expect(logoutButton).toHaveFocus();
+
+    logoutButton.focus();
+    await user.keyboard('{Tab}');
+    expect(closeButton).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Thêm' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(document.body.style.overflow).toBe('');
+
+    await user.click(trigger);
+    const backdrop = document.querySelector<HTMLElement>('.mobile-more-backdrop');
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+    expect(screen.queryByRole('dialog', { name: 'Thêm' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 
   it('marks the active workflow view for immersive reader layout', () => {

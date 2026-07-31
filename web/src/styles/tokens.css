@@ -1,0 +1,53 @@
+@layer tokens {
+:root {
+  --bg: #080b09;
+  --bg-deep: #050806;
+  --surface: #11140f;
+  --surface-elevated: #171b16;
+  --surface-subtle: #151811;
+  --surface-muted: #20251d;
+  --sidebar: #001d17;
+  --sidebar-strong: #00110d;
+  --text: #f5f4ec;
+  --text-muted: #b5baaf;
+  --text-soft: #858d82;
+  --border: rgb(255 255 255 / 8%);
+  --border-strong: rgb(255 255 255 / 14%);
+  --accent: #078b5b;
+  --accent-strong: #23c784;
+  --accent-soft: rgb(8 139 91 / 18%);
+  --accent-border: rgb(35 199 132 / 34%);
+  --ink: #56e0a2;
+  --ink-soft: rgb(86 224 162 / 14%);
+  --success-bg: rgb(18 120 82 / 20%);
+  --success-border: rgb(55 213 143 / 36%);
+  --warning-bg: rgb(208 147 37 / 15%);
+  --warning-border: rgb(232 184 76 / 35%);
+  --warning-text: #f0c766;
+  --danger: #ef7770;
+  --danger-bg: rgb(177 48 48 / 15%);
+  --danger-border: rgb(239 119 112 / 34%);
+  --shadow-soft: 0 26px 90px rgb(0 0 0 / 42%);
+  --shadow-panel: 0 18px 52px rgb(0 0 0 / 22%);
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    "Segoe UI Variable", Aptos, "Segoe UI", ui-sans-serif, system-ui,
+    -apple-system, BlinkMacSystemFont, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+/* Fidelity pass against supplied screenshots */
+:root {
+  font-family:
+    "Segoe UI Variable", "Segoe UI", Roboto, "Helvetica Neue", Arial, ui-sans-serif, system-ui,
+    -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+@media (max-width: 820px) {
+  :root {
+    --mobile-nav-height: 64px;
+  }
+}
+}

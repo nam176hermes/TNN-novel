@@ -1,23 +1,38 @@
 services:
-  novel-pipeline:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: novel-pipeline:local
-    container_name: novel-pipeline
+      target: api
+      args: &release-build-args
+        NOVEL_APP_VERSION: "${NOVEL_APP_VERSION:-0.1.0}"
+        NOVEL_FRONTEND_VERSION: "${NOVEL_FRONTEND_VERSION:-0.1.0}"
+        NOVEL_GIT_SHA: "${NOVEL_GIT_SHA:-unknown}"
+        NOVEL_BUILD_TIMESTAMP: "${NOVEL_BUILD_TIMESTAMP:-unknown}"
+        NOVEL_RELEASE_ID: "${NOVEL_RELEASE_ID:-development}"
+        NOVEL_IMAGE_TAG: "${NOVEL_API_IMAGE_TAG:-novel-pipeline-api:local}"
+    image: novel-pipeline-api:local
     restart: unless-stopped
+    init: true
     ports:
       - "${MOBILE_API_BIND:-127.0.0.1}:${MOBILE_API_PORT:-7860}:7860"
     environment:
       DATA_DIR: /data
+      # The hardened API filesystem is read-only; inbox imports must live in DATA_DIR.
+      EBOOK_INBOX_DIR: /data/inbox/ebooks
       MOBILE_API_HOST: 0.0.0.0
       MOBILE_API_PORT: 7860
       MOBILE_API_SERVE_WEB: "1"
       WEB_DIST_DIR: /app/web/dist
+      # Docker production delegates source/browser jobs to import-worker.
+      IMPORT_JOB_RUN_IN_API: "0"
       MOBILE_API_SECRET: "${MOBILE_API_SECRET:?Set MOBILE_API_SECRET in .env before running docker compose}"
       MOBILE_API_ADMIN_USERNAME: "${MOBILE_API_ADMIN_USERNAME:-admin}"
       MOBILE_API_ADMIN_PASSWORD: "${MOBILE_API_ADMIN_PASSWORD:?Set MOBILE_API_ADMIN_PASSWORD in .env before running docker compose}"
-      MOBILE_API_CORS_ORIGINS: "${MOBILE_API_CORS_ORIGINS:-http://localhost,http://127.0.0.1}"
+      MOBILE_API_CORS_ORIGINS: "${MOBILE_API_CORS_ORIGINS:-http://localhost,http://127.0.0.1,https://novel-tnn.tradingcompanydirect.com}"
+      PUBLIC_DEPLOY: "${PUBLIC_DEPLOY:-0}"
+      NOVEL_COMPONENT: api
+      NOVEL_IMAGE_DIGEST: "${NOVEL_API_IMAGE_DIGEST:-unknown}"
       REMOTE_API_KEY: "${REMOTE_API_KEY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
@@ -27,11 +42,80 @@ services:
       OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:14b}"
     volumes:
       - ./data:/data
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    cpus: "1.00"
+    mem_limit: 768m
+    stop_grace_period: 30s
+    networks:
+      - api-egress
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/api/ready >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       start_period: 20s
       retries: 3
+
+  import-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: import-worker
+      args:
+        <<: *release-build-args
+        NOVEL_IMAGE_TAG: "${NOVEL_WORKER_IMAGE_TAG:-novel-pipeline-import-worker:local}"
+    image: novel-pipeline-import-worker:local
+    restart: unless-stopped
+    init: true
+    command: ["sh", "-c", "umask 007 && exec python -m app.import_worker"]
+    environment:
+      DATA_DIR: /data
+      IMPORT_JOB_RUN_IN_API: "0"
+      NOVEL_COMPONENT: import-worker
+      NOVEL_IMAGE_DIGEST: "${NOVEL_WORKER_IMAGE_DIGEST:-unknown}"
+      IMPORT_WORKER_POLL_INTERVAL_SECONDS: "1"
+      IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS: "45"
+      IMPORT_JOB_MAX_CHAPTERS: "${IMPORT_JOB_MAX_CHAPTERS:-200}"
+      IMPORT_JOB_MAX_ACTIVE_PER_USER: "${IMPORT_JOB_MAX_ACTIVE_PER_USER:-4}"
+      IMPORT_JOB_MAX_RETRIES_PER_TASK: "${IMPORT_JOB_MAX_RETRIES_PER_TASK:-3}"
+      IMPORT_JOB_MAX_BYTES_PER_CHAPTER: "${IMPORT_JOB_MAX_BYTES_PER_CHAPTER:-5242880}"
+      IMPORT_JOB_MAX_DURATION_SECONDS: "${IMPORT_JOB_MAX_DURATION_SECONDS:-3600}"
+      SOURCE_CIRCUIT_FAILURE_THRESHOLD: "${SOURCE_CIRCUIT_FAILURE_THRESHOLD:-3}"
+      SOURCE_CIRCUIT_WINDOW_SECONDS: "${SOURCE_CIRCUIT_WINDOW_SECONDS:-60}"
+      SOURCE_CIRCUIT_COOLDOWN_SECONDS: "${SOURCE_CIRCUIT_COOLDOWN_SECONDS:-30}"
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      STEALTH_BROWSER_PROFILE_DIR: /tmp/browser-profile
+      COOKIE_STORE_DIR: /tmp/browser-cookies
+    volumes:
+      - ./data:/data
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 384
+    cpus: "2.00"
+    mem_limit: 1536m
+    stop_grace_period: 75s
+    networks:
+      - browser-egress
+    healthcheck:
+      test: ["CMD-SHELL", "python -m app.import_worker --healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+networks:
+  # Separate DNS namespaces prevent a browser page from resolving the API
+  # service name. Host firewall rules in the P15 runbook complete egress policy.
+  api-egress: {}
+  browser-egress: {}

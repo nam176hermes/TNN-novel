@@ -3,7 +3,12 @@ from __future__ import annotations
 import importlib
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
 
 
 def test_settings_read_environment_overrides() -> None:
@@ -143,3 +148,60 @@ def test_mobile_api_data_dir_creates_reader_dictionary_directory(tmp_path, monke
 
     assert data_dir == tmp_path
     assert (data_dir / "dictionaries").is_dir()
+
+
+def test_mobile_api_retention_settings_use_approved_defaults() -> None:
+    from app.mobile_api.config import MobileAPISettings
+
+    configured = MobileAPISettings()
+
+    assert configured.auth_session_retention_days == 30
+    assert configured.auth_session_retention_max_rows == 5_000
+    assert configured.auth_login_failure_retention_days == 30
+    assert configured.auth_login_failure_retention_max_rows == 5_000
+    assert configured.operational_event_retention_days == 90
+    assert configured.operational_event_retention_max_rows == 50_000
+    assert configured.operational_retention_batch_size == 500
+    assert configured.operational_retention_interval_seconds == 21_600
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "auth_session_retention_days",
+        "auth_session_retention_max_rows",
+        "auth_login_failure_retention_days",
+        "auth_login_failure_retention_max_rows",
+        "operational_event_retention_days",
+        "operational_event_retention_max_rows",
+        "operational_retention_batch_size",
+        "operational_retention_interval_seconds",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_mobile_api_retention_settings_reject_non_positive_values(
+    field_name: str,
+    invalid_value: int,
+) -> None:
+    from app.mobile_api.config import MobileAPISettings
+
+    with pytest.raises(ValidationError):
+        MobileAPISettings(**{field_name: invalid_value})
+
+
+def test_mobile_api_retention_environment_rejects_non_positive_defaults(
+) -> None:
+    environment = os.environ.copy()
+    environment["NOVEL_PIPELINE_IGNORE_DOTENV"] = "1"
+    environment["OPERATIONAL_RETENTION_BATCH_SIZE"] = "0"
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.mobile_api.config"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "ValidationError" in result.stderr

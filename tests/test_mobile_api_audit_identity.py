@@ -123,7 +123,7 @@ async def test_login_session_and_auth_events_store_seeded_operator_user_id(
     assert user is not None
     assert session["username"] == "audit_operator"
     assert session["user_id"] == user["id"]
-    assert token_response["refresh_token"] not in session["refresh_token_hash"]
+    assert "refresh_token" not in token_response
 
     events = _events(db_path)
     session_create = next(event for event in events if event["event_type"] == "session_create")
@@ -135,7 +135,6 @@ async def test_login_session_and_auth_events_store_seeded_operator_user_id(
     serialized = str(events)
     assert "audit-password" not in serialized
     assert token_response["access_token"] not in serialized
-    assert token_response["refresh_token"] not in serialized
 
 
 @pytest.mark.asyncio

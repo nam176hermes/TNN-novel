@@ -5,6 +5,10 @@ Auto-import watcher: scans NovelTNN downloads folder → pushes to pipeline API.
 Scans recursively for *.txt files, posts each to /api/import/paste,
 moves imported files to an "imported" subfolder to prevent re-processing.
 
+Set AUTO_IMPORT_WATCH_DIR to choose a directory.  Without it, the watcher
+uses ~/Downloads/NovelTNN so it works on native WSL, Linux, and macOS without
+depending on a Windows mount.
+
 Usage:
     python3 auto_import_watcher.py            # one-shot scan
     python3 auto_import_watcher.py --watch    # continuous (poll every 30s)
@@ -25,9 +29,16 @@ import requests
 PIPELINE_BASE = os.getenv("NOVEL_PIPELINE_URL", "http://localhost:7860")
 ADMIN_USERNAME = os.getenv("MOBILE_API_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("MOBILE_API_ADMIN_PASSWORD", "")
-WIN_DOWNLOAD_DIR = Path("/mnt/c/Users/thenam/Downloads/NovelTNN")
 IMPORTED_DIR_NAME = "_imported"
 POLL_INTERVAL = 30  # seconds
+
+
+def configured_watch_dir() -> Path:
+    """Return the operator-configured watch directory without OS-specific paths."""
+    configured = os.getenv("AUTO_IMPORT_WATCH_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Downloads" / "NovelTNN"
 
 # ─── Auth ──────────────────────────────────────────────────────────
 
@@ -118,20 +129,21 @@ def parse_filename(filepath: Path, book_override: str = "") -> tuple[str, int, s
 
 # ─── Core logic ────────────────────────────────────────────────────
 
-def scan_and_import() -> dict:
+def scan_and_import(watch_dir: Path | None = None) -> dict:
     """Scan download dir, import new files, move to _imported.
-    
+
     Returns: {"imported": N, "skipped": N, "errors": N, "total": N}
     """
     stats = {"imported": 0, "skipped": 0, "errors": 0, "total": 0}
 
-    if not WIN_DOWNLOAD_DIR.exists():
-        log(f"Download dir not found: {WIN_DOWNLOAD_DIR}")
+    resolved_watch_dir = watch_dir or configured_watch_dir()
+    if not resolved_watch_dir.exists():
+        log(f"Download dir not found: {resolved_watch_dir}")
         return stats
 
     # Find all .txt files recursively, excluding _imported subdirs
     txt_files = []
-    for f in WIN_DOWNLOAD_DIR.rglob("*.txt"):
+    for f in resolved_watch_dir.rglob("*.txt"):
         # Skip files already in _imported
         if IMPORTED_DIR_NAME in f.parts:
             continue
@@ -148,7 +160,7 @@ def scan_and_import() -> dict:
         if parsed is None:
             log(f"  SKIP (unparseable): {filepath.name}")
             stats["skipped"] += 1
-            move_to_imported(filepath)
+            move_to_imported(filepath, resolved_watch_dir)
             continue
 
         book_title, chapter_num, chapter_title = parsed
@@ -161,7 +173,7 @@ def scan_and_import() -> dict:
             except Exception:
                 log(f"  ERROR (encoding): {filepath.name}")
                 stats["errors"] += 1
-                move_to_imported(filepath)
+                move_to_imported(filepath, resolved_watch_dir)
                 continue
 
         # Strip any leading chapter title line the extension adds
@@ -172,7 +184,7 @@ def scan_and_import() -> dict:
         if len(text) < 50:
             log(f"  SKIP (too short): {filepath.name}")
             stats["skipped"] += 1
-            move_to_imported(filepath)
+            move_to_imported(filepath, resolved_watch_dir)
             continue
 
         try:
@@ -187,16 +199,17 @@ def scan_and_import() -> dict:
             log(f"  FAIL: {filepath.name} — {e}")
             stats["errors"] += 1
 
-        move_to_imported(filepath)
+        move_to_imported(filepath, resolved_watch_dir)
 
     return stats
 
 
-def move_to_imported(filepath: Path) -> None:
+def move_to_imported(filepath: Path, watch_dir: Path | None = None) -> None:
     """Move file to _imported subfolder (preserves book subfolder structure)."""
-    # Relative path from WIN_DOWNLOAD_DIR
-    rel = filepath.relative_to(WIN_DOWNLOAD_DIR)
-    imported_path = WIN_DOWNLOAD_DIR / IMPORTED_DIR_NAME / rel
+    resolved_watch_dir = watch_dir or configured_watch_dir()
+    # Relative path from the configured watch directory.
+    rel = filepath.relative_to(resolved_watch_dir)
+    imported_path = resolved_watch_dir / IMPORTED_DIR_NAME / rel
     imported_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -220,22 +233,23 @@ if __name__ == "__main__":
         sys.exit(1)
 
     watch_mode = "--watch" in sys.argv
+    watch_dir = configured_watch_dir()
 
     if watch_mode:
         log(f"Starting watcher — polling every {POLL_INTERVAL}s")
-        log(f"  Scan dir: {WIN_DOWNLOAD_DIR}")
+        log(f"  Scan dir: {watch_dir}")
         log(f"  Pipeline: {PIPELINE_BASE}")
         while True:
             try:
-                stats = scan_and_import()
+                stats = scan_and_import(watch_dir)
                 if stats["total"] > 0:
                     log(f"Done: imported={stats['imported']} skipped={stats['skipped']} errors={stats['errors']}")
             except Exception as e:
                 log(f"Scan error: {e}")
             time.sleep(POLL_INTERVAL)
     else:
-        log(f"One-shot scan — {WIN_DOWNLOAD_DIR}")
-        stats = scan_and_import()
+        log(f"One-shot scan — {watch_dir}")
+        stats = scan_and_import(watch_dir)
         log(f"Done: total={stats['total']} imported={stats['imported']} skipped={stats['skipped']} errors={stats['errors']}")
         if stats["errors"] > 0:
             sys.exit(1)

@@ -1,7 +1,9 @@
 {
   "name": "Novel-TNN Translator",
   "short_name": "Novel-TNN",
+  "id": "/",
   "description": "Single-operator Chinese to Vietnamese novel translation, reader, export, and audiobook dashboard.",
+  "lang": "vi",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

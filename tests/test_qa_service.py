@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from app.database.db import add_book, add_chapter, init_db, save_qa_report, update_chapter_paths
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
@@ -9,6 +12,52 @@ def make_pipeline(db_path):
     pipeline = object.__new__(PipelineService)
     pipeline.db_path = db_path
     return pipeline
+
+
+def test_qa_service_import_does_not_import_pipeline_service() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.modules.pop('app.mobile_api.services.pipeline_service', None); "
+                "import app.mobile_api.services.qa_service; "
+                "assert 'app.mobile_api.services.pipeline_service' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_qa_service_accepts_chapter_content_reader_protocol(temp_db_path, tmp_path) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
+
+    class RecordingContentReader:
+        db_path = temp_db_path
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def get_chapter_source(self, requested_chapter_id: int) -> str | None:
+            self.calls.append(("source", requested_chapter_id))
+            return "第一段。"
+
+        def get_chapter_translation(self, requested_chapter_id: int) -> str | None:
+            self.calls.append(("translation", requested_chapter_id))
+            return "Đoạn thứ nhất."
+
+    reader = RecordingContentReader()
+    report = QAService(reader).run_deterministic_qa(book_id, chapter_id)
+
+    assert report["overall_status"] == "PASS"
+    assert reader.calls == [("source", chapter_id), ("translation", chapter_id)]
 
 
 def test_qa_summary_treats_saved_0_to_10_score_as_pass(temp_db_path) -> None:

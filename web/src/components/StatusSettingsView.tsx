@@ -1,4 +1,4 @@
-import type { SystemStatus } from '../api/types';
+import type { JobStatus, RecoveryFreshness, SystemBackupItem, SystemStatus } from '../api/types';
 import { formatError } from '../state/types';
 import { useState } from 'react';
 import {
@@ -25,6 +25,16 @@ type StatusSettingsViewProps = {
   refreshIntervalSeconds?: number;
   retryLoading?: boolean;
   status: SystemStatus | null;
+  backupBusy?: boolean;
+  backupError?: string;
+  backupItems?: SystemBackupItem[];
+  backupJob?: JobStatus | null;
+  backupListLoading?: boolean;
+  latestBackup?: SystemBackupItem | null;
+  onCreateBackup?(): void | Promise<void>;
+  onCreateEncryptedBackup?(): void | Promise<void>;
+  onCancelBackup?(): void | Promise<void>;
+  onDownloadBackup?(filename: string): void | Promise<void>;
 };
 
 function formatBytes(value: number): string {
@@ -35,6 +45,65 @@ function formatBytes(value: number): string {
 
 function yesNo(value: boolean, yes = 'Bật', no = 'Tắt'): string {
   return value ? yes : no;
+}
+
+function backupStatusLabel(status: SystemBackupItem['metadata_status']): string {
+  return {
+    READY: 'Sẵn sàng',
+    METADATA_MISSING: 'Thiếu metadata',
+    METADATA_INVALID: 'Metadata không hợp lệ',
+    ARTIFACT_MISSING: 'Thiếu archive',
+    ARTIFACT_INVALID: 'Archive không hợp lệ',
+    UNSUPPORTED_FORMAT: 'Định dạng không hỗ trợ',
+  }[status];
+}
+
+function recoveryStateLabel(state: RecoveryFreshness['state']): string {
+  return {
+    fresh: 'Fresh',
+    stale: 'Stale',
+    missing: 'Missing',
+    corrupt: 'Invalid',
+    future: 'Future',
+    wrong_release: 'Wrong release',
+  }[state];
+}
+
+function RecoveryReceipt({
+  label,
+  receipt,
+  refreshFailed,
+  refreshing,
+}: {
+  label: string;
+  receipt: RecoveryFreshness;
+  refreshFailed: boolean;
+  refreshing: boolean;
+}) {
+  return (
+    <article aria-label={label}>
+      <div className="section-heading-row">
+        <strong>{label}</strong>
+        <span className={`status-chip ${receipt.state === 'fresh' && !refreshFailed && !refreshing ? 'status-chip-success' : 'status-chip-warning'}`}>
+          {refreshFailed ? 'Refresh failed' : refreshing ? 'Refreshing' : recoveryStateLabel(receipt.state)}
+        </span>
+      </div>
+      <dl>
+        <dt>Completed</dt><dd>{receipt.completed_at ?? '-'}</dd>
+        <dt>Producer</dt><dd>{receipt.producer_version ?? '-'}</dd>
+        <dt>Age</dt><dd>{receipt.age_seconds === null ? '-' : `${receipt.age_seconds.toLocaleString()} seconds`}</dd>
+        <dt>Hash ID</dt><dd>{receipt.archive_hash_id ?? '-'}</dd>
+        <dt>Threshold</dt><dd>{receipt.threshold_seconds.toLocaleString()} seconds</dd>
+      </dl>
+      {Object.keys(receipt.validation_counts).length ? (
+        <ul className="compact-list">
+          {Object.entries(receipt.validation_counts).map(([name, count]) => (
+            <li key={name}><span>{name}</span><strong>{count.toLocaleString()}</strong></li>
+          ))}
+        </ul>
+      ) : null}
+    </article>
+  );
 }
 
 function statusRows(status: SystemStatus) {
@@ -55,8 +124,11 @@ function statusRows(status: SystemStatus) {
       `${interruptedJobs.toLocaleString()} interrupted · ${failedJobs.toLocaleString()} failed`,
     ],
     ['Version', [status.app_version, status.build].filter(Boolean).join(' · ') || '-'],
-    ['Database', status.database_path || 'Ẩn trong public deploy'],
-    ['Data directory', status.data_dir || '-'],
+    ['Database available', yesNo(status.database_available, 'Available', 'Unavailable')],
+    ['Data storage available', yesNo(status.data_directory_available, 'Available', 'Unavailable')],
+    ['Storage health', status.storage_health || 'unknown'],
+    ['Storage label', status.storage_label || 'Configured data storage'],
+    ['Data size', formatBytes(status.data_size_bytes)],
     ['Cache', `${status.cache_count.toLocaleString()} mục · ${formatBytes(status.cache_size_bytes)}`],
     ['Database size', formatBytes(status.db_size_bytes)],
   ];
@@ -71,6 +143,16 @@ export default function StatusSettingsView({
   refreshIntervalSeconds = 10,
   retryLoading = false,
   status,
+  backupBusy = false,
+  backupError = '',
+  backupItems,
+  backupJob = null,
+  backupListLoading = false,
+  latestBackup = null,
+  onCreateBackup,
+  onCreateEncryptedBackup,
+  onCancelBackup,
+  onDownloadBackup,
 }: StatusSettingsViewProps) {
   const [backupHelpOpen, setBackupHelpOpen] = useState(false);
   const failedJob = status?.last_failed_job ?? null;
@@ -79,9 +161,14 @@ export default function StatusSettingsView({
   const retryCount = failedJob?.retry_count ?? 0;
   const recentOperationalErrors = status?.recent_operational_errors ?? [];
   const recentBackupEvent = status?.recent_backup_events?.[0] ?? null;
+  const visibleBackups = backupItems ?? (latestBackup ? [latestBackup] : []);
+  const newestBackup = visibleBackups[0] ?? latestBackup;
   const rows = status ? statusRows(status) : [];
   const firstColumnRows = rows.slice(0, 7);
   const secondColumnRows = rows.slice(7);
+  const backupJobActive = Boolean(
+    backupJob && ['queued', 'running'].includes(backupJob.status.toLowerCase()),
+  );
 
   return (
     <section aria-labelledby="system-status-title" className="workflow-management-view status-settings-view">
@@ -164,10 +251,37 @@ export default function StatusSettingsView({
             </div>
           </section>
 
-          <section aria-label="Thông tin runtime" className="panel status-runtime-panel">
-            <div className="panel-header">
-              <h3>Thông tin Runtime</h3>
+          <section aria-label="Recovery freshness" className="panel status-detail-panel">
+            <div className="panel-header"><h3>Recovery freshness</h3></div>
+            <div className="status-runtime-grid">
+              <RecoveryReceipt
+                label="External backup"
+                refreshFailed={Boolean(error)}
+                refreshing={loading}
+                receipt={status.external_backup ?? {
+                  state: 'missing', age_seconds: null, completed_at: null, archive_hash_id: null,
+                  validation_counts: {}, producer_version: null, threshold_seconds: 172800,
+                }}
+              />
+              <RecoveryReceipt
+                label="Restore drill"
+                refreshFailed={Boolean(error)}
+                refreshing={loading}
+                receipt={status.restore_drill ?? {
+                  state: 'missing', age_seconds: null, completed_at: null, archive_hash_id: null,
+                  validation_counts: {}, producer_version: null, threshold_seconds: 691200,
+                }}
+              />
             </div>
+          </section>
+
+          <details aria-label="Thông tin runtime" className="panel status-runtime-panel status-detail-panel">
+            <summary>
+              <span>
+                <strong>Thông tin Runtime</strong>
+                <small>Provider, jobs, storage và cấu hình vận hành.</small>
+              </span>
+            </summary>
             <div className="status-runtime-grid">
               {[firstColumnRows, secondColumnRows].map((column, index) => (
                 <table className="provider-table status-settings-table" key={index}>
@@ -182,12 +296,15 @@ export default function StatusSettingsView({
                 </table>
               ))}
             </div>
-          </section>
+          </details>
 
-          <section aria-label="Hiệu suất hệ thống" className="panel status-performance-panel">
-            <div className="panel-header">
-              <h3>Hiệu suất hệ thống</h3>
-            </div>
+          <details aria-label="Hiệu suất hệ thống" className="panel status-performance-panel status-detail-panel">
+            <summary>
+              <span>
+                <strong>Hiệu suất hệ thống</strong>
+                <small>Queue, job đang chạy, cache và kích thước DB.</small>
+              </span>
+            </summary>
             <div className="status-performance-grid">
               <article>
                 <ListChecks aria-hidden="true" size={18} />
@@ -218,7 +335,7 @@ export default function StatusSettingsView({
                 <i className="sparkline sparkline-gold" />
               </article>
             </div>
-          </section>
+          </details>
         </>
       ) : !loading ? (
         <p className="empty-detail">Chưa tải được trạng thái hệ thống.</p>
@@ -290,13 +407,13 @@ export default function StatusSettingsView({
       ) : null}
 
       {recentOperationalErrors.length > 0 ? (
-        <section aria-label="Recent operational errors" className="panel">
-          <div className="section-heading-row">
-            <div>
-              <p className="section-label">Operations</p>
-              <h3>Recent operational errors</h3>
-            </div>
-          </div>
+        <details aria-label="Recent operational errors" className="panel status-detail-panel">
+          <summary>
+            <span>
+              <strong>Lỗi vận hành gần đây</strong>
+              <small>{recentOperationalErrors.length.toLocaleString('vi-VN')} sự kiện cần kiểm tra.</small>
+            </span>
+          </summary>
           <ul className="compact-list">
             {recentOperationalErrors.slice(0, 5).map((event) => (
               <li key={event.id}>
@@ -305,27 +422,84 @@ export default function StatusSettingsView({
               </li>
             ))}
           </ul>
-        </section>
+        </details>
       ) : null}
 
       {status?.backup_recommendation ? (
-        <section aria-label="Backup" className="panel backup-status-panel">
-          <div className="section-heading-row">
-            <div>
-              <p className="section-label">Backup</p>
-              <h3>Khôi phục dữ liệu</h3>
+        <details aria-label="System backup" className="panel backup-status-panel status-detail-panel">
+          <summary>
+            <span>
+              <strong>Sao lưu hệ thống</strong>
+              <small>{newestBackup ? `Mới nhất: ${newestBackup.filename}` : 'Tạo và tải backup vận hành.'}</small>
+            </span>
+            <div className="backup-action-row">
+              <button
+                aria-expanded={backupHelpOpen}
+                className="secondary-action"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setBackupHelpOpen((current) => !current);
+                }}
+                type="button"
+              >
+                <ArchiveRestore aria-hidden="true" size={16} />
+                Mở hướng dẫn
+              </button>
+              <button
+                className="secondary-action"
+                disabled={backupBusy || !onCreateEncryptedBackup}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void onCreateEncryptedBackup?.();
+                }}
+                type="button"
+              >
+                <ShieldCheck aria-hidden="true" size={16} />
+                Backup mã hóa
+              </button>
+              <button
+                className="primary-action"
+                disabled={backupBusy || !onCreateBackup}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void onCreateBackup?.();
+                }}
+                type="button"
+              >
+                <Database aria-hidden="true" size={16} />
+                {backupBusy ? 'Đang tạo backup...' : 'Tạo backup'}
+              </button>
             </div>
-            <button
-              aria-expanded={backupHelpOpen}
-              className="secondary-action"
-              onClick={() => setBackupHelpOpen((current) => !current)}
-              type="button"
-            >
-              <ArchiveRestore aria-hidden="true" size={16} />
-              Mở hướng dẫn
-            </button>
-          </div>
+          </summary>
           <p>{status.backup_recommendation}</p>
+          <p className="empty-detail">
+            Book Export nằm ở mục Xuất file. System Backup dùng để khôi phục DB, private assets, glossary, QA, jobs và cấu hình vận hành.
+          </p>
+          <p className="empty-detail">
+            Secrets và provider API keys bị loại khỏi backup mặc định. Muốn kèm secrets phải dùng backup mã hóa.
+          </p>
+          {backupJob && backupJobActive ? (
+            <section aria-label="Tiến độ backup" className="inline-help-panel">
+              <div className="section-heading-row">
+                <div>
+                  <strong>{backupJob.message || 'Backup đang chạy'}</strong>
+                  <p className="empty-detail">
+                    {backupJob.progress.toLocaleString()} / {backupJob.total.toLocaleString()}
+                  </p>
+                </div>
+                <button
+                  className="secondary-action"
+                  disabled={!onCancelBackup}
+                  onClick={() => {
+                    void onCancelBackup?.();
+                  }}
+                  type="button"
+                >
+                  Hủy backup
+                </button>
+              </div>
+            </section>
+          ) : null}
           {backupHelpOpen ? (
             <div className="inline-help-panel">
               <p>
@@ -334,12 +508,55 @@ export default function StatusSettingsView({
               </p>
             </div>
           ) : null}
+          {backupError ? <p className="status-error">{backupError}</p> : null}
+          {backupListLoading ? <p className="empty-detail">Đang tải danh sách backup...</p> : null}
+          {!backupListLoading && visibleBackups.length === 0 ? (
+            <p className="empty-detail">Chưa có backup hệ thống.</p>
+          ) : null}
+          {visibleBackups.length > 0 ? (
+            <ul aria-label="Danh sách backup" className="backup-inventory-list">
+              {visibleBackups.map((backup) => (
+                <li key={backup.filename}>
+                  <div className="backup-inventory-main">
+                    <strong>{backup.filename}</strong>
+                    <span>
+                      {formatBytes(backup.size_bytes)} · {backup.encrypted ? 'mã hóa' : 'plain'} · secrets{' '}
+                      {backup.secrets_included ? 'có' : 'không'}
+                    </span>
+                    {backup.repair_needed ? (
+                      <small>Chạy lệnh backup-metadata-repair trên máy chủ để sửa metadata.</small>
+                    ) : null}
+                  </div>
+                  <div className="backup-inventory-actions">
+                    <span
+                      className={`status-chip ${backup.metadata_status === 'READY' ? 'status-chip-success' : 'status-chip-warning'}`}
+                    >
+                      {backupStatusLabel(backup.metadata_status)}
+                    </span>
+                    {backup.download_url && backup.archive_available ? (
+                      <button
+                        className="secondary-action"
+                        disabled={!onDownloadBackup}
+                        onClick={() => {
+                          void onDownloadBackup?.(backup.filename);
+                        }}
+                        type="button"
+                      >
+                        <HardDrive aria-hidden="true" size={16} />
+                        Tải backup
+                      </button>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : null}
           {recentBackupEvent ? (
             <p className="empty-detail">
               Last backup event: {recentBackupEvent.event_type} · {recentBackupEvent.message}
             </p>
           ) : null}
-        </section>
+        </details>
       ) : null}
     </section>
   );

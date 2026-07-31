@@ -1,14 +1,24 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ReaderAnnotation } from '../api/types';
 import type { Chapter, TranslatedBookSummary } from '../api/types';
-import { cacheReaderAudio, getCachedChapterAsync, putCachedChapter } from '../state/readerCache';
+import {
+  cacheReaderAudio,
+  getCachedChapterAsync,
+  putCachedChapter,
+  removeCachedChapterAsync,
+} from '../state/readerCache';
 import { saveCachedReaderDictionaryResult } from '../state/readerDictionaryCache';
 import { chapterMarksKey, loadReaderMarks, saveReaderMarks } from '../state/readerMarks';
 import { loadReaderProgressSnapshot, saveReaderProgressSnapshot } from '../state/readerProgress';
 import { buildReaderProgressTextAnchor } from '../state/readerProgressAnchor';
 import ReaderView, { type ReaderApiClient } from './ReaderView';
+import { loadReaderSettings, loadReaderTextMode, saveReaderTextMode } from './reader/readerSettings';
+
+vi.mock('../state/serviceWorker', () => ({
+  verifyReaderOfflineAppShellReady: vi.fn().mockResolvedValue(undefined),
+}));
 
 const books: TranslatedBookSummary[] = [
   {
@@ -38,6 +48,35 @@ const chapters: Chapter[] = [
   { id: 104, book_id: 42, chapter_number: 4, title: 'Chưa dịch', status: 'cleaned', audio_path: null, has_translation: false },
 ];
 
+const manifestFixtureForReaderTest = {
+  assets: [],
+  audio: [],
+  cachedAt: '2026-07-14T00:00:00Z',
+  checksum: 'failed-entry',
+  cover: null,
+  dictionary: {
+    cached: false,
+    chapterPacks: [],
+    counts: { builtin: 0, glossary: 0, offline_dictionary: 0, xray: 0 },
+    files: [],
+    generatedAt: '',
+    sourceCount: 0,
+  },
+  summary: {
+    assetsCached: 0,
+    assetsFailed: 0,
+    assetsTotal: 0,
+    audioCached: 0,
+    audioFailed: 0,
+    audioTotal: 0,
+    chaptersCached: 0,
+    chaptersFailed: 0,
+    chaptersTotal: 0,
+    dictionaryCached: false,
+  },
+  version: 3,
+};
+
 const remoteHighlight: ReaderAnnotation = {
   id: 700,
   book_id: 42,
@@ -64,6 +103,7 @@ function mockReaderApiClient(overrides: Partial<ReaderApiClient> = {}): ReaderAp
     chapterAudioUrl: vi.fn((bookId: number, chapterId: number) => (
       `http://test/api/books/${bookId}/chapters/${chapterId}/audio`
     )),
+    cancelJob: vi.fn().mockResolvedValue(undefined),
     createReaderAnnotation: vi.fn().mockResolvedValue(remoteHighlight),
     deleteReaderAnnotation: vi.fn().mockResolvedValue(undefined),
     deleteReaderDictionary: vi.fn().mockResolvedValue(undefined),
@@ -280,6 +320,10 @@ function renderReader(overrides: Partial<Parameters<typeof ReaderView>[0]> = {})
     selectedChapter: chapters[1],
     selectedChapterId: 102,
     contentHtml: '',
+    qaError: '',
+    qaReport: null,
+    qaState: 'empty' as const,
+    sourceText: '',
     textError: '',
     textState: 'ready' as const,
     translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
@@ -327,6 +371,13 @@ describe('ReaderView', () => {
     expect(screen.getByRole('button', { name: 'Cài đặt chữ' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Thêm tùy chọn' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Điều khiển đọc' })).not.toBeInTheDocument();
+    expect(reader.querySelectorAll('.reader-top-bar')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-bottom-bar')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-reference-chapter-nav')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-text-mode-switcher')).toHaveLength(1);
+    expect(reader.querySelectorAll('.reader-reference-actions')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Quay lại thư viện' })).toHaveClass('reader-icon-button');
+    expect(screen.getByRole('button', { name: 'Chương trước' })).toHaveClass('reader-chapter-nav-button');
 
     await userEvent.click(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }));
     expect(reader).toHaveAttribute('data-chrome-visible', 'false');
@@ -386,7 +437,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cài đặt chữ' }));
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     await userEvent.click(within(sheet).getByRole('button', { name: 'Sans' }));
     fireEvent.change(within(sheet).getByLabelText('Cỡ chữ'), { target: { value: '20' } });
     fireEvent.change(within(sheet).getByLabelText('Giãn dòng'), { target: { value: '2' } });
@@ -409,7 +460,7 @@ describe('ReaderView', () => {
       '--reader-margin-scale': '1.2',
       '--reader-paragraph-spacing': '1.4em',
     });
-    expect(JSON.parse(window.localStorage.getItem('novel-reader-settings-v1') ?? '{}')).toMatchObject({
+    expect(loadReaderSettings(window.localStorage)).toMatchObject({
       characterSpacing: 0.35,
       fontFamily: 'sans',
       fontSize: 20,
@@ -424,7 +475,7 @@ describe('ReaderView', () => {
 
   it('renders Vietnamese, raw, and split reading modes without duplicating the default text block', async () => {
     renderReader({
-      contentHtml: '<p>原文第一段。</p><p>原文第二段。</p>',
+      sourceText: '原文第一段。\n\n原文第二段。',
       translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
     });
 
@@ -444,6 +495,114 @@ describe('ReaderView', () => {
     expect(screen.getByRole('article', { name: 'Nội dung bản dịch tiếng Việt' })).toBeInTheDocument();
     expect(screen.getByText('原文第二段。')).toBeInTheDocument();
     expect(screen.getByText('Lục ca, ta cảm tạ huynh.')).toBeInTheDocument();
+  });
+
+  it('derives raw and split availability from current source and translation resources', () => {
+    renderReader({ sourceText: '原文只有一段。', translationText: '' });
+
+    expect(screen.getByRole('button', { name: 'Raw' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Song song' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Song song' })).toHaveAttribute(
+      'title',
+      'Cần cả raw/source tiếng Trung và bản dịch tiếng Việt',
+    );
+    expect(screen.getByRole('button', { name: 'Raw gọn' })).toBeDisabled();
+  });
+
+  it('disables source-dependent modes with a truthful current-chapter reason', () => {
+    renderReader({ sourceText: '', translationText: 'Chỉ có bản dịch.' });
+
+    expect(screen.getByRole('button', { name: 'Raw' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Raw' })).toHaveAttribute(
+      'title',
+      'Chương hiện tại chưa có raw/source tiếng Trung',
+    );
+    expect(screen.getByRole('button', { name: 'Song song' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Raw gọn' })).toBeDisabled();
+  });
+
+  it('falls back safely when the persisted mode is unavailable for the current chapter', async () => {
+    saveReaderTextMode('split', window.localStorage);
+    renderReader({ sourceText: '原文只有一段。', translationText: '' });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Raw' })).toHaveAttribute('aria-pressed', 'true'));
+    expect(loadReaderTextMode(window.localStorage)).toBe('raw');
+  });
+
+  it('persists the selected reader text mode across reader mounts', async () => {
+    renderReader({
+      sourceText: '原文第一段。',
+      translationText: 'Hàn Lập khẽ gật đầu.',
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    expect(loadReaderTextMode(window.localStorage)).toBe('raw');
+
+    cleanup();
+    renderReader({
+      sourceText: '原文第一段。',
+      translationText: 'Hàn Lập khẽ gật đầu.',
+    });
+
+    expect(screen.getByRole('button', { name: 'Raw' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('article', { name: 'Nội dung raw tiếng Trung' })).toBeInTheDocument();
+  });
+
+  it('renders raw-collapsed mode without exposing raw paragraphs until expanded', async () => {
+    renderReader({
+      sourceText: '原文第一段。\n\n原文第二段。',
+      translationText: 'Hàn Lập khẽ gật đầu.\n\nLục ca, ta cảm tạ huynh.',
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Raw gọn' }));
+
+    expect(screen.getByRole('article', { name: 'Bản dịch tiếng Việt kèm raw gọn' })).toBeInTheDocument();
+    expect(screen.getByText('Hàn Lập khẽ gật đầu.')).toBeInTheDocument();
+    expect(screen.queryByText('原文第一段。')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Mở raw đoạn 1' }));
+
+    expect(screen.getByText('原文第一段。')).toBeInTheDocument();
+    expect(screen.queryByText('原文第二段。')).not.toBeInTheDocument();
+  });
+
+  it('renders QA overlay summary and paragraph badges from the chapter QA report', async () => {
+    renderReader({
+      contentHtml: '<p>青云宗弟子取出灵石。</p><p>他进入筑基境。</p>',
+      qaState: 'ready',
+      qaReport: {
+        book_id: 42,
+        chapter_id: 102,
+        overall_status: 'WARNING',
+        chinese_leakage_count: 1,
+        glossary_violations: [
+          {
+            paragraph_index: 0,
+            source_term: '灵石',
+            expected_translation: 'linh thạch',
+            reason: 'Locked glossary term was not followed.',
+          },
+        ],
+        quality_score: 6.4,
+        repetition_warning: true,
+        term_consistency_status: 'FAIL',
+        report_json: {
+          internal_debug: '<script>alert(1)</script>',
+        },
+      },
+      translationText: 'Đệ tử lấy ra 灵石.\n\nĐệ tử lấy ra 灵石.',
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'QA' }));
+
+    const summary = screen.getByRole('region', { name: 'Tóm tắt QA chương' });
+    expect(within(summary).getByText('WARNING')).toBeInTheDocument();
+    expect(within(summary).getByText('Rò chữ Trung: 1')).toBeInTheDocument();
+    expect(within(summary).getByText('Vi phạm thuật ngữ: 1')).toBeInTheDocument();
+    expect(screen.getAllByText('Rò chữ Trung')).toHaveLength(1);
+    expect(screen.getAllByText('Vi phạm thuật ngữ')).toHaveLength(1);
+    expect(screen.queryByText(/internal_debug/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/<script>/)).not.toBeInTheDocument();
   });
 
   it('switches between scrolling and paginated reading modes', async () => {
@@ -1841,11 +2000,78 @@ describe('ReaderView', () => {
     const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
 
     await waitFor(() => expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument());
+    expect(within(menu).getByText(/xóa nội dung Reader riêng tư/)).toBeInTheDocument();
+    expect(within(menu).getByText(/dùng các nút bên dưới để xóa sớm hơn/)).toBeInTheDocument();
     expect(within(menu).getByText('Chương sau đã cache')).toBeInTheDocument();
     expect(within(menu).getByText(/^Cache \d+ KB$/)).toBeInTheDocument();
     expect(within(menu).getByText('Manifest 2 chương · abc12345')).toBeInTheDocument();
     expect(within(menu).getByText('Coverage 2/2 chương · 0 lỗi')).toBeInTheDocument();
     expect(within(menu).getByText('Resources 1/1 asset · 1/1 audio · 12 mục từ điển')).toBeInTheDocument();
+  });
+
+  it('refreshes current offline availability after the established cache update event', async () => {
+    renderReader();
+    await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    await waitFor(() => expect(within(menu).getByText('Chương hiện tại chưa cache')).toBeInTheDocument());
+    expect(screen.queryByLabelText('Có sẵn offline')).not.toBeInTheDocument();
+
+    act(() => {
+      putCachedChapter({
+        bookId: 42,
+        chapterId: 102,
+        html: '',
+        sourceText: '',
+        text: 'Hàn Lập khẽ gật đầu.',
+      });
+    });
+
+    expect(await screen.findByLabelText('Có sẵn offline')).toBeInTheDocument();
+    expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument();
+  });
+
+  it('renders cached chapter content supplied by the offline controller while live text loads', async () => {
+    putCachedChapter({
+      bookId: 42,
+      chapterId: 102,
+      html: '',
+      sourceText: '舊原文',
+      text: 'Bản dịch cache từ controller.',
+    });
+
+    renderReader({
+      contentHtml: '',
+      textError: '',
+      textState: 'loading',
+      translationText: '',
+    });
+
+    expect(await screen.findByText('Bản dịch cache từ controller.')).toBeInTheDocument();
+    expect(screen.queryByText('Đang tải bản đọc...')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Có sẵn offline')).toBeInTheDocument();
+  });
+
+  it('does not show the offline badge for a failed manifest entry without cached content', async () => {
+    window.localStorage.setItem('novel-reader-offline-manifest-v1', JSON.stringify({
+      42: {
+        ...manifestFixtureForReaderTest,
+        bookId: 42,
+        chapterIds: [102],
+        chapters: [{ cached: false, failed: true, htmlCached: false, id: 102, textCached: false }],
+        summary: {
+          ...manifestFixtureForReaderTest.summary,
+          chaptersCached: 0,
+          chaptersFailed: 1,
+          chaptersTotal: 1,
+        },
+      },
+    }));
+
+    renderReader({ contentHtml: '', textError: '', textState: 'ready', translationText: '' });
+    await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    await waitFor(() => expect(within(menu).getByText('Chương hiện tại chưa cache')).toBeInTheDocument());
+    expect(screen.queryByLabelText('Có sẵn offline')).not.toBeInTheDocument();
   });
 
   it('caches the whole translated book for offline reading from the more menu', async () => {
@@ -2018,6 +2244,52 @@ describe('ReaderView', () => {
     expect(window.localStorage.getItem('novel-reader-cache-v1')).not.toContain('"chapterId":102');
   });
 
+  it('does not automatically recreate chapter audio after the user removes its cache', async () => {
+    const originalCreateObjectUrl = URL.createObjectURL;
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:reader-audio-before-remove'),
+    });
+    const seedFetcher = vi.fn().mockResolvedValue({
+      blob: async () => new Blob(['seed-audio'], { type: 'audio/mpeg' }),
+      headers: new Headers({ 'content-type': 'audio/mpeg' }),
+      ok: true,
+    }) as unknown as typeof fetch;
+    const automaticFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      blob: async () => new Blob(['unexpected-audio'], { type: 'audio/mpeg' }),
+      headers: new Headers({ 'content-type': 'audio/mpeg' }),
+      ok: true,
+    } as Response);
+
+    try {
+      await cacheReaderAudio(42, 102, 'http://test/api/books/42/chapters/102/audio', seedFetcher);
+      putCachedChapter({
+        bookId: 42,
+        chapterId: 102,
+        html: '',
+        sourceText: '',
+        text: 'Hàn Lập khẽ gật đầu.',
+      });
+      const audioChapters = chapters.map((chapter) => (
+        chapter.id === 102 ? { ...chapter, audio_path: '/tmp/chapter-102.mp3' } : chapter
+      ));
+      renderReader({ chapters: audioChapters, selectedChapter: audioChapters[1] });
+
+      await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled());
+      await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
+      const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+      await waitFor(() => expect(within(menu).getByText('Chương hiện tại đã cache')).toBeInTheDocument());
+      await userEvent.click(within(menu).getByRole('button', { name: 'Xóa cache chương hiện tại' }));
+
+      expect(await within(menu).findByText('Đã xóa cache offline Chương 2.')).toBeInTheDocument();
+      await act(async () => Promise.resolve());
+      expect(automaticFetch).not.toHaveBeenCalled();
+    } finally {
+      await removeCachedChapterAsync(42, 102);
+      Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: originalCreateObjectUrl });
+    }
+  });
+
   it('uploads an offline reader dictionary from the more menu', async () => {
     const apiClient = mockReaderApiClient({
       getReaderDictionaryPack: vi.fn().mockResolvedValue({
@@ -2123,6 +2395,7 @@ describe('ReaderView', () => {
       expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
 
       const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(80);
       Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
       Object.defineProperty(main, 'clientHeight', { configurable: true, value: 600 });
       Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
@@ -2130,6 +2403,53 @@ describe('ReaderView', () => {
       fireEvent.scroll(main);
 
       expect(screen.getByText('Đoạn 120. Nội dung luyện khí.')).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(idleWindow, 'requestIdleCallback', {
+        configurable: true,
+        value: originalRequestIdleCallback,
+      });
+      Object.defineProperty(idleWindow, 'cancelIdleCallback', {
+        configurable: true,
+        value: originalCancelIdleCallback,
+      });
+    }
+  });
+
+  it('renders long QA overlay chapters in scroll chunks', async () => {
+    const idleWindow = window as TestIdleWindow;
+    const originalRequestIdleCallback = idleWindow.requestIdleCallback;
+    const originalCancelIdleCallback = idleWindow.cancelIdleCallback;
+    Object.defineProperty(idleWindow, 'requestIdleCallback', {
+      configurable: true,
+      value: vi.fn(() => 1),
+    });
+    Object.defineProperty(idleWindow, 'cancelIdleCallback', {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    try {
+      renderReader({
+        translationText: Array.from(
+          { length: 180 },
+          (_, index) => `Đoạn QA ${index + 1}. Nội dung luyện khí.`,
+        ).join('\n\n'),
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: 'QA' }));
+
+      expect(screen.getByText('Đoạn QA 1. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(screen.queryByText('Đoạn QA 120. Nội dung luyện khí.')).not.toBeInTheDocument();
+      expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
+
+      const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
+      Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
+      Object.defineProperty(main, 'clientHeight', { configurable: true, value: 600 });
+      Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
+      fireEvent.scroll(main);
+
+      expect(screen.getByText('Đoạn QA 120. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(160);
     } finally {
       Object.defineProperty(idleWindow, 'requestIdleCallback', {
         configurable: true,
@@ -3159,7 +3479,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
     await userEvent.click(screen.getByRole('button', { name: 'Nghe audio chương' }));
 
-    const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+    const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
     expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
       'src',
       'http://test/api/books/42/chapters/102/audio',
@@ -3215,7 +3535,7 @@ describe('ReaderView', () => {
     await waitFor(() => expect(apiClient.getBookAudioPlaylist).toHaveBeenCalledWith(42));
     await userEvent.click(await screen.findByRole('button', { name: 'Nghe audio chương' }));
 
-    const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+    const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
     expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
       'src',
       '/api/books/42/chapters/102/audio',
@@ -3252,7 +3572,7 @@ describe('ReaderView', () => {
       await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
       await userEvent.click(screen.getByRole('button', { name: 'Nghe audio chương' }));
 
-      const audioBar = screen.getByRole('region', { name: 'Audio chương' });
+      const audioBar = await screen.findByRole('region', { name: 'Audio chương' });
       await waitFor(() => expect(within(audioBar).getByLabelText('Audio Chương 2 · Thanh Ngưu trấn')).toHaveAttribute(
         'src',
         'blob:reader-audio-102',
@@ -3296,6 +3616,75 @@ describe('ReaderView', () => {
     expect(await screen.findByText(/Đã tạo job audio tts-read/)).toBeInTheDocument();
   });
 
+  it('shows a compact reader audio panel for chapters with and without audio', async () => {
+    const apiClient = mockReaderApiClient();
+    const audioChapters = chapters.map((chapter) => (
+      chapter.id === 102 ? { ...chapter, audio_path: '/tmp/chapter-102.mp3' } : chapter
+    ));
+    renderReader({
+      apiClient,
+      chapters: audioChapters,
+      selectedChapter: audioChapters[1],
+    });
+
+    const panel = screen.getByRole('region', { name: 'Audio và TTS chương' });
+    expect(within(panel).getByText('Audio có sẵn')).toBeInTheDocument();
+    expect(within(panel).getByRole('button', { name: 'Nghe audio' })).toBeInTheDocument();
+    expect(within(panel).getByRole('link', { name: 'Tải MP3' })).toHaveAttribute(
+      'href',
+      'http://test/api/books/42/chapters/102/audio/download',
+    );
+
+    await userEvent.click(within(panel).getByRole('button', { name: 'Nghe audio' }));
+
+    expect(await screen.findByRole('region', { name: 'Audio chương' })).toBeInTheDocument();
+  });
+
+  it('warns about QA FAIL and Chinese leakage before starting reader TTS', async () => {
+    const apiClient = mockReaderApiClient();
+    renderReader({
+      apiClient,
+      qaState: 'ready',
+      qaReport: {
+        book_id: 42,
+        chapter_id: 102,
+        overall_status: 'FAIL',
+        chinese_leakage_count: 2,
+        glossary_violations: [],
+        quality_score: 3,
+        repetition_warning: false,
+      },
+      translationText: 'Đệ tử lấy ra 灵石.\n\nHắn đi tiếp.',
+    });
+
+    const panel = await screen.findByRole('region', { name: 'Audio và TTS chương' });
+    expect(within(panel).getByText(/QA đang FAIL/)).toBeInTheDocument();
+    expect(within(panel).getByText(/Còn 2 dấu hiệu rò chữ Trung/)).toBeInTheDocument();
+
+    await userEvent.click(within(panel).getByRole('button', { name: 'Tạo audio chương' }));
+
+    expect(apiClient.startTtsJob).toHaveBeenCalledWith(42, [102]);
+  });
+
+  it('shows missing translation warning and blocks chapter TTS when text is empty', () => {
+    const apiClient = mockReaderApiClient();
+    renderReader({
+      apiClient,
+      translationText: '',
+    });
+
+    const panel = screen.getByRole('region', { name: 'Audio và TTS chương' });
+    expect(within(panel).getByText(/Chưa có bản dịch tiếng Việt/)).toBeInTheDocument();
+    expect(within(panel).getByRole('button', { name: 'Tạo audio chương' })).toBeDisabled();
+  });
+
+  it('disables compact chapter TTS when the API connection is unavailable', () => {
+    renderReader({ apiClient: undefined });
+
+    const panel = screen.getByRole('region', { name: 'Audio và TTS chương' });
+    expect(within(panel).getByRole('button', { name: 'Tạo audio chương' })).toBeDisabled();
+  });
+
   it('shows TTS progress, failed chunks, friendly errors, and retry without leaking secrets', async () => {
     const apiClient = mockReaderApiClient({
       startTtsJob: vi.fn().mockResolvedValue({
@@ -3317,6 +3706,9 @@ describe('ReaderView', () => {
         status: 'failed',
         progress: 33,
         error_message: 'ffmpeg missing at /home/thenam176/private with sk-live-secret GEMINI_API_KEY',
+        audio_summary: {
+          warnings: ['1 completed chunk file is missing', 'Audio QA reported 2 warning(s)'],
+        },
         chunks: [
           { id: 'chunk-1', job_id: 'tts-failed-123456', chunk_index: 0, text_hash: 'a', status: 'completed' },
           {
@@ -3354,6 +3746,8 @@ describe('ReaderView', () => {
     expect(within(audioStatus).getByText('Job audio tts-fail')).toBeInTheDocument();
     expect(within(audioStatus).getByText('33%')).toBeInTheDocument();
     expect(within(audioStatus).getByText('2 chunk lỗi')).toBeInTheDocument();
+    expect(within(audioStatus).getByText('1 completed chunk file is missing')).toBeInTheDocument();
+    expect(within(audioStatus).getByText('Audio QA reported 2 warning(s)')).toBeInTheDocument();
     expect(within(audioStatus).getByText(/Thiếu ffmpeg/)).toBeInTheDocument();
     expect(audioStatus).not.toHaveTextContent('sk-live-secret');
     expect(audioStatus).not.toHaveTextContent('GEMINI_API_KEY');
@@ -3365,12 +3759,65 @@ describe('ReaderView', () => {
     expect(await screen.findByText(/Đã gửi retry TTS tts-retr/)).toBeInTheDocument();
   });
 
+  it('shows running TTS progress in the reader audio panel and cancels through the existing job API', async () => {
+    const apiClient = mockReaderApiClient({
+      startTtsJob: vi.fn().mockResolvedValue({
+        job_id: 'tts-running-123456',
+        status: 'pending',
+        message: 'TTS job started',
+      }),
+      getJobStatus: vi.fn().mockResolvedValue({
+        job_id: 'tts-running-123456',
+        job_type: 'tts',
+        status: 'running',
+        progress: 1,
+        total: 4,
+        current_chapter_id: 102,
+        current_chunk_index: 1,
+        total_chunks: 4,
+        provider: 'f5_vietnamese',
+        model: 'vivioice',
+        retry_count: 0,
+        message: 'Generating chunk 2',
+      }),
+      getTtsJob: vi.fn().mockResolvedValue({
+        job_id: 'tts-running-123456',
+        status: 'running',
+        progress: 25,
+        chunks: [
+          { id: 'chunk-1', job_id: 'tts-running-123456', chunk_index: 0, text_hash: 'a', status: 'completed' },
+          { id: 'chunk-2', job_id: 'tts-running-123456', chunk_index: 1, text_hash: 'b', status: 'running' },
+        ],
+      }),
+    });
+    renderReader({ apiClient });
+
+    const panel = screen.getByRole('region', { name: 'Audio và TTS chương' });
+    await userEvent.click(within(panel).getByRole('button', { name: 'Tạo audio chương' }));
+
+    const status = await screen.findByRole('status', { name: 'Trạng thái audio' });
+    expect(within(status).getByText('running')).toBeInTheDocument();
+    expect(within(status).getByText('25%')).toBeInTheDocument();
+    expect(within(status).getByText('1/2 chunks')).toBeInTheDocument();
+
+    await userEvent.click(within(status).getByRole('button', { name: 'Hủy job audio' }));
+
+    expect(apiClient.cancelJob).toHaveBeenCalledWith('tts-running-123456');
+    expect(await screen.findByText(/Đã yêu cầu hủy job audio/)).toBeInTheDocument();
+  });
+
   it('starts a book TTS job for missing audiobook chapters', async () => {
     const apiClient = mockReaderApiClient();
     renderReader({ apiClient });
 
     await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
     await userEvent.click(screen.getByRole('button', { name: 'Tạo audiobook còn thiếu' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Xác nhận tạo audiobook' });
+    expect(within(dialog).getByText('3 chương đã dịch')).toBeInTheDocument();
+    expect(within(dialog).getByText('0 chương đã có audio')).toBeInTheDocument();
+    expect(within(dialog).getByText('1 chương thiếu bản dịch')).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Tạo audiobook' }));
 
     expect(apiClient.startBookTtsJob).toHaveBeenCalledWith(42, { limit: 200 });
     expect(await screen.findByText(/Đã tạo job audiobook tts-book/)).toBeInTheDocument();
@@ -4287,7 +4734,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Mục lục' }));
     const drawer = screen.getByRole('dialog', { name: 'Mục lục' });
 
-    expect(within(drawer).getAllByRole('button')).toHaveLength(4);
+    expect(within(drawer).getAllByRole('button', { name: /^Ch\. \d/ })).toHaveLength(3);
     const currentChapterButton = within(drawer).getByRole('button', { name: 'Ch. 2 Thanh Ngưu trấn' });
     expect(currentChapterButton).toHaveAttribute('aria-current', 'true');
     expect(within(currentChapterButton).getByText('11 từ')).toBeInTheDocument();
@@ -4307,6 +4754,38 @@ describe('ReaderView', () => {
 
     await userEvent.click(within(menu).getByRole('button', { name: 'Mở bàn dịch' }));
     expect(props.onOpenWorkbench).toHaveBeenCalledTimes(1);
+  });
+
+  it('contains keyboard focus in Reader options and restores the trigger on Escape', async () => {
+    renderReader();
+    const user = userEvent.setup();
+    const trigger = screen.getByRole('button', { name: 'Thêm tùy chọn' });
+
+    trigger.focus();
+    await user.keyboard('{Enter}');
+
+    const menu = screen.getByRole('dialog', { name: 'Tùy chọn đọc' });
+    const bookSelect = within(menu).getByLabelText('Chọn truyện');
+    expect(bookSelect).toHaveFocus();
+    expect(document.body.style.overflow).toBe('hidden');
+
+    const enabledButtons = within(menu).getAllByRole('button')
+      .filter((button) => !button.hasAttribute('disabled'));
+    enabledButtons[enabledButtons.length - 1]?.focus();
+    await user.keyboard('{Tab}');
+    expect(bookSelect).toHaveFocus();
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Tùy chọn đọc' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(document.body.style.overflow).toBe('');
+
+    await user.click(trigger);
+    const backdrop = document.querySelector<HTMLElement>('.reader-more-backdrop');
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+    expect(screen.queryByRole('dialog', { name: 'Tùy chọn đọc' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 
   it('opens X-Ray with no-spoiler data for the current chapter', async () => {
@@ -4433,7 +4912,7 @@ describe('ReaderView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cài đặt chữ' }));
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     expect(article).toHaveAttribute('data-theme', 'dark');
 
     fireEvent.change(within(sheet).getByLabelText('Cỡ chữ'), { target: { value: '20' } });

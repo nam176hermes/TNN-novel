@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual env
 .venv/
+.venv.*/
 venv/
 env/
 
@@ -27,17 +28,23 @@ Thumbs.db
 
 # Data (generated)
 data/
-data/pipeline.db
-data/*.db
-data/*.db-*
 data/logs/runtime/
 backups/
 data_restored/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 inbox/
 output/
 work/
 test-results/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 .playwright-cli/
 browser-helper/
 browser-helper.tar.gz
@@ -45,6 +52,7 @@ AUDIT_REPORT*.md
 audit_results.txt
 audit_summary.txt
 docs/superpowers/
+.worktrees/
 
 # Local novel/content samples and generated audit artifacts
 chapter_*_zh.txt
@@ -61,7 +69,18 @@ yongye_ch*_final_translation.md
 
 # Logs
 *.log
+*.pid
+
+# Private credentials and provider artifacts
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
 
 # Frontend
+node_modules/
+.vite/
 web/node_modules/
 web/dist/

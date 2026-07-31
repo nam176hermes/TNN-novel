@@ -1,6 +1,5 @@
 export type TokenResponse = {
   access_token: string;
-  refresh_token: string;
   token_type: string;
 };
 
@@ -148,10 +147,34 @@ export type TtsJobStatus = {
   provider?: string;
   model?: string;
   progress?: number;
-  output_mp3_path?: string;
-  output_m4b_path?: string;
+  output_mp3_ready?: boolean;
+  output_m4b_ready?: boolean;
+  output_mp3_download_url?: string;
+  output_m4b_download_url?: string;
   error_message?: string;
+  audio_summary?: {
+    expected_chunk_count?: number;
+    completed_chunk_count?: number;
+    failed_chunk_count?: number;
+    missing_chunk_file_count?: number;
+    qa_warning_count?: number;
+    output_mp3_ready?: boolean;
+    output_mp3_size_bytes?: number;
+    output_m4b_ready?: boolean;
+    output_m4b_size_bytes?: number;
+    warnings?: string[];
+  };
   chunks: TtsChunkStatus[];
+};
+
+export type RecoveryFreshness = {
+  state: 'missing' | 'corrupt' | 'future' | 'wrong_release' | 'stale' | 'fresh';
+  age_seconds: number | null;
+  completed_at: string | null;
+  archive_hash_id: string | null;
+  validation_counts: Record<string, number>;
+  producer_version: string | null;
+  threshold_seconds: number;
 };
 
 export type SystemStatus = {
@@ -189,14 +212,19 @@ export type SystemStatus = {
   }>;
   app_version: string;
   build: string;
-  database_path: string;
+  database_available: boolean;
+  data_directory_available: boolean;
+  data_size_bytes: number;
+  storage_health: string;
+  storage_label: string;
   backup_recommendation: string;
   db_size_bytes: number;
   cache_count: number;
   cache_size_bytes: number;
   ollama_host: string;
   ollama_model: string;
-  data_dir: string;
+  external_backup?: RecoveryFreshness;
+  restore_drill?: RecoveryFreshness;
 };
 
 export type ExportFormat = 'txt' | 'docx' | 'epub';
@@ -229,9 +257,51 @@ export type ExportResponse = {
   format: ExportFormat;
   filename: string;
   path: string;
+  download_url?: string;
   media_type: string;
   size_bytes: number;
   chapter_count: number;
+};
+
+export type SystemBackupRequest = {
+  include_audio?: boolean;
+  include_exports?: boolean;
+  include_job_logs?: boolean;
+  include_secrets?: boolean;
+  passphrase?: string;
+};
+
+export type SystemBackupJobStart = {
+  job_id: string;
+  status: string;
+  message: string;
+};
+
+export type SystemBackupItem = {
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+  encrypted: boolean;
+  secrets_included: boolean;
+  included_modules: string[];
+  excluded_modules: string[];
+  manifest: Record<string, unknown>;
+  download_url: string;
+  metadata_status:
+    | 'READY'
+    | 'METADATA_MISSING'
+    | 'METADATA_INVALID'
+    | 'ARTIFACT_MISSING'
+    | 'ARTIFACT_INVALID'
+    | 'UNSUPPORTED_FORMAT';
+  repair_needed: boolean;
+  manifest_available: boolean;
+  archive_available: boolean;
+  warning: string;
+};
+
+export type SystemBackupList = {
+  items: SystemBackupItem[];
 };
 
 export type ExportDownload = {
@@ -588,7 +658,42 @@ export type ImportFileRequest = {
   file: File;
 };
 
+export type ImportContentKind = 'raw' | 'translated' | 'both' | 'unknown';
+
+export type WizardTextImportChapter = {
+  chapter_number: number;
+  chapter_title: string;
+  text?: string;
+  raw_text?: string;
+  translated_text?: string;
+};
+
+export type WizardTextImportRequest = {
+  title: string;
+  author?: string;
+  target_book_id?: number | null;
+  content_kind: ImportContentKind;
+  duplicate_strategy?: EbookDuplicateStrategy;
+  source_type?: 'paste' | 'txt' | 'wizard' | string;
+  chapters: WizardTextImportChapter[];
+};
+
+export type WizardTextImportResult = {
+  book_id: number;
+  title: string;
+  content_kind: ImportContentKind | string;
+  chapter_count: number;
+  imported_chapters: number;
+  skipped_chapters: number;
+  overwritten_chapters: number;
+  chapter_ids: number[];
+  warnings?: EbookImportWarning[];
+  message: string;
+};
+
 export type EbookDuplicateStrategy = 'error' | 'skip' | 'overwrite';
+
+export type EbookBookMatchReason = 'title' | 'selected' | 'new';
 
 export type EbookSplitMode = 'auto' | 'single';
 
@@ -618,6 +723,11 @@ export type EbookImportDryRun = {
   would_skip: number;
   would_overwrite: number;
   would_error: number;
+  existing_book_id: number | null;
+  existing_book_title: string;
+  existing_chapter_count: number;
+  book_match_reason: EbookBookMatchReason;
+  requires_existing_book_confirmation: boolean;
 };
 
 export type EbookPreview = {
@@ -656,6 +766,7 @@ export type EbookImportRequest = {
   uploadId?: string;
   inboxFile?: string;
   targetBookId?: number | null;
+  confirmedExistingBookId?: number | null;
   duplicateStrategy?: EbookDuplicateStrategy;
   splitMode?: EbookSplitMode;
 };
@@ -718,6 +829,191 @@ export type SourcePreview = {
     max_concurrency: number;
     retry_limit: number;
   } | null;
+  managed_source_id: string;
+  managed_source_status: string;
+  managed_source_trust_level: string;
+  automation_allowed: boolean;
+  automation_reason: string;
+  bypass_used: boolean;
+  bypass_method: string;
+  fetch_method: string;
+  fetch_status_code: number | null;
+  fetch_attempts: number;
+  fetch_elapsed_ms: number;
+  fetch_bytes_received: number;
+  fetch_final_url: string;
+  fetch_cookies_refreshed: boolean;
+  fetch_cache_hit: boolean;
+};
+
+export type URLFetchChapterRequest = {
+  url: string;
+  chapter_number: number;
+  title: string;
+};
+
+export type URLFetchRequest = {
+  source_url: string;
+  title: string;
+  author: string;
+  source: string;
+  chapters: URLFetchChapterRequest[];
+};
+
+export type URLFetchChapterResult = {
+  chapter_number: number;
+  title: string;
+  url: string;
+  success: boolean;
+  error: string;
+  text_length: number;
+  book_id: number;
+  chapter_id: number;
+  stored_text_length?: number;
+  content_hash?: string;
+  operation?: string;
+  warnings?: string[];
+  error_code?: string;
+  retryable?: boolean;
+  attempts?: number;
+  fetch_method?: string;
+  elapsed_ms?: number;
+  started_at?: string;
+  finished_at?: string;
+};
+
+export type URLFetchResponse = {
+  title: string;
+  book_id: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+  chapters: URLFetchChapterResult[];
+};
+
+export type ImportJobStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partially_succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type ChapterTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_retry'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'user_verification_required';
+
+export type ChapterTaskStage =
+  | 'queued'
+  | 'fetching'
+  | 'waiting_retry'
+  | 'parsing'
+  | 'validating'
+  | 'importing'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'user_verification_required';
+
+export type ImportJobEventType =
+  | 'job_created'
+  | 'job_enqueued'
+  | 'job_transitioned'
+  | 'job_recovered'
+  | 'job_retry_requested'
+  | 'cancel_requested'
+  | 'task_created'
+  | 'task_claimed'
+  | 'task_transitioned'
+  | 'task_cancelled'
+  | 'task_recovered'
+  | 'task_retry_requested'
+  | 'task_retry_scheduled';
+
+export type ImportJobCreateRequest = URLFetchRequest;
+
+export type ImportJobAcceptedResponse = {
+  job_id: string;
+  status: ImportJobStatus;
+  total: number;
+};
+
+export type ImportJobAccepted = ImportJobAcceptedResponse;
+
+export type ChapterTask = {
+  id: number;
+  chapter_number: number;
+  title: string;
+  status: ChapterTaskStatus;
+  stage: ChapterTaskStage;
+  attempts: number;
+  next_attempt_at: string;
+  error_code: string;
+  error_message: string;
+  retryable: boolean;
+  fetch_method: string;
+  text_length: number;
+  content_hash: string;
+  elapsed_ms: number;
+  started_at: string;
+  finished_at: string;
+  book_id: number | null;
+  chapter_id: number | null;
+  /** Optional until every P09 snapshot producer exposes the P04 import outcome. */
+  operation?: string;
+};
+
+export type ImportJobTaskSummary = ChapterTask;
+
+export type ImportJob = {
+  job_id: string;
+  status: ImportJobStatus;
+  source: string;
+  book_id: number | null;
+  total: number;
+  queued_count: number;
+  running_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  waiting_retry_count: number;
+  verification_required_count: number;
+  created_at: string;
+  started_at: string;
+  finished_at: string;
+  cancel_requested_at: string;
+  error_summary: string;
+  tasks: ChapterTask[];
+};
+
+export type ImportJobSnapshot = ImportJob;
+
+export type JobEvent = {
+  sequence: number;
+  job_id: string;
+  task_id: number | null;
+  type: ImportJobEventType;
+  data: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ImportJobEvent = JobEvent;
+
+export type JobEventSubscription = {
+  abort: () => void;
+  done: Promise<void>;
+};
+
+export type ImportJobEventStream = JobEventSubscription;
+
+export type JobEventSubscriptionOptions = {
+  cursor?: number;
+  lastEventId?: number;
 };
 
 export type SourceCapability = {
@@ -757,6 +1053,21 @@ export type SourceCatalogEntry = {
   last_check_error: string;
   last_check_http_status: number | null;
   last_check_final_url: string;
+  managed_source_id: string;
+  managed_status: 'IMPORTED' | 'NEEDS_REVIEW' | 'VERIFIED' | 'BROKEN' | 'BLOCKED' | string;
+  managed_trust_level: 'UNKNOWN' | 'LOW' | 'MEDIUM' | 'HIGH' | 'MANUAL_ONLY' | string;
+  managed_last_test_status: string;
+  managed_last_tested_at: string;
+  managed_last_successful_fetch_at: string;
+  managed_last_error: string;
+  managed_rate_limit_requests_per_minute: number;
+  managed_rate_limit_delay_ms: number;
+  managed_max_concurrent_requests: number;
+  managed_cooldown_after_error_seconds: number;
+  managed_notes: string;
+  managed_parser_type: string;
+  managed_language: string;
+  can_use_in_jobs: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -775,6 +1086,8 @@ export type SourceCatalogQuery = {
   tag?: string;
   domain?: string;
   supported?: 'true' | 'false' | 'supported' | 'unsupported' | 'all' | '';
+  status?: string;
+  trust_level?: string;
   page?: number;
   page_size?: number;
 };
@@ -787,6 +1100,80 @@ export type SourceCatalogHealthResult = {
   checked_at: string;
   final_url: string;
   http_status: number | null;
+};
+
+export type ManagedSource = {
+  id: string;
+  catalog_entry_id: string;
+  name: string;
+  base_url: string;
+  domain: string;
+  language: string;
+  parser_type: string;
+  parser_config: Record<string, unknown>;
+  status: 'IMPORTED' | 'NEEDS_REVIEW' | 'VERIFIED' | 'BROKEN' | 'BLOCKED' | string;
+  trust_level: 'UNKNOWN' | 'LOW' | 'MEDIUM' | 'HIGH' | 'MANUAL_ONLY' | string;
+  supported_source_id: string;
+  last_test_status: string;
+  last_tested_at: string;
+  last_successful_fetch_at: string;
+  last_error: string;
+  rate_limit_requests_per_minute: number;
+  rate_limit_delay_ms: number;
+  max_concurrent_requests: number;
+  cooldown_after_error_seconds: number;
+  notes: string;
+  can_use_in_jobs: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ManagedSourceList = {
+  items: ManagedSource[];
+  total: number;
+  page: number;
+  per_page: number;
+  page_size: number;
+};
+
+export type ManagedSourceTestResult = {
+  source_id: string;
+  domain: string;
+  status: 'reachable' | 'blocked_by_policy' | 'timeout' | 'invalid_url' | 'fetch_failed' | 'parse_failed' | 'parser_config_missing' | 'success' | string;
+  reason: string;
+  tested_at: string;
+  final_url: string;
+  http_status: number | null;
+};
+
+export type ManagedSourceImportSummary = {
+  selected: number;
+  inserted: number;
+  duplicates: number;
+  invalid: number;
+  skipped: number;
+  items: ManagedSource[];
+};
+
+export type ManagedSourceQuery = {
+  query?: string;
+  status?: string;
+  trust_level?: string;
+  language?: string;
+  page?: number;
+  page_size?: number;
+};
+
+export type ManagedSourceUpdateRequest = {
+  status?: string;
+  trust_level?: string;
+  parser_type?: string;
+  parser_config?: Record<string, unknown>;
+  notes?: string;
+  rate_limit_requests_per_minute?: number;
+  rate_limit_delay_ms?: number;
+  max_concurrent_requests?: number;
+  cooldown_after_error_seconds?: number;
 };
 
 export type SourceAdapterCandidate = {
@@ -818,6 +1205,7 @@ export type ImportUrlRequest = {
   title: string;
   author?: string;
   source?: string;
+  managed_source_id?: string;
   chapters: SourceChapterPreview[];
   retry_limit?: number;
 };
@@ -852,6 +1240,17 @@ export type JobAttemptResponse = {
 export type QaReport = {
   book_id: number;
   chapter_id: number;
+  job_id?: string;
+  overall_status?: 'PASS' | 'WARNING' | 'FAIL' | 'NOT_RUN' | string;
+  missing_paragraph_warning?: boolean | number;
+  chinese_leakage_count?: number;
+  name_consistency_status?: string;
+  term_consistency_status?: string;
+  length_ratio?: number;
+  repetition_warning?: boolean | number;
+  style_warnings?: Array<Record<string, unknown>>;
+  glossary_violations?: Array<Record<string, unknown>>;
+  suggested_fixes?: Array<Record<string, unknown>>;
   quality_score: number;
   fidelity_score?: number;
   style_score?: number;
@@ -902,7 +1301,14 @@ export type GlossaryTerm = {
   locked: number;
   genre: string;
   term_type: string;
+  alternatives?: string;
+  gender?: string;
+  first_seen_chapter_id?: number;
+  first_seen_chapter_number?: number;
+  review_status?: string;
+  source_context?: string;
   created_at?: string;
+  updated_at?: string;
 };
 
 export type GlossaryTermUpdate = Partial<
@@ -919,6 +1325,10 @@ export type GlossaryTermUpdate = Partial<
     | 'locked'
     | 'genre'
     | 'term_type'
+    | 'alternatives'
+    | 'gender'
+    | 'review_status'
+    | 'source_context'
   >
 >;
 

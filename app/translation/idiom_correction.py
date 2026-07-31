@@ -55,7 +55,7 @@ def correct_idioms(text: str) -> str:
 
 def correct_chinese_idioms_in_translation(text: str) -> str:
     """Correct Chinese idioms that leaked through translation.
-    
+
     Only applies to 100% Vietnamese corrections. All entries must be
     verified pure Vietnamese output.
     """

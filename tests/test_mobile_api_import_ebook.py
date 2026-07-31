@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from pathlib import Path
+import threading
 import zipfile
 
 import httpx
 import pytest
 
-from app.database.db import get_book_by_title, init_db, list_chapters
+from app.database.db import (
+    add_book,
+    get_book_by_title,
+    init_db,
+    list_books,
+    list_chapters,
+    list_ebook_import_runs,
+)
+from app.mobile_api import upload_limits
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.routers import import_routes
@@ -136,6 +146,33 @@ def test_stage_ebook_upload_handles_cross_device_temp_files(tmp_path: Path, temp
     service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
     source = Path("/tmp/novel-stage-cross-device.epub")
     source.write_bytes(b"ebook")
+
+    upload_id = _stage_ebook_upload(service, source, "translated.epub")
+
+    staged = service.data_dir / "import_uploads" / f"{upload_id}.epub"
+    assert staged.read_bytes() == b"ebook"
+    assert not source.exists()
+
+
+def test_stage_ebook_upload_copies_content_when_cross_device_rename_fails(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+    source = tmp_path / "upload-tmp" / "translated.epub"
+    source.parent.mkdir()
+    source.write_bytes(b"ebook")
+
+    def cross_device_rename(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def metadata_copy_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("staging must not copy file metadata across filesystems")
+
+    monkeypatch.setattr(import_routes.os, "replace", cross_device_rename)
+    monkeypatch.setattr(import_routes.shutil, "move", metadata_copy_must_not_run)
+    monkeypatch.setattr(import_routes.shutil, "copystat", metadata_copy_must_not_run)
 
     upload_id = _stage_ebook_upload(service, source, "translated.epub")
 
@@ -418,6 +455,7 @@ async def test_ebook_import_endpoint_defaults_to_skipping_duplicate_chapters(
         )
         second = await client.post(
             "/api/import/ebook",
+            data={"confirmed_existing_book_id": str(first.json()["book_id"])},
             files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
             headers=headers,
         )
@@ -427,6 +465,410 @@ async def test_ebook_import_endpoint_defaults_to_skipping_duplicate_chapters(
     data = second.json()
     assert data["imported_chapters"] == 0
     assert data["skipped_chapters"] == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_ebook_requires_confirmation_before_sync_import(
+    override_ebook_service: EbookImportService,
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        first = await client.post(
+            "/api/import/ebook",
+            data={"duplicate_strategy": "error"},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        missing = await client.post(
+            "/api/import/ebook",
+            data={"duplicate_strategy": "skip"},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        mismatched = await client.post(
+            "/api/import/ebook",
+            data={"duplicate_strategy": "skip", "confirmed_existing_book_id": str(first.json()["book_id"] + 1)},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        confirmed = await client.post(
+            "/api/import/ebook",
+            data={
+                "duplicate_strategy": "skip",
+                "confirmed_existing_book_id": str(first.json()["book_id"]),
+            },
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+
+    safe_detail = "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    assert first.status_code == 200
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == safe_detail
+    assert mismatched.status_code == 409
+    assert mismatched.json()["detail"] == safe_detail
+    assert confirmed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_confirmed_existing_ebook_job_is_created_only_after_staged_preflight(
+    override_ebook_service: EbookImportService,
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        first = await client.post(
+            "/api/import/ebook",
+            data={"duplicate_strategy": "error"},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        preview = await client.post(
+            "/api/import/ebook/preview",
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        upload_id = preview.json()["upload_id"]
+        missing = await client.post(
+            "/api/import/ebook/job",
+            data={"duplicate_strategy": "skip", "upload_id": upload_id},
+            headers=headers,
+        )
+        mismatched = await client.post(
+            "/api/import/ebook/job",
+            data={
+                "duplicate_strategy": "skip",
+                "upload_id": upload_id,
+                "confirmed_existing_book_id": str(first.json()["book_id"] + 1),
+            },
+            headers=headers,
+        )
+
+        tracker = get_shared_job_tracker(override_ebook_service.db_path)
+        assert tracker.list_jobs() == []
+        upload_dir = override_ebook_service.data_dir / "import_uploads"
+        assert (upload_dir / f"{upload_id}.epub").exists()
+        assert (upload_dir / f"{upload_id}.json").exists()
+        books_before_confirmed_import = list_books(override_ebook_service.db_path)
+
+        confirmed = await client.post(
+            "/api/import/ebook/job",
+            data={
+                "duplicate_strategy": "skip",
+                "upload_id": upload_id,
+                "confirmed_existing_book_id": str(first.json()["book_id"]),
+            },
+            headers=headers,
+        )
+
+    safe_detail = "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    assert first.status_code == 200
+    assert preview.status_code == 200
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == safe_detail
+    assert mismatched.status_code == 409
+    assert mismatched.json()["detail"] == safe_detail
+    assert all(
+        forbidden not in missing.text
+        for forbidden in ("/home/", "/mnt/", "traceback", "Đấu khí, ba đoạn!")
+    )
+    assert confirmed.status_code == 200
+    job = tracker.get_job(confirmed.json()["job_id"])
+    assert job is not None
+    assert job.params["confirmed_existing_book_id"] == first.json()["book_id"]
+    for _ in range(100):
+        job = tracker.get_job(confirmed.json()["job_id"])
+        if job and job.status in {"completed", "failed"}:
+            break
+        await asyncio.sleep(0.02)
+    assert job is not None
+    assert job.status == "completed"
+    books_after_confirmed_import = list_books(override_ebook_service.db_path)
+    assert len(books_after_confirmed_import) == 1
+    assert [
+        (book["id"], book["book_key"])
+        for book in books_after_confirmed_import
+    ] == [
+        (book["id"], book["book_key"])
+        for book in books_before_confirmed_import
+    ]
+    assert books_after_confirmed_import[0]["book_key"] == "đấupháthươngkhung"
+
+
+@pytest.mark.asyncio
+async def test_new_title_preview_race_requires_confirmation_before_any_import_mutation(
+    override_ebook_service: EbookImportService,
+) -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        preview = await client.post(
+            "/api/import/ebook/preview",
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        assert preview.status_code == 200
+        assert preview.json()["dry_run"]["book_match_reason"] == "new"
+        upload_id = preview.json()["upload_id"]
+
+        raced_book_id = add_book(
+            override_ebook_service.db_path,
+            "Đấu Phá Thương Khung",
+            "Thiên Tằm Thổ Đậu",
+            "manual",
+        )
+        artifact_root = override_ebook_service.data_dir
+        artifacts_before = sorted(
+            path.relative_to(artifact_root).as_posix()
+            for path in artifact_root.rglob("*")
+            if path.is_file()
+        )
+        chapters_before = list_chapters(override_ebook_service.db_path, raced_book_id)
+        history_before = list_ebook_import_runs(override_ebook_service.db_path)
+
+        conflict = await client.post(
+            "/api/import/ebook/job",
+            data={"duplicate_strategy": "skip", "upload_id": upload_id},
+            headers=headers,
+        )
+
+    safe_detail = "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == safe_detail
+    assert list_chapters(override_ebook_service.db_path, raced_book_id) == chapters_before == []
+    assert list_ebook_import_runs(override_ebook_service.db_path) == history_before == []
+    assert sorted(
+        path.relative_to(artifact_root).as_posix()
+        for path in artifact_root.rglob("*")
+        if path.is_file()
+    ) == artifacts_before
+    assert get_shared_job_tracker(override_ebook_service.db_path).list_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_confirmed_existing_ebook_job_conflict_cleans_direct_upload_temp(
+    override_ebook_service: EbookImportService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(upload_limits.tempfile, "tempdir", str(tmp_path))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        first = await client.post(
+            "/api/import/ebook",
+            data={"duplicate_strategy": "error"},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+        conflict = await client.post(
+            "/api/import/ebook/job",
+            data={"duplicate_strategy": "skip"},
+            files={"file": ("translated.epub", minimal_epub_bytes(), "application/epub+zip")},
+            headers=headers,
+        )
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert not list(tmp_path.glob("novel-ebook-*"))
+
+
+@pytest.mark.asyncio
+async def test_existing_inbox_ebook_job_conflict_is_safe_and_retains_source(
+    override_ebook_service: EbookImportService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    inbox_dir = tmp_path / "inbox" / "ebooks"
+    inbox_dir.mkdir(parents=True)
+    inbox_path = inbox_dir / "translated-from-inbox.epub"
+    write_minimal_epub(inbox_path)
+    monkeypatch.setenv("EBOOK_INBOX_DIR", str(inbox_dir))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        first = await client.post(
+            "/api/import/ebook",
+            data={"inbox_file": inbox_path.name, "duplicate_strategy": "error"},
+            headers=headers,
+        )
+        conflict = await client.post(
+            "/api/import/ebook/job",
+            data={"inbox_file": inbox_path.name, "duplicate_strategy": "skip"},
+            headers=headers,
+        )
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == (
+        "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    )
+    assert inbox_path.exists()
+    assert all(
+        forbidden not in conflict.text
+        for forbidden in ("/home/", "/mnt/", "traceback", "Đấu khí, ba đoạn!")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", ["staged", "direct", "inbox"])
+async def test_background_target_race_preserves_recovery_source_and_reports_confirmation_conflict(
+    source_kind: str,
+    override_ebook_service: EbookImportService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = override_ebook_service
+    entered_background_import = threading.Event()
+    release_background_import = threading.Event()
+    original_import = service.import_translated_ebook
+
+    def import_after_barrier(*args, **kwargs):  # type: ignore[no-untyped-def]
+        entered_background_import.set()
+        assert release_background_import.wait(timeout=5)
+        return original_import(*args, **kwargs)
+
+    monkeypatch.setattr(service, "import_translated_ebook", import_after_barrier)
+    monkeypatch.setattr(upload_limits.tempfile, "tempdir", str(tmp_path))
+
+    inbox_path = tmp_path / "inbox" / "ebooks" / "translated-race.epub"
+    if source_kind == "inbox":
+        inbox_path.parent.mkdir(parents=True)
+        write_minimal_epub(inbox_path)
+        monkeypatch.setenv("EBOOK_INBOX_DIR", str(inbox_path.parent))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        upload_id = ""
+        if source_kind == "staged":
+            preview = await client.post(
+                "/api/import/ebook/preview",
+                files={"file": ("translated-race.epub", minimal_epub_bytes(), "application/epub+zip")},
+                headers=headers,
+            )
+            assert preview.status_code == 200
+            upload_id = preview.json()["upload_id"]
+            response = await client.post(
+                "/api/import/ebook/job",
+                data={"duplicate_strategy": "skip", "upload_id": upload_id},
+                headers=headers,
+            )
+        elif source_kind == "inbox":
+            response = await client.post(
+                "/api/import/ebook/job",
+                data={"duplicate_strategy": "skip", "inbox_file": inbox_path.name},
+                headers=headers,
+            )
+        else:
+            response = await client.post(
+                "/api/import/ebook/job",
+                data={"duplicate_strategy": "skip"},
+                files={"file": ("translated-race.epub", minimal_epub_bytes(), "application/epub+zip")},
+                headers=headers,
+            )
+
+        assert response.status_code == 200
+        assert await asyncio.to_thread(entered_background_import.wait, 5)
+
+        raced_book_id = add_book(
+            service.db_path,
+            "Đấu Phá Thương Khung",
+            "Thiên Tằm Thổ Đậu",
+            "manual",
+        )
+        release_background_import.set()
+
+    tracker = get_shared_job_tracker(service.db_path)
+    job_id = response.json()["job_id"]
+    job = None
+    for _ in range(200):
+        job = tracker.get_job(job_id)
+        if job and job.status in {"completed", "failed"}:
+            break
+        await asyncio.sleep(0.02)
+
+    safe_detail = "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+    assert job is not None
+    assert job.status == "failed"
+    assert job.error == safe_detail
+    assert job.message == safe_detail
+    expected_source = {"staged": "preview_upload", "direct": "upload", "inbox": "inbox"}[source_kind]
+    assert job.params["source"] == expected_source
+    assert job.params["original_filename"] == "translated-race.epub"
+    assert list_chapters(service.db_path, raced_book_id) == []
+    assert list_ebook_import_runs(service.db_path) == []
+    assert not list((service.data_dir / "raw").glob("*"))
+
+    if source_kind == "inbox":
+        assert inbox_path.exists()
+        assert job.params["retry_inbox_file"] == inbox_path.name
+        assert "retry_upload_id" not in job.params
+    else:
+        retry_upload_id = job.params["retry_upload_id"]
+        if source_kind == "staged":
+            assert retry_upload_id == upload_id
+        retry_path, retry_name = import_routes._resolve_staged_ebook_upload(service, retry_upload_id)
+        assert retry_path.exists()
+        assert retry_name == "translated-race.epub"
+
+    assert all(
+        forbidden not in f"{job.error} {job.message}"
+        for forbidden in ("/home/", "/mnt/", "traceback", "Đấu khí, ba đoạn!")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", ["staged", "direct", "inbox"])
+async def test_background_non_confirmation_failure_keeps_existing_source_cleanup_rules(
+    source_kind: str,
+    override_ebook_service: EbookImportService,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = override_ebook_service
+    source_path = tmp_path / f"{source_kind}.epub"
+    write_minimal_epub(source_path)
+    cleanup_upload_id = ""
+    cleanup_temp_path = source_kind == "direct"
+    if source_kind == "staged":
+        cleanup_upload_id = _stage_ebook_upload(service, source_path, source_path.name)
+        source_path, _ = import_routes._resolve_staged_ebook_upload(service, cleanup_upload_id)
+
+    def fail_import(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ValueError("ordinary ebook validation failure")
+
+    monkeypatch.setattr(service, "import_translated_ebook", fail_import)
+    tracker = get_shared_job_tracker(service.db_path)
+    job = tracker.create_job("import_ebook", [], 1, {"source": source_kind})
+
+    await import_routes._run_translated_ebook_import_job(
+        job_id=job.job_id,
+        tracker=tracker,
+        service=service,
+        ebook_path=source_path,
+        original_name=f"{source_kind}.epub",
+        target_book_id=None,
+        duplicate_strategy="skip",
+        split_mode="auto",
+        confirmed_existing_book_id=None,
+        cleanup_upload_id=cleanup_upload_id,
+        cleanup_temp_path=cleanup_temp_path,
+    )
+
+    failed_job = tracker.get_job(job.job_id)
+    assert failed_job is not None
+    assert failed_job.status == "failed"
+    assert failed_job.error == (
+        "Translated ebook import failed. Check duplicate settings, ebook file, and server logs."
+    )
+    if source_kind == "inbox":
+        assert source_path.exists()
+    else:
+        assert not source_path.exists()
+    assert not list((service.data_dir / "import_uploads").glob("*"))
 
 
 @pytest.mark.asyncio

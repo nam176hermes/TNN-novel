@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import type { GlossaryTerm, JobStatus, TmSearchResult } from '../api/types';
+import type { GlossaryTerm, JobStatus, QaReport, TmSearchResult } from '../api/types';
 import type { NormalizedQaIssue } from '../state/useQa';
 import type { LoadState } from '../state/types';
 import JobProgress from './JobProgress';
@@ -9,6 +9,7 @@ export type AssistPanelProps = {
   glossaryError: string;
   pendingGlossaryCount: number;
   qaIssues: NormalizedQaIssue[];
+  qaReport?: QaReport | null;
   qaState: LoadState;
   relevantTerms: GlossaryTerm[];
   tmError: string;
@@ -22,10 +23,28 @@ export type AssistPanelProps = {
 function renderQaState(
   qaState: LoadState,
   qaIssues: NormalizedQaIssue[],
+  qaReport: QaReport | null | undefined,
   onApplyQaFix: (issue: NormalizedQaIssue) => void,
 ) {
+  const hasDeterministicSummary = Boolean(
+    qaReport?.overall_status
+      || typeof qaReport?.chinese_leakage_count === 'number'
+      || typeof qaReport?.length_ratio === 'number'
+      || qaReport?.missing_paragraph_warning
+      || qaReport?.repetition_warning
+      || qaReport?.term_consistency_status
+      || qaReport?.name_consistency_status
+      || (Array.isArray(qaReport?.glossary_violations) && qaReport.glossary_violations.length > 0),
+  );
+
+  const glossaryViolations = Array.isArray(qaReport?.glossary_violations)
+    ? qaReport.glossary_violations
+    : [];
+
   if (qaIssues.length > 0) {
     return (
+      <>
+        {hasDeterministicSummary ? <QaSummary report={qaReport} /> : null}
       <ul className="review-issues">
         {qaIssues.map((issue, index) => (
           <li key={`${issue.type}-${index}`}>
@@ -61,12 +80,75 @@ function renderQaState(
           </li>
         ))}
       </ul>
+        {glossaryViolations.length > 0 ? <GlossaryViolations violations={glossaryViolations} /> : null}
+      </>
     );
   }
 
   if (qaState === 'loading') return <p className="empty-detail">Đang tải QA...</p>;
   if (qaState === 'error') return null;
+  if (hasDeterministicSummary) {
+    return (
+      <>
+        <QaSummary report={qaReport} />
+        {glossaryViolations.length > 0 ? <GlossaryViolations violations={glossaryViolations} /> : null}
+      </>
+    );
+  }
   return <p className="empty-detail">Chưa có QA</p>;
+}
+
+function boolWarning(value: unknown): boolean {
+  return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function QaSummary({ report }: { report: QaReport | null | undefined }) {
+  if (!report) return null;
+  const rows: Array<[string, string | number]> = [];
+  if (report.overall_status) rows.push(['Trạng thái', report.overall_status]);
+  if (typeof report.chinese_leakage_count === 'number') rows.push(['Rò chữ Trung', report.chinese_leakage_count]);
+  if (typeof report.length_ratio === 'number') rows.push(['Tỷ lệ dài/ngắn', Number(report.length_ratio.toFixed(2))]);
+  if (boolWarning(report.missing_paragraph_warning)) rows.push(['Thiếu đoạn', 'Cảnh báo']);
+  if (boolWarning(report.repetition_warning)) rows.push(['Lặp nội dung', 'Cảnh báo']);
+  if (report.name_consistency_status) rows.push(['Nhất quán tên', report.name_consistency_status]);
+  if (report.term_consistency_status) rows.push(['Nhất quán thuật ngữ', report.term_consistency_status]);
+  if (rows.length === 0) return null;
+
+  return (
+    <dl className="quality-summary assist-qa-summary" aria-label="Tổng quan QA chương">
+      {rows.map(([label, value]) => (
+        <div key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function GlossaryViolations({ violations }: { violations: Array<Record<string, unknown>> }) {
+  return (
+    <div className="qa-issue-card assist-glossary-violations">
+      <strong>Vi phạm thuật ngữ khóa</strong>
+      <ul>
+        {violations.map((violation, index) => {
+          const sourceTerm = readString(violation.source_term) || readString(violation.raw_text) || 'Thuật ngữ';
+          const expected = readString(violation.expected) || readString(violation.preferred_translation);
+          const message = readString(violation.message) || readString(violation.reason);
+          return (
+            <li key={`${sourceTerm}-${index}`}>
+              <span>{expected ? `${sourceTerm} -> ${expected}` : sourceTerm}</span>
+              {message ? <p>{message}</p> : null}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
 function renderTmState(tmState: LoadState, tmResults: TmSearchResult[]) {
@@ -108,6 +190,7 @@ export default function AssistPanel({
   glossaryError,
   pendingGlossaryCount,
   qaIssues,
+  qaReport,
   qaState,
   relevantTerms,
   tmError,
@@ -145,7 +228,7 @@ export default function AssistPanel({
             Chạy QA
           </button>
         </div>
-        {renderQaState(qaState, qaIssues, onApplyQaFix)}
+        {renderQaState(qaState, qaIssues, qaReport, onApplyQaFix)}
       </section>
 
       <section aria-labelledby="assist-terms-title" className="assist-panel-section assist-terms-section">

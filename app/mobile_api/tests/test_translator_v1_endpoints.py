@@ -119,7 +119,7 @@ async def test_chapter_source_translation_save_and_fetch_round_trip():
         assert translation_resp.json()["missing"] is False
 
 
-async def test_audio_stream_accepts_asset_cookie_without_bearer_header():
+async def test_audio_stream_requires_authentication_and_allows_bearer_token():
     async with make_client() as client:
         headers = await auth_headers(client)
         import_resp = await client.post(
@@ -140,8 +140,11 @@ async def test_audio_stream_accepts_asset_cookie_without_bearer_header():
         audio_path.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00audio-bytes")
         update_chapter_paths(get_db_path(), chapter_id, audio_path=audio_path, status="audio_done")
 
-        stream_resp = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/audio")
+        client.cookies.clear()
+        unauthenticated_resp = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/audio")
+        stream_resp = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/audio", headers=headers)
 
+    assert unauthenticated_resp.status_code in {401, 403}, unauthenticated_resp.text
     assert stream_resp.status_code == 200, stream_resp.text
     assert stream_resp.headers["content-type"].startswith("audio/mpeg")
     assert stream_resp.headers.get("cache-control") == "private, no-store"

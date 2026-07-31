@@ -116,7 +116,7 @@ describe('LibraryBooksView', () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc Phàm Nhân Tu Tiên' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Phàm Nhân Tu Tiên' }));
 
     expect(onOpenReader).toHaveBeenCalledWith(42);
   });
@@ -289,7 +289,7 @@ describe('LibraryBooksView', () => {
     );
 
     await userEvent.click(screen.getByRole('button', { name: 'Tùy chọn sách Phàm Nhân Tu Tiên' }));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Mở bàn dịch' }));
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Sửa' }));
 
     expect(onOpenWorkbench).toHaveBeenCalledWith(42, 103);
 
@@ -299,7 +299,7 @@ describe('LibraryBooksView', () => {
     expect(onOpenReader).toHaveBeenCalledWith(42);
 
     await userEvent.click(screen.getByRole('button', { name: 'Tùy chọn sách Phàm Nhân Tu Tiên' }));
-    await userEvent.click(screen.getByRole('menuitem', { name: 'Xóa sách' }));
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Xóa' }));
 
     expect(onDeleteBook).toHaveBeenCalledWith(books.data[0]);
   });

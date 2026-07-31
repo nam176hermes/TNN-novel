@@ -57,6 +57,16 @@ async def search_glossary(
     return {"results": results, "total": len(results)}
 
 
+@router.get("/conflicts")
+async def list_glossary_conflicts(
+    book_id: int | None = Query(None),
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    """List glossary conflicts and target reuse warnings."""
+    conflicts = svc.get_conflicts(book_id)
+    return {"conflicts": conflicts, "total": len(conflicts)}
+
+
 @router.post("/tm", response_model=dict, status_code=201)
 async def add_tm_entry(
     entry: TranslationMemoryEntryCreate,

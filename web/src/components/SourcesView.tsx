@@ -18,6 +18,9 @@ import {
 } from 'lucide-react';
 import sourcesInfoGlobe from '../assets/reference-ui/sources-info-globe.png';
 import type {
+  ManagedSource,
+  ManagedSourceImportSummary,
+  ManagedSourceTestResult,
   SourceAdapterCandidate,
   SourceAdapterCandidateList,
   SourceCapability,
@@ -34,11 +37,15 @@ export type SourcesViewProps = {
   checkCatalogSource?: (entryId: string) => Promise<SourceCatalogHealthResult>;
   createParserCandidate?: (entryId: string) => Promise<SourceAdapterCandidate>;
   error: string;
+  importCatalogSources?: (entryIds: string[]) => Promise<ManagedSourceImportSummary>;
   loadCatalog?: (params: SourceCatalogQuery) => Promise<SourceCatalogList>;
   loadParserCandidates?: () => Promise<SourceAdapterCandidateList>;
+  markManagedSourceStatus?: (sourceId: string, status: 'BROKEN' | 'BLOCKED' | 'NEEDS_REVIEW') => Promise<ManagedSource>;
   onRefresh(): Promise<void> | void;
   sources: SourceCapability[];
   state: LoadState;
+  testManagedSource?: (sourceId: string) => Promise<ManagedSourceTestResult>;
+  verifyManagedSource?: (sourceId: string) => Promise<ManagedSource>;
 };
 
 const CATALOG_PAGE_SIZE = 25;
@@ -83,15 +90,71 @@ function selectedCatalogEntries(entries: SourceCatalogEntry[], selectedIds: Set<
   return entries.filter((entry) => selectedIds.has(entry.id));
 }
 
+function applyManagedSourceToEntry(entry: SourceCatalogEntry, managed: ManagedSource): SourceCatalogEntry {
+  if (entry.id !== managed.catalog_entry_id) return entry;
+  return {
+    ...entry,
+    managed_source_id: managed.id,
+    managed_status: managed.status,
+    managed_trust_level: managed.trust_level,
+    managed_last_test_status: managed.last_test_status,
+    managed_last_tested_at: managed.last_tested_at,
+    managed_last_successful_fetch_at: managed.last_successful_fetch_at,
+    managed_last_error: managed.last_error,
+    managed_rate_limit_requests_per_minute: managed.rate_limit_requests_per_minute,
+    managed_rate_limit_delay_ms: managed.rate_limit_delay_ms,
+    managed_max_concurrent_requests: managed.max_concurrent_requests,
+    managed_cooldown_after_error_seconds: managed.cooldown_after_error_seconds,
+    managed_notes: managed.notes,
+    managed_parser_type: managed.parser_type,
+    managed_language: managed.language,
+    can_use_in_jobs: managed.status === 'VERIFIED',
+  };
+}
+
+function managedStatusLabel(entry: SourceCatalogEntry): string {
+  return entry.managed_status || 'UNMANAGED';
+}
+
+function managedTrustLabel(entry: SourceCatalogEntry): string {
+  return entry.managed_trust_level || 'UNKNOWN';
+}
+
+function useMobileSourcesLayout(): boolean {
+  const [isMobileLayout, setIsMobileLayout] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+
+    const media = window.matchMedia('(max-width: 760px)');
+    const update = () => setIsMobileLayout(media.matches);
+    update();
+
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', update);
+      return () => media.removeEventListener('change', update);
+    }
+
+    media.addListener(update);
+    return () => media.removeListener(update);
+  }, []);
+
+  return isMobileLayout;
+}
+
 export default function SourcesView({
   checkCatalogSource,
   createParserCandidate,
   error,
+  importCatalogSources,
   loadCatalog,
   loadParserCandidates,
+  markManagedSourceStatus,
   onRefresh,
   sources,
   state,
+  testManagedSource,
+  verifyManagedSource,
 }: SourcesViewProps) {
   const [activeTab, setActiveTab] = useState<SourceHubTab>('supported');
   const [catalog, setCatalog] = useState<SourceCatalogList | null>(null);
@@ -101,17 +164,22 @@ export default function SourcesView({
   const [catalogTag, setCatalogTag] = useState('');
   const [catalogDomain, setCatalogDomain] = useState('');
   const [catalogSupported, setCatalogSupported] = useState('');
+  const [catalogManagedStatus, setCatalogManagedStatus] = useState('');
+  const [catalogTrustLevel, setCatalogTrustLevel] = useState('');
   const [catalogPage, setCatalogPage] = useState(1);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [expandedId, setExpandedId] = useState('');
   const [copyMessage, setCopyMessage] = useState('');
   const [healthLoadingId, setHealthLoadingId] = useState('');
   const [healthMessage, setHealthMessage] = useState('');
+  const [managedMessage, setManagedMessage] = useState('');
+  const [managedLoadingId, setManagedLoadingId] = useState('');
   const [candidateList, setCandidateList] = useState<SourceAdapterCandidateList | null>(null);
   const [candidateState, setCandidateState] = useState<LoadState>('idle');
   const [candidateError, setCandidateError] = useState('');
   const [candidateMessage, setCandidateMessage] = useState('');
   const [candidateLoadingId, setCandidateLoadingId] = useState('');
+  const isMobileSourcesLayout = useMobileSourcesLayout();
 
   const entries = useMemo(() => catalogEntries(catalog), [catalog]);
   const selectedEntries = useMemo(() => selectedCatalogEntries(entries, selectedIds), [entries, selectedIds]);
@@ -129,6 +197,8 @@ export default function SourcesView({
         tag: catalogTag,
         domain: catalogDomain.trim(),
         supported: catalogSupported as SourceCatalogQuery['supported'],
+        status: catalogManagedStatus,
+        trust_level: catalogTrustLevel,
         page: catalogPage,
         page_size: CATALOG_PAGE_SIZE,
       })
@@ -148,7 +218,7 @@ export default function SourcesView({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [activeTab, catalogDomain, catalogPage, catalogQuery, catalogSupported, catalogTag, loadCatalog]);
+  }, [activeTab, catalogDomain, catalogManagedStatus, catalogPage, catalogQuery, catalogSupported, catalogTag, catalogTrustLevel, loadCatalog]);
 
   useEffect(() => {
     if (activeTab !== 'candidates' || !loadParserCandidates) return;
@@ -226,6 +296,18 @@ export default function SourcesView({
     });
   }
 
+  function updateCatalogManagedSource(managed: ManagedSource): void {
+    setCatalog((current) => {
+      if (!current) return current;
+      const update = (entry: SourceCatalogEntry): SourceCatalogEntry => applyManagedSourceToEntry(entry, managed);
+      return {
+        ...current,
+        entries: current.entries.map(update),
+        items: current.items.map(update),
+      };
+    });
+  }
+
   async function handleCheckCatalogSource(entry: SourceCatalogEntry): Promise<void> {
     if (!checkCatalogSource) return;
     setHealthLoadingId(entry.id);
@@ -267,17 +349,113 @@ export default function SourcesView({
     }
   }
 
+  async function handleImportCatalogEntries(entryIds: string[]): Promise<void> {
+    if (!importCatalogSources || entryIds.length === 0) return;
+    const selectedCount = entryIds.length;
+    if (!window.confirm(`Import ${selectedCount} nguồn đã chọn vào Source Hub để review?`)) return;
+    setManagedLoadingId('bulk-import');
+    setManagedMessage('');
+    setCatalogError('');
+    try {
+      const summary = await importCatalogSources(entryIds);
+      summary.items.forEach((item) => {
+        if (item?.id) updateCatalogManagedSource(item as ManagedSource);
+      });
+      setManagedMessage(
+        `Đã nhập ${summary.inserted} nguồn vào Source Hub. Trùng: ${summary.duplicates}. Không hợp lệ: ${summary.invalid}.`,
+      );
+      setSelectedIds(new Set());
+    } catch (loadError: unknown) {
+      setCatalogError(loadError instanceof Error ? loadError.message : 'Không import được nguồn đã chọn.');
+    } finally {
+      setManagedLoadingId('');
+    }
+  }
+
+  async function handleImportSelectedCatalog(): Promise<void> {
+    await handleImportCatalogEntries([...selectedIds]);
+  }
+
+  async function handleTestManagedSource(entry: SourceCatalogEntry): Promise<void> {
+    if (!testManagedSource || !entry.managed_source_id) return;
+    setManagedLoadingId(entry.managed_source_id);
+    setManagedMessage('');
+    setCatalogError('');
+    try {
+      const result = await testManagedSource(entry.managed_source_id);
+      setCatalog((current) => {
+        if (!current) return current;
+        const update = (item: SourceCatalogEntry): SourceCatalogEntry => {
+          if (item.id !== entry.id) return item;
+          return {
+            ...item,
+            managed_last_test_status: result.status,
+            managed_last_tested_at: result.tested_at,
+            managed_last_successful_fetch_at:
+              result.status === 'success' ? result.tested_at : item.managed_last_successful_fetch_at,
+            managed_last_error: result.status === 'success' ? '' : result.reason,
+          };
+        };
+        return {
+          ...current,
+          entries: current.entries.map(update),
+          items: current.items.map(update),
+        };
+      });
+      setManagedMessage(`Đã test nguồn ${entry.name || entry.domain}: ${result.status}.`);
+    } catch (loadError: unknown) {
+      setCatalogError(loadError instanceof Error ? loadError.message : 'Không test được nguồn.');
+    } finally {
+      setManagedLoadingId('');
+    }
+  }
+
+  async function handleVerifyManagedSource(entry: SourceCatalogEntry): Promise<void> {
+    if (!verifyManagedSource || !entry.managed_source_id) return;
+    setManagedLoadingId(entry.managed_source_id);
+    setManagedMessage('');
+    setCatalogError('');
+    try {
+      const managed = await verifyManagedSource(entry.managed_source_id);
+      updateCatalogManagedSource(managed);
+      setManagedMessage(`Nguồn ${entry.name || entry.domain} đã được xác minh và có thể dùng cho automation.`);
+    } catch (loadError: unknown) {
+      setCatalogError(loadError instanceof Error ? loadError.message : 'Không thể xác minh nguồn.');
+    } finally {
+      setManagedLoadingId('');
+    }
+  }
+
+  async function handleSetManagedStatus(
+    entry: SourceCatalogEntry,
+    status: 'BROKEN' | 'BLOCKED' | 'NEEDS_REVIEW',
+  ): Promise<void> {
+    if (!markManagedSourceStatus || !entry.managed_source_id) return;
+    setManagedLoadingId(entry.managed_source_id);
+    setManagedMessage('');
+    setCatalogError('');
+    try {
+      const managed = await markManagedSourceStatus(entry.managed_source_id, status);
+      updateCatalogManagedSource(managed);
+      setManagedMessage(`Đã cập nhật trạng thái ${entry.name || entry.domain} thành ${status}.`);
+    } catch (loadError: unknown) {
+      setCatalogError(loadError instanceof Error ? loadError.message : 'Không thể cập nhật trạng thái nguồn.');
+    } finally {
+      setManagedLoadingId('');
+    }
+  }
+
   return (
     <section aria-labelledby="sources-view-title" className="workflow-management-view sources-view sources-reference-view panel">
       <div className="management-view-header sources-reference-header">
         <div>
-          <p className="sources-eyebrow">Source Hub</p>
+          <p className="sources-eyebrow">Nguồn truyện</p>
           <h2 id="sources-view-title">Nguồn truyện</h2>
           <p className="view-subtitle">Quản lý nguồn hỗ trợ và tra cứu kho metadata nguồn truyện.</p>
         </div>
         <button className="secondary-action sources-refresh-button" disabled={state === 'loading'} onClick={() => void onRefresh()} type="button">
           <RefreshCw aria-hidden="true" size={15} />
-          Refresh
+          Làm mới
         </button>
       </div>
 
@@ -292,68 +470,98 @@ export default function SourcesView({
           Ứng viên parser
         </button>
         <button aria-pressed={activeTab === 'health'} onClick={() => setActiveTab('health')} type="button">
-          Health check
+          Kiểm tra
         </button>
       </div>
 
       {activeTab === 'supported' ? (
         <>
-          {state === 'loading' ? <p className="source-support-note">Loading source policies...</p> : null}
+          {state === 'loading' ? <p className="source-support-note">Đang tải chính sách nguồn...</p> : null}
           {error ? (
             <p className="status-error" role="alert">
               {error}
             </p>
           ) : null}
           {state !== 'loading' && !error && sources.length === 0 ? (
-            <p className="source-support-note">No source policies returned by backend.</p>
+            <p className="source-support-note">Backend chưa trả về chính sách nguồn nào.</p>
           ) : null}
 
           {sources.length > 0 ? (
-            <div className="source-support-table-wrap">
-              <table className="source-support-table sources-table">
-                <thead>
-                  <tr>
-                    <th scope="col">Source</th>
-                    <th scope="col">Domains</th>
-                    <th scope="col">Parser</th>
-                    <th scope="col">Policy</th>
-                    <th aria-label="Actions" scope="col" />
-                  </tr>
-                </thead>
-                <tbody>
+            <>
+              <div className="source-support-table-wrap">
+                <table className="source-support-table sources-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Nguồn</th>
+                      <th scope="col">Domain</th>
+                      <th scope="col">Parser</th>
+                      <th scope="col">Chính sách</th>
+                      <th aria-label="Actions" scope="col" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sources.map((source) => {
+                      const policyLabel = `${source.delay_seconds}s delay · ${source.max_concurrency} concurrent · ${source.retry_limit} retries`;
+                      const primaryDomain = source.domains[0] ?? '';
+                      return (
+                        <tr key={source.source_id}>
+                          <th scope="row">
+                            <span className="source-name-cell">
+                              <Globe2 aria-hidden="true" size={16} />
+                              {source.label}
+                            </span>
+                          </th>
+                          <td>
+                            <ul className="source-domain-list">
+                              {source.domains.map((domain) => (
+                                <li key={domain}>
+                                  <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
+                                    {domain}
+                                  </a>
+                                </li>
+                              ))}
+                            </ul>
+                          </td>
+                          <td>{source.adapter_label || source.adapter_id}</td>
+                          <td>
+                            <span className="source-policy-cell">
+                              <Clock3 aria-hidden="true" size={15} />
+                              <span aria-hidden="true">
+                                {source.delay_seconds}s delay · {source.max_concurrency} concurrent
+                              </span>
+                              <span className="sr-only">{policyLabel}</span>
+                            </span>
+                          </td>
+                          <td>
+                            <button
+                              aria-label={`Mở domain chính ${source.label}`}
+                              className="icon-action source-row-action"
+                              disabled={!primaryDomain}
+                              onClick={() => {
+                                if (primaryDomain) window.open(domainHref(primaryDomain), '_blank', 'noopener,noreferrer');
+                              }}
+                              type="button"
+                            >
+                              <MoreVertical aria-hidden="true" size={16} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {isMobileSourcesLayout ? (
+                <div className="source-support-card-list">
                   {sources.map((source) => {
-                    const policyLabel = `${source.delay_seconds}s delay · ${source.max_concurrency} concurrent · ${source.retry_limit} retries`;
                     const primaryDomain = source.domains[0] ?? '';
                     return (
-                      <tr key={source.source_id}>
-                        <th scope="row">
+                      <article className="source-support-card" key={source.source_id}>
+                        <header>
                           <span className="source-name-cell">
-                            <Globe2 aria-hidden="true" size={16} />
+                            <Globe2 aria-hidden="true" size={17} />
                             {source.label}
                           </span>
-                        </th>
-                        <td>
-                          <ul className="source-domain-list">
-                            {source.domains.map((domain) => (
-                              <li key={domain}>
-                                <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
-                                  {domain}
-                                </a>
-                              </li>
-                            ))}
-                          </ul>
-                        </td>
-                        <td>{source.adapter_label || source.adapter_id}</td>
-                        <td>
-                          <span className="source-policy-cell">
-                            <Clock3 aria-hidden="true" size={15} />
-                            <span aria-hidden="true">
-                              {source.delay_seconds}s delay · {source.max_concurrency} concurrent
-                            </span>
-                            <span className="sr-only">{policyLabel}</span>
-                          </span>
-                        </td>
-                        <td>
                           <button
                             aria-label={`Mở domain chính ${source.label}`}
                             className="icon-action source-row-action"
@@ -365,13 +573,32 @@ export default function SourcesView({
                           >
                             <MoreVertical aria-hidden="true" size={16} />
                           </button>
-                        </td>
-                      </tr>
+                        </header>
+                        <ul className="source-domain-list">
+                          {source.domains.map((domain) => (
+                            <li key={domain}>
+                              <a className="source-domain-link" href={domainHref(domain)} rel="noreferrer" target="_blank">
+                                {domain}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                        <dl>
+                          <div>
+                            <dt>Parser</dt>
+                            <dd>{source.adapter_label || source.adapter_id}</dd>
+                          </div>
+                          <div>
+                          <dt>Chính sách</dt>
+                            <dd>{source.delay_seconds}s delay · {source.max_concurrency} concurrent · {source.retry_limit} retries</dd>
+                          </div>
+                        </dl>
+                      </article>
                     );
                   })}
-                </tbody>
-              </table>
-            </div>
+                </div>
+              ) : null}
+            </>
           ) : null}
         </>
       ) : null}
@@ -440,10 +667,49 @@ export default function SourcesView({
                 <option value="false">unsupported</option>
               </select>
             </label>
+            <label>
+              <span>Review</span>
+              <select
+                onChange={(event) => {
+                  setCatalogManagedStatus(event.target.value);
+                  resetCatalogPage();
+                }}
+                value={catalogManagedStatus}
+              >
+                <option value="">Tất cả</option>
+                <option value="UNMANAGED">Chưa import</option>
+                <option value="IMPORTED">IMPORTED</option>
+                <option value="NEEDS_REVIEW">NEEDS_REVIEW</option>
+                <option value="VERIFIED">VERIFIED</option>
+                <option value="BROKEN">BROKEN</option>
+                <option value="BLOCKED">BLOCKED</option>
+              </select>
+            </label>
+            <label>
+              <span>Trust</span>
+              <select
+                onChange={(event) => {
+                  setCatalogTrustLevel(event.target.value);
+                  resetCatalogPage();
+                }}
+                value={catalogTrustLevel}
+              >
+                <option value="">Tất cả</option>
+                <option value="MANUAL_ONLY">MANUAL_ONLY</option>
+                <option value="UNKNOWN">UNKNOWN</option>
+                <option value="LOW">LOW</option>
+                <option value="MEDIUM">MEDIUM</option>
+                <option value="HIGH">HIGH</option>
+              </select>
+            </label>
           </div>
 
           <div className="source-catalog-bulkbar">
             <span>{selectedIds.size} nguồn đã chọn</span>
+            <button disabled={selectedIds.size === 0 || !importCatalogSources || managedLoadingId === 'bulk-import'} onClick={() => void handleImportSelectedCatalog()} type="button">
+              <Database aria-hidden="true" size={14} />
+              Import để review
+            </button>
             <button disabled={selectedIds.size === 0} onClick={() => void copyBulk('url')} type="button">
               <Copy aria-hidden="true" size={14} />
               Sao chép URL đã chọn
@@ -459,6 +725,7 @@ export default function SourcesView({
           </div>
           {copyMessage ? <p className="source-copy-message">{copyMessage}</p> : null}
           {healthMessage ? <p className="source-health-message">{healthMessage}</p> : null}
+          {managedMessage ? <p className="source-copy-message">{managedMessage}</p> : null}
           {candidateMessage ? <p className="source-copy-message">{candidateMessage}</p> : null}
           {candidateError ? (
             <p className="status-error" role="alert">
@@ -477,15 +744,15 @@ export default function SourcesView({
 
           {entries.length > 0 ? (
             <>
-              <div className="source-support-table-wrap source-catalog-table-wrap">
+              <div className="source-support-table-wrap source-catalog-table-wrap source-catalog-main-table-wrap">
                 <table className="source-support-table sources-table source-catalog-table">
                   <thead>
                     <tr>
                       <th aria-label="Select" scope="col" />
-                      <th scope="col">Name</th>
+                      <th scope="col">Tên nguồn</th>
                       <th scope="col">Domain</th>
                       <th scope="col">Tags</th>
-                      <th scope="col">Status</th>
+                      <th scope="col">Trạng thái</th>
                       <th scope="col">Meta</th>
                       <th aria-label="Actions" scope="col" />
                     </tr>
@@ -493,6 +760,9 @@ export default function SourcesView({
                   <tbody>
                     {entries.map((entry) => {
                       const jsonUrl = sourceJsonHref(entry);
+                      const managedStatus = managedStatusLabel(entry);
+                      const managedSourceId = entry.managed_source_id;
+                      const managedBusy = managedSourceId !== '' && managedLoadingId === managedSourceId;
                       return (
                         <Fragment key={entry.id}>
                           <tr>
@@ -527,10 +797,21 @@ export default function SourcesView({
                                 {entry.supported ? <CheckCircle2 aria-hidden="true" size={13} /> : <ShieldAlert aria-hidden="true" size={13} />}
                                 {statusLabel(entry)}
                               </span>
+                              <span className={`source-status-badge ${entry.can_use_in_jobs ? 'is-supported' : managedStatus === 'BLOCKED' || managedStatus === 'BROKEN' ? 'is-failed' : 'is-unchecked'}`}>
+                                {managedStatus}
+                              </span>
+                              <span className="source-invalid-reason">
+                                Trust: {managedTrustLabel(entry)} · Jobs: {entry.can_use_in_jobs ? 'enabled' : 'disabled'}
+                              </span>
                               {entry.invalid_reason ? <span className="source-invalid-reason">{entry.invalid_reason}</span> : null}
                               {entry.last_check_status ? (
                                 <span className={`source-status-badge source-health-badge ${healthTone(entry.last_check_status)}`}>
                                   {entry.last_check_status}
+                                </span>
+                              ) : null}
+                              {entry.managed_last_test_status ? (
+                                <span className={`source-status-badge source-health-badge ${healthTone(entry.managed_last_test_status === 'success' ? 'reachable' : 'error')}`}>
+                                  test: {entry.managed_last_test_status}
                                 </span>
                               ) : null}
                               {entry.last_check_at ? (
@@ -539,6 +820,12 @@ export default function SourcesView({
                                   {entry.last_check_http_status ? ` · HTTP ${entry.last_check_http_status}` : ''}
                                 </span>
                               ) : null}
+                              {entry.managed_last_tested_at ? (
+                                <span className="source-invalid-reason">
+                                  Last fetch test: {entry.managed_last_tested_at}
+                                </span>
+                              ) : null}
+                              {entry.managed_last_error ? <span className="source-invalid-reason">{entry.managed_last_error}</span> : null}
                               {entry.last_check_error ? <span className="source-invalid-reason">{entry.last_check_error}</span> : null}
                             </td>
                             <td>
@@ -546,10 +833,23 @@ export default function SourcesView({
                                 {entry.author || 'Unknown author'}
                                 <br />
                                 {entry.version ? `v${entry.version}` : 'No version'}
+                                <br />
+                                {entry.managed_parser_type || 'parser n/a'}
                               </span>
                             </td>
                             <td>
                               <span className="source-row-actions">
+                                <button
+                                  aria-label={`Import source metadata ${entry.name || entry.domain}`}
+                                  className="icon-action"
+                                  disabled={Boolean(managedSourceId) || !importCatalogSources}
+                                  onClick={() => {
+                                    void handleImportCatalogEntries([entry.id]);
+                                  }}
+                                  type="button"
+                                >
+                                  <Database aria-hidden="true" size={15} />
+                                </button>
                                 <button aria-label={`Sao chép URL ${entry.name || entry.domain}`} className="icon-action" disabled={!entry.url} onClick={() => void copyText(entry.url, 'URL nguồn')} type="button">
                                   <Copy aria-hidden="true" size={15} />
                                 </button>
@@ -569,6 +869,24 @@ export default function SourcesView({
                                   <RefreshCw aria-hidden="true" size={15} />
                                 </button>
                                 <button
+                                  aria-label={`Test managed source ${entry.name || entry.domain}`}
+                                  className="icon-action"
+                                  disabled={!managedSourceId || !testManagedSource || managedBusy}
+                                  onClick={() => void handleTestManagedSource(entry)}
+                                  type="button"
+                                >
+                                  <ShieldCheck aria-hidden="true" size={15} />
+                                </button>
+                                <button
+                                  aria-label={`Verify managed source ${entry.name || entry.domain}`}
+                                  className="icon-action"
+                                  disabled={!managedSourceId || !verifyManagedSource || managedBusy}
+                                  onClick={() => void handleVerifyManagedSource(entry)}
+                                  type="button"
+                                >
+                                  <CheckCircle2 aria-hidden="true" size={15} />
+                                </button>
+                                <button
                                   aria-label={`Create parser candidate ${entry.name || entry.domain}`}
                                   className="icon-action"
                                   disabled={!createParserCandidate || candidateLoadingId === entry.id}
@@ -578,11 +896,48 @@ export default function SourcesView({
                                   <FileJson aria-hidden="true" size={15} />
                                 </button>
                               </span>
+                              {managedSourceId ? (
+                                <span className="source-row-actions">
+                                  <button disabled={!markManagedSourceStatus || managedBusy} onClick={() => void handleSetManagedStatus(entry, 'NEEDS_REVIEW')} type="button">
+                                    Review
+                                  </button>
+                                  <button disabled={!markManagedSourceStatus || managedBusy} onClick={() => void handleSetManagedStatus(entry, 'BROKEN')} type="button">
+                                    Broken
+                                  </button>
+                                  <button disabled={!markManagedSourceStatus || managedBusy} onClick={() => void handleSetManagedStatus(entry, 'BLOCKED')} type="button">
+                                    Block
+                                  </button>
+                                </span>
+                              ) : null}
                             </td>
                           </tr>
                           {expandedId === entry.id ? (
                             <tr className="source-catalog-details-row">
                               <td colSpan={7}>
+                                <div className="source-catalog-details-grid">
+                                  <div>
+                                    <strong>Base URL</strong>
+                                    <p>{entry.url || '—'}</p>
+                                  </div>
+                                  <div>
+                                    <strong>Parser</strong>
+                                    <p>{entry.managed_parser_type || (entry.supported ? 'policy_supported' : 'generic_html')}</p>
+                                  </div>
+                                  <div>
+                                    <strong>Rate limit</strong>
+                                    <p>
+                                      {entry.managed_rate_limit_requests_per_minute || 0} rpm · {entry.managed_rate_limit_delay_ms || 0} ms · {entry.managed_max_concurrent_requests || 0} concurrent
+                                    </p>
+                                  </div>
+                                  <div>
+                                    <strong>Cooldown</strong>
+                                    <p>{entry.managed_cooldown_after_error_seconds || 0}s</p>
+                                  </div>
+                                  <div>
+                                    <strong>Notes</strong>
+                                    <p>{entry.managed_notes || 'Chưa có ghi chú review.'}</p>
+                                  </div>
+                                </div>
                                 <pre>{JSON.stringify(entry, null, 2)}</pre>
                               </td>
                             </tr>
@@ -593,6 +948,98 @@ export default function SourcesView({
                   </tbody>
                 </table>
               </div>
+              {isMobileSourcesLayout ? (
+                <div className="source-catalog-card-list">
+                  {entries.map((entry) => {
+                    const jsonUrl = sourceJsonHref(entry);
+                    const managedStatus = managedStatusLabel(entry);
+                    const managedSourceId = entry.managed_source_id;
+                    const managedBusy = managedSourceId !== '' && managedLoadingId === managedSourceId;
+                    return (
+                      <article className="source-catalog-card" key={entry.id}>
+                        <header>
+                          <label>
+                            <input
+                              aria-label={`Chọn nguồn ${entry.name || entry.domain}`}
+                              checked={selectedIds.has(entry.id)}
+                              onChange={() => toggleSelected(entry.id)}
+                              type="checkbox"
+                            />
+                            <span>{entry.name || entry.domain || 'Nguồn chưa đặt tên'}</span>
+                          </label>
+                          <span className={`source-status-badge ${statusTone(entry)}`}>
+                            {entry.supported ? <CheckCircle2 aria-hidden="true" size={13} /> : <ShieldAlert aria-hidden="true" size={13} />}
+                            {statusLabel(entry)}
+                          </span>
+                        </header>
+                        {entry.url ? (
+                          <a className="source-catalog-url" href={entry.url} rel="noreferrer" target="_blank">
+                            {entry.url}
+                          </a>
+                        ) : null}
+                        <dl>
+                          <div>
+                            <dt>Domain</dt>
+                            <dd>{entry.domain || '-'}</dd>
+                          </div>
+                          <div>
+                            <dt>Review</dt>
+                            <dd>{managedStatus} · Trust {managedTrustLabel(entry)}</dd>
+                          </div>
+                          <div>
+                            <dt>Meta</dt>
+                            <dd>{entry.author || 'Không rõ tác giả'} · {entry.version ? `v${entry.version}` : 'chưa có version'}</dd>
+                          </div>
+                        </dl>
+                        <span className="source-tag-list">
+                          {[...entry.tags, ...entry.unknown_tags].map((tag) => (
+                            <span className="source-tag-chip" key={tag}>
+                              {tag}
+                            </span>
+                          ))}
+                        </span>
+                        <div className="source-row-actions">
+                          <button
+                            disabled={Boolean(managedSourceId) || !importCatalogSources}
+                            onClick={() => {
+                              void handleImportCatalogEntries([entry.id]);
+                            }}
+                            type="button"
+                          >
+                            <Database aria-hidden="true" size={15} />
+                            Import
+                          </button>
+                          <button disabled={!entry.url} onClick={() => void copyText(entry.url, 'URL nguồn')} type="button">
+                            <Copy aria-hidden="true" size={15} />
+                            URL
+                          </button>
+                          <button disabled={!jsonUrl} onClick={() => void copyText(jsonUrl, 'source JSON URL')} type="button">
+                            <FileJson aria-hidden="true" size={15} />
+                            JSON
+                          </button>
+                          <button disabled={!checkCatalogSource || healthLoadingId === entry.id} onClick={() => void handleCheckCatalogSource(entry)} type="button">
+                            <RefreshCw aria-hidden="true" size={15} />
+                            Check
+                          </button>
+                        </div>
+                        {managedSourceId ? (
+                          <div className="source-row-actions">
+                            <button disabled={!testManagedSource || managedBusy} onClick={() => void handleTestManagedSource(entry)} type="button">
+                              Test
+                            </button>
+                            <button disabled={!verifyManagedSource || managedBusy} onClick={() => void handleVerifyManagedSource(entry)} type="button">
+                              Verify
+                            </button>
+                            <button disabled={!markManagedSourceStatus || managedBusy} onClick={() => void handleSetManagedStatus(entry, 'NEEDS_REVIEW')} type="button">
+                              Review
+                            </button>
+                          </div>
+                        ) : null}
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : null}
               <div className="source-catalog-pagination">
                 <button disabled={catalogPage <= 1 || catalogState === 'loading'} onClick={() => setCatalogPage((page) => Math.max(1, page - 1))} type="button">
                   <ChevronLeft aria-hidden="true" size={15} />
@@ -615,7 +1062,7 @@ export default function SourcesView({
         <div className="source-catalog-panel">
           <div className="source-catalog-notice">
             <ShieldAlert aria-hidden="true" size={18} />
-            <p>Candidate is not a supported source. Import remains blocked until a developer/operator adds a real source policy and parser.</p>
+            <p>Ứng viên parser chưa phải nguồn được hỗ trợ. Import vẫn bị chặn cho đến khi có source policy và parser thật.</p>
           </div>
           {candidateMessage ? <p className="source-copy-message">{candidateMessage}</p> : null}
           {candidateError ? (
@@ -631,13 +1078,13 @@ export default function SourcesView({
               <table className="source-support-table sources-table source-catalog-table source-candidate-table">
                 <thead>
                   <tr>
-                    <th scope="col">Title</th>
+                    <th scope="col">Tiêu đề</th>
                     <th scope="col">Domain</th>
-                    <th scope="col">Sample URL</th>
-                    <th scope="col">Confidence</th>
-                    <th scope="col">Status</th>
-                    <th scope="col">Signals</th>
-                    <th scope="col">Created</th>
+                    <th scope="col">URL mẫu</th>
+                    <th scope="col">Độ tin cậy</th>
+                    <th scope="col">Trạng thái</th>
+                    <th scope="col">Tín hiệu</th>
+                    <th scope="col">Ngày tạo</th>
                   </tr>
                 </thead>
                 <tbody>

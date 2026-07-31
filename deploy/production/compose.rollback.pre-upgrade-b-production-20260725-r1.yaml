@@ -1,0 +1,6 @@
+# Exact image tags running immediately before the Upgrade B production cutover.
+services:
+  api:
+    image: novel-pipeline-api:ux-pwa-001-production-20260724-r1
+  import-worker:
+    image: novel-pipeline-import-worker:ux-pwa-001-production-20260724-r1

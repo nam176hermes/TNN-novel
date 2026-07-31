@@ -34,7 +34,7 @@ if (
 from dotenv import load_dotenv
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:7860"
-DEFAULT_WEB_URL = "http://127.0.0.1:5174"
+DEFAULT_WEB_URL = DEFAULT_API_BASE_URL
 DEFAULT_TIMEOUT_MS = 15_000
 USER_AGENT = "novel-pipeline-reader-smoke/1.0"
 
@@ -233,6 +233,7 @@ def run_browser_smoke(
     api_base_url: str,
     password: str,
     smoke_book: SmokeBook,
+    token: str,
     username: str,
     web_url: str,
 ) -> tuple[Path, Path]:
@@ -293,9 +294,19 @@ def run_browser_smoke(
         page.on("requestfailed", record_reader_request_failed)
 
         page.goto(web_url.rstrip("/") + "/", wait_until="networkidle")
-        page.get_by_label("Username").fill(username)
-        page.get_by_label("Password").fill(password)
-        page.get_by_role("button", name="Login").click()
+        login_form = page.get_by_label("Username")
+        if login_form.count() > 0 and login_form.first.is_visible():
+            login_form.first.fill(username)
+            page.get_by_label("Password").fill(password)
+            page.get_by_role("button", name="Login").click()
+        else:
+            page.evaluate(
+                """(accessToken) => {
+                    window.localStorage.setItem('novel-operator-token', accessToken);
+                }""",
+                token,
+            )
+            page.reload(wait_until="networkidle")
         expect(page.get_by_role("button", name="Thư viện")).to_be_visible()
 
         page.get_by_role("button", name="Thư viện").click()
@@ -402,6 +413,9 @@ def run_browser_smoke(
         expect(marks_panel).to_contain_text("Thiếu niên đứng trước sơn môn")
         marks_panel.get_by_role("button", name="Notes").click()
         expect(marks_panel).to_contain_text(updated_note_text)
+        page.get_by_role("button", name="Đóng dấu đọc").click()
+        audio_panel = page.get_by_role("region", name="Audio và TTS chương")
+        expect(audio_panel).to_be_visible()
         fail_on_reader_api_errors()
 
         required_reader_hits = {
@@ -420,6 +434,12 @@ def run_browser_smoke(
 
         page.set_viewport_size({"width": 390, "height": 844})
         page.wait_for_timeout(250)
+        expect(audio_panel).to_be_visible()
+        mobile_overflow = page.evaluate(
+            "() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 2"
+        )
+        if mobile_overflow:
+            raise AssertionError("Reader mobile layout has horizontal overflow")
         page.screenshot(path=mobile_screenshot, full_page=True)
         page.set_viewport_size({"width": 1440, "height": 1000})
         page.wait_for_timeout(250)
@@ -434,15 +454,11 @@ def run_browser_smoke(
 def main() -> int:
     load_dotenv(ROOT / ".env")
     default_api_base_url = f"http://127.0.0.1:{os.getenv('MOBILE_API_PORT', '7860')}"
-    default_web_url = f"http://127.0.0.1:{os.getenv('WEB_PORT', '5174')}"
     api_base_url = os.getenv(
         "SMOKE_API_BASE_URL",
         os.getenv("API_BASE_URL", default_api_base_url or DEFAULT_API_BASE_URL),
     ).rstrip("/")
-    web_url = os.getenv(
-        "SMOKE_WEB_URL",
-        os.getenv("WEB_URL", default_web_url or DEFAULT_WEB_URL),
-    ).rstrip("/")
+    web_url = os.getenv("SMOKE_WEB_URL", os.getenv("WEB_URL", api_base_url or DEFAULT_WEB_URL)).rstrip("/")
     username = os.getenv("MOBILE_API_ADMIN_USERNAME", "admin")
     password = os.getenv("MOBILE_API_ADMIN_PASSWORD", "change_me")
 
@@ -456,6 +472,7 @@ def main() -> int:
             api_base_url=api_base_url,
             password=password,
             smoke_book=smoke_book,
+            token=token,
             username=username,
             web_url=web_url,
         )

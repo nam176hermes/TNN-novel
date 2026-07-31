@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import errno
 import json
 import logging
 import os
@@ -11,34 +12,108 @@ import shutil
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import StreamingResponse
 
 from app.config import PROJECT_ROOT
-from app.database.db import list_ebook_import_runs
-from app.ingestion.source_adapters import SourceAdapterError, list_source_capabilities, validate_public_http_url
+from app.database.db import find_managed_source_for_url, get_chapter_by_id, get_managed_source, list_ebook_import_runs
+from app.database.import_jobs import (
+    ImportJob,
+    InvalidImportJobTransition,
+    JobStatus as DurableImportJobStatus,
+    TaskStatus as DurableImportTaskStatus,
+)
+from app.ingestion.source_adapters import FetchErrorCode, FetchMethod, SourceAdapterError, list_source_capabilities, validate_public_http_url
 from app.ingestion.source_policies import chapter_url_matches_source_book, get_source_policy
+from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.config import mobile_settings
 from app.mobile_api.dependencies import get_db_path
 from app.mobile_api.schemas import (
     JobResponse,
+    ImportJobAcceptedResponse,
+    ImportJobCreateRequest,
+    ImportJobErrorResponse,
+    ImportJobEventData,
+    ImportJobSnapshotResponse,
     PasteImport,
     SourceCapabilityList,
     SourcePreviewResponse,
+    URLFetchChapterResult,
+    URLFetchRequest,
+    URLFetchResponse,
     URLImportStart,
     URLNoteImport,
     URLPreviewRequest,
+    WizardTextImport,
+    WizardTextImportResult,
 )
-from app.mobile_api.services.ebook_import_service import EbookImportService
+from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
 from app.mobile_api.services.job_service import JobService, get_shared_job_tracker
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload_to_temp_limited
+from app.services.import_job_service import ImportJobService
+from app.services.import_job_quotas import ImportJobQuotaError
+from app.services.import_job_factory import create_import_job_service
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 logger = logging.getLogger(__name__)
 EBOOK_UPLOAD_TTL_SECONDS = 6 * 60 * 60
 EBOOK_UPLOAD_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 SUPPORTED_EBOOK_SUFFIXES = {".epub", ".azw3", ".mobi", ".prc", ".txt", ".html", ".htm"}
+MAX_WIZARD_TEXT_IMPORT_BYTES = 5 * 1024 * 1024
+EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
+    "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+)
+IMPORT_JOB_TERMINAL_STATUSES = {
+    DurableImportJobStatus.SUCCEEDED,
+    DurableImportJobStatus.PARTIALLY_SUCCEEDED,
+    DurableImportJobStatus.FAILED,
+    DurableImportJobStatus.CANCELLED,
+}
+IMPORT_JOB_SSE_POLL_SECONDS = 0.25
+IMPORT_JOB_SSE_KEEPALIVE_SECONDS = 15.0
+IMPORT_JOB_ERROR_RESPONSES = {
+    400: {"model": ImportJobErrorResponse, "description": "Invalid import request"},
+    404: {"model": ImportJobErrorResponse, "description": "Import job not found"},
+    409: {"model": ImportJobErrorResponse, "description": "Import job state conflict"},
+    422: {"model": ImportJobErrorResponse, "description": "Import request quota or validation failure"},
+}
+IMPORT_JOB_SSE_RESPONSES = {
+    **IMPORT_JOB_ERROR_RESPONSES,
+    200: {
+        "description": "Persisted import job events",
+        "content": {
+            "text/event-stream": {
+                "schema": ImportJobEventData.model_json_schema(),
+            }
+        },
+    },
+}
+
+
+def _source_adapter_http_exception(exc: SourceAdapterError, *, default_status: int = 400) -> HTTPException:
+    return HTTPException(
+        status_code=exc.http_status or default_status,
+        detail=exc.safe_message,
+        headers={
+            "X-Novel-Fetch-Error-Code": exc.code.value,
+            "X-Novel-Fetch-Retryable": "1" if exc.retryable else "0",
+        },
+    )
 
 
 def get_pipeline():
@@ -49,8 +124,248 @@ def get_job_service():
     return JobService(PipelineService(), tracker=get_shared_job_tracker(get_db_path()))
 
 
+def get_import_job_service(
+    pipeline: PipelineService = Depends(get_pipeline),
+) -> ImportJobService:
+    return create_import_job_service(
+        worker_id=f"api-{os.getpid()}",
+        pipeline=pipeline,
+        db_path=Path(getattr(pipeline, "db_path", get_db_path())),
+    )
+
+
 def get_ebook_import_service():
     return EbookImportService()
+
+
+def _import_job_owner(current_user: dict) -> str:
+    owner = str(current_user.get("user_id") or current_user.get("username") or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "invalid_owner", "retryable": False, "message": "Authenticated owner is unavailable"},
+        )
+    return owner
+
+
+def _import_job_http_error(code: str, message: str, status_code: int) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "retryable": False, "message": message},
+    )
+
+
+def _raise_import_job_error(exc: Exception) -> None:
+    if isinstance(exc, ImportJobQuotaError):
+        status_code = 422 if exc.code == "chapter_quota_exceeded" else 429
+        raise _import_job_http_error(exc.code, exc.safe_message, status_code) from exc
+    if isinstance(exc, (LookupError, PermissionError)):
+        raise _import_job_http_error("job_not_found", "Import job not found", 404) from exc
+    if isinstance(exc, InvalidImportJobTransition):
+        raise _import_job_http_error("invalid_job_state", "Import job state does not allow this action", 409) from exc
+    if isinstance(exc, SourceAdapterError):
+        raise HTTPException(
+            status_code=exc.http_status or 400,
+            detail={"code": exc.code.value, "retryable": exc.retryable, "message": exc.safe_message},
+        ) from exc
+    raise exc
+
+
+def _validated_import_job_selection(
+    data: ImportJobCreateRequest | URLFetchRequest,
+) -> tuple[str, str, list[dict[str, object]]]:
+    if not data.title.strip():
+        raise _import_job_http_error("invalid_request", "Book title is required", 422)
+    if not data.chapters:
+        raise _import_job_http_error("invalid_request", "At least one chapter must be selected", 422)
+    if len(data.chapters) > mobile_settings.import_job_max_chapters:
+        raise _import_job_http_error(
+            "chapter_quota_exceeded",
+            f"A job can include at most {mobile_settings.import_job_max_chapters} chapters",
+            422,
+        )
+
+    source_url = validate_public_http_url(data.source_url or data.chapters[0].url)
+    source_policy = get_source_policy(source_url)
+    if source_policy is None:
+        raise SourceAdapterError(
+            "Unsupported source domain",
+            code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+            retryable=False,
+            http_status=400,
+        )
+
+    tasks: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for chapter in data.chapters:
+        chapter_url = validate_public_http_url(chapter.url)
+        chapter_policy = get_source_policy(chapter_url)
+        if chapter_policy is None or chapter_policy.source_id != source_policy.source_id:
+            raise SourceAdapterError(
+                "Selected chapters must belong to the same supported source",
+                code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                retryable=False,
+                http_status=400,
+            )
+        if not chapter_url_matches_source_book(source_url, chapter_url):
+            raise SourceAdapterError(
+                "Selected chapters must belong to the same source book",
+                code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                retryable=False,
+                http_status=400,
+            )
+        if chapter_url in seen:
+            raise SourceAdapterError(
+                "Duplicate chapter selection",
+                code=FetchErrorCode.DUPLICATE,
+                retryable=False,
+                http_status=409,
+            )
+        seen.add(chapter_url)
+        tasks.append(
+            {
+                "canonical_identity": f"{source_policy.source_id}:{chapter_url}",
+                "canonical_chapter_url": chapter_url,
+                "chapter_number": chapter.chapter_number,
+                "title": chapter.title,
+            }
+        )
+    return source_url, source_policy.source_id, tasks
+
+
+def _create_durable_import_job(
+    service: ImportJobService,
+    data: ImportJobCreateRequest | URLFetchRequest,
+    owner_user_id: str,
+) -> ImportJob:
+    source_url, source_id, tasks = _validated_import_job_selection(data)
+    job = service.create_job(
+        owner_user_id=owner_user_id,
+        source=data.source.strip() or source_id,
+        source_url=source_url,
+        tasks=tasks,
+        config_snapshot={
+            "title": data.title.strip(),
+            "author": data.author.strip(),
+            "source": data.source.strip() or source_id,
+            "source_url": source_url,
+        },
+    )
+    return service.enqueue_job(job.id, owner_user_id)
+
+
+def _run_import_job_until_idle(
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+) -> ImportJob:
+    """Drain bounded P07 batches without introducing an autonomous scheduler."""
+    while True:
+        before = service.get_job(job_id, owner_user_id)
+        job = service.run_job(job_id, owner_user_id)
+        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
+            return job
+        if job.cancel_requested_at or job.queued_count == 0:
+            return job
+        if job.version == before.version:
+            return job
+
+
+def _import_job_snapshot(
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+) -> dict:
+    job = service.get_job(job_id, owner_user_id)
+    tasks = service.list_tasks(job_id, owner_user_id)
+    return {
+        "job_id": job.id,
+        "status": job.status.value,
+        "source": job.source,
+        "book_id": job.book_id,
+        "total": job.total,
+        "queued_count": job.queued_count,
+        "running_count": job.running_count,
+        "succeeded_count": job.succeeded_count,
+        "failed_count": job.failed_count,
+        "cancelled_count": job.cancelled_count,
+        "waiting_retry_count": job.waiting_retry_count,
+        "verification_required_count": job.verification_required_count,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+        "cancel_requested_at": job.cancel_requested_at,
+        "error_summary": job.error_summary,
+        "tasks": [
+            {
+                "id": task.id,
+                "chapter_number": task.chapter_number,
+                "title": task.title,
+                "status": task.status.value,
+                "stage": task.stage.value,
+                "attempts": task.attempts,
+                "next_attempt_at": task.next_attempt_at,
+                "error_code": task.error_code,
+                "error_message": task.error_message,
+                "retryable": task.retryable,
+                "fetch_method": task.fetch_method,
+                "text_length": task.text_length,
+                "content_hash": task.content_hash,
+                "elapsed_ms": task.elapsed_ms,
+                "started_at": task.started_at,
+                "finished_at": task.finished_at,
+                "book_id": task.book_id,
+                "chapter_id": task.chapter_id,
+            }
+            for task in tasks
+        ],
+    }
+
+
+def _sse_event(event) -> str:
+    payload = {
+        "sequence": event.sequence,
+        "job_id": event.job_id,
+        "task_id": event.task_id,
+        "type": event.event_type,
+        "data": event.payload,
+        "created_at": event.created_at,
+    }
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event.sequence}\nevent: import_job_event\ndata: {data}\n\n"
+
+
+async def _stream_import_job_events(
+    request: Request,
+    service: ImportJobService,
+    job_id: str,
+    owner_user_id: str,
+    *,
+    cursor: int,
+):
+    last_sequence = max(0, cursor)
+    last_emit_at = time.monotonic()
+    while True:
+        if await request.is_disconnected():
+            return
+        events = await asyncio.to_thread(
+            service.list_events,
+            job_id,
+            owner_user_id,
+            after_sequence=last_sequence,
+        )
+        for event in events:
+            last_sequence = event.sequence
+            last_emit_at = time.monotonic()
+            yield _sse_event(event)
+
+        job = await asyncio.to_thread(service.get_job, job_id, owner_user_id)
+        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
+            return
+        if time.monotonic() - last_emit_at >= IMPORT_JOB_SSE_KEEPALIVE_SECONDS:
+            last_emit_at = time.monotonic()
+            yield ": keepalive\n\n"
+        await asyncio.sleep(IMPORT_JOB_SSE_POLL_SECONDS)
 
 
 @router.get("/sources", response_model=SourceCapabilityList)
@@ -64,11 +379,41 @@ def _import_error_status(error: ValueError) -> int:
     return 409 if "Duplicate chapter" in message else 400
 
 
+def _url_fetch_error_metadata(exc: Exception) -> tuple[FetchErrorCode, bool, str, str]:
+    if isinstance(exc, SourceAdapterError):
+        method = (
+            FetchMethod.USER_VERIFICATION_REQUIRED.value
+            if exc.code is FetchErrorCode.USER_VERIFICATION_REQUIRED
+            else ""
+        )
+        return exc.code, exc.retryable, exc.safe_message, method
+    if isinstance(exc, ValueError) and "Duplicate" in str(exc):
+        return FetchErrorCode.DUPLICATE, False, "Chapter already exists", ""
+    return (
+        FetchErrorCode.IMPORT_FAILED,
+        False,
+        "Chapter import failed. Check the source metadata and try again.",
+        "",
+    )
+
+
 def _safe_import_response(result: dict, request: Request) -> dict:
     payload = dict(result)
     if is_public_request(request):
         payload["path"] = ""
     return payload
+
+
+def _wizard_text_payload_bytes(data: WizardTextImport) -> int:
+    total = 0
+    for chapter in data.chapters:
+        total += len(chapter.text.encode("utf-8"))
+        total += len(chapter.raw_text.encode("utf-8"))
+        total += len(chapter.translated_text.encode("utf-8"))
+        total += len(chapter.chapter_title.encode("utf-8"))
+    total += len(data.title.encode("utf-8"))
+    total += len(data.author.encode("utf-8"))
+    return total
 
 
 def _validated_url_import_payload(data: URLImportStart) -> tuple[str, list[dict], int]:
@@ -101,7 +446,7 @@ async def import_paste(
     """Import from pasted text."""
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="Text is empty")
-    
+
     try:
         result = pipeline.import_from_text(
             title=data.title,
@@ -136,6 +481,83 @@ async def import_paste(
     return {**_safe_import_response(result, request), "message": "Imported from paste"}
 
 
+@router.post("/wizard/text", response_model=WizardTextImportResult)
+async def import_wizard_text(
+    data: WizardTextImport,
+    request: Request,
+    pipeline: PipelineService = Depends(get_pipeline),
+):
+    """Commit a reviewed paste/TXT import plan from the guided wizard."""
+    if _wizard_text_payload_bytes(data) > MAX_WIZARD_TEXT_IMPORT_BYTES:
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Wizard text import rejected because payload is too large",
+            request=request,
+            details={"import_type": "wizard_text", "result": "failure", "reason": "payload_too_large"},
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"Import text payload is too large. Limit is {MAX_WIZARD_TEXT_IMPORT_BYTES // (1024 * 1024)} MB.",
+        )
+    try:
+        result = await asyncio.to_thread(
+            pipeline.import_reviewed_text_plan,
+            title=data.title,
+            author=data.author,
+            target_book_id=data.target_book_id,
+            content_kind=data.content_kind,
+            duplicate_strategy=data.duplicate_strategy,
+            source_type=data.source_type,
+            chapters=[chapter.model_dump() for chapter in data.chapters],
+        )
+    except ValueError as exc:
+        message = str(exc)
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Wizard text import failed",
+            request=request,
+            details={
+                "import_type": "wizard_text",
+                "result": "failure",
+                "reason": "duplicate" if "Duplicate chapter" in message else "validation",
+            },
+        )
+        raise HTTPException(status_code=_import_error_status(exc), detail=message) from exc
+    except Exception:
+        logger.exception("Wizard text import failed")
+        record_audit_event(
+            event_type="import_failure",
+            severity="error",
+            source="import",
+            message="Wizard text import failed",
+            request=request,
+            details={"import_type": "wizard_text", "result": "failure"},
+        )
+        raise HTTPException(status_code=500, detail="Import failed. Check the import plan and server logs.") from None
+
+    record_audit_event(
+        event_type="import_complete",
+        severity="info",
+        source="import",
+        message="Wizard text import completed",
+        request=request,
+        details={
+            "import_type": "wizard_text",
+            "result": "success",
+            "book_id": result.get("book_id", 0),
+            "chapter_count": result.get("chapter_count", 0),
+            "imported_chapters": result.get("imported_chapters", 0),
+            "skipped_chapters": result.get("skipped_chapters", 0),
+            "overwritten_chapters": result.get("overwritten_chapters", 0),
+        },
+    )
+    return {**result, "message": "Imported reviewed text"}
+
+
 @router.post("/file", response_model=dict)
 async def import_file(
     request: Request,
@@ -148,7 +570,7 @@ async def import_file(
     """Import from uploaded .txt file."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
-    
+
     # Save uploaded file to temp location
     data_dir = pipeline.data_dir
     raw_dir = data_dir / "raw"
@@ -156,10 +578,10 @@ async def import_file(
     original_name = Path(file.filename).name
     safe_name = pipeline._safe_filename_part(original_name) or "upload.txt"
     temp_path = raw_dir / f"upload_{time.time_ns()}_{safe_name}"
-    
+
     content = await read_upload_bytes_limited(file, label="Raw text upload")
     temp_path.write_bytes(content)
-    
+
     try:
         result = pipeline.import_from_file(
             title=title,
@@ -237,7 +659,19 @@ def _stage_ebook_upload(service: EbookImportService, temp_path: Path, original_n
     upload_id = uuid.uuid4().hex
     upload_dir = _ebook_upload_dir(service)
     staged_path = upload_dir / f"{upload_id}{temp_path.suffix.lower()}"
-    shutil.move(str(temp_path), str(staged_path))
+    try:
+        os.replace(temp_path, staged_path)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # ``copy2`` preserves timestamps and permissions, which is rejected by
+        # some production bind mounts. Staging only needs the ebook bytes.
+        try:
+            shutil.copyfile(temp_path, staged_path)
+            temp_path.unlink()
+        except Exception:
+            staged_path.unlink(missing_ok=True)
+            raise
     meta_path = upload_dir / f"{upload_id}.json"
     meta_path.write_text(json.dumps({"filename": original_name}, ensure_ascii=False), encoding="utf-8")
     return upload_id
@@ -280,10 +714,12 @@ async def _run_translated_ebook_import_job(
     target_book_id: int | None,
     duplicate_strategy: str,
     split_mode: str,
+    confirmed_existing_book_id: int | None,
     cleanup_upload_id: str = "",
     cleanup_temp_path: bool = False,
 ) -> None:
     tracker.update_job(job_id, status="running", progress=0, message="Importing translated ebook")
+    confirmation_conflict = False
     try:
         result = await asyncio.to_thread(
             service.import_translated_ebook,
@@ -292,6 +728,7 @@ async def _run_translated_ebook_import_job(
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
             original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
         )
         imported = int(result.get("imported_chapters") or 0)
         skipped = int(result.get("skipped_chapters") or 0)
@@ -326,6 +763,33 @@ async def _run_translated_ebook_import_job(
                 "skipped_chapters": skipped,
             },
         )
+    except ExistingBookConfirmationRequired:
+        confirmation_conflict = True
+        job = tracker.get_job(job_id)
+        params = dict(job.params or {}) if job else {}
+        params["confirmed_existing_book_id"] = None
+        if cleanup_upload_id:
+            params["retry_upload_id"] = cleanup_upload_id
+        elif cleanup_temp_path:
+            params["retry_upload_id"] = _stage_ebook_upload(service, ebook_path, original_name)
+        else:
+            params["retry_inbox_file"] = original_name
+        logger.info("Translated ebook import job %s requires a fresh Preview and confirmation", job_id)
+        tracker.update_job(
+            job_id,
+            status="failed",
+            error=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+            message=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+            params=params,
+        )
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Translated ebook import requires existing book confirmation",
+            job_id=job_id,
+            details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
+        )
     except ValueError as exc:
         logger.info("Translated ebook import job %s failed: %s", job_id, exc)
         tracker.update_job(
@@ -359,10 +823,11 @@ async def _run_translated_ebook_import_job(
             details={"import_type": "ebook", "result": "failure"},
         )
     finally:
-        if cleanup_upload_id:
-            _delete_staged_ebook_upload(service, cleanup_upload_id)
-        if cleanup_temp_path:
-            ebook_path.unlink(missing_ok=True)
+        if not confirmation_conflict:
+            if cleanup_upload_id:
+                _delete_staged_ebook_upload(service, cleanup_upload_id)
+            if cleanup_temp_path:
+                ebook_path.unlink(missing_ok=True)
 
 
 def _ebook_inbox_dir() -> Path:
@@ -470,6 +935,7 @@ async def import_translated_ebook(
     target_book_id: int | None = Form(default=None),
     duplicate_strategy: str = Form(default="skip"),
     split_mode: str = Form(default="auto"),
+    confirmed_existing_book_id: int | None = Form(default=None),
     service: EbookImportService = Depends(get_ebook_import_service),
 ):
     """Import an already-translated ebook directly into the Library."""
@@ -484,6 +950,7 @@ async def import_translated_ebook(
         using_uploaded_file = True
     else:
         raise HTTPException(status_code=400, detail="No file uploaded")
+    confirmation_conflict = False
     try:
         result = service.import_translated_ebook(
             temp_path,
@@ -491,7 +958,19 @@ async def import_translated_ebook(
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
             original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
         )
+    except ExistingBookConfirmationRequired as exc:
+        confirmation_conflict = True
+        record_audit_event(
+            event_type="import_failure",
+            severity="warning",
+            source="import",
+            message="Translated ebook import requires existing book confirmation",
+            request=request,
+            details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
+        )
+        raise HTTPException(status_code=409, detail=EBOOK_CONFIRMATION_REQUIRED_DETAIL) from exc
     except ValueError as exc:
         message = str(exc)
         status = 409 if "Duplicate chapter" in message else 400
@@ -505,7 +984,7 @@ async def import_translated_ebook(
         )
         raise HTTPException(status_code=status, detail=message) from exc
     finally:
-        if using_staged_upload and upload_id:
+        if using_staged_upload and upload_id and not confirmation_conflict:
             _delete_staged_ebook_upload(service, upload_id)
         elif using_uploaded_file:
             temp_path.unlink(missing_ok=True)
@@ -534,6 +1013,7 @@ async def start_translated_ebook_import_job(
     target_book_id: int | None = Form(default=None),
     duplicate_strategy: str = Form(default="skip"),
     split_mode: str = Form(default="auto"),
+    confirmed_existing_book_id: int | None = Form(default=None),
     service: EbookImportService = Depends(get_ebook_import_service),
 ):
     """Start a background import job for an already-translated ebook."""
@@ -553,6 +1033,23 @@ async def start_translated_ebook_import_job(
     else:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
+    try:
+        service.validate_existing_book_confirmation(
+            ebook_path,
+            target_book_id=target_book_id,
+            split_mode=split_mode,
+            original_filename=original_name,
+            confirmed_existing_book_id=confirmed_existing_book_id,
+        )
+    except ExistingBookConfirmationRequired as exc:
+        if cleanup_temp_path:
+            ebook_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail=EBOOK_CONFIRMATION_REQUIRED_DETAIL) from exc
+    except ValueError as exc:
+        if cleanup_temp_path:
+            ebook_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     tracker = get_shared_job_tracker(service.db_path)
     job = tracker.create_job(
         "import_ebook",
@@ -564,6 +1061,7 @@ async def start_translated_ebook_import_job(
             "duplicate_strategy": duplicate_strategy,
             "split_mode": split_mode,
             "target_book_id": target_book_id,
+            "confirmed_existing_book_id": confirmed_existing_book_id,
         },
     )
     tracker.start_background_task(
@@ -577,6 +1075,7 @@ async def start_translated_ebook_import_job(
             target_book_id=target_book_id,
             duplicate_strategy=duplicate_strategy,
             split_mode=split_mode,
+            confirmed_existing_book_id=confirmed_existing_book_id,
             cleanup_upload_id=cleanup_upload_id,
             cleanup_temp_path=cleanup_temp_path,
         ),
@@ -633,9 +1132,39 @@ async def preview_source_url(
 ):
     """Preview a public novel/book URL and extract candidate chapter links."""
     try:
-        return await asyncio.to_thread(pipeline.preview_source_url, data.url)
+        preview = await asyncio.to_thread(pipeline.preview_source_url, data.url)
+        managed = find_managed_source_for_url(
+            get_db_path(),
+            str(preview.get("source_url") or data.url),
+            str(preview.get("source") or ""),
+            str(preview.get("policy", {}).get("source_id") or ""),
+        )
+        preview["managed_source_id"] = str(managed.get("id") or "") if managed else ""
+        preview["managed_source_status"] = str(managed.get("status") or "") if managed else ""
+        preview["managed_source_trust_level"] = str(managed.get("trust_level") or "") if managed else ""
+        preview["automation_allowed"] = bool(managed and managed.get("status") == "VERIFIED")
+        preview["automation_reason"] = (
+            ""
+            if preview["automation_allowed"]
+            else (
+                "Nguồn này chưa được nhập vào Source Hub và xác minh."
+                if managed is None
+                else f"Nguồn đang ở trạng thái {managed.get('status', 'NEEDS_REVIEW')} nên chưa thể tạo job tự động."
+            )
+        )
+        preview.setdefault("bypass_used", False)
+        preview.setdefault("bypass_method", "")
+        preview.setdefault("fetch_method", "")
+        preview.setdefault("fetch_status_code", None)
+        preview.setdefault("fetch_attempts", 0)
+        preview.setdefault("fetch_elapsed_ms", 0)
+        preview.setdefault("fetch_bytes_received", 0)
+        preview.setdefault("fetch_final_url", "")
+        preview.setdefault("fetch_cookies_refreshed", False)
+        preview.setdefault("fetch_cache_hit", False)
+        return preview
     except SourceAdapterError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _source_adapter_http_exception(exc) from exc
     except Exception as exc:
         logger.warning("Source preview failed for %s", data.url, exc_info=True)
         record_audit_event(
@@ -665,9 +1194,20 @@ async def import_source_url(
         raise HTTPException(status_code=400, detail="At least one chapter must be selected")
 
     try:
+        managed_source_id = str(data.managed_source_id or "").strip()
+        if not managed_source_id:
+            raise SourceAdapterError("Only VERIFIED sources can start automated URL import jobs")
+        managed_source = get_managed_source(get_db_path(), managed_source_id)
+        if managed_source is None:
+            raise SourceAdapterError("Managed source not found")
+        if str(managed_source.get("status") or "").upper() != "VERIFIED":
+            raise SourceAdapterError("Only VERIFIED sources can start automated URL import jobs")
         source_url, chapters, retry_limit = _validated_url_import_payload(data)
+        if source_url != str(managed_source.get("base_url") or ""):
+            raise SourceAdapterError("Managed source URL does not match the selected preview URL")
         job_id = service.start_import_url_job(
             url=source_url,
+            managed_source_id=managed_source_id,
             title=data.title,
             author=data.author,
             source=data.source,
@@ -683,7 +1223,7 @@ async def import_source_url(
             request=request,
             details={"import_type": "url", "result": "failure"},
         )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _source_adapter_http_exception(exc) from exc
     record_audit_event(
         event_type="import_start",
         severity="info",
@@ -700,3 +1240,212 @@ async def import_source_url(
         },
     )
     return JobResponse(job_id=job_id, status="pending", message="URL import job started")
+
+
+@router.post(
+    "/jobs",
+    response_model=ImportJobAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def create_import_job(
+    data: ImportJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    """Create and enqueue a durable URL import job."""
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        job = _create_durable_import_job(service, data, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    if mobile_settings.import_job_run_in_api:
+        background_tasks.add_task(_run_import_job_until_idle, service, job.id, owner_user_id)
+    return ImportJobAcceptedResponse(job_id=job.id, status=job.status.value, total=job.total)
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def get_import_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        return _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+
+
+@router.get(
+    "/jobs/{job_id}/events",
+    response_class=StreamingResponse,
+    responses=IMPORT_JOB_SSE_RESPONSES,
+)
+async def stream_import_job_events(
+    job_id: str,
+    request: Request,
+    cursor: int = Query(default=0, ge=0),
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        service.get_job(job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    header_cursor = 0
+    if last_event_id:
+        try:
+            header_cursor = max(0, int(last_event_id))
+        except ValueError as exc:
+            raise _import_job_http_error("invalid_cursor", "Last-Event-ID must be an integer", 400) from exc
+    resolved_cursor = max(cursor, header_cursor)
+    return StreamingResponse(
+        _stream_import_job_events(
+            request,
+            service,
+            job_id,
+            owner_user_id,
+            cursor=resolved_cursor,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def cancel_import_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        service.request_cancel(job_id, owner_user_id)
+        return _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+
+
+@router.post(
+    "/jobs/{job_id}/retry-failed",
+    response_model=ImportJobSnapshotResponse,
+    responses=IMPORT_JOB_ERROR_RESPONSES,
+)
+async def retry_failed_import_job_tasks(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        retried = service.retry_failed_tasks(job_id, owner_user_id)
+        snapshot = _import_job_snapshot(service, job_id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+    if retried and mobile_settings.import_job_run_in_api:
+        background_tasks.add_task(_run_import_job_until_idle, service, job_id, owner_user_id)
+    return snapshot
+
+
+@router.post("/url/fetch", response_model=URLFetchResponse)
+async def fetch_source_chapters(
+    data: URLFetchRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+):
+    """Compatibility response backed by the same durable P09 job engine."""
+    owner_user_id = _import_job_owner(current_user)
+    try:
+        job = _create_durable_import_job(service, data, owner_user_id)
+        await asyncio.to_thread(_run_import_job_until_idle, service, job.id, owner_user_id)
+        tasks = service.list_tasks(job.id, owner_user_id)
+    except Exception as exc:
+        _raise_import_job_error(exc)
+        raise
+
+    original_by_number = {chapter.chapter_number: chapter for chapter in data.chapters}
+    results: list[URLFetchChapterResult] = []
+    book_id = 0
+    for task in tasks:
+        original = original_by_number.get(task.chapter_number)
+        succeeded_task = task.status is DurableImportTaskStatus.SUCCEEDED
+        operation = "created" if succeeded_task else "failed"
+        warnings: list[str] = []
+        if task.chapter_id:
+            stored = get_chapter_by_id(service.repository.db_path, task.chapter_id)
+            if stored:
+                operation = str(stored.get("last_import_operation") or operation)
+        if succeeded_task and task.book_id:
+            book_id = task.book_id
+        results.append(
+            URLFetchChapterResult(
+                chapter_number=task.chapter_number,
+                title=task.title,
+                url=original.url if original is not None else "",
+                success=succeeded_task,
+                error="" if succeeded_task else task.error_message,
+                text_length=task.text_length,
+                book_id=task.book_id or 0,
+                chapter_id=task.chapter_id or 0,
+                stored_text_length=task.text_length,
+                content_hash=task.content_hash,
+                operation=operation,
+                warnings=warnings,
+                error_code=task.error_code,
+                retryable=task.retryable,
+                attempts=task.attempts,
+                fetch_method=task.fetch_method,
+                elapsed_ms=task.elapsed_ms,
+                started_at=task.started_at,
+                finished_at=task.finished_at,
+            )
+        )
+    succeeded = sum(int(item.success) for item in results)
+    failed = len(results) - succeeded
+
+    record_audit_event(
+        event_type="import_url_fetch",
+        severity="info" if failed == 0 else "warning",
+        source="import",
+        message=f"URL fetch: {succeeded}/{len(data.chapters)} chapters imported",
+        request=request,
+        details={
+            "import_type": "url_fetch",
+            "title": data.title,
+            "total": len(data.chapters),
+            "succeeded": succeeded,
+            "failed": failed,
+        },
+    )
+
+    return URLFetchResponse(
+        title=data.title,
+        book_id=book_id,
+        total=len(data.chapters),
+        succeeded=succeeded,
+        failed=failed,
+        chapters=results,
+    )

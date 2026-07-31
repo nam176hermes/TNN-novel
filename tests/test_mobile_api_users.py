@@ -7,6 +7,15 @@ import httpx
 import pytest
 
 
+def test_auth_router_uses_db_auth_repository_exports() -> None:
+    from app.database import auth_repository
+    from app.mobile_api.routers import auth
+
+    assert auth.create_auth_session is auth_repository.create_auth_session
+    assert auth.rotate_auth_session_refresh is auth_repository.rotate_auth_session_refresh
+    assert auth.record_auth_login_failure is auth_repository.record_auth_login_failure
+
+
 def _fetch_users(db_path: Path) -> list[sqlite3.Row]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row

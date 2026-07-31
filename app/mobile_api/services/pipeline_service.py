@@ -1,27 +1,33 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import hashlib
-import io
 import json
+import logging
 import os
 import shutil
 import unicodedata
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import struct
 import time
-import zipfile
+import uuid
+from dataclasses import dataclass, replace
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 
 from app.database.db import (
     get_book_by_id,
-    list_books,
+    find_import_book_with_connection,
+    get_connection,
+    insert_import_chapter_with_connection,
+    list_active_import_chapters_with_connection,
+    list_books_with_active_chapters,
+    list_translated_book_summaries as db_list_translated_book_summaries,
     add_book,
+    resolve_import_book_with_connection,
     update_book as db_update_book,
     delete_book as db_delete_book,
     delete_chapter_translation_data,
@@ -30,9 +36,6 @@ from app.database.db import (
     get_provider_defaults,
     get_reader_dictionary_cache,
     get_reader_ai_cache,
-    get_reader_annotation,
-    get_reader_annotation_by_client_id,
-    get_reader_progress,
     load_glossary,
     load_glossary_names,
     list_glossary,
@@ -42,22 +45,31 @@ from app.database.db import (
     list_reader_timeline_events,
     list_reader_xray_entities,
     record_job_attempt,
-    add_reader_annotation,
     add_reader_entity,
     add_reader_entity_mention,
     add_reader_timeline_event,
     save_qa_report,
-    soft_delete_reader_annotation,
     soft_delete_chapter,
     update_chapter_paths,
+    update_import_chapter_with_connection,
+    upsert_import_chapter_with_connection,
+    canonicalize_import_url,
     add_chapter,
-    update_reader_annotation,
     upsert_reader_ai_cache,
     upsert_reader_dictionary_cache,
-    upsert_reader_progress,
 )
-from app.ingestion.source_adapters import SourceChapterContent, get_source_registry
-from app.mobile_api.services.import_metadata import detect_import_metadata
+from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
+from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
+from app.mobile_api.services.content_file_service import ContentFileService
+from app.mobile_api.services.reader_dictionary_service import (
+    MAX_READER_DICTIONARY_ARCHIVE_FILES as _MAX_READER_DICTIONARY_ARCHIVE_FILES,
+    MAX_READER_DICTIONARY_BYTES as _MAX_READER_DICTIONARY_BYTES,
+    READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES as _READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES,
+    READER_OFFLINE_DICTIONARY_DIR,
+    READER_OFFLINE_DICTIONARY_SUFFIXES,
+    ReaderDictionaryService,
+)
+from app.mobile_api.services.reader_service import ReaderService
 from app.translation.ollama_client import call_llm, is_retryable_provider_error, translate_chapter
 from app.translation.idiom_correction import clean_translation_layout, post_process_with_idioms
 from app.translation.literary_style import LITERARY_STYLE_GUIDE, render_literary_phrase_guide
@@ -69,6 +81,68 @@ from app.translation.presets import get_translation_preset
 from app.translation.pronoun_memory import render_pronoun_memory
 from app.scheduler.daily_queue import get_pending_chapters, get_failed_chapters
 from app.mobile_api.dependencies import get_data_dir, get_db_path
+from app.config import settings
+from app.services.tts.availability import is_f5_provider, require_tts_runtime_available
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
+
+
+logger = logging.getLogger(__name__)
+
+# Compatibility aliases retained at the original module import path.
+MAX_READER_DICTIONARY_ARCHIVE_FILES = _MAX_READER_DICTIONARY_ARCHIVE_FILES
+MAX_READER_DICTIONARY_BYTES = _MAX_READER_DICTIONARY_BYTES
+READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES = _READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES
+
+
+@dataclass(frozen=True)
+class ChapterImportResult(Mapping[str, object]):
+    """Typed, compatibility-preserving metadata for one stored chapter import."""
+
+    book_id: int
+    chapter_id: int
+    stored_text_length: int
+    content_hash: str
+    operation: str
+    warnings: tuple[str, ...] = ()
+    title: str = ""
+    chapter_number: int = 0
+    chapter_title: str = ""
+    source_type: str = ""
+    source_url: str = ""
+    adapter_id: str = ""
+    path: str = ""
+    fetch_method: str = ""
+    fetch_attempts: int = 0
+    fetch_elapsed_ms: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "book_id": self.book_id,
+            "chapter_id": self.chapter_id,
+            "stored_text_length": self.stored_text_length,
+            "content_hash": self.content_hash,
+            "operation": self.operation,
+            "warnings": list(self.warnings),
+            "title": self.title,
+            "chapter_number": self.chapter_number,
+            "chapter_title": self.chapter_title,
+            "source_type": self.source_type,
+            "source_url": self.source_url,
+            "adapter_id": self.adapter_id,
+            "path": self.path,
+            "fetch_method": self.fetch_method,
+            "fetch_attempts": self.fetch_attempts,
+            "fetch_elapsed_ms": self.fetch_elapsed_ms,
+        }
+
+    def __getitem__(self, key: str) -> object:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
 
 
 CLASSICAL_PRONOUN_STYLE_GUIDE = """Vietnamese classical web-novel style rules:
@@ -98,11 +172,6 @@ MAX_READER_XRAY_ENRICH_CONTEXT_CHARS = 12_000
 MAX_READER_XRAY_ENRICH_CONTEXT_CHARS_PER_CHAPTER = 2_500
 DICTIONARY_LOOKUP_LIMIT = 12
 ONLINE_DICTIONARY_TIMEOUT_SECONDS = 2.0
-READER_OFFLINE_DICTIONARY_DIR = "dictionaries"
-READER_OFFLINE_DICTIONARY_SUFFIXES = {".csv", ".dsl", ".json", ".jsonl", ".tsv", ".u8", ".txt"}
-READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES = {".zip"}
-MAX_READER_DICTIONARY_BYTES = 80 * 1024 * 1024
-MAX_READER_DICTIONARY_ARCHIVE_FILES = 40
 DICTIONARY_SOURCE_PRIORITY = {
     "glossary": 0,
     "offline_dictionary": 1,
@@ -2091,6 +2160,74 @@ class PipelineService:
     def __init__(self):
         self.data_dir = get_data_dir()
         self.db_path = get_db_path()
+        self.legacy_artifact_root = settings.artifact_legacy_root
+        self.content_file_service = ContentFileService(
+            data_dir=self.data_dir,
+            db_path=self.db_path,
+            legacy_artifact_root=self.legacy_artifact_root,
+        )
+        self.reader_service = ReaderService(
+            db_path=self.db_path,
+            content_file_service=self.content_file_service,
+        )
+        self.reader_dictionary_service = ReaderDictionaryService(
+            data_dir=self.data_dir,
+            file_rows=_reader_dictionary_file_rows,
+            stardict_rows=_reader_dictionary_rows_from_stardict_bytes,
+            jsonl_bytes=_reader_dictionary_jsonl_bytes,
+        )
+
+    def _content_files(self) -> ContentFileService:
+        service = getattr(self, "content_file_service", None)
+        data_root = getattr(self, "data_dir", None)
+        database_path = getattr(self, "db_path", None)
+        if data_root is None:
+            data_root = Path(database_path).resolve().parent if database_path is not None else settings.resolved_data_dir
+        if database_path is None:
+            database_path = Path(data_root) / "pipeline.db"
+        configured_legacy_root = getattr(self, "legacy_artifact_root", settings.artifact_legacy_root)
+        legacy_root = Path(configured_legacy_root) if configured_legacy_root is not None else None
+        if (
+            service is None
+            or service.data_dir != Path(data_root)
+            or service.db_path != Path(database_path)
+            or service.legacy_artifact_root != legacy_root
+        ):
+            service = ContentFileService(
+                data_dir=data_root,
+                db_path=database_path,
+                legacy_artifact_root=legacy_root,
+            )
+            self.content_file_service = service
+        return service
+
+    def _reader(self) -> ReaderService:
+        service = getattr(self, "reader_service", None)
+        content_files = self._content_files()
+        if (
+            service is None
+            or service.db_path != Path(self.db_path)
+            or service.content_file_service is not content_files
+        ):
+            service = ReaderService(
+                db_path=self.db_path,
+                content_file_service=content_files,
+            )
+            self.reader_service = service
+        return service
+
+    def _reader_dictionaries(self) -> ReaderDictionaryService:
+        service = getattr(self, "reader_dictionary_service", None)
+        data_dir = Path(self.data_dir)
+        if service is None or service.data_dir != data_dir:
+            service = ReaderDictionaryService(
+                data_dir=data_dir,
+                file_rows=_reader_dictionary_file_rows,
+                stardict_rows=_reader_dictionary_rows_from_stardict_bytes,
+                jsonl_bytes=_reader_dictionary_jsonl_bytes,
+            )
+            self.reader_dictionary_service = service
+        return service
 
     @staticmethod
     def _safe_filename_part(value: str) -> str:
@@ -2106,12 +2243,18 @@ class PipelineService:
         if not cover_path:
             return ""
         covers_dir = self.data_dir / "covers"
-        path = Path(cover_path)
+        try:
+            path = self.resolve_artifact_file(cover_path, ArtifactClass.COVER)
+        except ArtifactPathError:
+            return ""
         try:
             relative_path = path.relative_to(covers_dir)
         except ValueError:
             return ""
         return f"/covers/{relative_path.as_posix()}"
+
+    def resolve_artifact_file(self, value: str | Path | None, artifact_class: ArtifactClass) -> Path:
+        return self._content_files().resolve_artifact_file(value, artifact_class)
 
     def _book_cover_extension(self, filename: str, content_type: str) -> str:
         normalized_type = content_type.lower().split(";", 1)[0].strip()
@@ -2127,221 +2270,17 @@ class PipelineService:
         safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._-")
         return safe_title or f"book_{book_id}"
 
-    def _reader_dictionary_dir(self) -> Path:
-        path = self.data_dir / READER_OFFLINE_DICTIONARY_DIR
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _safe_reader_dictionary_filename(self, filename: str) -> str:
-        safe_name = self._safe_filename_part(Path(filename or "").name).strip("._-")
-        if not safe_name:
-            raise ValueError("Dictionary filename is required")
-        suffix = Path(safe_name).suffix.casefold()
-        if suffix not in READER_OFFLINE_DICTIONARY_SUFFIXES:
-            supported = ", ".join(sorted(READER_OFFLINE_DICTIONARY_SUFFIXES))
-            raise ValueError(f"Unsupported dictionary format. Supported: {supported}")
-        return safe_name
-
-    def _safe_reader_dictionary_archive_filename(self, filename: str) -> str:
-        safe_name = self._safe_filename_part(Path(filename or "").name).strip("._-")
-        if not safe_name:
-            raise ValueError("Dictionary filename is required")
-        suffix = Path(safe_name).suffix.casefold()
-        if suffix not in READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES:
-            supported = ", ".join(sorted(READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES))
-            raise ValueError(f"Unsupported dictionary archive format. Supported: {supported}")
-        return safe_name
-
-    def _reader_dictionary_payload(self, path: Path) -> dict:
-        return {
-            "filename": path.name,
-            "entry_count": len(_reader_dictionary_file_rows(path)),
-            "size_bytes": path.stat().st_size,
-        }
-
     def list_reader_dictionaries(self) -> list[dict]:
-        dictionaries_dir = self._reader_dictionary_dir()
-        payloads: list[dict] = []
-        for path in sorted(dictionaries_dir.iterdir(), key=lambda item: item.name.casefold()):
-            if path.is_file() and path.suffix.casefold() in READER_OFFLINE_DICTIONARY_SUFFIXES:
-                payloads.append(self._reader_dictionary_payload(path))
-        return payloads
-
-    def _write_reader_dictionary_file(self, *, safe_name: str, content: bytes) -> dict:
-        if not content:
-            raise ValueError("Dictionary file is empty")
-        if len(content) > MAX_READER_DICTIONARY_BYTES:
-            raise ValueError("Dictionary file is too large")
-
-        target = self._reader_dictionary_dir() / safe_name
-        temp = target.with_name(f".{target.stem}.upload{target.suffix}")
-        temp.write_bytes(content)
-        entry_count = len(_reader_dictionary_file_rows(temp))
-        if entry_count <= 0:
-            temp.unlink(missing_ok=True)
-            raise ValueError("Dictionary file contains no readable entries")
-        temp.replace(target)
-        return {
-            "filename": target.name,
-            "entry_count": entry_count,
-            "size_bytes": target.stat().st_size,
-        }
-
-    @staticmethod
-    def _zip_member_basename(filename: str) -> str | None:
-        member_path = PurePosixPath(filename)
-        if member_path.is_absolute() or any(part == ".." for part in member_path.parts):
-            return None
-        return member_path.name or None
-
-    def _save_reader_dictionary_archive(self, *, filename: str, content: bytes) -> dict:
-        safe_archive_name = self._safe_reader_dictionary_archive_filename(filename)
-        extracted: list[dict] = []
-        seen_names: set[str] = set()
-
-        try:
-            archive = zipfile.ZipFile(io.BytesIO(content))
-        except zipfile.BadZipFile as exc:
-            raise ValueError("Dictionary archive is not a valid ZIP file") from exc
-
-        with archive:
-            file_members = [member for member in archive.infolist() if not member.is_dir()]
-            if len(file_members) > MAX_READER_DICTIONARY_ARCHIVE_FILES:
-                raise ValueError(
-                    f"Dictionary archive contains too many files; max {MAX_READER_DICTIONARY_ARCHIVE_FILES}"
-                )
-
-            stardict_groups: dict[str, dict[str, bytes]] = {}
-            for member in file_members:
-                member_path = PurePosixPath(member.filename)
-                if (
-                    member_path.is_absolute()
-                    or any(part == ".." for part in member_path.parts)
-                    or not member_path.name
-                ):
-                    continue
-                member_name = str(member_path)
-                lowered_name = member_name.casefold()
-                if lowered_name.endswith(".dict.dz"):
-                    suffix = ".dict.dz"
-                    group_key = member_name[: -len(".dict.dz")]
-                    part_key = ".dict"
-                else:
-                    suffix = member_path.suffix.casefold()
-                    group_key = str(member_path.with_suffix(""))
-                    part_key = suffix
-                if suffix not in {".dict", ".dict.dz", ".idx", ".ifo"}:
-                    continue
-                if member.file_size <= 0:
-                    continue
-                if member.file_size > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                content_bytes = archive.read(member)
-                if len(content_bytes) > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                if suffix == ".dict.dz":
-                    try:
-                        content_bytes = gzip.decompress(content_bytes)
-                    except (OSError, EOFError) as exc:
-                        raise ValueError(f"StarDict compressed dictionary is invalid: {member_path.name}") from exc
-                    if len(content_bytes) > MAX_READER_DICTIONARY_BYTES:
-                        raise ValueError(f"StarDict file inside archive is too large: {member_path.name}")
-                stardict_groups.setdefault(group_key, {})[part_key] = content_bytes
-
-            for group_key, parts in stardict_groups.items():
-                if not {".dict", ".idx", ".ifo"}.issubset(parts):
-                    continue
-                safe_stem = self._safe_filename_part(PurePosixPath(group_key).name).strip("._-") or "stardict"
-                safe_member_name = self._safe_reader_dictionary_filename(f"{safe_stem}.stardict.jsonl")
-                if safe_member_name in seen_names:
-                    continue
-                rows = _reader_dictionary_rows_from_stardict_bytes(
-                    ifo_content=parts[".ifo"],
-                    idx_content=parts[".idx"],
-                    dict_content=parts[".dict"],
-                )
-                if not rows:
-                    continue
-                try:
-                    extracted.append(
-                        self._write_reader_dictionary_file(
-                            safe_name=safe_member_name,
-                            content=_reader_dictionary_jsonl_bytes(rows),
-                        )
-                    )
-                    seen_names.add(safe_member_name)
-                except ValueError:
-                    continue
-
-            for member in file_members:
-                basename = self._zip_member_basename(member.filename)
-                if not basename:
-                    continue
-                try:
-                    safe_member_name = self._safe_reader_dictionary_filename(basename)
-                except ValueError:
-                    continue
-                if safe_member_name in seen_names:
-                    continue
-                if member.file_size <= 0:
-                    continue
-                if member.file_size > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"Dictionary file inside archive is too large: {safe_member_name}")
-
-                member_content = archive.read(member)
-                if len(member_content) > MAX_READER_DICTIONARY_BYTES:
-                    raise ValueError(f"Dictionary file inside archive is too large: {safe_member_name}")
-                try:
-                    extracted.append(
-                        self._write_reader_dictionary_file(
-                            safe_name=safe_member_name,
-                            content=member_content,
-                        )
-                    )
-                    seen_names.add(safe_member_name)
-                except ValueError:
-                    continue
-
-        extracted = sorted(extracted, key=lambda item: item["filename"].casefold())
-        if not extracted:
-            raise ValueError("Dictionary archive contains no readable dictionary files")
-        return {
-            "filename": safe_archive_name,
-            "entry_count": sum(int(item["entry_count"]) for item in extracted),
-            "file_count": len(extracted),
-            "files": extracted,
-            "size_bytes": len(content),
-        }
+        return self._reader_dictionaries().list_reader_dictionaries()
 
     def save_reader_dictionary(self, *, filename: str, content: bytes) -> dict:
-        if not content:
-            raise ValueError("Dictionary file is empty")
-        if len(content) > MAX_READER_DICTIONARY_BYTES:
-            raise ValueError("Dictionary file is too large")
-
-        if Path(filename or "").suffix.casefold() in READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES:
-            return self._save_reader_dictionary_archive(filename=filename, content=content)
-
-        safe_name = self._safe_reader_dictionary_filename(filename)
-        return self._write_reader_dictionary_file(safe_name=safe_name, content=content)
+        return self._reader_dictionaries().save_reader_dictionary(filename=filename, content=content)
 
     def delete_reader_dictionary(self, filename: str) -> bool:
-        safe_name = self._safe_reader_dictionary_filename(filename)
-        target = self._reader_dictionary_dir() / safe_name
-        if not target.exists() or not target.is_file():
-            return False
-        target.unlink()
-        return True
+        return self._reader_dictionaries().delete_reader_dictionary(filename)
 
     def get_reader_dictionary_path(self, filename: str) -> Path | None:
-        raw_name = (filename or "").strip()
-        if not raw_name or "/" in raw_name or "\\" in raw_name:
-            raise ValueError("Dictionary filename must not include paths")
-        safe_name = self._safe_reader_dictionary_filename(raw_name)
-        target = self._reader_dictionary_dir() / safe_name
-        if not target.exists() or not target.is_file():
-            return None
-        return target
+        return self._reader_dictionaries().get_reader_dictionary_path(filename)
 
     def _book_payload(self, book: dict | None) -> dict | None:
         if not book:
@@ -2386,59 +2325,14 @@ class PipelineService:
     def list_books(self) -> list[dict]:
         return [
             self._book_payload(book)
-            for book in list_books(self.db_path)
-            if list_chapters(self.db_path, book["id"])
+            for book in list_books_with_active_chapters(self.db_path)
         ]
 
     def list_translated_book_summaries(self) -> list[dict]:
-        summaries: list[dict] = []
-        for book in list_books(self.db_path):
-            chapters = list_chapters(self.db_path, book["id"])
-            translated_chapters = [chapter for chapter in chapters if _chapter_has_translation(chapter)]
-            if not translated_chapters:
-                continue
-
-            translated_by_number = sorted(
-                translated_chapters,
-                key=lambda chapter: (chapter.get("chapter_number") or 0, chapter.get("id") or 0),
-            )
-            first_translated = translated_by_number[0]
-            latest_translated = translated_by_number[-1]
-            last_activity = (
-                latest_translated.get("translated_at")
-                or latest_translated.get("audio_created_at")
-                or book.get("updated_at")
-                or book.get("created_at")
-                or ""
-            )
-
-            summaries.append(
-                {
-                    "id": book["id"],
-                    "title": book["title"],
-                    "author": book.get("author") or "",
-                    "source": book.get("source") or "",
-                    "source_url": book.get("source_url") or "",
-                    "cover_path": book.get("cover_path") or "",
-                    "cover_url": self._cover_url(book.get("cover_path")),
-                    "total_chapters": len(chapters),
-                    "translated_chapters": len(translated_chapters),
-                    "audio_chapters": len([chapter for chapter in chapters if chapter.get("audio_path")]),
-                    "failed_chapters": len([chapter for chapter in chapters if chapter.get("status") == "failed"]),
-                    "qa_low_chapters": len([chapter for chapter in chapters if chapter.get("status") == "qa_low"]),
-                    "first_translated_chapter_id": first_translated.get("id"),
-                    "latest_translated_chapter_id": latest_translated.get("id"),
-                    "latest_chapter_number": latest_translated.get("chapter_number"),
-                    "latest_chapter_title": latest_translated.get("title") or "",
-                    "last_activity": last_activity,
-                }
-            )
-
-        return sorted(
-            summaries,
-            key=lambda summary: (summary.get("last_activity") or "", summary.get("id") or 0),
-            reverse=True,
-        )
+        summaries = db_list_translated_book_summaries(self.db_path)
+        for summary in summaries:
+            summary["cover_url"] = self._cover_url(summary.get("cover_path"))
+        return summaries
 
     def get_book(self, book_id: int) -> dict | None:
         return self._book_payload(get_book_by_id(self.db_path, book_id))
@@ -2528,43 +2422,17 @@ class PipelineService:
         return list_chapters(self.db_path, book_id)
 
     def get_chapter_source(self, chapter_id: int) -> str | None:
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
-        if not chapter or not chapter.get("raw_text_path"):
-            return None
-        path = Path(chapter["raw_text_path"])
-        if not path.exists():
-            return None
-        return clean_translation_layout(path.read_text(encoding="utf-8"))
+        return self._content_files().get_chapter_source(chapter_id)
 
     def get_chapter_translation(self, chapter_id: int) -> str | None:
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
-        if not chapter or not chapter.get("translated_text_path"):
-            return None
-        path = Path(chapter["translated_text_path"])
-        if not path.exists():
-            return None
-        return path.read_text(encoding="utf-8")
+        return self._content_files().get_chapter_translation(chapter_id)
 
     def get_chapter_content(self, chapter_id: int) -> dict | None:
-        text = self.get_chapter_translation(chapter_id)
-        if text is None:
-            return None
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
-        html = ""
-        if chapter and chapter.get("content_html_path"):
-            path = Path(chapter["content_html_path"])
-            if path.exists():
-                html = path.read_text(encoding="utf-8")
-        return {"text": text, "html": html}
+        return self._content_files().get_chapter_content(chapter_id)
 
-    # Reader state
+    # Reader state compatibility facade
     def get_reader_state(self, book_id: int) -> dict | None:
-        if not get_book_by_id(self.db_path, book_id):
-            return None
-        return {
-            "progress": get_reader_progress(self.db_path, book_id),
-            "annotations": list_reader_annotations(self.db_path, book_id),
-        }
+        return self._reader().get_reader_state(book_id)
 
     def save_reader_progress(
         self,
@@ -2580,11 +2448,8 @@ class PipelineService:
         anchor: dict | None = None,
         updated_at: str | None = None,
     ) -> dict | None:
-        if not self.get_chapter_for_book(book_id, chapter_id):
-            return None
-        return upsert_reader_progress(
-            self.db_path,
-            book_id=book_id,
+        return self._reader().save_reader_progress(
+            book_id,
             chapter_id=chapter_id,
             mode=mode,
             percent=percent,
@@ -2597,9 +2462,7 @@ class PipelineService:
         )
 
     def list_reader_annotations(self, book_id: int) -> list[dict] | None:
-        if not get_book_by_id(self.db_path, book_id):
-            return None
-        return list_reader_annotations(self.db_path, book_id)
+        return self._reader().list_reader_annotations(book_id)
 
     def create_reader_annotation(
         self,
@@ -2615,12 +2478,9 @@ class PipelineService:
         color: str = "yellow",
         client_id: str = "",
     ) -> dict | None:
-        if not self.get_chapter_for_book(book_id, chapter_id):
-            return None
-        return add_reader_annotation(
-            self.db_path,
-            book_id=book_id,
-            chapter_id=chapter_id,
+        return self._reader().create_reader_annotation(
+            book_id,
+            chapter_id,
             kind=kind,
             paragraph_index=paragraph_index,
             char_start=char_start,
@@ -2631,107 +2491,8 @@ class PipelineService:
             client_id=client_id,
         )
 
-    def import_reader_annotations(
-        self,
-        book_id: int,
-        *,
-        annotations: list[dict],
-    ) -> dict | None:
-        if not get_book_by_id(self.db_path, book_id):
-            return None
-
-        chapters = self.list_chapters(book_id)
-        chapters_by_number = {
-            int(chapter.get("chapter_number") or 0): chapter
-            for chapter in chapters
-            if int(chapter.get("chapter_number") or 0) > 0
-        }
-        existing_annotations = list_reader_annotations(self.db_path, book_id, include_deleted=True)
-        existing_signatures = {
-            (
-                int(annotation.get("chapter_id") or 0),
-                str(annotation.get("kind") or ""),
-                int(annotation.get("paragraph_index") or 0),
-                int(annotation.get("char_start") or 0),
-                int(annotation.get("char_end") or 0),
-                str(annotation.get("selected_text") or ""),
-                str(annotation.get("note") or ""),
-                str(annotation.get("color") or ""),
-            )
-            for annotation in existing_annotations
-        }
-        imported_annotations: list[dict] = []
-        imported = 0
-        duplicates = 0
-        invalid = 0
-
-        def resolved_chapter_id(annotation: dict) -> int | None:
-            raw_chapter_id = int(annotation.get("chapter_id") or 0)
-            if raw_chapter_id and self.get_chapter_for_book(book_id, raw_chapter_id):
-                return raw_chapter_id
-            raw_chapter_number = int(annotation.get("chapter_number") or 0)
-            chapter = chapters_by_number.get(raw_chapter_number)
-            return int(chapter["id"]) if chapter else None
-
-        for annotation in annotations:
-            chapter_id = resolved_chapter_id(annotation)
-            if not chapter_id:
-                invalid += 1
-                continue
-
-            client_id = str(annotation.get("client_id") or "").strip()
-            if client_id and get_reader_annotation_by_client_id(
-                self.db_path,
-                book_id,
-                client_id,
-                include_deleted=True,
-            ):
-                duplicates += 1
-                continue
-
-            signature = (
-                chapter_id,
-                str(annotation.get("kind") or "highlight"),
-                int(annotation.get("paragraph_index") or 0),
-                int(annotation.get("char_start") or 0),
-                int(annotation.get("char_end") or 0),
-                str(annotation.get("selected_text") or ""),
-                str(annotation.get("note") or ""),
-                str(annotation.get("color") or "yellow"),
-            )
-            if signature in existing_signatures:
-                duplicates += 1
-                continue
-
-            created = add_reader_annotation(
-                self.db_path,
-                book_id=book_id,
-                chapter_id=chapter_id,
-                kind=str(annotation.get("kind") or "highlight"),
-                paragraph_index=int(annotation.get("paragraph_index") or 0),
-                char_start=int(annotation.get("char_start") or 0),
-                char_end=int(annotation.get("char_end") or 0),
-                selected_text=str(annotation.get("selected_text") or ""),
-                note=str(annotation.get("note") or ""),
-                color=str(annotation.get("color") or "yellow"),
-                client_id=client_id,
-            )
-            if not created:
-                invalid += 1
-                continue
-            imported += 1
-            imported_annotations.append(created)
-            existing_signatures.add(signature)
-
-        return {
-            "summary": {
-                "imported": imported,
-                "skipped": duplicates + invalid,
-                "duplicates": duplicates,
-                "invalid": invalid,
-            },
-            "annotations": imported_annotations,
-        }
+    def import_reader_annotations(self, book_id: int, *, annotations: list[dict]) -> dict | None:
+        return self._reader().import_reader_annotations(book_id, annotations=annotations)
 
     def update_reader_annotation(
         self,
@@ -2739,110 +2500,10 @@ class PipelineService:
         annotation_id: int,
         **updates,
     ) -> dict | None:
-        if not get_reader_annotation(self.db_path, book_id, annotation_id):
-            return None
-        return update_reader_annotation(
-            self.db_path,
-            book_id=book_id,
-            annotation_id=annotation_id,
-            kind=updates.get("kind"),
-            paragraph_index=updates.get("paragraph_index"),
-            char_start=updates.get("char_start"),
-            char_end=updates.get("char_end"),
-            selected_text=updates.get("selected_text"),
-            note=updates.get("note"),
-            color=updates.get("color"),
-            client_id=updates.get("client_id"),
-        )
+        return self._reader().update_reader_annotation(book_id, annotation_id, **updates)
 
     def delete_reader_annotation(self, book_id: int, annotation_id: int) -> bool:
-        return soft_delete_reader_annotation(self.db_path, book_id, annotation_id)
-
-    @staticmethod
-    def _sync_timestamp(value: str | None) -> datetime:
-        if not value:
-            return datetime.min.replace(tzinfo=timezone.utc)
-        normalized = value.strip().replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return datetime.min.replace(tzinfo=timezone.utc)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-
-    @staticmethod
-    def _sync_conflict(
-        *,
-        entity: str,
-        resolution: str,
-        reason: str,
-        id: int | None = None,
-        client_id: str | None = None,
-        server_annotation: dict | None = None,
-        client_annotation: dict | None = None,
-    ) -> dict:
-        conflict = {
-            "entity": entity,
-            "id": id,
-            "client_id": client_id,
-            "resolution": resolution,
-            "reason": reason,
-        }
-        if server_annotation is not None:
-            conflict["server_annotation"] = dict(server_annotation)
-        if client_annotation is not None:
-            conflict["client_annotation"] = dict(client_annotation)
-        return conflict
-
-    @staticmethod
-    def _sync_annotation_differs(existing: dict, incoming: dict) -> bool:
-        comparable_fields = (
-            "chapter_id",
-            "kind",
-            "paragraph_index",
-            "char_start",
-            "char_end",
-            "selected_text",
-            "note",
-            "color",
-        )
-        for field in comparable_fields:
-            existing_value = existing.get(field)
-            incoming_value = incoming.get(field)
-            if field in {"chapter_id", "paragraph_index", "char_start", "char_end"}:
-                existing_value = int(existing_value or 0)
-                incoming_value = int(incoming_value or 0)
-            else:
-                existing_value = str(existing_value or "")
-                incoming_value = str(incoming_value or "")
-            if existing_value != incoming_value:
-                return True
-        return bool(existing.get("deleted_at")) != bool(incoming.get("deleted_at"))
-
-    @staticmethod
-    def _sync_progress_differs(existing: dict, incoming: dict) -> bool:
-        comparable_fields = (
-            "chapter_id",
-            "mode",
-            "percent",
-            "paragraph_index",
-            "char_offset",
-            "absolute_char_offset",
-            "page_index",
-        )
-        for field in comparable_fields:
-            existing_value = existing.get(field)
-            incoming_value = incoming.get(field)
-            if field == "mode":
-                existing_value = str(existing_value or "scroll")
-                incoming_value = str(incoming_value or "scroll")
-            else:
-                existing_value = int(existing_value or 0)
-                incoming_value = int(incoming_value or 0)
-            if existing_value != incoming_value:
-                return True
-        return False
+        return self._reader().delete_reader_annotation(book_id, annotation_id)
 
     def sync_reader_state(
         self,
@@ -2853,201 +2514,13 @@ class PipelineService:
         progress: dict | None = None,
         annotations: list[dict] | None = None,
     ) -> dict | None:
-        if not get_book_by_id(self.db_path, book_id):
-            return None
-
-        conflicts: list[dict] = []
-        has_sync_base = bool(last_sync_at and last_sync_at.strip())
-        last_sync_timestamp = self._sync_timestamp(last_sync_at)
-
-        if progress:
-            chapter_id = int(progress.get("chapter_id") or 0)
-            if self.get_chapter_for_book(book_id, chapter_id):
-                server_progress = get_reader_progress(self.db_path, book_id)
-                client_updated_at = str(progress.get("updated_at") or "").strip()
-                client_timestamp = self._sync_timestamp(client_updated_at)
-                server_timestamp = self._sync_timestamp(server_progress.get("updated_at") if server_progress else None)
-                if server_progress is None or client_timestamp > server_timestamp:
-                    if server_progress is not None and has_sync_base and server_timestamp > last_sync_timestamp:
-                        conflicts.append(
-                            self._sync_conflict(
-                                entity="progress",
-                                id=None,
-                                client_id=device_id or None,
-                                resolution="client_won",
-                                reason="diverged_since_last_sync",
-                            )
-                        )
-                    self.save_reader_progress(
-                        book_id,
-                        chapter_id=chapter_id,
-                        mode=progress.get("mode") or "scroll",
-                        percent=int(progress.get("percent") or 0),
-                        paragraph_index=int(progress.get("paragraph_index") or 0),
-                        char_offset=int(progress.get("char_offset") or 0),
-                        absolute_char_offset=int(progress.get("absolute_char_offset") or 0),
-                        page_index=int(progress.get("page_index") or 0),
-                        anchor=progress.get("anchor") if isinstance(progress.get("anchor"), dict) else None,
-                        updated_at=client_updated_at if client_timestamp > datetime.min.replace(tzinfo=timezone.utc) else None,
-                    )
-                elif client_timestamp < server_timestamp:
-                    conflicts.append(
-                        self._sync_conflict(
-                            entity="progress",
-                            id=None,
-                            client_id=device_id or None,
-                            resolution="server_won",
-                            reason="server_newer",
-                        )
-                    )
-                elif server_progress is not None and self._sync_progress_differs(server_progress, progress):
-                    conflicts.append(
-                        self._sync_conflict(
-                            entity="progress",
-                            id=None,
-                            client_id=device_id or None,
-                            resolution="server_won",
-                            reason="same_timestamp_different",
-                        )
-                    )
-
-        for annotation in annotations or []:
-            annotation_id = annotation.get("id")
-            client_id = annotation.get("client_id")
-            existing = (
-                get_reader_annotation(self.db_path, book_id, int(annotation_id), include_deleted=True)
-                if annotation_id is not None
-                else None
-            )
-            if existing is None and client_id:
-                existing = get_reader_annotation_by_client_id(
-                    self.db_path,
-                    book_id,
-                    str(client_id),
-                    include_deleted=True,
-                )
-            client_timestamp = self._sync_timestamp(annotation.get("updated_at") or annotation.get("deleted_at"))
-            server_timestamp = self._sync_timestamp(existing.get("updated_at") if existing else None)
-            client_updated_at = str(annotation.get("updated_at") or "").strip()
-            client_created_at = str(annotation.get("created_at") or "").strip()
-            client_deleted_at = str(annotation.get("deleted_at") or "").strip()
-            valid_client_updated_at = (
-                client_updated_at
-                if self._sync_timestamp(client_updated_at) > datetime.min.replace(tzinfo=timezone.utc)
-                else None
-            )
-            valid_client_created_at = (
-                client_created_at
-                if self._sync_timestamp(client_created_at) > datetime.min.replace(tzinfo=timezone.utc)
-                else None
-            )
-            valid_client_deleted_at = (
-                client_deleted_at
-                if self._sync_timestamp(client_deleted_at) > datetime.min.replace(tzinfo=timezone.utc)
-                else None
-            )
-
-            if existing:
-                if client_timestamp > server_timestamp:
-                    if has_sync_base and server_timestamp > last_sync_timestamp:
-                        conflicts.append(
-                            self._sync_conflict(
-                                entity="annotation",
-                                id=existing["id"],
-                                client_id=client_id,
-                                resolution="client_won",
-                                reason="diverged_since_last_sync",
-                                server_annotation=existing,
-                                client_annotation=annotation,
-                            )
-                        )
-                    if annotation.get("deleted_at"):
-                        soft_delete_reader_annotation(
-                            self.db_path,
-                            book_id,
-                            existing["id"],
-                            deleted_at=valid_client_deleted_at,
-                            updated_at=valid_client_updated_at or valid_client_deleted_at,
-                        )
-                    elif not existing.get("deleted_at") and self.get_chapter_for_book(book_id, annotation["chapter_id"]):
-                        update_reader_annotation(
-                            self.db_path,
-                            book_id=book_id,
-                            annotation_id=existing["id"],
-                            kind=annotation.get("kind"),
-                            paragraph_index=annotation.get("paragraph_index"),
-                            char_start=annotation.get("char_start"),
-                            char_end=annotation.get("char_end"),
-                            selected_text=annotation.get("selected_text"),
-                            note=annotation.get("note"),
-                            color=annotation.get("color"),
-                            client_id=client_id,
-                            updated_at=valid_client_updated_at,
-                        )
-                    else:
-                        conflicts.append(
-                            self._sync_conflict(
-                                entity="annotation",
-                                id=existing["id"],
-                                client_id=client_id,
-                                resolution="server_won",
-                                reason="server_deleted",
-                                server_annotation=existing,
-                                client_annotation=annotation,
-                            )
-                        )
-                elif client_timestamp < server_timestamp:
-                    conflicts.append(
-                        self._sync_conflict(
-                            entity="annotation",
-                            id=existing["id"],
-                            client_id=client_id,
-                            resolution="server_won",
-                            reason="server_newer",
-                            server_annotation=existing,
-                            client_annotation=annotation,
-                        )
-                    )
-                elif self._sync_annotation_differs(existing, annotation):
-                    conflicts.append(
-                        self._sync_conflict(
-                            entity="annotation",
-                            id=existing["id"],
-                            client_id=client_id,
-                            resolution="server_won",
-                            reason="same_timestamp_different",
-                            server_annotation=existing,
-                            client_annotation=annotation,
-                        )
-                    )
-                continue
-
-            if annotation.get("deleted_at"):
-                continue
-            if not self.get_chapter_for_book(book_id, int(annotation.get("chapter_id") or 0)):
-                continue
-            add_reader_annotation(
-                self.db_path,
-                book_id=book_id,
-                chapter_id=int(annotation["chapter_id"]),
-                kind=annotation.get("kind") or "highlight",
-                paragraph_index=int(annotation.get("paragraph_index") or 0),
-                char_start=int(annotation.get("char_start") or 0),
-                char_end=int(annotation.get("char_end") or 0),
-                selected_text=annotation.get("selected_text") or "",
-                note=annotation.get("note") or "",
-                color=annotation.get("color") or "yellow",
-                client_id=str(client_id or "").strip(),
-                created_at=valid_client_created_at,
-                updated_at=valid_client_updated_at,
-            )
-
-        return {
-            "progress": get_reader_progress(self.db_path, book_id),
-            "annotations": list_reader_annotations(self.db_path, book_id, include_deleted=True),
-            "conflicts": conflicts,
-            "server_time": datetime.now(timezone.utc).isoformat(),
-        }
+        return self._reader().sync_reader_state(
+            book_id,
+            device_id=device_id,
+            last_sync_at=last_sync_at,
+            progress=progress,
+            annotations=annotations,
+        )
 
     def search_reader_book(
         self,
@@ -5121,10 +4594,15 @@ class PipelineService:
         text = self.get_chapter_translation(chapter_id)
         if not text:
             return None
+        provider = settings.tts_provider
+        legacy_fallback = text_to_speech_file
+        if is_f5_provider(provider):
+            require_tts_runtime_available(provider=provider)
+            legacy_fallback = None
         pipeline = TTSPipeline(
             self.db_path,
             self.data_dir,
-            legacy_fallback=text_to_speech_file,
+            legacy_fallback=legacy_fallback,
         )
         generate_kwargs: dict[str, object] = {
             "book_id": book_id,
@@ -5205,53 +4683,501 @@ class PipelineService:
         book_source: str = "manual",
         book_source_url: str = "",
         adapter_id: str = "",
-    ) -> dict:
+    ) -> ChapterImportResult:
+        normalized_text = normalize_import_text(text)
+        if not normalized_text:
+            raise SourceAdapterError(
+                "Chapter content is empty",
+                code=FetchErrorCode.CONTENT_INVALID,
+                retryable=False,
+                http_status=422,
+            )
         metadata = detect_import_metadata(
             title=title,
             chapter_number=chapter_number,
             chapter_title=chapter_title,
-            text=text,
+            text=normalized_text,
         )
         detected_title = metadata["title"]
         detected_chapter_number = metadata["chapter_number"]
         detected_chapter_title = metadata["chapter_title"]
-        book_id = self._book_id_for_import(
-            detected_title,
-            author=author,
-            source=book_source,
-            source_url=book_source_url or source_url,
-        )
+        try:
+            canonical_chapter_url = canonicalize_import_url(source_url)
+            canonical_source_url = canonicalize_import_url(book_source_url or source_url)
+        except Exception as exc:
+            code_value = str(getattr(exc, "code", FetchErrorCode.INVALID_URL.value))
+            try:
+                code = FetchErrorCode(code_value)
+            except ValueError:
+                code = FetchErrorCode.INVALID_URL
+            raise SourceAdapterError(
+                "Source URL is invalid for import",
+                code=code,
+                retryable=False,
+                http_status=400,
+            ) from exc
 
         safe_title = self._safe_filename_part(detected_title) or "book"
         safe_chapter_title = self._safe_filename_part(detected_chapter_title) or "chapter"
         raw_dir = self.data_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         raw_path = raw_dir / f"{safe_title}_ch{detected_chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
-        raw_path.write_text(text, encoding="utf-8")
         try:
-            chapter_id = add_chapter(
-                self.db_path,
-                book_id,
-                detected_chapter_number,
-                detected_chapter_title,
-                source_url,
-                raw_text_path=raw_path,
-                source_hash=metadata["source_hash"],
-                adapter_id=adapter_id,
-            )
-        except Exception:
+            raw_path.write_text(normalized_text, encoding="utf-8")
+            stored_text = raw_path.read_text(encoding="utf-8")
+        except OSError as exc:
             raw_path.unlink(missing_ok=True)
+            raise SourceAdapterError(
+                "Could not store chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        try:
+            with get_connection(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                book = resolve_import_book_with_connection(
+                    conn,
+                    title=detected_title,
+                    author=author,
+                    source=book_source,
+                    source_url=book_source_url or source_url,
+                    canonical_source_url=canonical_source_url,
+                )
+                book_id = int(book["id"])
+                upserted = upsert_import_chapter_with_connection(
+                    conn,
+                    book_id=book_id,
+                    chapter_number=detected_chapter_number,
+                    title=detected_chapter_title,
+                    source_url=source_url,
+                    canonical_chapter_url=canonical_chapter_url,
+                    adapter_id=adapter_id,
+                    raw_text_path=raw_path,
+                    content_hash=metadata["source_hash"],
+                    source_updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                conn.commit()
+        except ValueError as exc:
+            raw_path.unlink(missing_ok=True)
+            if "Duplicate" in str(exc):
+                raise SourceAdapterError(
+                    str(exc),
+                    code=FetchErrorCode.DUPLICATE,
+                    retryable=False,
+                    http_status=409,
+                ) from exc
+            raise SourceAdapterError(
+                "Could not import chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        except Exception as exc:
+            raw_path.unlink(missing_ok=True)
+            raise SourceAdapterError(
+                "Could not import chapter content",
+                code=FetchErrorCode.IMPORT_FAILED,
+                retryable=False,
+                http_status=500,
+            ) from exc
+        chapter_id = upserted.chapter_id
+        operation = upserted.operation
+        if operation == "skipped_duplicate":
+            raw_path.unlink(missing_ok=True)
+            result_path = upserted.raw_text_path
+        else:
+            result_path = str(raw_path)
+        return ChapterImportResult(
+            book_id=book_id,
+            chapter_id=chapter_id,
+            stored_text_length=len(stored_text),
+            content_hash=source_hash(stored_text),
+            operation=operation,
+            title=detected_title,
+            chapter_number=detected_chapter_number,
+            chapter_title=detected_chapter_title,
+            source_type=source_type,
+            source_url=source_url,
+            adapter_id=adapter_id,
+            path=result_path,
+        )
+
+    def _write_import_text_file(
+        self,
+        *,
+        book_title: str,
+        chapter_number: int,
+        chapter_title: str,
+        text: str,
+        content_kind: str,
+    ) -> Path:
+        safe_title = self._safe_filename_part(book_title) or "book"
+        safe_chapter_title = self._safe_filename_part(chapter_title) or "chapter"
+        directory = self.data_dir / ("translated" if content_kind == "translated" else "raw")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{safe_title}_ch{chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _prepare_reviewed_import_items(
+        self,
+        *,
+        chapters: list[dict],
+        content_kind: str,
+    ) -> list[dict]:
+        prepared: list[dict] = []
+        for item in chapters:
+            chapter_number = int(item.get("chapter_number") or 0)
+            chapter_title = str(item.get("chapter_title") or "").strip() or f"Chương {chapter_number}"
+            if chapter_number <= 0:
+                raise ValueError("Chapter number must be positive")
+
+            raw_text = str(item.get("raw_text") or "")
+            translated_text = str(item.get("translated_text") or "")
+            text = str(item.get("text") or "")
+            if content_kind == "raw":
+                raw_text = raw_text or text
+            elif content_kind == "translated":
+                translated_text = translated_text or text
+            else:
+                raw_text = raw_text or text
+
+            raw_text = raw_text.strip()
+            translated_text = translated_text.strip()
+            if not raw_text and not translated_text:
+                raise ValueError(f"Chapter {chapter_number} text is empty")
+            prepared.append(
+                {
+                    "chapter_number": chapter_number,
+                    "chapter_title": chapter_title,
+                    "raw_text": raw_text,
+                    "translated_text": translated_text,
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def _import_chapter_fingerprint(chapter: dict) -> tuple:
+        return (
+            int(chapter.get("id") or 0),
+            int(chapter.get("chapter_number") or 0),
+            str(chapter.get("title") or ""),
+            str(chapter.get("raw_text_path") or ""),
+            str(chapter.get("translated_text_path") or ""),
+            str(chapter.get("source_hash") or ""),
+            str(chapter.get("status") or ""),
+            str(chapter.get("translated_at") or ""),
+            str(chapter.get("deleted_at") or ""),
+        )
+
+    def _classify_reviewed_import_items(
+        self,
+        *,
+        prepared: list[dict],
+        existing_chapters: list[dict],
+        duplicate_strategy: str,
+        book_id: int | None,
+    ) -> list[dict]:
+        by_number = {int(chapter["chapter_number"]): dict(chapter) for chapter in existing_chapters}
+        by_source_hash = {
+            str(chapter.get("source_hash") or ""): dict(chapter)
+            for chapter in existing_chapters
+            if str(chapter.get("source_hash") or "")
+        }
+        classified: list[dict] = []
+
+        for item in prepared:
+            planned = dict(item)
+            chapter_number = int(planned["chapter_number"])
+            source_hash = str(planned["source_hash"])
+            existing = by_number.get(chapter_number)
+            source_duplicate = by_source_hash.get(source_hash)
+            if source_duplicate and int(source_duplicate["chapter_number"]) != chapter_number:
+                raise ValueError(
+                    f"Duplicate chapter content for chapter {chapter_number} in book {book_id or 'new'}"
+                )
+
+            if existing:
+                if duplicate_strategy == "error":
+                    raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id or 'new'}")
+                planned["action"] = "SKIP" if duplicate_strategy == "skip" else "REPLACE"
+                planned["existing_id"] = int(existing.get("id") or 0)
+                planned["existing_fingerprint"] = self._import_chapter_fingerprint(existing)
+            else:
+                planned["action"] = "ADD"
+                planned["existing_id"] = 0
+                planned["existing_fingerprint"] = None
+
+            classified.append(planned)
+            if planned["action"] != "SKIP":
+                synthetic = {
+                    "id": planned["existing_id"],
+                    "chapter_number": chapter_number,
+                    "title": planned["chapter_title"],
+                    "raw_text_path": existing.get("raw_text_path") if existing else "",
+                    "translated_text_path": existing.get("translated_text_path") if existing else "",
+                    "source_hash": source_hash,
+                    "status": "translated" if planned["translated_text"] else "imported",
+                    "translated_at": existing.get("translated_at") if existing else "",
+                    "deleted_at": "",
+                }
+                by_number[chapter_number] = synthetic
+                by_source_hash[source_hash] = synthetic
+        return classified
+
+    def _stage_reviewed_import_files(self, *, plan: list[dict], book_title: str) -> tuple[Path, list[dict]]:
+        staging_dir = self.data_dir / ".import-staging" / uuid.uuid4().hex
+        staged: list[dict] = []
+        try:
+            for index, item in enumerate(plan):
+                if item["action"] == "SKIP":
+                    continue
+                entry = dict(item)
+                for content_kind in ("raw", "translated"):
+                    text = str(item[f"{content_kind}_text"] or "")
+                    if not text:
+                        entry[f"{content_kind}_staged_path"] = None
+                        entry[f"{content_kind}_final_path"] = None
+                        continue
+                    safe_title = self._safe_filename_part(book_title) or "book"
+                    safe_chapter_title = self._safe_filename_part(item["chapter_title"]) or "chapter"
+                    filename = (
+                        f"{safe_title}_ch{item['chapter_number']}_{safe_chapter_title}_"
+                        f"{uuid.uuid4().hex}.txt"
+                    )
+                    staged_path = staging_dir / f"{index}_{content_kind}.txt"
+                    final_path = self.data_dir / content_kind / filename
+                    staged_path.parent.mkdir(parents=True, exist_ok=True)
+                    staged_path.write_text(text, encoding="utf-8")
+                    entry[f"{content_kind}_staged_path"] = staged_path
+                    entry[f"{content_kind}_final_path"] = final_path
+                staged.append(entry)
+            return staging_dir, staged
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+
+    @staticmethod
+    def _finalize_reviewed_import_files(plan: list[dict]) -> list[Path]:
+        finalized: list[Path] = []
+        try:
+            for item in plan:
+                for content_kind in ("raw", "translated"):
+                    staged_path = item.get(f"{content_kind}_staged_path")
+                    final_path = item.get(f"{content_kind}_final_path")
+                    if not staged_path or not final_path:
+                        continue
+                    final_path.parent.mkdir(parents=True, exist_ok=True)
+                    staged_path.replace(final_path)
+                    finalized.append(final_path)
+            return finalized
+        except Exception:
+            for path in finalized:
+                path.unlink(missing_ok=True)
+            raise
+
+    def import_reviewed_text_plan(
+        self,
+        *,
+        title: str,
+        chapters: list[dict],
+        content_kind: str,
+        duplicate_strategy: str = "skip",
+        target_book_id: int | None = None,
+        author: str = "",
+        source_type: str = "wizard",
+    ) -> dict:
+        if content_kind == "unknown":
+            raise ValueError("Choose raw or translated content mode before importing")
+        if content_kind not in {"raw", "translated", "both"}:
+            raise ValueError("Unsupported import content mode")
+        if duplicate_strategy not in {"error", "skip", "overwrite"}:
+            raise ValueError("Unsupported duplicate strategy")
+        if not chapters:
+            raise ValueError("No chapters to import")
+
+        target_title = title.strip()
+        if target_book_id is None and not target_title:
+            raise ValueError("Book title is required")
+        prepared = self._prepare_reviewed_import_items(chapters=chapters, content_kind=content_kind)
+
+        staging_dir: Path | None = None
+        finalized_paths: list[Path] = []
+        imported = 0
+        skipped = 0
+        overwritten = 0
+        chapter_ids: list[int] = []
+        warnings: list[dict] = []
+
+        with get_connection(self.db_path) as conn:
+            initial_book = find_import_book_with_connection(
+                conn,
+                title=target_title,
+                target_book_id=target_book_id,
+            )
+            if target_book_id is not None and not initial_book:
+                raise ValueError(f"Book {target_book_id} not found")
+            target_title = target_title or str((initial_book or {}).get("title") or "")
+            for item in prepared:
+                item["source_hash"] = detect_import_metadata(
+                    title=target_title,
+                    chapter_number=int(item["chapter_number"]),
+                    chapter_title=str(item["chapter_title"]),
+                    text=str(item["raw_text"] or item["translated_text"]),
+                )["source_hash"]
+
+            initial_book_id = int(initial_book["id"]) if initial_book else None
+            existing = (
+                list_active_import_chapters_with_connection(conn, initial_book_id)
+                if initial_book_id is not None
+                else []
+            )
+            initial_plan = self._classify_reviewed_import_items(
+                prepared=prepared,
+                existing_chapters=existing,
+                duplicate_strategy=duplicate_strategy,
+                book_id=initial_book_id,
+            )
+            staging_dir, staged_plan = self._stage_reviewed_import_files(
+                plan=initial_plan,
+                book_title=target_title,
+            )
+
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                book = resolve_import_book_with_connection(
+                    conn,
+                    title=target_title,
+                    author=author,
+                    source=source_type,
+                    target_book_id=target_book_id,
+                )
+                book_id = int(book["id"])
+                current_plan = self._classify_reviewed_import_items(
+                    prepared=prepared,
+                    existing_chapters=list_active_import_chapters_with_connection(conn, book_id),
+                    duplicate_strategy=duplicate_strategy,
+                    book_id=book_id,
+                )
+                initial_signature = [
+                    (item["action"], item["existing_id"], item["existing_fingerprint"])
+                    for item in initial_plan
+                ]
+                current_signature = [
+                    (item["action"], item["existing_id"], item["existing_fingerprint"])
+                    for item in current_plan
+                ]
+                if current_signature != initial_signature:
+                    raise ValueError("The target book changed after review; preview and confirm the import again")
+
+                finalized_paths = self._finalize_reviewed_import_files(staged_plan)
+                inserted_ids_by_number: dict[int, int] = {}
+                batch_paths_by_number: dict[int, dict[str, Path | None]] = {}
+                for item in staged_plan:
+                    chapter_number = int(item["chapter_number"])
+                    raw_path = item.get("raw_final_path")
+                    translated_path = item.get("translated_final_path")
+                    status = "translated" if translated_path else "imported"
+                    if item["action"] == "REPLACE":
+                        chapter_id = int(item["existing_id"]) or inserted_ids_by_number[chapter_number]
+                        update_import_chapter_with_connection(
+                            conn,
+                            chapter_id=chapter_id,
+                            title=str(item["chapter_title"]),
+                            raw_text_path=raw_path,
+                            translated_text_path=translated_path,
+                            status=status,
+                        )
+                        previous_paths = batch_paths_by_number.get(chapter_number, {})
+                        for content_kind, replacement_path in (
+                            ("raw", raw_path),
+                            ("translated", translated_path),
+                        ):
+                            previous_path = previous_paths.get(content_kind)
+                            if replacement_path and previous_path and previous_path != replacement_path:
+                                previous_path.unlink(missing_ok=True)
+                        batch_paths_by_number[chapter_number] = {
+                            "raw": raw_path or previous_paths.get("raw"),
+                            "translated": translated_path or previous_paths.get("translated"),
+                        }
+                        overwritten += 1
+                    else:
+                        chapter_id = insert_import_chapter_with_connection(
+                            conn,
+                            book_id=book_id,
+                            chapter_number=int(item["chapter_number"]),
+                            title=str(item["chapter_title"]),
+                            raw_text_path=raw_path,
+                            translated_text_path=translated_path,
+                            source_hash=str(item["source_hash"]) if raw_path else "",
+                            status=status,
+                        )
+                        inserted_ids_by_number[chapter_number] = chapter_id
+                        batch_paths_by_number[chapter_number] = {
+                            "raw": raw_path,
+                            "translated": translated_path,
+                        }
+                        imported += 1
+                    item["chapter_id"] = chapter_id
+                    chapter_ids.append(chapter_id)
+
+                skipped_items = [item for item in initial_plan if item["action"] == "SKIP"]
+                skipped = len(skipped_items)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                for path in finalized_paths:
+                    path.unlink(missing_ok=True)
+                raise
+            finally:
+                if staging_dir is not None:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+        for item in initial_plan:
+            if item["action"] == "SKIP":
+                warnings.append(
+                    {
+                        "type": "duplicate_chapter",
+                        "message": f"Skipped existing chapter {item['chapter_number']}",
+                        "chapter_number": int(item["chapter_number"]),
+                        "title": str(item["chapter_title"]),
+                    }
+                )
+        for item in staged_plan:
+            chapter_id_for_followup = int(item["chapter_id"])
+            try:
+                from app.mobile_api.services.glossary_service import GlossaryService
+                from app.mobile_api.services.qa_service import QAService
+
+                GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
+                if item.get("translated_final_path"):
+                    QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
+            except Exception:
+                logger.warning(
+                    "Post-import glossary/QA follow-up failed for book %s chapter %s",
+                    book_id,
+                    chapter_id_for_followup,
+                )
+                warnings.append(
+                    {
+                        "type": "post_import_qa_warning",
+                        "message": "Imported content was saved, but glossary/QA follow-up did not complete.",
+                        "chapter_number": int(item["chapter_number"]),
+                        "reason": "Follow-up failed; check server logs.",
+                    }
+                )
+
         return {
             "book_id": book_id,
-            "chapter_id": chapter_id,
-            "path": str(raw_path),
-            "title": detected_title,
-            "chapter_number": detected_chapter_number,
-            "chapter_title": detected_chapter_title,
-            "source_type": source_type,
-            "source_url": source_url,
-            "adapter_id": adapter_id,
+            "title": target_title,
+            "content_kind": content_kind,
+            "chapter_count": len(chapters),
+            "imported_chapters": imported,
+            "skipped_chapters": skipped,
+            "overwritten_chapters": overwritten,
+            "chapter_ids": chapter_ids,
+            "warnings": warnings,
         }
 
     def preview_source_url(self, url: str) -> dict:
@@ -5270,9 +5196,9 @@ class PipelineService:
         chapter_url: str,
         chapter_number: int = 1,
         chapter_title: str = "",
-    ) -> dict:
+    ) -> ChapterImportResult:
         chapter = self.fetch_source_chapter(chapter_url)
-        return self.import_from_text(
+        imported = self.import_from_text(
             title=book_title,
             chapter_number=chapter_number or chapter.chapter_number,
             chapter_title=chapter_title or chapter.title,
@@ -5283,6 +5209,12 @@ class PipelineService:
             book_source=source or chapter.source,
             book_source_url=source_url,
             adapter_id=chapter.adapter_id,
+        )
+        return replace(
+            imported,
+            fetch_method=chapter.fetch_method,
+            fetch_attempts=chapter.fetch_attempts,
+            fetch_elapsed_ms=chapter.fetch_elapsed_ms,
         )
 
     def import_from_file(

@@ -3,6 +3,9 @@ from __future__ import annotations
 import shutil
 import os
 import sqlite3
+from pathlib import Path
+import threading
+import time
 
 from fastapi import APIRouter, Request, Response
 
@@ -10,10 +13,68 @@ from app.config import settings
 from app.database.db import count_mobile_jobs_by_status, list_operational_events
 from app.mobile_api.config import auth_bypass_enabled, mobile_settings, validate_public_deploy_settings
 from app.mobile_api.public_mode import is_public_request, sanitize_public_payload
-from app.mobile_api.schemas import HealthResponse, ReadinessResponse, SystemStatusResponse, VersionResponse
+from app.mobile_api.schemas import HealthResponse, ReadinessResponse, RecoveryFreshnessResponse, SystemStatusResponse, VersionResponse
 from app.mobile_api.dependencies import get_db_path, get_data_dir
+from app.mobile_api.services.retention_service import RetentionService
+from app.runtime_identity import get_runtime_identity
+from app.recovery_receipts import read_recovery_receipt
+from app.runtime_status import inspect_worker_runtime
+from app.services.tts.availability import inspect_tts_capability
 
 router = APIRouter(prefix="/api", tags=["health"])
+
+_DATA_SIZE_CACHE_TTL_SECONDS = 60.0
+_data_size_cache: dict[Path, tuple[int, float]] = {}
+_data_size_refreshing: set[Path] = set()
+_data_size_cache_lock = threading.Lock()
+
+
+def _directory_size_bytes(root) -> int:
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _refresh_data_size_snapshot(root: Path) -> None:
+    size_bytes = _directory_size_bytes(root)
+    with _data_size_cache_lock:
+        _data_size_cache[root] = (size_bytes, time.monotonic())
+        _data_size_refreshing.discard(root)
+
+
+def _cached_directory_size_bytes(root: Path, *, minimum_bytes: int = 0) -> int:
+    resolved_root = root.resolve(strict=False)
+    now = time.monotonic()
+    refresh_thread: threading.Thread | None = None
+    with _data_size_cache_lock:
+        cached = _data_size_cache.get(resolved_root)
+        if cached is None or now - cached[1] > _DATA_SIZE_CACHE_TTL_SECONDS:
+            if resolved_root not in _data_size_refreshing:
+                _data_size_refreshing.add(resolved_root)
+                refresh_thread = threading.Thread(
+                    target=_refresh_data_size_snapshot,
+                    args=(resolved_root,),
+                    daemon=True,
+                    name="novel-data-size-snapshot",
+                )
+        cached_size = cached[0] if cached is not None else 0
+    if refresh_thread is not None:
+        refresh_thread.start()
+    return max(cached_size, minimum_bytes)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -88,19 +149,64 @@ async def readiness_check(request: Request, response: Response):
         checks["public_deploy"] = True
         public_details["public_deploy"] = "enabled" if mobile_settings.public_deploy else "disabled"
 
-    status = "ok" if all(checks.values()) else "degraded"
-    if status != "ok":
+    identity = get_runtime_identity(component="api")
+    worker = inspect_worker_runtime(
+        data_dir=data_dir,
+        db_path=get_db_path(),
+        api_identity=identity,
+        required=not mobile_settings.import_job_run_in_api,
+        max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
+    )
+    checks["worker"] = worker.queue_claim_capable
+    public_details["worker"] = worker.status
+    if not public_request and not mobile_settings.public_deploy:
+        details["worker"] = worker.status
+
+    tts = inspect_tts_capability()
+    required_checks = {
+        name: value
+        for name, value in checks.items()
+        if name != "public_deploy" or public_request
+    }
+    core_ready = all(
+        required_checks.get(name, False)
+        for name in ("storage", "data_dir_writable", "database", "disk_space", "jobs")
+    ) and required_checks.get("public_config", True) and required_checks.get("public_deploy", True)
+    jobs_ready = worker.queue_claim_capable
+    if not core_ready or not jobs_ready:
+        status = "not_ready"
+    elif not tts.available:
+        status = "ready_with_degraded_capabilities"
+    else:
+        status = "ready"
+    if status == "not_ready":
         response.status_code = 503
     return ReadinessResponse(
         status=status,
         checks=checks,
         details=public_details if (public_request or mobile_settings.public_deploy) else details,
+        core={
+            "api": "ready",
+            "database": "ready" if checks.get("database") else "not_ready",
+            "storage": "ready" if checks.get("storage") else "not_ready",
+            "disk": "ready" if checks.get("disk_space") else "not_ready",
+            "configuration": "ready" if checks.get("public_config", True) else "not_ready",
+        },
+        job_processing=worker.safe_dict(),
+        capabilities={"tts": tts.safe_dict()},
+        release={
+            "release_id": identity.release_id,
+            "git_sha": identity.git_sha,
+            "worker_release": worker.release_id,
+            "match": "true" if worker.release_match else "false",
+        },
     )
 
 
 @router.get("/version", response_model=VersionResponse)
 async def version_info():
-    return VersionResponse(version=mobile_settings.version, build="phase1")
+    identity = get_runtime_identity(component="api")
+    return VersionResponse(**identity.safe_dict(), build=identity.release_id)
 
 
 @router.get("/system/status", response_model=SystemStatusResponse)
@@ -108,14 +214,14 @@ async def system_status(request: Request):
     from app.translation.cache import get_cache_stats
     from app.mobile_api.routers.jobs import get_shared_job_tracker
     from app.mobile_api.services.provider_service import ProviderService
-    
+
     db_path = get_db_path()
     data_dir = get_data_dir()
     public_request = is_public_request(request)
-    
+
     # DB size
     db_size = db_path.stat().st_size if db_path.exists() else 0
-    
+
     # Cache stats
     try:
         cache = get_cache_stats(db_path)
@@ -132,14 +238,17 @@ async def system_status(request: Request):
     job_counts = count_mobile_jobs_by_status(db_path)
     recent_operational_errors = list_operational_events(db_path, limit=10)
     recent_events = list_operational_events(db_path, limit=50, severities=())
-    if public_request:
-        last_failed = sanitize_public_payload(last_failed)
-        recent_operational_errors = sanitize_public_payload(recent_operational_errors)
-        recent_events = sanitize_public_payload(recent_events)
+    last_failed = sanitize_public_payload(last_failed)
+    recent_operational_errors = sanitize_public_payload(recent_operational_errors)
+    recent_events = sanitize_public_payload(recent_events)
     recent_backup_events = [
         event for event in recent_events
         if str(event.get("event_type") or "").startswith("backup_")
     ][:5]
+    retention_service = getattr(request.app.state, "retention_service", None)
+    if retention_service is None or getattr(retention_service, "db_path", None) != db_path:
+        retention_service = RetentionService(db_path, settings=mobile_settings)
+    retention_status = await retention_service.get_status()
 
     active_provider = ""
     for job in running_jobs:
@@ -154,14 +263,44 @@ async def system_status(request: Request):
             active_provider = ""
 
     api_ready = data_dir.exists() and db_path.exists()
-    
+    data_directory_available = data_dir.is_dir()
+    database_available = db_path.is_file()
+    database_inside_data_dir = False
+    try:
+        db_path.resolve().relative_to(data_dir.resolve())
+        database_inside_data_dir = True
+    except ValueError:
+        pass
+    data_size_bytes = (
+        _cached_directory_size_bytes(
+            data_dir,
+            minimum_bytes=db_size if database_inside_data_dir else 0,
+        )
+        if data_directory_available
+        else 0
+    )
+    if not database_inside_data_dir:
+        data_size_bytes += db_size
+    storage_health = "healthy" if api_ready else "degraded"
+
+    identity = get_runtime_identity(component="api")
+    external_backup = read_recovery_receipt(
+        data_dir, "external_backup", expected_release=identity.release_id
+    )
+    restore_drill = read_recovery_receipt(
+        data_dir, "restore_drill", expected_release=identity.release_id
+    )
     return SystemStatusResponse(
         db_size_bytes=db_size,
         cache_count=cache.get("count", 0),
         cache_size_bytes=cache.get("total_bytes", 0),
+        data_size_bytes=data_size_bytes,
         ollama_host="" if public_request else settings.ollama_host,
         ollama_model="" if public_request else settings.ollama_model,
-        data_dir="" if public_request else str(data_dir),
+        database_available=database_available,
+        data_directory_available=data_directory_available,
+        storage_health=storage_health,
+        storage_label="Configured data storage",
         public_deploy=mobile_settings.public_deploy,
         api_ready=api_ready,
         active_provider=active_provider,
@@ -177,8 +316,10 @@ async def system_status(request: Request):
         recent_operational_errors=recent_operational_errors,
         recent_operational_events=recent_events[:20],
         recent_backup_events=recent_backup_events,
-        app_version=mobile_settings.version,
-        build="phase1",
-        database_path="" if (public_request or mobile_settings.public_deploy) else str(db_path),
-        backup_recommendation="Run scripts/backup-local.sh before upgrades or public deploy changes.",
+        retention=retention_status,
+        app_version=identity.version,
+        build=identity.release_id,
+        backup_recommendation="System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.",
+        external_backup=RecoveryFreshnessResponse(**external_backup),
+        restore_drill=RecoveryFreshnessResponse(**restore_drill),
     )

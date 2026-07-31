@@ -32,6 +32,13 @@ def test_audio_qa_rejects_empty_file(tmp_path: Path) -> None:
     assert "empty" in result.error.lower()
 
 
+def test_audio_qa_rejects_missing_file(tmp_path: Path) -> None:
+    result = analyze_audio(tmp_path / "missing.wav", text="Xin chào")
+
+    assert result.passed is False
+    assert "does not exist" in result.error.lower()
+
+
 def test_audio_qa_rejects_silent_wav(tmp_path: Path) -> None:
     path = tmp_path / "silent.wav"
     _write_wav(path, silent=True)
@@ -51,3 +58,15 @@ def test_audio_qa_accepts_valid_wav(tmp_path: Path) -> None:
     assert result.passed is True
     assert result.duration_seconds > 0
     assert result.rms > 0
+
+
+def test_audio_qa_warns_when_ffprobe_is_unavailable_for_mp3(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "voice.mp3"
+    path.write_bytes(b"mp3 bytes")
+    monkeypatch.setattr("app.services.tts.audio_qa.ffprobe_available", lambda: False)
+    monkeypatch.setattr("app.services.tts.audio_qa._probe_duration", lambda _path: 1.2)
+
+    result = analyze_audio(path, text="Một đoạn tiếng Việt ngắn")
+
+    assert result.passed is True
+    assert "ffprobe unavailable; duration QA skipped" in result.warnings

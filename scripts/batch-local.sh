@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# shellcheck disable=SC1091
+source "$ROOT/scripts/lib/python.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -56,10 +59,7 @@ if [[ "$EXPLICIT_PYTHON_BIN_SET" -eq 1 ]]; then
   export PYTHON_BIN="$EXPLICIT_PYTHON_BIN"
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="${PYTHON_BIN_FALLBACK:-python3}"
-fi
+PYTHON_BIN="$(resolve_python_bin "$ROOT")"
 
 DATA_DIR_VALUE="${DATA_DIR:-data}"
 if [[ "$DATA_DIR_VALUE" = /* ]]; then

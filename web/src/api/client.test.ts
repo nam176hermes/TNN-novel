@@ -9,7 +9,6 @@ describe('ApiClient', () => {
         ok: true,
         json: async () => ({
           access_token: 'access',
-          refresh_token: 'refresh',
           token_type: 'bearer',
         }),
       });
@@ -32,7 +31,6 @@ describe('ApiClient', () => {
       ok: true,
       json: async () => ({
         access_token: 'access',
-        refresh_token: 'refresh',
         token_type: 'bearer',
       }),
     });
@@ -52,27 +50,26 @@ describe('ApiClient', () => {
     );
   });
 
-  it('rotates refresh tokens and stores the new bearer token after refresh', async () => {
+  it('refreshes through credentials and the double-submit csrf header', async () => {
+    document.cookie = 'novel_csrf=csrf-test; path=/';
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
         access_token: 'new-access',
-        refresh_token: 'new-refresh',
         token_type: 'bearer',
       }),
     });
     const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
 
-    const result = await client.refresh('old-refresh');
+    const result = await client.refresh();
 
-    expect(result.refresh_token).toBe('new-refresh');
+    expect(result.access_token).toBe('new-access');
     expect(client.token).toBe('new-access');
     expect(fetchMock).toHaveBeenCalledWith(
       'http://test/api/auth/refresh',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ refresh_token: 'old-refresh' }),
+        headers: expect.objectContaining({ 'X-CSRF-Token': 'csrf-test' }),
       }),
     );
   });
@@ -143,8 +140,12 @@ describe('ApiClient', () => {
       },
       app_version: '0.1.0',
       build: 'phase1',
-      database_path: '',
-      backup_recommendation: 'Run scripts/backup-local.sh before upgrades or public deploy changes.',
+      database_available: true,
+      data_directory_available: true,
+      data_size_bytes: 8192,
+      storage_health: 'healthy',
+      storage_label: 'Configured data storage',
+      backup_recommendation: 'System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.',
     };
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => status });
     const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
@@ -479,6 +480,7 @@ describe('ApiClient', () => {
         uploadId: 'preview-upload-1',
         duplicateStrategy: 'skip',
         targetBookId: 7,
+        confirmedExistingBookId: 7,
       }),
     ).resolves.toEqual(job);
 
@@ -495,11 +497,12 @@ describe('ApiClient', () => {
     expect(body.get('file')).toBeNull();
     expect(body.get('duplicate_strategy')).toBe('skip');
     expect(body.get('target_book_id')).toBe('7');
+    expect(body.get('confirmed_existing_book_id')).toBe('7');
   });
 
   it('loads, previews, and imports a translated ebook from the server inbox', async () => {
     const inbox = {
-      directory: '/home/thenam176/novel_pipeline/inbox/ebooks',
+      directory: '/srv/novel-tnn/inbox/ebooks',
       files: [{ name: 'translated-from-inbox.epub', size: 130000000, modified_at: '2026-06-27T00:00:00Z' }],
     };
     const preview = {
@@ -648,6 +651,7 @@ describe('ApiClient', () => {
 
     const body = fetchMock.mock.calls[0]?.[1]?.body as FormData;
     expect(body.get('duplicate_strategy')).toBe('skip');
+    expect(body.get('confirmed_existing_book_id')).toBeNull();
   });
 
   it('loads books and chapters with auth headers', async () => {
@@ -942,13 +946,15 @@ describe('ApiClient', () => {
         tag: 'search',
         domain: 'www.69shuba.com',
         supported: 'true',
+        status: 'VERIFIED',
+        trust_level: 'HIGH',
         page: 2,
         page_size: 25,
       }),
     ).resolves.toEqual(catalog);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://test/api/source-catalog?query=69&tag=search&domain=www.69shuba.com&supported=true&page=2&page_size=25',
+      'http://test/api/source-catalog?query=69&tag=search&domain=www.69shuba.com&supported=true&status=VERIFIED&trust_level=HIGH&page=2&page_size=25',
       expect.objectContaining({
         headers: expect.objectContaining({ Authorization: 'Bearer access' }),
       }),
@@ -976,6 +982,98 @@ describe('ApiClient', () => {
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('imports, tests, verifies, and blocks managed sources with auth headers', async () => {
+    const importSummary = {
+      selected: 1,
+      inserted: 1,
+      duplicates: 0,
+      invalid: 0,
+      skipped: 0,
+      items: [{ id: 'src-1', catalog_entry_id: 'catalog-1', status: 'NEEDS_REVIEW', trust_level: 'MANUAL_ONLY', can_use_in_jobs: false }],
+    };
+    const testResult = {
+      source_id: 'src-1',
+      status: 'success',
+      reason: 'ok',
+      tested_at: '2026-07-09T00:00:00+00:00',
+      final_url: 'https://www.69shuba.com/book/1',
+      http_status: 200,
+    };
+    const managedSource = {
+      id: 'src-1',
+      catalog_entry_id: 'catalog-1',
+      name: '69 Source',
+      base_url: 'https://www.69shuba.com/book/1',
+      domain: 'www.69shuba.com',
+      language: 'zh-CN',
+      parser_type: 'policy_supported',
+      parser_config: {},
+      status: 'VERIFIED',
+      trust_level: 'HIGH',
+      supported_source_id: '69shuba',
+      last_test_status: 'success',
+      last_tested_at: '2026-07-09T00:00:00+00:00',
+      last_successful_fetch_at: '2026-07-09T00:00:00+00:00',
+      last_error: '',
+      rate_limit_requests_per_minute: 7,
+      rate_limit_delay_ms: 8000,
+      max_concurrent_requests: 1,
+      cooldown_after_error_seconds: 300,
+      notes: '',
+      created_at: '',
+      updated_at: '',
+      can_use_in_jobs: true,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => importSummary })
+      .mockResolvedValueOnce({ ok: true, json: async () => testResult })
+      .mockResolvedValueOnce({ ok: true, json: async () => managedSource })
+      .mockResolvedValueOnce({ ok: true, json: async () => managedSource });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await expect(client.importManagedSources(['catalog-1'])).resolves.toEqual(importSummary);
+    await expect(client.testManagedSource('src-1')).resolves.toEqual(testResult);
+    await expect(client.verifyManagedSource('src-1')).resolves.toEqual(managedSource);
+    await expect(client.setManagedSourceStatus('src-1', 'BLOCKED')).resolves.toEqual(managedSource);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://test/api/sources/import-catalog',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access', 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ entry_ids: ['catalog-1'] }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://test/api/sources/src-1/test',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/sources/src-1/verify',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      'http://test/api/sources/src-1/status',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access', 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ status: 'BLOCKED' }),
       }),
     );
   });
@@ -1042,7 +1140,8 @@ describe('ApiClient', () => {
       book_title: 'Phàm Nhân Tu Tiên',
       format: 'txt',
       filename: 'pham_nhan_tu_tien.txt',
-      path: '/tmp/pham_nhan_tu_tien.txt',
+      path: '',
+      download_url: '/api/books/1/exports/txt/download',
       media_type: 'text/plain; charset=utf-8',
       size_bytes: 1024,
       chapter_count: 2,
@@ -1105,6 +1204,75 @@ describe('ApiClient', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
       'http://test/api/books/1/exports/audiobook/m4b/download',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('creates, lists, and downloads protected system backups with auth headers', async () => {
+    const backupItem = {
+      filename: 'novel-pipeline-backup-20260709-100000.tar.gz',
+      size_bytes: 2048,
+      created_at: '2026-07-09T10:00:00',
+      encrypted: false,
+      secrets_included: false,
+      included_modules: ['database', 'uploads', 'audio'],
+      excluded_modules: ['exports', 'job_logs', 'secrets'],
+      manifest: {},
+      download_url: '/api/system/backups/novel-pipeline-backup-20260709-100000.tar.gz/download',
+    };
+    const backupJob: import('./types').SystemBackupJobStart = {
+      job_id: 'backup-job-1',
+      status: 'queued',
+      message: 'Backup queued',
+    };
+    const backupBlob = new Blob(['backup'], { type: 'application/octet-stream' });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ items: [backupItem] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => backupJob })
+      .mockResolvedValueOnce({
+        ok: true,
+        blob: async () => backupBlob,
+        headers: new Headers({
+          'content-disposition': 'attachment; filename="novel-pipeline-backup-20260709-100000.tar.gz"',
+          'content-type': 'application/octet-stream',
+        }),
+      });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await expect(client.listSystemBackups()).resolves.toEqual({ items: [backupItem] });
+    await expect(client.createSystemBackup({ include_audio: true })).resolves.toEqual(backupJob);
+    await expect(client.downloadSystemBackup(backupItem.filename)).resolves.toMatchObject({
+      blob: backupBlob,
+      filename: backupItem.filename,
+      mediaType: 'application/octet-stream',
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://test/api/system/backups',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://test/api/system/backups',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access',
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify({ include_audio: true }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/system/backups/novel-pipeline-backup-20260709-100000.tar.gz/download',
       expect.objectContaining({
         headers: expect.objectContaining({ Authorization: 'Bearer access' }),
       }),
@@ -1458,5 +1626,174 @@ describe('ApiClient', () => {
         }),
       }),
     );
+  });
+
+  it('streams import job SSE with bearer auth and a reconnect cursor', async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('id: 7\nevent: import_job_event\ndata: {"sequence":7,"job_id":"job-1",'));
+        controller.enqueue(encoder.encode('"task_id":null,"type":"job_transitioned","data":{"status":"running"},"created_at":"now"}\n\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const events: unknown[] = [];
+
+    const stream = client.openImportJobEventStream('job 1', (event) => events.push(event), { cursor: 6 });
+    await stream.done;
+
+    expect(events).toEqual([
+      {
+        sequence: 7,
+        job_id: 'job-1',
+        task_id: null,
+        type: 'job_transitioned',
+        data: { status: 'running' },
+        created_at: 'now',
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job%201/events?cursor=6',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it('aborts import job streaming without surfacing an AbortError', async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+
+    const stream = client.openImportJobEventStream('job-1', vi.fn());
+    stream.abort();
+
+    await expect(stream.done).resolves.toBeUndefined();
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.signal?.aborted).toBe(true);
+  });
+
+  it('supports the canonical P10 retryFailedTasks method', async () => {
+    const snapshot = { job_id: 'job-1', status: 'queued', tasks: [] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => snapshot });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await expect(client.retryFailedTasks('job 1')).resolves.toEqual(snapshot);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job%201/retry-failed',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('creates, loads, and cancels import jobs through the P09 endpoints', async () => {
+    const accepted = { job_id: 'job-1', status: 'queued', total: 1 };
+    const snapshot = { job_id: 'job-1', status: 'running', tasks: [] };
+    const cancelled = { job_id: 'job-1', status: 'cancelled', tasks: [] };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => accepted })
+      .mockResolvedValueOnce({ ok: true, json: async () => snapshot })
+      .mockResolvedValueOnce({ ok: true, json: async () => cancelled });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const createRequest = {
+      source_url: 'https://www.69shuba.com/book/1',
+      title: 'Đại Đạo Triều Thiên',
+      author: '',
+      source: '69shuba',
+      chapters: [{
+        url: 'https://www.69shuba.com/book/1/1.html',
+        chapter_number: 1,
+        title: 'Chương 1',
+      }],
+    };
+
+    await expect(client.createImportJob(createRequest)).resolves.toEqual(accepted);
+    await expect(client.getImportJob('job-1')).resolves.toEqual(snapshot);
+    await expect(client.cancelImportJob('job-1')).resolves.toEqual(cancelled);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://test/api/import/jobs',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access',
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify(createRequest),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://test/api/import/jobs/job-1',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access' }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/import/jobs/job-1/cancel',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ Authorization: 'Bearer access' }),
+      }),
+    );
+  });
+
+  it('supports the canonical P10 subscribeJobEvents method with Last-Event-ID', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await client.subscribeJobEvents('job-1', vi.fn(), { cursor: 7, lastEventId: 7 }).done;
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/import/jobs/job-1/events?cursor=7',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access',
+          'Last-Event-ID': '7',
+        }),
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it('preserves typed import job errors without parsing the message', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      statusText: 'Not Found',
+      json: async () => ({
+        detail: { code: 'job_not_found', retryable: false, message: 'Import job not found' },
+      }),
+    });
+    const client = new ApiClient('http://test/', fetchMock as unknown as typeof fetch);
+
+    const error: unknown = await client.getImportJob('missing').then(
+      () => null,
+      (value: unknown) => value,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    if (!(error instanceof ApiError)) throw new Error('Expected ApiError');
+    expect(error.code).toBe('job_not_found');
+    expect(error.retryable).toBe(false);
   });
 });

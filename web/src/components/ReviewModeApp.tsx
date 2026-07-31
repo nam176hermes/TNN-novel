@@ -121,7 +121,7 @@ function ReviewRaw() {
 
 function ReviewLibrary() {
   return (
-    <PageFrame eyebrow="Library" title="Thư viện đã dịch">
+    <PageFrame eyebrow="Kho truyện" title="Thư viện">
       <div className="review-library-grid">
         {[
           { title: 'Độc Tu', author: 'Thủy Đạo Bất Cô', cover: coverDocTu, progress: '100%', chapters: '1400/1400' },

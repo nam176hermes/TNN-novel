@@ -1,6 +1,7 @@
-const SHELL_CACHE = 'reader-offline-shell-v2';
-const RUNTIME_CACHE = 'reader-offline-runtime-v2';
+const SHELL_CACHE = 'reader-offline-shell-v6';
+const RUNTIME_CACHE = 'reader-offline-runtime-v6';
 const CACHE_PREFIX = 'reader-offline-';
+const VERIFY_APP_SHELL_MESSAGE = 'VERIFY_READER_OFFLINE_APP_SHELL';
 const APP_SHELL_URLS = [
   '/',
   '/index.html',
@@ -11,14 +12,72 @@ const APP_SHELL_URLS = [
   '/pwa-maskable-512.png',
 ];
 const STATIC_DESTINATIONS = new Set(['font', 'image', 'manifest', 'script', 'style']);
+const PRIVATE_PATH_PREFIXES = [
+  '/api/',
+  '/covers/',
+  '/book-assets/',
+  '/exports/',
+  '/backup',
+  '/backups/',
+  '/data/',
+];
+
+async function cacheAppShell() {
+  const cache = await caches.open(SHELL_CACHE);
+  await cache.addAll(APP_SHELL_URLS);
+
+  const cachedIndex = await cache.match('/index.html');
+  if (!cachedIndex) return;
+  const html = await cachedIndex.text();
+  const assetUrls = new Set();
+  const attributePattern = /(?:src|href)=["']([^"']+)["']/g;
+  for (const match of html.matchAll(attributePattern)) {
+    const url = new URL(match[1], self.location.origin);
+    if (sameOrigin(url) && url.pathname.startsWith('/assets/')) assetUrls.add(url.href);
+  }
+  await Promise.all(Array.from(assetUrls, (url) => cache.add(url)));
+}
+
+function allowedAppShellAssetUrls(assetUrls = []) {
+  const allowed = new Set();
+  for (const candidate of assetUrls) {
+    try {
+      const url = new URL(candidate, self.location.origin);
+      if (sameOrigin(url) && url.pathname.startsWith('/assets/')) allowed.add(url.href);
+    } catch {
+      // Ignore malformed or non-URL message data.
+    }
+  }
+  return allowed;
+}
+
+async function verifyAppShellReady(currentAssetUrls = []) {
+  const cache = await caches.open(SHELL_CACHE);
+  const requiredUrls = new Set(APP_SHELL_URLS);
+  const cachedIndex = await cache.match('/index.html');
+  if (cachedIndex) {
+    const html = await cachedIndex.text();
+    const attributePattern = /(?:src|href)=["']([^"']+)["']/g;
+    for (const match of html.matchAll(attributePattern)) {
+      const url = new URL(match[1], self.location.origin);
+      if (sameOrigin(url) && url.pathname.startsWith('/assets/')) requiredUrls.add(url.href);
+    }
+  }
+
+  for (const url of allowedAppShellAssetUrls(currentAssetUrls)) {
+    requiredUrls.add(url);
+    if (!await cache.match(url)) await cache.add(url);
+  }
+
+  const missing = [];
+  for (const url of requiredUrls) {
+    if (!await cache.match(url)) missing.push(url);
+  }
+  return { missing, ready: missing.length === 0 };
+}
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches
-      .open(SHELL_CACHE)
-      .then((cache) => cache.addAll(APP_SHELL_URLS))
-      .then(() => self.skipWaiting()),
-  );
+  event.waitUntil(cacheAppShell().then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
@@ -34,16 +93,22 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+self.addEventListener('message', (event) => {
+  if (event.data?.type !== VERIFY_APP_SHELL_MESSAGE || !event.ports[0]) return;
+  const responsePort = event.ports[0];
+  event.waitUntil(
+    verifyAppShellReady(event.data.assetUrls)
+      .then((result) => responsePort.postMessage(result))
+      .catch(() => responsePort.postMessage({ missing: [], ready: false })),
+  );
+});
+
 function sameOrigin(url) {
   return url.origin === self.location.origin;
 }
 
 function isPrivateAppPath(url) {
-  return (
-    url.pathname.startsWith('/api/')
-    || url.pathname.startsWith('/covers/')
-    || url.pathname.startsWith('/book-assets/')
-  );
+  return PRIVATE_PATH_PREFIXES.some((prefix) => url.pathname === prefix || url.pathname.startsWith(prefix));
 }
 
 function isStaticAssetRequest(request, url) {
@@ -72,12 +137,13 @@ async function networkFirstNavigation(request) {
 }
 
 async function staleWhileRevalidate(request) {
-  const cache = await caches.open(RUNTIME_CACHE);
-  const cached = await cache.match(request);
+  const runtimeCache = await caches.open(RUNTIME_CACHE);
+  const shellCache = await caches.open(SHELL_CACHE);
+  const cached = await runtimeCache.match(request) || await shellCache.match(request, { ignoreVary: true });
   const networkResponse = fetch(request)
     .then((response) => {
       if (response.ok) {
-        cache.put(request, response.clone());
+        runtimeCache.put(request, response.clone());
       }
       return response;
     })

@@ -1,0 +1,6 @@
+# Exact image tags running immediately before the WS7 production cutover.
+services:
+  api:
+    image: novel-pipeline-api:ws6-production-20260723-r1
+  import-worker:
+    image: novel-pipeline-import-worker:ws6-production-20260723-r1

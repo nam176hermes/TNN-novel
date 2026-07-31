@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Mapping
 from typing import Any
 
@@ -17,11 +18,17 @@ def is_public_request(request: Request | None) -> bool:
     if request is None:
         return False
 
+    client_host = request.client.host if request.client else ""
+    try:
+        client_is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        client_is_loopback = client_host.strip().lower() in _LOCAL_HOSTS
+    if not client_is_loopback:
+        return True
+
     host = request.url.hostname or request.headers.get("host", "").split(":", 1)[0]
     host = host.strip().lower().strip("[]")
-    if host in _LOCAL_HOSTS or host.endswith(".localhost"):
-        return False
-    return True
+    return host not in _LOCAL_HOSTS and not host.endswith(".localhost")
 
 
 def public_safe_value(key: str, value: Any) -> Any:

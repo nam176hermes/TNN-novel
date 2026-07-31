@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import base64
 import importlib
+import json
 import os
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+
+
+def test_session_auth_uses_db_auth_repository_exports() -> None:
+    from app.database import auth_repository
+    from app.mobile_api import session_auth
+
+    assert session_auth.get_auth_session is auth_repository.get_auth_session
+    assert session_auth.touch_auth_session is auth_repository.touch_auth_session
+    assert session_auth.auth_session_is_active is auth_repository.auth_session_is_active
 
 
 def _build_app_with_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -32,6 +43,14 @@ async def _login(client: httpx.AsyncClient) -> dict[str, str]:
     )
     assert response.status_code == 200
     return response.json()
+
+
+def _csrf_header(client: httpx.AsyncClient) -> dict[str, str]:
+    from app.mobile_api.config import mobile_settings
+
+    token = client.cookies.get(mobile_settings.csrf_cookie_name)
+    assert token
+    return {mobile_settings.csrf_header_name: token}
 
 
 def _auth_header(token: str) -> dict[str, str]:
@@ -104,7 +123,7 @@ async def test_public_ready_sanitizes_internal_diagnostics(
     payload = ready.model_dump()
 
     assert response.status_code == 200
-    assert payload["status"] == "ok"
+    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
     assert payload["checks"]["database"] is True
     assert payload["checks"]["storage"] is True
     assert payload["checks"]["jobs"] is True
@@ -136,7 +155,7 @@ async def test_local_ready_keeps_useful_internal_diagnostics(
     ready = await health_router.readiness_check(_request_for_url("http://test/api/ready"), Response())
     payload = ready.model_dump()
 
-    assert payload["status"] == "ok"
+    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
     assert payload["details"]["data_dir"] == str(data_dir)
     assert payload["details"]["database"] == str(db_path)
 
@@ -163,7 +182,53 @@ async def test_mobile_api_allows_authenticated_books_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mobile_api_refresh_accepts_json_body() -> None:
+async def test_book_and_chapter_metadata_do_not_expose_internal_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.database.db import add_book, add_chapter, init_db, update_book, update_chapter_paths
+
+    app, db_path = _build_app_with_data_dir(tmp_path, monkeypatch)
+    init_db(db_path)
+    cover_path = tmp_path / "private" / "cover.jpg"
+    raw_path = tmp_path / "private" / "raw.txt"
+    translated_path = tmp_path / "private" / "translated.txt"
+    content_path = tmp_path / "private" / "chapter.html"
+    audio_path = tmp_path / "private" / "chapter.mp3"
+    book_id = add_book(db_path, "Path Safety")
+    update_book(db_path, book_id, cover_path=str(cover_path))
+    chapter_id = add_chapter(db_path, book_id, 1, "Chapter", raw_text_path=raw_path)
+    update_chapter_paths(
+        db_path,
+        chapter_id,
+        cleaned_text_path=raw_path,
+        translated_text_path=translated_path,
+        content_html_path=content_path,
+        audio_path=audio_path,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        token = await _login(client)
+        headers = _auth_header(token["access_token"])
+        book = await client.get(f"/api/books/{book_id}", headers=headers)
+        chapters = await client.get(f"/api/books/{book_id}/chapters", headers=headers)
+
+    assert book.status_code == 200
+    assert chapters.status_code == 200
+    serialized = book.text + chapters.text
+    assert str(tmp_path) not in serialized
+    assert book.json()["cover_path"] == ""
+    chapter = chapters.json()[0]
+    assert chapter["raw_text_path"] == "available"
+    assert chapter["cleaned_text_path"] == "available"
+    assert chapter["translated_text_path"] == "available"
+    assert chapter["content_html_path"] == "available"
+    assert chapter["audio_path"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_mobile_api_refresh_uses_httponly_cookie_and_csrf_header() -> None:
     from app.mobile_api.config import mobile_settings
     from app.mobile_api.main import app
 
@@ -178,12 +243,100 @@ async def test_mobile_api_refresh_accepts_json_body() -> None:
         )
         refresh = await client.post(
             "/api/auth/refresh",
-            json={"refresh_token": login.json()["refresh_token"]},
+            headers=_csrf_header(client),
         )
 
     assert login.status_code == 200
+    assert "refresh_token" not in login.json()
     assert refresh.status_code == 200
     assert "access_token" in refresh.json()
+    assert "refresh_token" not in refresh.json()
+    set_cookie = login.headers.get_list("set-cookie")
+    assert any("novel_refresh_session=" in value and "HttpOnly" in value for value in set_cookie)
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_missing_or_mismatched_csrf_without_rotating_session(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, db_path = _build_app_with_data_dir(tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await _login(client)
+        missing = await client.post("/api/auth/refresh")
+        mismatched = await client.post(
+            "/api/auth/refresh",
+            headers={"X-CSRF-Token": "not-the-cookie-value"},
+        )
+
+    assert missing.status_code == 403
+    assert mismatched.status_code == 403
+    assert missing.json()["detail"] == {
+        "code": "csrf_rejected",
+        "message": "Request verification failed",
+    }
+    with sqlite3.connect(db_path) as conn:
+        session = conn.execute(
+            "SELECT revoked_at, reuse_detected_at FROM auth_sessions"
+        ).fetchone()
+    assert session == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_login_cookie_flags_match_local_and_public_requests(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.config import mobile_settings
+
+    app, _ = _build_app_with_data_dir(tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    credentials = {
+        "username": mobile_settings.admin_username,
+        "password": mobile_settings.admin_password,
+    }
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as local_client:
+        local = await local_client.post("/api/auth/login", json=credentials)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://novel.example.com",
+    ) as public_client:
+        public = await public_client.post("/api/auth/login", json=credentials)
+
+    local_refresh = next(
+        value for value in local.headers.get_list("set-cookie") if "novel_refresh_session=" in value
+    )
+    public_refresh = next(
+        value for value in public.headers.get_list("set-cookie") if "novel_refresh_session=" in value
+    )
+    assert "HttpOnly" in local_refresh and "SameSite=lax" in local_refresh
+    assert "Secure" not in local_refresh
+    assert "HttpOnly" in public_refresh and "SameSite=lax" in public_refresh
+    assert "Secure" in public_refresh
+
+
+@pytest.mark.asyncio
+async def test_browser_security_headers_cover_local_public_and_guard_responses() -> None:
+    from app.mobile_api.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        local = await client.get("/api/health")
+        guarded = await client.get("/api/books")
+        public = await client.get(
+            "/api/health",
+            headers={"Host": "novel.example.com", "X-Forwarded-Proto": "https"},
+        )
+
+    for response in (local, guarded, public):
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+        assert response.headers["permissions-policy"]
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert "strict-transport-security" not in local.headers
+    assert public.headers["strict-transport-security"].startswith("max-age=31536000")
 
 
 @pytest.mark.asyncio
@@ -204,7 +357,7 @@ async def test_login_creates_server_side_session(tmp_path, monkeypatch: pytest.M
     assert rows[0]["session_id"]
     assert rows[0]["username"]
     assert rows[0]["refresh_token_hash"]
-    assert token_response["refresh_token"] not in rows[0]["refresh_token_hash"]
+    assert "refresh_token" not in token_response
     assert rows[0]["revoked_at"] in ("", None)
 
 
@@ -239,6 +392,8 @@ async def test_logout_revokes_current_server_side_session(
 
     assert logout.status_code == 200
     assert after_logout.status_code == 401
+    assert not client.cookies.get("novel_refresh_session")
+    assert not client.cookies.get("novel_csrf")
     with sqlite3.connect(db_path) as conn:
         revoked_at = conn.execute("SELECT revoked_at FROM auth_sessions").fetchone()[0]
     assert revoked_at
@@ -291,17 +446,18 @@ async def test_refresh_token_rotation_rejects_old_refresh_token(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        token_response = await _login(client)
-        old_refresh = token_response["refresh_token"]
-        first_refresh = await client.post("/api/auth/refresh", json={"refresh_token": old_refresh})
-        new_refresh = await client.post(
-            "/api/auth/refresh",
-            json={"refresh_token": first_refresh.json()["refresh_token"]},
-        )
-        second_refresh = await client.post("/api/auth/refresh", json={"refresh_token": old_refresh})
+        await _login(client)
+        from app.mobile_api.config import mobile_settings
+        old_refresh = client.cookies.get(mobile_settings.refresh_cookie_name)
+        assert old_refresh
+        first_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
+        new_refresh_token = client.cookies.get(mobile_settings.refresh_cookie_name)
+        assert new_refresh_token and new_refresh_token != old_refresh
+        new_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
+        client.cookies.set(mobile_settings.refresh_cookie_name, old_refresh, path="/api/auth")
+        second_refresh = await client.post("/api/auth/refresh", headers=_csrf_header(client))
 
     assert first_refresh.status_code == 200
-    assert first_refresh.json()["refresh_token"] != old_refresh
     assert new_refresh.status_code == 200
     assert second_refresh.status_code == 401
     events = list_operational_events(db_path, limit=20, severities=())
@@ -361,7 +517,7 @@ async def test_auth_audit_events_do_not_store_raw_tokens_or_passwords(
         token_response = await _login(client)
         refresh_response = await client.post(
             "/api/auth/refresh",
-            json={"refresh_token": token_response["refresh_token"]},
+            headers=_csrf_header(client),
         )
         await client.post(
             "/api/auth/logout",
@@ -374,8 +530,8 @@ async def test_auth_audit_events_do_not_store_raw_tokens_or_passwords(
     assert any(event["event_type"] == "session_refresh_success" for event in events)
     assert any(event["event_type"] == "auth_logout" for event in events)
     assert token_response["access_token"] not in serialized
-    assert token_response["refresh_token"] not in serialized
-    assert refresh_response.json()["refresh_token"] not in serialized
+    assert "refresh_token" not in token_response
+    assert "refresh_token" not in refresh_response.json()
     assert password_marker not in serialized
 
 
@@ -487,6 +643,25 @@ def test_public_deploy_safety_gate_rejects_unsafe_defaults() -> None:
     assert any("MOBILE_API_ADMIN_PASSWORD" in error for error in errors)
     assert any("MOBILE_API_CORS_ORIGINS" in error for error in errors)
     assert any("MOBILE_API_DISABLE_AUTH" in error for error in errors)
+
+
+def test_external_bind_requires_public_deploy_safety_gate() -> None:
+    from app.mobile_api.config import MobileAPISettings, validate_public_deploy_settings
+
+    errors = validate_public_deploy_settings(
+        MobileAPISettings(
+            host="0.0.0.0",
+            public_deploy=False,
+            secret_key="dev-secret-change-in-production",
+            admin_username="admin",
+            admin_password="change_me",
+        )
+    )
+
+    assert any("PUBLIC_DEPLOY=1" in error for error in errors)
+    assert any("MOBILE_API_SECRET" in error for error in errors)
+    assert any("MOBILE_API_ADMIN_USERNAME" in error for error in errors)
+    assert any("MOBILE_API_ADMIN_PASSWORD" in error for error in errors)
 
 
 def test_public_deploy_auth_bypass_requires_explicit_override() -> None:
@@ -663,3 +838,46 @@ async def test_remote_api_key_does_not_block_bearer_authenticated_dashboard() ->
         from app.mobile_api import main as main_mod
 
         importlib.reload(main_mod)
+
+
+def _jwt_header(token: str) -> dict[str, object]:
+    encoded = token.split(".", 1)[0]
+    padding = "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded + padding))
+
+
+def test_auth_tokens_are_signed_with_hs256() -> None:
+    from app.mobile_api.security import create_access_token, create_refresh_token
+
+    access = create_access_token({"sub": "operator"})
+    refresh = create_refresh_token({"sub": "operator"})
+
+    assert _jwt_header(access)["alg"] == "HS256"
+    assert _jwt_header(refresh)["alg"] == "HS256"
+
+
+def test_token_boundaries_reject_accidental_ecdsa_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.mobile_api import security as security_mod
+
+    valid_hs256_token = security_mod.create_access_token({"sub": "operator"})
+    monkeypatch.setattr(security_mod.mobile_settings, "algorithm", "ES256")
+
+    with pytest.raises(RuntimeError, match="HS256"):
+        security_mod.create_access_token({"sub": "operator"})
+    with pytest.raises(RuntimeError, match="HS256"):
+        security_mod.decode_token(valid_hs256_token)
+
+
+def test_public_deploy_rejects_non_hs256_jwt_algorithm() -> None:
+    from app.mobile_api.config import MobileAPISettings, validate_public_deploy_settings
+
+    settings = MobileAPISettings(
+        public_deploy=True,
+        secret_key="0123456789abcdef0123456789abcdef",
+        algorithm="ES256",
+        admin_username="private_operator",
+        admin_password="correct horse battery staple 2026",
+        cors_origins=["https://novel.example.com"],
+    )
+
+    assert any("HS256" in error for error in validate_public_deploy_settings(settings))

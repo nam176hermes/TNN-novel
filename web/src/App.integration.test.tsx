@@ -99,6 +99,12 @@ async function expectNoGlobalAlert(): Promise<void> {
   await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
 }
 
+async function expectReaderPage(): Promise<void> {
+  expect(
+    await screen.findByRole('heading', { name: 'Đọc truyện' }, { timeout: 10_000 }),
+  ).toBeInTheDocument();
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -120,12 +126,93 @@ async function openTranslatedWorkbench(bookTitle = 'Live Book'): Promise<void> {
   await userEvent.click(
     within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }),
   );
-  expect(await screen.findByRole('heading', { name: 'Thư viện đã dịch' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
 
   const bookHeading = await screen.findByRole('heading', { name: bookTitle });
   const row = bookHeading.closest('article');
   expect(row).not.toBeNull();
   await userEvent.click(within(row as HTMLElement).getByRole('button', { name: 'Sửa' }));
+}
+
+function installDirtyWorkbenchApiMock({ saveUnauthorized = false } = {}) {
+  let logoutCalls = 0;
+  const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+    const target = String(url);
+
+    if (target.endsWith('/api/providers')) {
+      return { ok: true, json: async () => ({ providers: [fixtureProvider] }) };
+    }
+    if (target.endsWith('/api/style-profiles')) {
+      return { ok: true, json: async () => ({ profiles: [fixtureStyleProfile] }) };
+    }
+    if (target.endsWith('/api/books')) {
+      return { ok: true, json: async () => [fixtureBook] };
+    }
+    if (target.endsWith('/api/books/42/chapters')) {
+      return { ok: true, json: async () => [fixtureChapter] };
+    }
+    if (target.endsWith('/api/books/42/chapters/4201/source')) {
+      return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Live source text' }) };
+    }
+    if (target.endsWith('/api/books/42/chapters/4201/translation')) {
+      if (init?.method === 'PATCH') {
+        if (saveUnauthorized) {
+          return {
+            ok: false,
+            status: 401,
+            statusText: 'Unauthorized',
+            json: async () => ({ detail: 'Not authenticated' }),
+          };
+        }
+        return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Dirty draft' }) };
+      }
+      return { ok: true, json: async () => ({ chapter_id: 4201, text: 'Saved translation' }) };
+    }
+    if (target.endsWith('/api/providers/estimate')) {
+      return {
+        ok: true,
+        json: async () => ({
+          provider_id: fixtureProvider.id,
+          model: fixtureProvider.model,
+          chapter_count: 1,
+          estimated_input_tokens: 100,
+          estimated_output_tokens: 100,
+          estimated_cost_usd: 0.0001,
+          within_budget: true,
+        }),
+      };
+    }
+    if (target.endsWith('/api/providers/usage')) {
+      return { ok: true, json: async () => ({ usage: fixtureUsage }) };
+    }
+    if (target.endsWith('/api/system/status')) {
+      return { ok: true, json: async () => ({ api_ready: true, active_jobs: 0, running_jobs: 0 }) };
+    }
+    if (target.endsWith('/api/auth/logout') && init?.method === 'POST') {
+      logoutCalls += 1;
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+
+    const assistResponse = defaultAssistAutoLoadResponse(target);
+    if (assistResponse) return assistResponse;
+
+    throw new Error(`Unexpected URL: ${target}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return { fetchMock, getLogoutCalls: () => logoutCalls };
+}
+
+async function renderDirtyWorkbench(options: { saveUnauthorized?: boolean } = {}) {
+  saveToken('access');
+  const api = installDirtyWorkbenchApiMock(options);
+  const rendered = render(<App />);
+  await openTranslatedWorkbench();
+  const translation = await screen.findByLabelText('Bản dịch tiếng Việt');
+  expect(translation).toHaveValue('Saved translation');
+  await userEvent.clear(translation);
+  await userEvent.type(translation, 'Dirty draft');
+  expect(translation).toHaveValue('Dirty draft');
+  return { ...api, ...rendered, translation };
 }
 
 describe('App live data wiring', () => {
@@ -175,6 +262,65 @@ describe('App live data wiring', () => {
     await expectNoGlobalAlert();
   });
 
+  it('PR-2 unsaved translation guard registers beforeunload only while dirty and removes it when clean or unmounted', async () => {
+    saveToken('access');
+    installDirtyWorkbenchApiMock();
+    const rendered = render(<App />);
+    await openTranslatedWorkbench();
+    const translation = await screen.findByLabelText('Bản dịch tiếng Việt');
+    expect(translation).toHaveValue('Saved translation');
+
+    const cleanEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(cleanEvent)).toBe(true);
+    expect(cleanEvent.defaultPrevented).toBe(false);
+
+    await userEvent.clear(translation);
+    await userEvent.type(translation, 'Dirty draft');
+    const dirtyEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(dirtyEvent)).toBe(false);
+    expect(dirtyEvent.defaultPrevented).toBe(true);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Lưu' })).toBeDisabled());
+    const savedEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(savedEvent)).toBe(true);
+    expect(savedEvent.defaultPrevented).toBe(false);
+
+    await userEvent.type(translation, ' changed again');
+    rendered.unmount();
+    const unmountedEvent = new Event('beforeunload', { cancelable: true });
+    expect(window.dispatchEvent(unmountedEvent)).toBe(true);
+    expect(unmountedEvent.defaultPrevented).toBe(false);
+  });
+
+  it('PR-2 unsaved translation guard skips same-view actions and cancel keeps the Workbench draft unchanged', async () => {
+    const confirmLeave = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmLeave);
+    const { translation } = await renderDirtyWorkbench();
+    const workflowNav = screen.getByRole('navigation', { name: 'Quy trình' });
+
+    await userEvent.click(within(workflowNav).getByRole('button', { name: 'Bàn dịch' }));
+    expect(confirmLeave).not.toHaveBeenCalled();
+    expect(translation).toHaveValue('Dirty draft');
+
+    await userEvent.click(within(workflowNav).getByRole('button', { name: 'Raw chưa dịch' }));
+    expect(confirmLeave).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('region', { name: 'Workbench' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Bản dịch tiếng Việt')).toHaveValue('Dirty draft');
+  });
+
+  it('PR-2 unsaved translation guard never blocks forced 401 expiry while a draft is dirty', async () => {
+    const confirmLeave = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirmLeave);
+    await renderDirtyWorkbench({ saveUnauthorized: true });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu' }));
+
+    expect(await screen.findByRole('button', { name: 'Login' })).toBeInTheDocument();
+    expect(await screen.findByText('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.')).toBeInTheDocument();
+    expect(confirmLeave).not.toHaveBeenCalled();
+  });
+
   it('retries the last failed job from the status page', async () => {
     saveToken('access');
     const systemStatus = {
@@ -183,12 +329,13 @@ describe('App live data wiring', () => {
       api_ready: true,
       app_version: '0.1.0',
       asset_protection_enabled: true,
-      backup_recommendation: 'Run scripts/backup-local.sh before upgrades or public deploy changes.',
+      backup_recommendation: 'System backup is separate from book export. Run scripts/backup-local.sh before upgrades or public deploy changes.',
       build: 'phase1',
       cache_count: 0,
       cache_size_bytes: 0,
-      data_dir: '/home/thenam176/novel_pipeline/data',
-      database_path: '/home/thenam176/novel_pipeline/data/pipeline.db',
+      data_directory_available: true,
+      data_size_bytes: 8192,
+      database_available: true,
       db_size_bytes: 4096,
       last_failed_job: {
         job_id: 'job-restarted',
@@ -202,6 +349,8 @@ describe('App live data wiring', () => {
       },
       ollama_host: 'http://localhost:11434/v1',
       ollama_model: 'qwen3:14b',
+      storage_health: 'healthy',
+      storage_label: 'Configured data storage',
       public_deploy: true,
       running_jobs: 0,
       upload_max_bytes: 104857600,
@@ -328,7 +477,7 @@ describe('App live data wiring', () => {
 
       if (target.endsWith('/api/providers')) return { ok: true, json: async () => ({ providers: [] }) };
       if (target.endsWith('/api/style-profiles')) return { ok: true, json: async () => ({ profiles: [] }) };
-      if (target.endsWith('/api/books')) return { ok: true, json: async () => [] };
+      if (target.endsWith('/api/books')) return { ok: true, json: async () => [importedBook] };
       if (target.endsWith('/api/books/101/chapters')) return { ok: true, json: async () => [importedChapter] };
       if (target.endsWith('/api/providers/usage')) return { ok: true, json: async () => ({ usage: fixtureUsage }) };
 
@@ -346,6 +495,23 @@ describe('App live data wiring', () => {
             cover_present: false,
             chapter_count: 1,
             chapters: [{ chapter_number: 1, title: 'Vẫn Lạc Thiên Tài', sample: 'Đấu khí, ba đoạn!' }],
+            dry_run: {
+              target_book_id: 101,
+              target_title: 'Đấu Phá Thương Khung',
+              duplicate_strategy: 'skip',
+              chapter_count: 1,
+              new_chapters: 0,
+              duplicate_chapters: 1,
+              would_import: 0,
+              would_skip: 1,
+              would_overwrite: 0,
+              would_error: 0,
+              existing_book_id: 101,
+              existing_book_title: 'Đấu Phá Thương Khung',
+              existing_chapter_count: 1,
+              book_match_reason: 'title',
+              requires_existing_book_confirmation: true,
+            },
           }),
         };
       }
@@ -354,6 +520,7 @@ describe('App live data wiring', () => {
         const body = init.body as FormData;
         expect(body.get('duplicate_strategy')).toBe('skip');
         expect(body.get('split_mode')).toBe('auto');
+        expect(body.get('confirmed_existing_book_id')).toBe('101');
         return {
           ok: true,
           json: async () => ({
@@ -368,7 +535,7 @@ describe('App live data wiring', () => {
         return {
           ok: true,
           body: streamFromText(
-            'data: {"job_id":"job-import-ebook","job_type":"import_ebook","status":"completed","progress":1,"total":1,"message":"Imported 1 translated ebook chapter(s), skipped 0."}\n\n',
+            'data: {"job_id":"job-import-ebook","job_type":"import_ebook","status":"completed","progress":1,"total":1,"message":"Imported 0 translated ebook chapter(s), skipped 1."}\n\n',
           ),
         };
       }
@@ -382,7 +549,7 @@ describe('App live data wiring', () => {
             status: 'completed',
             progress: 1,
             total: 1,
-            message: 'Imported 1 translated ebook chapter(s), skipped 0.',
+            message: 'Imported 0 translated ebook chapter(s), skipped 1.',
           }),
         };
       }
@@ -398,7 +565,7 @@ describe('App live data wiring', () => {
                 status: 'completed',
                 progress: 1,
                 total: 1,
-                message: 'Imported 1 translated ebook chapter(s), skipped 0.',
+                message: 'Imported 0 translated ebook chapter(s), skipped 1.',
               },
             ],
           }),
@@ -451,16 +618,118 @@ describe('App live data wiring', () => {
 
     expect(await screen.findByRole('heading', { name: 'Đấu Phá Thương Khung' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('radio', { name: 'Bỏ qua chương trùng' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+    const importButton = screen.getByRole('button', { name: 'Import vào Library' });
+    expect(importButton).toBeDisabled();
+    await userEvent.click(screen.getByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.'));
+    expect(importButton).toBeEnabled();
+    await userEvent.click(importButton);
 
     expect(await screen.findByRole('heading', { name: 'Tác vụ' })).toBeInTheDocument();
     expect(screen.getByText('Đã bắt đầu import ebook. Theo dõi tác vụ job-impo.')).toBeInTheDocument();
-    expect(await screen.findAllByText('Imported 1 translated ebook chapter(s), skipped 0.')).not.toHaveLength(0);
+    expect(await screen.findAllByText('Imported 0 translated ebook chapter(s), skipped 1.')).not.toHaveLength(0);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/import/ebook/job',
       expect.objectContaining({ method: 'POST' }),
     ));
     await expectNoGlobalAlert();
+  });
+
+  it('keeps the import page and clears stale confirmation after an ebook job conflict', async () => {
+    saveToken('access');
+    const existingBook = {
+      id: 101,
+      title: 'Đấu Phá Thương Khung',
+      author: 'Thiên Tằm Thổ Đậu',
+      source: 'ebook',
+      source_url: '',
+      created_at: '2026-06-26T00:00:00Z',
+      updated_at: '2026-06-26T00:00:00Z',
+    };
+    const safeDetail = 'Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có.';
+    const fetchMock = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      const target = String(url);
+
+      if (target.endsWith('/api/providers')) return { ok: true, json: async () => ({ providers: [] }) };
+      if (target.endsWith('/api/style-profiles')) return { ok: true, json: async () => ({ profiles: [] }) };
+      if (target.endsWith('/api/books')) return { ok: true, json: async () => [existingBook] };
+      if (target.endsWith('/api/books/101/chapters')) return { ok: true, json: async () => [] };
+      if (target.endsWith('/api/providers/usage')) return { ok: true, json: async () => ({ usage: fixtureUsage }) };
+
+      if (target.endsWith('/api/import/ebook/preview') && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            title: existingBook.title,
+            author: existingBook.author,
+            language: 'vi',
+            source_format: 'epub',
+            cover_present: false,
+            chapter_count: 1,
+            chapters: [{ chapter_number: 1, title: 'Vẫn Lạc Thiên Tài', sample: 'Đấu khí, ba đoạn!' }],
+            dry_run: {
+              target_book_id: 101,
+              target_title: existingBook.title,
+              duplicate_strategy: 'skip',
+              chapter_count: 1,
+              new_chapters: 1,
+              duplicate_chapters: 0,
+              would_import: 1,
+              would_skip: 0,
+              would_overwrite: 0,
+              would_error: 0,
+              existing_book_id: 101,
+              existing_book_title: existingBook.title,
+              existing_chapter_count: 0,
+              book_match_reason: 'title',
+              requires_existing_book_confirmation: true,
+            },
+          }),
+        };
+      }
+
+      if (target.endsWith('/api/import/ebook/job') && init?.method === 'POST') {
+        const body = init.body as FormData;
+        expect(body.get('confirmed_existing_book_id')).toBe('101');
+        return {
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: safeDetail }),
+        };
+      }
+
+      const assistResponse = defaultAssistAutoLoadResponse(target);
+      if (assistResponse) return assistResponse;
+
+      throw new Error(`Unexpected URL: ${target}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Nhập chương' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Ebook bản dịch' }));
+    await userEvent.upload(
+      await screen.findByLabelText('Ebook file'),
+      new File(['ebook'], 'dau-pha.epub', { type: 'application/epub+zip' }),
+    );
+    await userEvent.click(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.'));
+    await userEvent.click(screen.getByRole('button', { name: 'Import vào Library' }));
+
+    expect(await screen.findAllByText(new RegExp(safeDetail))).not.toHaveLength(0);
+    expect(screen.getByRole('heading', { name: 'Ebook bản dịch' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Tác vụ' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeInTheDocument();
+
+    const retryButton = screen.getByRole('button', { name: 'Preview lại' });
+    expect(retryButton).toBeEnabled();
+    await userEvent.click(retryButton);
+
+    expect(await screen.findByLabelText('Tôi xác nhận gộp ebook này vào truyện đã có.')).not.toBeChecked();
+    expect(fetchMock.mock.calls.filter(([url, init]) => (
+      String(url).endsWith('/api/import/ebook/preview') && init?.method === 'POST'
+    ))).toHaveLength(2);
   });
 
   it('opens translated library and reader as separate workflow pages', async () => {
@@ -570,14 +839,14 @@ describe('App live data wiring', () => {
     expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
 
-    expect(await screen.findByRole('heading', { name: 'Thư viện đã dịch' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
     expect(screen.getByText('1/1 chương đã dịch')).toBeVisible();
     expect(translatedLibraryRequests).toBe(1);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
 
-    expect(await screen.findByRole('heading', { name: 'Đọc truyện' })).toBeInTheDocument();
+    await expectReaderPage();
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Hắn bước vào động phủ.');
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Linh khí cuồn cuộn.');
     expect(
@@ -672,9 +941,9 @@ describe('App live data wiring', () => {
 
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Đọc Live Book' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đọc tiếp Live Book' }));
 
-    expect(await screen.findByRole('heading', { name: 'Đọc truyện' })).toBeInTheDocument();
+    await expectReaderPage();
     expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toHaveTextContent('Chương hai từ local progress.');
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:7860/api/books/42/reader/state',
@@ -750,7 +1019,7 @@ describe('App live data wiring', () => {
       'http://127.0.0.1:7860/api/books/42',
       expect.objectContaining({ method: 'DELETE' }),
     ));
-    expect(await screen.findByText('Chưa có truyện đã dịch.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện trống' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Live Book' })).not.toBeInTheDocument();
     await expectNoGlobalAlert();
   });
@@ -2032,10 +2301,21 @@ describe('App live data wiring', () => {
         };
       }
 
-      if (target.endsWith('/api/import/paste') && init?.method === 'POST') {
+      if (target.endsWith('/api/import/wizard/text') && init?.method === 'POST') {
         return {
           ok: true,
-          json: async () => ({ book_id: 42, chapter_id: 4202, message: 'Imported' }),
+          json: async () => ({
+            book_id: 42,
+            title: 'Live Book',
+            content_kind: 'raw',
+            chapter_count: 1,
+            imported_chapters: 1,
+            skipped_chapters: 0,
+            overwritten_chapters: 0,
+            chapter_ids: [4202],
+            warnings: [],
+            message: 'Imported reviewed text',
+          }),
         };
       }
 
@@ -2052,11 +2332,15 @@ describe('App live data wiring', () => {
     await userEvent.click(
       within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Nhập chương' }),
     );
-    await userEvent.type(screen.getByLabelText('Book title'), 'Live Book');
-    await userEvent.clear(screen.getByLabelText('Chapter number'));
-    await userEvent.type(screen.getByLabelText('Chapter number'), '2');
-    await userEvent.type(screen.getByLabelText('Chapter title'), 'Imported Chapter');
-    await userEvent.type(screen.getByLabelText('Source text'), 'Imported source text');
+    await userEvent.type(
+      await screen.findByPlaceholderText('Nhập tên truyện hoặc để trống nếu đã chọn từ Library'),
+      'Live Book',
+    );
+    const chapterNumberInput = screen.getByRole('spinbutton');
+    await userEvent.clear(chapterNumberInput);
+    await userEvent.type(chapterNumberInput, '2');
+    await userEvent.type(screen.getByPlaceholderText('Nhập tiêu đề chương'), 'Imported Chapter');
+    await userEvent.type(screen.getByPlaceholderText('Dán nội dung chương vào đây...'), '第2章 Imported Chapter\\n\\n少年走入山中。');
     await userEvent.click(screen.getByRole('button', { name: 'Import chapter' }));
 
     expect(await screen.findByRole('heading', { name: 'Imported Chapter' })).toBeInTheDocument();

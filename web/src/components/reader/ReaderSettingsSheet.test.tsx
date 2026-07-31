@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
-import type { ReaderSettings } from '../ReaderView';
 import ReaderSettingsSheet from './ReaderSettingsSheet';
+import type { ReaderSettings } from './types';
 
 const settings: ReaderSettings = {
   characterSpacing: 0,
@@ -45,7 +45,7 @@ describe('ReaderSettingsSheet', () => {
     );
     const sheet = screen.getByRole('dialog', { name: 'Cài đặt đọc' });
 
-    await userEvent.click(within(sheet).getByRole('button', { name: 'Dark' }));
+    await userEvent.click(within(sheet).getByRole('button', { name: 'Tối' }));
     expect(onUpdate).toHaveBeenCalledWith({ theme: 'dark' });
 
     await userEvent.click(within(sheet).getByRole('button', { name: 'E-ink' }));

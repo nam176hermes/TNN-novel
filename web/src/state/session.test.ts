@@ -12,14 +12,18 @@ describe('session token storage', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     localStorage.clear();
+    sessionStorage.clear();
   });
 
-  it('saves, loads, and clears the token from localStorage', () => {
+  it('keeps the short-lived access token in sessionStorage only', () => {
     saveToken('access');
     saveRefreshToken('refresh');
 
     expect(loadToken()).toBe('access');
-    expect(loadRefreshToken()).toBe('refresh');
+    expect(loadRefreshToken()).toBe('');
+    expect(sessionStorage.getItem('novel-operator-token')).toBe('access');
+    expect(localStorage.getItem('novel-operator-token')).toBeNull();
+    expect(localStorage.getItem('novel-operator-refresh-token')).toBeNull();
 
     clearToken();
 
@@ -27,14 +31,28 @@ describe('session token storage', () => {
     expect(loadRefreshToken()).toBe('');
   });
 
-  it('saves an access and refresh token pair for persistent sessions', () => {
+  it('never persists a refresh token supplied by an older caller', () => {
     saveSessionTokens('new-access', 'new-refresh');
 
     expect(loadToken()).toBe('new-access');
-    expect(loadRefreshToken()).toBe('new-refresh');
+    expect(loadRefreshToken()).toBe('');
+    expect(JSON.stringify({
+      local: Object.fromEntries(Object.entries(localStorage)),
+      session: Object.fromEntries(Object.entries(sessionStorage)),
+    })).not.toContain('new-refresh');
   });
 
-  it('falls back safely when localStorage is unavailable', () => {
+  it('removes legacy persistent auth tokens during migration', () => {
+    localStorage.setItem('novel-operator-token', 'legacy-access');
+    localStorage.setItem('novel-operator-refresh-token', 'legacy-refresh');
+
+    expect(loadToken()).toBe('');
+    expect(localStorage.getItem('novel-operator-token')).toBeNull();
+    expect(localStorage.getItem('novel-operator-refresh-token')).toBeNull();
+  });
+
+  it('falls back safely when browser storage is unavailable', () => {
+    vi.stubGlobal('sessionStorage', undefined);
     vi.stubGlobal('localStorage', undefined);
 
     expect(loadToken()).toBe('');

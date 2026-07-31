@@ -1,15 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
-  ArrowLeft,
   BookOpenText,
   Bookmark,
   Download,
-  List,
-  MoreVertical,
   ScrollText,
-  Search,
   Trash2,
-  Type,
   Upload,
   Volume2,
   Wrench,
@@ -17,9 +12,8 @@ import {
 } from 'lucide-react';
 import type { ApiClient } from '../api/client';
 import type {
-  BookAudioPlaylistItem,
   Chapter,
-  JobStatus,
+  QaReport,
   ReaderAnnotationExportFormat,
   ReaderAnnotationImportItem,
   ReaderAnnotationKind,
@@ -32,11 +26,11 @@ import type {
   ReaderSearchResult,
   ReaderXrayResponse,
   ReaderXraySpoilerMode,
-  TtsJobStatus,
   TranslatedBookSummary,
 } from '../api/types';
 import coverDocTu from '../assets/reference-ui/cover-doc-tu-clean.png';
 import coverThanhSon from '../assets/reference-ui/cover-thanh-son-clean.png';
+import { useDialogFocusLifecycle } from '../hooks/useDialogFocusLifecycle';
 import {
   absoluteCharOffsetForParagraph,
   bookProgressPercent,
@@ -74,17 +68,7 @@ import {
   type ReaderMarksStore,
   type ReaderNote,
 } from '../state/readerMarks';
-import type { LoadState } from '../state/types';
-import {
-  READER_CACHE_UPDATED_EVENT,
-  cacheReaderAudio,
-  getCachedReaderAssetUrl,
-  getCachedReaderAudioUrl,
-  readerCacheStatusAsync,
-  removeCachedBookAsync,
-  removeCachedChapterAsync,
-  type ReaderCacheStatus,
-} from '../state/readerCache';
+import { formatError, type LoadState } from '../state/types';
 import {
   loadCachedReaderDictionaryResult,
   lookupCachedReaderDictionaryPack,
@@ -92,14 +76,7 @@ import {
   saveCachedReaderDictionaryResult,
 } from '../state/readerDictionaryCache';
 import { loadReaderDeviceId } from '../state/readerDevice';
-import {
-  cacheBookForOffline,
-  cacheChapterForOffline,
-  loadReaderOfflineManifest,
-  removeReaderOfflineManifestChapter,
-  removeReaderOfflineManifest,
-  type ReaderOfflineManifest,
-} from '../state/readerOfflineCache';
+import type { ReaderOfflineManifest } from '../state/readerOfflineCache';
 import {
   chooseLatestReaderProgressSnapshot,
   loadReaderLastSyncAt,
@@ -118,21 +95,71 @@ import {
   type ReaderRichBlock,
 } from '../state/readerRichContent';
 import { searchCurrentChapter, type ReaderSearchOptions } from '../state/readerSearch';
-import ReaderAudioBar from './reader/ReaderAudioBar';
+import ReaderAudioSummary from './reader/ReaderAudioSummary';
 import ReaderDictionaryPanel from './reader/ReaderDictionaryPanel';
 import ReaderMarksPanel, { type ReaderMarkPanelItem } from './reader/ReaderMarksPanel';
 import ReaderAiPanel, { type ReaderAiPanelMode } from './reader/ReaderAiPanel';
-import ReaderProgressBar from './reader/ReaderProgressBar';
+import { useReaderOfflineCache } from './reader/useReaderOfflineCache';
+import {
+  ReaderChromeBottom,
+  ReaderChromeTop,
+  type ReaderChromeActions,
+  type ReaderChromeNavigation,
+  type ReaderChromeTitle,
+} from './reader/ReaderChrome';
+import {
+  ReaderQuickActionBar,
+  ReaderQuickSettingsSheet,
+  ReaderTextModeSwitcher,
+  type ReaderQuickModeControls,
+  type ReaderQuickSettingsControls,
+} from './reader/ReaderQuickControls';
 import ReaderSearchPanel from './reader/ReaderSearchPanel';
 import ReaderSelectionPopover, { type ReaderSelectionAction } from './reader/ReaderSelectionPopover';
-import ReaderSettingsSheet from './reader/ReaderSettingsSheet';
-import ReaderTextSurface, { type ReaderVisibleRichBlock } from './reader/ReaderTextSurface';
+import ReaderTocSheet, { type TocChapterPreview } from './reader/ReaderTocSheet';
+import ReaderTextSurface, { type ReaderParagraphQaBadge, type ReaderVisibleRichBlock } from './reader/ReaderTextSurface';
 import ReaderXrayPanel from './reader/ReaderXrayPanel';
+import { useReaderAudio } from './reader/useReaderAudio';
+import {
+  deriveReaderTextModeCapabilities,
+  resolveReaderTextMode,
+} from './reader/readerTextModeCapabilities';
+import {
+  loadReaderSettings,
+  loadReaderTextMode,
+  saveReaderSettings,
+  saveReaderTextMode,
+} from './reader/readerSettings';
+import type {
+  ReaderFontFamily,
+  ReaderSettings,
+  ReaderTextMode,
+  ReaderTheme,
+  ReaderWidth,
+} from './reader/types';
+
+const ReaderAudioFeature = lazy(() => import('./reader/ReaderAudioFeature'));
+
+export function ReaderAudioFeatureBoundary({
+  active,
+  audio,
+}: {
+  active: boolean;
+  audio: ReturnType<typeof useReaderAudio>;
+}) {
+  if (!active) return null;
+  return (
+    <Suspense fallback={null}>
+      <ReaderAudioFeature audio={audio} />
+    </Suspense>
+  );
+}
 
 export type ReaderApiClient = Pick<
   ApiClient,
   | 'chapterAudioDownloadUrl'
   | 'chapterAudioUrl'
+  | 'cancelJob'
   | 'createReaderAnnotation'
   | 'deleteReaderAnnotation'
   | 'deleteReaderDictionary'
@@ -169,6 +196,10 @@ export type ReaderViewProps = {
   selectedChapter: Chapter | null;
   selectedChapterId: number | null;
   contentHtml: string;
+  qaError: string;
+  qaReport: QaReport | null;
+  qaState: LoadState;
+  sourceText: string;
   textError: string;
   textState: LoadState;
   translationText: string;
@@ -187,6 +218,117 @@ function splitParagraphs(text: string): string[] {
 
 function containsHanText(text: string): boolean {
   return /[\u3400-\u9fff]/u.test(text);
+}
+
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function readRecordString(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function readRecordNumber(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.round(value));
+    if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+      return Math.max(0, Math.round(Number(value)));
+    }
+  }
+  return null;
+}
+
+function glossaryViolationsFromQaReport(report: QaReport | null): Array<Record<string, unknown>> {
+  if (!report || !Array.isArray(report.glossary_violations)) return [];
+  return report.glossary_violations.flatMap((item) => {
+    const record = recordFromUnknown(item);
+    return record ? [record] : [];
+  });
+}
+
+function addReaderQaBadge(
+  badgesByParagraph: Map<number, ReaderParagraphQaBadge[]>,
+  paragraphIndex: number,
+  badge: ReaderParagraphQaBadge,
+): void {
+  if (!Number.isInteger(paragraphIndex) || paragraphIndex < 0) return;
+  const current = badgesByParagraph.get(paragraphIndex) ?? [];
+  if (current.some((item) => item.key === badge.key)) return;
+  badgesByParagraph.set(paragraphIndex, [...current, badge]);
+}
+
+function findQaViolationParagraphIndex(
+  violation: Record<string, unknown>,
+  translatedParagraphs: string[],
+  rawParagraphs: string[],
+): number {
+  const explicitIndex = readRecordNumber(violation, ['paragraph_index', 'paragraphIndex', 'paragraph']);
+  if (explicitIndex !== null) return explicitIndex;
+
+  const sourceTerm = readRecordString(violation, ['source_term', 'sourceTerm', 'raw_text', 'rawText', 'term']);
+  const expected = readRecordString(violation, ['expected_translation', 'expectedTranslation', 'preferred_translation']);
+  if (sourceTerm) {
+    const rawIndex = rawParagraphs.findIndex((paragraph) => paragraph.includes(sourceTerm));
+    if (rawIndex >= 0) return rawIndex;
+    const translatedIndex = translatedParagraphs.findIndex((paragraph) => paragraph.includes(sourceTerm));
+    if (translatedIndex >= 0) return translatedIndex;
+  }
+  if (expected) {
+    const translatedIndex = translatedParagraphs.findIndex((paragraph) => paragraph.includes(expected));
+    if (translatedIndex >= 0) return translatedIndex;
+  }
+  return 0;
+}
+
+function buildReaderQaBadges(
+  report: QaReport | null,
+  translatedParagraphs: string[],
+  rawParagraphs: string[],
+): Map<number, ReaderParagraphQaBadge[]> {
+  const badgesByParagraph = new Map<number, ReaderParagraphQaBadge[]>();
+  if (!report) return badgesByParagraph;
+
+  const leakageCount = Math.max(0, Math.round(report.chinese_leakage_count ?? 0));
+  if (leakageCount > 0) {
+    let marked = 0;
+    translatedParagraphs.forEach((paragraph, index) => {
+      if (marked >= leakageCount || !containsHanText(paragraph)) return;
+      addReaderQaBadge(badgesByParagraph, index, {
+        key: `cjk-${index}`,
+        label: 'Rò chữ Trung',
+        tone: 'fail',
+      });
+      marked += 1;
+    });
+  }
+
+  glossaryViolationsFromQaReport(report).forEach((violation, index) => {
+    const sourceTerm = readRecordString(violation, ['source_term', 'sourceTerm', 'raw_text', 'rawText', 'term']);
+    const expected = readRecordString(violation, ['expected_translation', 'expectedTranslation', 'preferred_translation']);
+    const reason = readRecordString(violation, ['reason', 'message', 'detail']);
+    const detail = [
+      sourceTerm ? `Term: ${sourceTerm}` : '',
+      expected ? `Nên dùng: ${expected}` : '',
+      reason,
+    ].filter(Boolean).join(' · ');
+    addReaderQaBadge(
+      badgesByParagraph,
+      findQaViolationParagraphIndex(violation, translatedParagraphs, rawParagraphs),
+      {
+        key: `glossary-${index}-${sourceTerm || expected || 'term'}`,
+        label: 'Vi phạm thuật ngữ',
+        detail,
+        tone: report.term_consistency_status === 'FAIL' ? 'fail' : 'warning',
+      },
+    );
+  });
+
+  return badgesByParagraph;
 }
 
 function normalizedContentKey(value: string): string {
@@ -275,27 +417,6 @@ function offlineManifestResourcesLabel(manifest: ReaderOfflineManifest): string 
   ].join(' · ');
 }
 
-export type ReaderTheme = 'light' | 'dark' | 'sepia' | 'eink';
-export type ReaderWidth = 'narrow' | 'medium' | 'wide';
-export type ReaderFontFamily = 'serif' | 'sans';
-export type ReaderMode = 'scroll' | 'paginated';
-type ReaderTextMode = 'translation' | 'raw' | 'split';
-
-export type ReaderSettings = {
-  characterSpacing: number;
-  fontFamily: ReaderFontFamily;
-  fontSize: number;
-  fontWeight: number;
-  fullscreen: boolean;
-  lineHeight: number;
-  marginScale: number;
-  paragraphSpacing: number;
-  readingMode: ReaderMode;
-  instantMode: boolean;
-  theme: ReaderTheme;
-  width: ReaderWidth;
-};
-
 type ReaderScrollProgress = {
   canScroll: boolean;
   location: number;
@@ -311,13 +432,6 @@ type ReaderTextProgress = {
   totalChars: number;
 };
 
-type TocChapterPreview = {
-  readingState: 'read' | 'reading' | 'unread';
-  stateLabel: string;
-  timeLabel: string;
-  wordLabel: string;
-};
-
 type ReaderSelectionState = {
   anchor: { left: number; top: number };
   charEnd: number;
@@ -328,7 +442,6 @@ type ReaderSelectionState = {
   text: string;
 };
 
-const READER_SETTINGS_STORAGE_KEY = 'novel-reader-settings-v1';
 const FALLBACK_PARAGRAPHS_PER_PAGE = 4;
 const LONG_CHAPTER_PARAGRAPH_THRESHOLD = 120;
 const INITIAL_SCROLL_PARAGRAPH_LIMIT = 80;
@@ -360,187 +473,6 @@ const readerAnnotationExportScopes: Array<{ kind: ReaderAnnotationKind | null; l
   { kind: 'highlight', label: 'Highlights' },
   { kind: 'note', label: 'Notes' },
 ];
-const FAILED_TTS_STATUSES = new Set(['failed', 'error', 'qa_failed']);
-const COMPLETE_TTS_STATUSES = new Set(['completed', 'done', 'success']);
-
-type ReaderAudioJobKind = 'audio' | 'audiobook';
-
-function shortJobId(jobId: string): string {
-  return jobId.trim().slice(0, 8);
-}
-
-function sanitizeAudioErrorText(value: string): string {
-  return value
-    .replace(/sk-[A-Za-z0-9_-]{6,}/gi, '[redacted]')
-    .replace(/\b[A-Z][A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\b/g, '[redacted]')
-    .replace(/\/(?:home|Users|mnt|tmp|var|srv|app|root)\/[^\s'",)<]+/gi, '[path]')
-    .replace(/[A-Za-z]:\\[^\s'",)<]+/g, '[path]');
-}
-
-function friendlyAudioError(message: string, fallback = 'TTS thất bại. Kiểm tra cấu hình audio và log server.'): string {
-  const cleaned = sanitizeAudioErrorText(message).toLowerCase();
-  if (!cleaned.trim()) return fallback;
-  if (cleaned.includes('ffmpeg')) {
-    return 'Thiếu ffmpeg hoặc ffmpeg không chạy được. Cài ffmpeg rồi chạy lại audio.';
-  }
-  if (
-    cleaned.includes('checkpoint')
-    || cleaned.includes('ckpt')
-    || cleaned.includes('vocab')
-    || cleaned.includes('model')
-    || cleaned.includes('hugging face')
-  ) {
-    return 'Thiếu model TTS hoặc file cấu hình. Kiểm tra TTS_CKPT_FILE/TTS_VOCAB_FILE trên server.';
-  }
-  if (cleaned.includes('cuda') || cleaned.includes('gpu') || cleaned.includes('out of memory')) {
-    return 'Thiết bị TTS không sẵn sàng. Kiểm tra CUDA/GPU hoặc chuyển TTS_DEVICE=cpu.';
-  }
-  if (cleaned.includes('already running') || cleaned.includes('job already')) {
-    return 'Đã có job audio đang chạy. Đợi job hiện tại xong hoặc mở trang Tác vụ để kiểm tra.';
-  }
-  if (cleaned.includes('artifact') || cleaned.includes('not found') || cleaned.includes('no audio')) {
-    return 'Chưa có file audio để nghe hoặc tải. Hãy tạo audio trước.';
-  }
-  if (cleaned.includes('provider') || cleaned.includes('unauthorized') || cleaned.includes('forbidden')) {
-    return 'Provider TTS không sẵn sàng. Kiểm tra cấu hình provider trên server.';
-  }
-  if (cleaned.includes('chunk')) {
-    return 'Một hoặc nhiều đoạn audio bị lỗi. Có thể chạy lại các chunk lỗi.';
-  }
-  return fallback;
-}
-
-function audioErrorFromUnknown(error: unknown, fallback: string): string {
-  if (error instanceof Error) return friendlyAudioError(error.message, fallback);
-  if (typeof error === 'string') return friendlyAudioError(error, fallback);
-  return fallback;
-}
-
-function failedTtsChunkCount(ttsJob: TtsJobStatus | null): number {
-  return (ttsJob?.chunks ?? []).filter((chunk) => (
-    FAILED_TTS_STATUSES.has(chunk.status.toLowerCase())
-    || (chunk.qa_status ? FAILED_TTS_STATUSES.has(chunk.qa_status.toLowerCase()) : false)
-  )).length;
-}
-
-function completedTtsChunkCount(ttsJob: TtsJobStatus | null): number {
-  return (ttsJob?.chunks ?? []).filter((chunk) => (
-    COMPLETE_TTS_STATUSES.has(chunk.status.toLowerCase())
-  )).length;
-}
-
-function audioJobProgressPercent(job: JobStatus | null, ttsJob: TtsJobStatus | null): number | null {
-  if (typeof ttsJob?.progress === 'number' && Number.isFinite(ttsJob.progress)) {
-    return Math.max(0, Math.min(100, Math.round(ttsJob.progress)));
-  }
-  if (job && Number.isFinite(job.progress) && Number.isFinite(job.total) && job.total > 0) {
-    return Math.max(0, Math.min(100, Math.round((job.progress / job.total) * 100)));
-  }
-  return null;
-}
-
-function audioJobFailureReason(job: JobStatus | null, ttsJob: TtsJobStatus | null): string {
-  if (ttsJob?.error_message) return ttsJob.error_message;
-  const failedChunk = (ttsJob?.chunks ?? []).find((chunk) => (
-    FAILED_TTS_STATUSES.has(chunk.status.toLowerCase()) && Boolean(chunk.error_message)
-  ));
-  if (failedChunk?.error_message) return failedChunk.error_message;
-  if (job?.error) return job.error;
-  if (job?.status.toLowerCase() === 'failed') return job.message;
-  return '';
-}
-
-const defaultReaderSettings: ReaderSettings = {
-  characterSpacing: 0,
-  fontFamily: 'serif',
-  fontSize: 18,
-  fontWeight: 400,
-  fullscreen: false,
-  instantMode: false,
-  lineHeight: 1.9,
-  marginScale: 1,
-  paragraphSpacing: 1.05,
-  readingMode: 'scroll',
-  theme: 'light',
-  width: 'medium',
-};
-
-function getBrowserStorage(): Storage | null {
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
-}
-
-function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
-  const numberValue = Number(value);
-  if (!Number.isFinite(numberValue)) return fallback;
-  return Math.min(max, Math.max(min, numberValue));
-}
-
-function normalizeReaderTheme(value: unknown): ReaderTheme | null {
-  if (value === 'light' || value === 'dark' || value === 'sepia' || value === 'eink') return value;
-  if (value === 'paper') return 'light';
-  if (value === 'night') return 'dark';
-  if (value === 'oled') return 'eink';
-  return null;
-}
-
-function isReaderWidth(value: unknown): value is ReaderWidth {
-  return value === 'narrow' || value === 'medium' || value === 'wide';
-}
-
-function isReaderFontFamily(value: unknown): value is ReaderFontFamily {
-  return value === 'serif' || value === 'sans';
-}
-
-function isReaderMode(value: unknown): value is ReaderMode {
-  return value === 'scroll' || value === 'paginated';
-}
-
-function loadReaderSettings(storage: Storage | null = getBrowserStorage()): ReaderSettings {
-  if (!storage) return defaultReaderSettings;
-  try {
-    const parsed = JSON.parse(storage.getItem(READER_SETTINGS_STORAGE_KEY) ?? '{}') as Partial<ReaderSettings>;
-    return {
-      characterSpacing: clampNumber(
-        parsed.characterSpacing,
-        defaultReaderSettings.characterSpacing,
-        0,
-        1.5,
-      ),
-      fontFamily: isReaderFontFamily(parsed.fontFamily) ? parsed.fontFamily : defaultReaderSettings.fontFamily,
-      fontSize: clampNumber(parsed.fontSize, defaultReaderSettings.fontSize, 16, 24),
-      fontWeight: clampNumber(parsed.fontWeight, defaultReaderSettings.fontWeight, 350, 800),
-      fullscreen: typeof parsed.fullscreen === 'boolean' ? parsed.fullscreen : defaultReaderSettings.fullscreen,
-      instantMode: typeof parsed.instantMode === 'boolean' ? parsed.instantMode : defaultReaderSettings.instantMode,
-      lineHeight: clampNumber(parsed.lineHeight, defaultReaderSettings.lineHeight, 1.5, 2.2),
-      marginScale: clampNumber(parsed.marginScale, defaultReaderSettings.marginScale, 0.75, 1.5),
-      paragraphSpacing: clampNumber(
-        parsed.paragraphSpacing,
-        defaultReaderSettings.paragraphSpacing,
-        0.6,
-        2.4,
-      ),
-      readingMode: isReaderMode(parsed.readingMode) ? parsed.readingMode : defaultReaderSettings.readingMode,
-      theme: normalizeReaderTheme(parsed.theme) ?? defaultReaderSettings.theme,
-      width: isReaderWidth(parsed.width) ? parsed.width : defaultReaderSettings.width,
-    };
-  } catch {
-    return defaultReaderSettings;
-  }
-}
-
-function saveReaderSettings(settings: ReaderSettings, storage: Storage | null = getBrowserStorage()): void {
-  if (!storage) return;
-  try {
-    storage.setItem(READER_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // Reading should still work when browser storage is unavailable.
-  }
-}
-
 function readerProgressSnapshotToSyncProgress(snapshot: ReaderProgressSnapshot): ReaderSyncProgress {
   const progress: ReaderSyncProgress = {
     chapter_id: snapshot.chapterId,
@@ -615,20 +547,158 @@ function ReaderRawTextSurface({
         </header>
       ) : null}
 
-      {textState === 'loading' ? <p>Đang tải raw/source...</p> : null}
+      {textState === 'loading' ? <p className="reader-empty-state">Đang tải raw/source...</p> : null}
       {textError ? (
         <p className="status-error" role="alert">
           {textError}
         </p>
       ) : null}
       {selectedChapter && textState !== 'loading' && paragraphs.length === 0 && !textError ? (
-        <p>Chưa có raw/source text cho chương này.</p>
+        <p className="reader-empty-state">Chưa có raw/source text cho chương này.</p>
       ) : null}
       {paragraphs.map((paragraph, index) => (
         <div className="reader-paragraph-block" data-paragraph-index={index} key={`raw-${index}-${paragraph.slice(0, 24)}`}>
           <p className="reader-paragraph-text">{paragraph}</p>
         </div>
       ))}
+    </article>
+  );
+}
+
+function ReaderQaSummaryPanel({
+  error,
+  report,
+  state,
+}: {
+  error: string;
+  report: QaReport | null;
+  state: LoadState;
+}) {
+  const glossaryViolationCount = glossaryViolationsFromQaReport(report).length;
+  const chineseLeakageCount = Math.max(0, Math.round(report?.chinese_leakage_count ?? 0));
+  const overallStatus = report?.overall_status || (state === 'empty' ? 'NOT_RUN' : '');
+  return (
+    <section aria-label="Tóm tắt QA chương" className="reader-qa-summary-panel">
+      <div>
+        <p className="section-label">QA overlay</p>
+        <h3>{overallStatus || 'Đang tải QA'}</h3>
+      </div>
+      {state === 'loading' ? <span>Đang tải QA...</span> : null}
+      {state === 'error' ? <span className="status-error">{error || 'Không tải được QA report.'}</span> : null}
+      {state === 'empty' || !report ? (
+        <span>Chưa có QA report cho chương này.</span>
+      ) : null}
+      {report ? (
+        <div className="reader-qa-summary-grid">
+          <span>Rò chữ Trung: {chineseLeakageCount.toLocaleString('vi-VN')}</span>
+          <span>Vi phạm thuật ngữ: {glossaryViolationCount.toLocaleString('vi-VN')}</span>
+          <span>Lặp đoạn: {report.repetition_warning ? 'Có' : 'Không'}</span>
+          {typeof report.length_ratio === 'number' ? (
+            <span>Length ratio: {report.length_ratio.toFixed(2)}</span>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ReaderCollapsedRawSurface({
+  fontFamily,
+  rawParagraphs,
+  readerStyle,
+  selectedChapter,
+  textError,
+  textState,
+  theme,
+  translatedParagraphs,
+  width,
+  onToggleChrome,
+}: {
+  fontFamily: ReaderFontFamily;
+  rawParagraphs: string[];
+  readerStyle: CSSProperties;
+  selectedChapter: Chapter | null;
+  textError: string;
+  textState: LoadState;
+  theme: ReaderTheme;
+  translatedParagraphs: string[];
+  width: ReaderWidth;
+  onToggleChrome(): void;
+}) {
+  const [expandedParagraphs, setExpandedParagraphs] = useState<Set<number>>(() => new Set());
+
+  function handleChromeToggle(): void {
+    if (window.getSelection()?.toString().trim()) return;
+    onToggleChrome();
+  }
+
+  function toggleRawParagraph(index: number): void {
+    setExpandedParagraphs((current) => {
+      const next = new Set(current);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <article
+      aria-label="Bản dịch tiếng Việt kèm raw gọn"
+      className="reader-mode-content reader-page-content reader-raw-collapsed-content"
+      data-font={fontFamily}
+      data-reading-mode="scroll"
+      data-theme={theme}
+      data-width={width}
+      onClick={handleChromeToggle}
+      style={readerStyle}
+    >
+      {selectedChapter ? (
+        <header className="reader-chapter-title">
+          <p className="section-label">Bản dịch tiếng Việt · Raw gọn · Chương {selectedChapter.chapter_number}</p>
+          <h3>{selectedChapter.title}</h3>
+        </header>
+      ) : null}
+
+      {textState === 'loading' ? <p className="reader-empty-state">Đang tải bản đọc...</p> : null}
+      {textError ? (
+        <p className="status-error" role="alert">
+          {textError}
+        </p>
+      ) : null}
+      {selectedChapter && textState !== 'loading' && translatedParagraphs.length === 0 && !textError ? (
+        <p className="reader-empty-state">Chưa có bản dịch tiếng Việt.</p>
+      ) : null}
+      {translatedParagraphs.map((paragraph, index) => {
+        const rawParagraph = rawParagraphs[index] ?? '';
+        const expanded = expandedParagraphs.has(index);
+        return (
+          <div className="reader-paragraph-block reader-collapsed-raw-block" data-paragraph-index={index} key={`collapsed-${index}-${paragraph.slice(0, 24)}`}>
+            <p className="reader-paragraph-text">{paragraph}</p>
+            {rawParagraph ? (
+              <button
+                aria-expanded={expanded}
+                className="reader-inline-raw-toggle"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleRawParagraph(index);
+                }}
+                type="button"
+              >
+                {expanded ? `Ẩn raw đoạn ${index + 1}` : `Mở raw đoạn ${index + 1}`}
+              </button>
+            ) : null}
+            {expanded && rawParagraph ? (
+              <blockquote className="reader-collapsed-raw-text">
+                <span>Raw Chinese</span>
+                <p>{rawParagraph}</p>
+              </blockquote>
+            ) : null}
+          </div>
+        );
+      })}
     </article>
   );
 }
@@ -1443,6 +1513,10 @@ export default function ReaderView({
   selectedChapter,
   selectedChapterId,
   contentHtml,
+  qaError,
+  qaReport,
+  qaState,
+  sourceText,
   textError,
   textState,
   translationText,
@@ -1458,7 +1532,7 @@ export default function ReaderView({
   const readerAiCacheRef = useRef(new Map<string, ReaderExplainResponse>());
   const readerDeviceId = useMemo(() => loadReaderDeviceId(), []);
   const [readerSettings, setReaderSettings] = useState<ReaderSettings>(() => loadReaderSettings());
-  const [readerTextMode, setReaderTextMode] = useState<ReaderTextMode>('translation');
+  const [readerTextMode, setReaderTextModeState] = useState<ReaderTextMode>(() => loadReaderTextMode());
   const [scrollProgress, setScrollProgress] = useState<ReaderScrollProgress>({
     canScroll: false,
     location: 0,
@@ -1469,7 +1543,6 @@ export default function ReaderView({
   const [chromeVisible, setChromeVisible] = useState(true);
   const [tocOpen, setTocOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [searchOpen, setSearchOpen] = useState(false);
   const [readerSearchOpen, setReaderSearchOpen] = useState(false);
   const [readerSearchQuery, setReaderSearchQuery] = useState('');
   const [readerSearchOptions, setReaderSearchOptions] = useState<ReaderSearchOptions>({
@@ -1479,6 +1552,7 @@ export default function ReaderView({
   const [bookSearchLoading, setBookSearchLoading] = useState(false);
   const [bookSearchError, setBookSearchError] = useState('');
   const [moreOpen, setMoreOpen] = useState(false);
+  const moreDialogRef = useDialogFocusLifecycle<HTMLDivElement>(moreOpen, () => setMoreOpen(false));
   const [marksPanelOpen, setMarksPanelOpen] = useState(false);
   const [marksError, setMarksError] = useState('');
   const [readerSyncStatus, setReaderSyncStatus] = useState('');
@@ -1491,9 +1565,6 @@ export default function ReaderView({
   const [currentPage, setCurrentPage] = useState(0);
   const [autoScrollEnabled, setAutoScrollEnabled] = useState(false);
   const [renderedParagraphLimit, setRenderedParagraphLimit] = useState(INITIAL_SCROLL_PARAGRAPH_LIMIT);
-  const [readerCacheVersion, setReaderCacheVersion] = useState(0);
-  const [cacheStatus, setCacheStatus] = useState<ReaderCacheStatus | null>(null);
-  const [offlineManifest, setOfflineManifest] = useState<ReaderOfflineManifest | null>(null);
   const [viewportPages, setViewportPages] = useState<ReaderViewportPage[]>([]);
   const [pendingParagraphJump, setPendingParagraphJump] = useState<{
     charOffset?: number;
@@ -1521,22 +1592,6 @@ export default function ReaderView({
   const [dictionaryDeletingFilename, setDictionaryDeletingFilename] = useState('');
   const [dictionaryUploadLoading, setDictionaryUploadLoading] = useState(false);
   const [dictionaryUploadStatus, setDictionaryUploadStatus] = useState('');
-  const [audioOpen, setAudioOpen] = useState(false);
-  const [audioAutoNext, setAudioAutoNext] = useState(false);
-  const [audioJobLoading, setAudioJobLoading] = useState(false);
-  const [audioJobStatus, setAudioJobStatus] = useState('');
-  const [audioJobError, setAudioJobError] = useState('');
-  const [audioJobId, setAudioJobId] = useState('');
-  const [audioJobKind, setAudioJobKind] = useState<ReaderAudioJobKind>('audio');
-  const [audioJobSnapshot, setAudioJobSnapshot] = useState<JobStatus | null>(null);
-  const [audioTtsSnapshot, setAudioTtsSnapshot] = useState<TtsJobStatus | null>(null);
-  const [audioJobRefreshing, setAudioJobRefreshing] = useState(false);
-  const [audioPlaylist, setAudioPlaylist] = useState<BookAudioPlaylistItem[]>([]);
-  const [audioPlaylistError, setAudioPlaylistError] = useState('');
-  const [cachedAudioUrl, setCachedAudioUrl] = useState('');
-  const [readerCoverUrl, setReaderCoverUrl] = useState('');
-  const [offlineCacheLoading, setOfflineCacheLoading] = useState(false);
-  const [offlineCacheStatus, setOfflineCacheStatus] = useState('');
   const [annotationExportStatus, setAnnotationExportStatus] = useState('');
   const [annotationImportLoading, setAnnotationImportLoading] = useState(false);
   const [annotationExportKind, setAnnotationExportKind] = useState<ReaderAnnotationKind | null>(null);
@@ -1555,7 +1610,7 @@ export default function ReaderView({
   const [xrayEnriching, setXrayEnriching] = useState(false);
   const [xrayEnrichingScope, setXrayEnrichingScope] = useState<'chapter' | 'book' | null>(null);
   const [xrayError, setXrayError] = useState('');
-  const [chapterQuery, setChapterQuery] = useState('');
+
   const translatedChapters = useMemo(
     () => sortChapters(chapters.filter((chapter) => chapter.has_translation)),
     [chapters],
@@ -1564,47 +1619,147 @@ export default function ReaderView({
     () => new Map(translatedChapters.map((chapter, index) => [chapter.id, index])),
     [translatedChapters],
   );
-  const normalizedChapterQuery = chapterQuery.trim().toLowerCase();
-  const visibleChapters = useMemo(
-    () => (normalizedChapterQuery
-      ? translatedChapters.filter((chapter) => (
-        String(chapter.chapter_number).includes(normalizedChapterQuery)
-        || chapter.title.toLowerCase().includes(normalizedChapterQuery)
-      ))
-      : translatedChapters),
-    [normalizedChapterQuery, translatedChapters],
-  );
   const selectedBook = books.find((book) => book.id === activeBookId);
-  const audioPlaylistByChapterId = useMemo(
-    () => new Map(audioPlaylist.map((item) => [item.chapter_id, item])),
-    [audioPlaylist],
-  );
   const selectedIndex = translatedChapters.findIndex((chapter) => chapter.id === selectedChapterId);
   const currentPosition = selectedIndex >= 0 ? selectedIndex + 1 : 0;
   const previousChapter = selectedIndex > 0 ? translatedChapters[selectedIndex - 1] : null;
   const nextChapter = selectedIndex >= 0 && selectedIndex < translatedChapters.length - 1
     ? translatedChapters[selectedIndex + 1]
     : null;
-  const currentChapterInOfflineManifest = Boolean(
-    selectedChapterId && offlineManifest?.chapterIds.includes(selectedChapterId),
-  );
-  const currentChapterAvailableOffline = Boolean(cacheStatus?.currentCached || currentChapterInOfflineManifest);
-  const nextAudioChapter = selectedIndex >= 0
-    ? translatedChapters
-      .slice(selectedIndex + 1)
-      .find((chapter) => Boolean(chapter.audio_path) || audioPlaylistByChapterId.has(chapter.id)) ?? null
+  const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
+  const fallbackCoverUrl = fallbackReaderCover(selectedBook);
+  const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
+  const readerOfflineCache = useReaderOfflineCache({
+    apiClient,
+    bookId: activeBookId,
+    chapters: translatedChapters,
+    coverUrl: fallbackCoverUrl ? '' : backendCoverUrl,
+    liveCoverUrl,
+    nextChapterId: nextChapter?.id ?? null,
+    onError: setMarksError,
+    selectedChapter,
+    selectedChapterId,
+  });
+  const currentCachedChapter = readerOfflineCache.cachedChapter?.bookId === activeBookId
+    && readerOfflineCache.cachedChapter.chapterId === selectedChapterId
+    ? readerOfflineCache.cachedChapter
     : null;
-  const paragraphs = useMemo(() => splitParagraphs(translationText), [translationText]);
-  const rawText = useMemo(() => htmlTextContent(contentHtml), [contentHtml]);
-  const richBlocks = useMemo(() => extractReaderRichBlocks(contentHtml), [contentHtml]);
-  const rawParagraphs = useMemo(() => {
-    const blockTexts = richBlocks.map((block) => block.text.trim()).filter(Boolean);
-    return blockTexts.length > 0 ? blockTexts : splitParagraphs(rawText);
-  }, [rawText, richBlocks]);
-  const rawContentAvailable = rawParagraphs.length > 0;
-  const richContentAvailable = contentHtml.trim().length > 0;
-  const contentHtmlLooksRawSource = translationText.trim().length > 0 && containsHanText(rawText);
-  const hasRichContent = richContentAvailable && !contentHtmlLooksRawSource;
+  const useCachedChapterContent = Boolean(
+    currentCachedChapter
+    && (textState === 'loading' || textState === 'error'),
+  );
+  const readerTranslationText = useCachedChapterContent
+    ? currentCachedChapter?.text ?? ''
+    : translationText;
+  const readerContentHtml = useCachedChapterContent
+    ? currentCachedChapter?.html ?? ''
+    : contentHtml;
+  const readerSourceText = useCachedChapterContent
+    ? currentCachedChapter?.sourceText ?? ''
+    : sourceText;
+  const readerTextState: LoadState = useCachedChapterContent ? 'ready' : textState;
+  const readerTextError = useCachedChapterContent ? '' : textError;
+  const selectAudioChapter = useCallback((chapterId: number) => {
+    onSelectChapter(chapterId);
+    setTocOpen(false);
+    setReaderSearchOpen(false);
+    setMoreOpen(false);
+    setMarksPanelOpen(false);
+    setReaderSelection(null);
+    setDictionaryOpen(false);
+    setXrayOpen(false);
+  }, [onSelectChapter]);
+  const readerAudio = useReaderAudio({
+    activeBookId,
+    allowAutomaticAudioCache: readerOfflineCache.allowAutomaticAudioCache,
+    apiClient,
+    cachedAudioLoading: readerOfflineCache.metadataLoading,
+    cachedAudioUrl: readerOfflineCache.cachedAudioUrl,
+    cacheAudio: readerOfflineCache.cacheAudio,
+    chapters,
+    onDownload: triggerBrowserDownload,
+    onError: setMarksError,
+    onSelectChapter: selectAudioChapter,
+    qaReport,
+    selectedChapter,
+    selectedChapterId,
+    translationText: readerTranslationText,
+  });
+  const exitReader = useCallback(() => {
+    const state = window.history.state as Record<string, unknown> | null;
+    if (state?.novelTnnReader === true) {
+      window.history.back();
+      return;
+    }
+    onBackToLibrary();
+  }, [onBackToLibrary]);
+
+  useEffect(() => {
+    const currentState = (window.history.state ?? {}) as Record<string, unknown>;
+    if (currentState.novelTnnReader !== true) {
+      window.history.pushState({ ...currentState, novelTnnReader: true }, '');
+    }
+
+    const handlePopState = () => onBackToLibrary();
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      const state = (window.history.state ?? {}) as Record<string, unknown>;
+      if (state.novelTnnReader === true) {
+        window.history.replaceState({ ...state, novelTnnReader: false }, '');
+      }
+    };
+  }, [onBackToLibrary]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key !== 'Escape') return;
+      if (tocOpen) {
+        setTocOpen(false);
+        return;
+      }
+      if (settingsOpen) {
+        setSettingsOpen(false);
+        return;
+      }
+      exitReader();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [exitReader, settingsOpen, tocOpen]);
+
+  const setReaderTextMode = useCallback((mode: ReaderTextMode) => {
+    setReaderTextModeState(mode);
+    saveReaderTextMode(mode);
+  }, []);
+  const {
+    cacheStatus,
+    currentAvailable: currentChapterAvailableOffline,
+    loading: offlineCacheLoading,
+    manifest: offlineManifest,
+    message: offlineCacheStatus,
+    cacheCurrentBook: cacheCurrentBookOffline,
+    cacheCurrentChapter,
+    removeCurrentBook: clearCurrentBookOfflineCache,
+    removeCurrentChapter: clearCurrentChapterOfflineCache,
+  } = readerOfflineCache;
+  const cacheCurrentChapterOffline = () => cacheCurrentChapter(readerAudio.playback.streamUrl);
+  const readerCoverUrl = readerOfflineCache.coverUrl;
+  const paragraphs = useMemo(() => splitParagraphs(readerTranslationText), [readerTranslationText]);
+  const rawText = readerSourceText.trim();
+  const richBlocks = useMemo(() => extractReaderRichBlocks(readerContentHtml), [readerContentHtml]);
+  const rawParagraphs = useMemo(() => splitParagraphs(rawText), [rawText]);
+  const textModeCapabilities = deriveReaderTextModeCapabilities({
+    contentHtml: readerContentHtml,
+    sourceText: readerSourceText,
+    translationText: readerTranslationText,
+  });
+  const richContentAvailable = readerContentHtml.trim().length > 0;
+  const hasRichContent = richContentAvailable;
   const progressTextBlocks = useMemo(
     () => (hasRichContent ? richBlocks.map((block) => block.text) : paragraphs),
     [hasRichContent, paragraphs, richBlocks],
@@ -1630,7 +1785,7 @@ export default function ReaderView({
   );
   const activeViewportPages = isPaginatedMode && viewportPages.length > 0 ? viewportPages : fallbackPages;
   const pageCount = Math.max(1, activeViewportPages.length);
-  const lazyScrollEnabled = readerTextMode === 'translation'
+  const lazyScrollEnabled = (readerTextMode === 'translation' || readerTextMode === 'qa-overlay')
     && !isPaginatedMode
     && !hasRichContent
     && paragraphs.length > LONG_CHAPTER_PARAGRAPH_THRESHOLD;
@@ -1672,18 +1827,18 @@ export default function ReaderView({
       };
     });
   const hasReadableRichText = rawText.length > 0;
-  const selectedChapterStatText = translationText.trim() || rawText;
+  const selectedChapterStatText = readerTranslationText.trim() || rawText;
   const hasReadableChapterContent = paragraphs.length > 0 || hasRichContent;
   const hasTitleOnlyImportContent = Boolean(
     selectedChapter
-      && translationLooksTitleOnly(translationText, selectedChapter)
+      && translationLooksTitleOnly(readerTranslationText, selectedChapter)
       && (!hasRichContent || !hasReadableRichText),
   );
+  const compatibleReaderTextMode = resolveReaderTextMode(readerTextMode, textModeCapabilities);
   useEffect(() => {
-    if (!rawContentAvailable && readerTextMode !== 'translation') {
-      setReaderTextMode('translation');
-    }
-  }, [rawContentAvailable, readerTextMode]);
+    if (compatibleReaderTextMode !== readerTextMode) setReaderTextMode(compatibleReaderTextMode);
+  }, [compatibleReaderTextMode, readerTextMode, setReaderTextMode]);
+
   const readerStyle = {
     '--reader-character-spacing': `${readerSettings.characterSpacing}px`,
     '--reader-font-size': `${readerSettings.fontSize}px`,
@@ -1697,6 +1852,10 @@ export default function ReaderView({
   const bookmarked = chapterMarks.bookmarked;
   const highlightedParagraphs = new Set(chapterMarks.highlights.map((highlight) => highlight.paragraphIndex));
   const notesByParagraph = new Map(chapterMarks.notes.map((note) => [note.paragraphIndex, note]));
+  const qaBadgesByParagraph = useMemo(
+    () => buildReaderQaBadges(qaReport, paragraphs, rawParagraphs),
+    [paragraphs, qaReport, rawParagraphs],
+  );
   const markPanelItems = buildReaderMarkPanelItems(marksStore, chapters, activeBookId);
   const readerSearchScopes = readerSearchOptions.scopes ?? DEFAULT_READER_SEARCH_SCOPES;
   const searchScopesKey = readerSearchScopes.join(',');
@@ -1710,9 +1869,6 @@ export default function ReaderView({
     }),
     [chapterMarks, progressTextBlocks, readerSearchOptions, readerSearchQuery, selectedChapter],
   );
-  const chapterCountLabel = normalizedChapterQuery
-    ? `${visibleChapters.length.toLocaleString()}/${translatedChapters.length.toLocaleString()} chương`
-    : `${translatedChapters.length.toLocaleString()} chương đã dịch`;
   const totalProgressChars = totalTextLength(progressTextBlocks);
   const currentPageStartCharOffset = isPaginatedMode ? currentViewportPage.startChar ?? 0 : 0;
   const currentPageStartAbsoluteCharOffset = isPaginatedMode
@@ -1800,36 +1956,6 @@ export default function ReaderView({
   const activeChapterTitle = selectedChapter
     ? `Chương ${selectedChapter.chapter_number} · ${selectedChapter.title}`
     : 'Chưa chọn chương';
-  const selectedAudioPlaylistItem = selectedChapterId
-    ? audioPlaylistByChapterId.get(selectedChapterId) ?? null
-    : null;
-  const canPlayAudio = Boolean(
-    apiClient
-    && activeBookId
-    && selectedChapterId
-    && (selectedChapter?.audio_path || selectedAudioPlaylistItem),
-  );
-  const audioStreamUrl = canPlayAudio && apiClient && activeBookId && selectedChapterId
-    ? selectedAudioPlaylistItem?.stream_url || apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
-    : '';
-  const audioDownloadUrl = canPlayAudio && apiClient && activeBookId && selectedChapterId
-    ? selectedAudioPlaylistItem?.download_url || apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId)
-    : '';
-  const audioPlaybackUrl = cachedAudioUrl || audioStreamUrl;
-  const audioStatusValue = audioTtsSnapshot?.status || audioJobSnapshot?.status || (audioJobId ? 'queued' : '');
-  const audioProgressPercent = audioJobProgressPercent(audioJobSnapshot, audioTtsSnapshot);
-  const audioFailedChunks = failedTtsChunkCount(audioTtsSnapshot);
-  const audioCompletedChunks = completedTtsChunkCount(audioTtsSnapshot);
-  const audioTotalChunks = audioTtsSnapshot?.chunks.length ?? 0;
-  const audioFailureMessage = audioJobError || friendlyAudioError(
-    audioJobFailureReason(audioJobSnapshot, audioTtsSnapshot),
-    '',
-  );
-  const canRetryAudioChunks = Boolean(
-    apiClient
-    && audioJobId
-    && (audioFailedChunks > 0 || audioStatusValue.toLowerCase() === 'failed'),
-  );
   const canGoPrevious = isPaginatedMode
     ? currentPage > 0 || Boolean(previousChapter)
     : Boolean(previousChapter);
@@ -1882,116 +2008,6 @@ export default function ReaderView({
   }, [autoScrollEnabled, isPaginatedMode, updateScrollProgress]);
 
   useEffect(() => {
-    function handleCacheUpdated(): void {
-      setReaderCacheVersion((current) => current + 1);
-    }
-
-    window.addEventListener(READER_CACHE_UPDATED_EVENT, handleCacheUpdated);
-    return () => window.removeEventListener(READER_CACHE_UPDATED_EVENT, handleCacheUpdated);
-  }, []);
-
-  useEffect(() => {
-    if (!activeBookId || !selectedChapterId) {
-      setCacheStatus(null);
-      return;
-    }
-    let cancelled = false;
-    void readerCacheStatusAsync({
-      bookId: activeBookId,
-      chapterId: selectedChapterId,
-      nextChapterId: nextChapter?.id ?? null,
-    }).then((status) => {
-      if (!cancelled) setCacheStatus(status);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, nextChapter?.id, readerCacheVersion, selectedChapterId]);
-
-  useEffect(() => {
-    setOfflineManifest(activeBookId ? loadReaderOfflineManifest(activeBookId) : null);
-  }, [activeBookId, readerCacheVersion]);
-
-  useEffect(() => {
-    const backendCoverUrl = selectedBook?.cover_url?.trim() ?? '';
-    const fallbackCoverUrl = fallbackReaderCover(selectedBook);
-    const liveCoverUrl = fallbackCoverUrl || backendCoverUrl;
-    setReaderCoverUrl(liveCoverUrl);
-    if (!activeBookId || !backendCoverUrl || fallbackCoverUrl) return;
-
-    let cancelled = false;
-    void getCachedReaderAssetUrl(activeBookId, 0, backendCoverUrl)
-      .then((cachedCoverUrl) => {
-        if (!cancelled && cachedCoverUrl) setReaderCoverUrl(cachedCoverUrl);
-      })
-      .catch(() => {
-        if (!cancelled) setReaderCoverUrl(liveCoverUrl);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, readerCacheVersion, selectedBook]);
-
-  useEffect(() => {
-    if (!apiClient || !activeBookId) {
-      setAudioPlaylist([]);
-      setAudioPlaylistError('');
-      return;
-    }
-
-    let cancelled = false;
-    setAudioPlaylistError('');
-    void apiClient.getBookAudioPlaylist(activeBookId)
-      .then((playlist) => {
-        if (cancelled) return;
-        setAudioPlaylist(playlist.chapters);
-      })
-      .catch((error: unknown) => {
-        if (cancelled) return;
-        setAudioPlaylist([]);
-        setAudioPlaylistError(error instanceof Error ? error.message : 'Failed to load audiobook playlist');
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, apiClient]);
-
-  useEffect(() => {
-    if (!canPlayAudio || !activeBookId || !selectedChapterId || !audioStreamUrl) {
-      setCachedAudioUrl('');
-      return;
-    }
-
-    let cancelled = false;
-    setCachedAudioUrl('');
-    void getCachedReaderAudioUrl(activeBookId, selectedChapterId, audioStreamUrl)
-      .then((url) => {
-        if (!cancelled && url) setCachedAudioUrl(url);
-        return url;
-      })
-      .then((url) => {
-        if (url || cancelled) return undefined;
-        return cacheReaderAudio(activeBookId, selectedChapterId, audioStreamUrl)
-          .then((result) => {
-            if (!result.cached || cancelled) return;
-            return getCachedReaderAudioUrl(activeBookId, selectedChapterId, audioStreamUrl)
-              .then((cachedUrl) => {
-                if (!cancelled) setCachedAudioUrl(cachedUrl);
-              });
-          });
-      })
-      .catch(() => {
-        if (!cancelled) setCachedAudioUrl('');
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBookId, audioStreamUrl, canPlayAudio, selectedChapterId]);
-
-  useEffect(() => {
     if (!apiClient || !activeBookId) return;
     let cancelled = false;
 
@@ -2041,7 +2057,7 @@ export default function ReaderView({
   }, [
     isPaginatedMode,
     canMeasureViewportPages,
-    contentHtml,
+    readerContentHtml,
     measureViewportPagesNow,
     paginatedBlockCount,
     readerSettings.characterSpacing,
@@ -2053,12 +2069,12 @@ export default function ReaderView({
     readerSettings.marginScale,
     readerSettings.paragraphSpacing,
     readerSettings.width,
-    translationText,
+    readerTranslationText,
   ]);
 
   useEffect(() => {
     setRenderedParagraphLimit(INITIAL_SCROLL_PARAGRAPH_LIMIT);
-  }, [contentHtml, readerSettings.readingMode, selectedChapterId, translationText]);
+  }, [readerContentHtml, readerSettings.readingMode, selectedChapterId, readerTranslationText]);
 
   useEffect(() => {
     if (!hasMoreScrollParagraphs) return;
@@ -2320,14 +2336,14 @@ export default function ReaderView({
   }, [
     activeBookId,
     activeViewportPages,
-    contentHtml,
+    readerContentHtml,
     expandRenderedParagraphs,
     isPaginatedMode,
     pageCount,
     progressTextBlocks,
     readerSettings.readingMode,
     selectedChapterId,
-    translationText,
+    readerTranslationText,
     updateScrollProgress,
     visibleScrollParagraphLimit,
   ]);
@@ -2522,7 +2538,7 @@ export default function ReaderView({
     });
   }, [
     activeViewportPages,
-    contentHtml,
+    readerContentHtml,
     currentPage,
     expandRenderedParagraphs,
     isPaginatedMode,
@@ -2530,7 +2546,7 @@ export default function ReaderView({
     pendingParagraphJump,
     progressTextBlocks,
     selectedChapterId,
-    translationText,
+    readerTranslationText,
     updateScrollProgress,
     visibleParagraphs.length,
     visibleScrollParagraphLimit,
@@ -2608,14 +2624,13 @@ export default function ReaderView({
   function handleSelectChapter(chapterId: number, options: { keepAudioOpen?: boolean } = {}): void {
     onSelectChapter(chapterId);
     setTocOpen(false);
-    setSearchOpen(false);
     setReaderSearchOpen(false);
     setMoreOpen(false);
     setMarksPanelOpen(false);
     setReaderSelection(null);
     setDictionaryOpen(false);
     if (!options.keepAudioOpen) {
-      setAudioOpen(false);
+      readerAudio.actions.close();
     }
     setXrayOpen(false);
   }
@@ -3172,254 +3187,6 @@ export default function ReaderView({
       .finally(() => setAnnotationImportLoading(false));
   }
 
-  function refreshReaderAudioJobStatus(jobId = audioJobId): void {
-    if (!apiClient || !jobId) return;
-
-    setAudioJobRefreshing(true);
-    void Promise.allSettled([
-      apiClient.getJobStatus(jobId),
-      apiClient.getTtsJob(jobId),
-    ])
-      .then(([jobResult, ttsResult]) => {
-        if (jobResult.status === 'fulfilled') {
-          setAudioJobSnapshot(jobResult.value);
-        }
-        if (ttsResult.status === 'fulfilled') {
-          setAudioTtsSnapshot(ttsResult.value);
-        }
-        if (jobResult.status === 'rejected' && ttsResult.status === 'rejected') {
-          setAudioJobError(audioErrorFromUnknown(
-            jobResult.reason,
-            'Không đọc được trạng thái job audio. Mở trang Tác vụ để kiểm tra.',
-          ));
-        } else {
-          setAudioJobError('');
-        }
-      })
-      .finally(() => setAudioJobRefreshing(false));
-  }
-
-  function startReaderAudioJob(): void {
-    if (!apiClient || !activeBookId || !selectedChapterId) {
-      setAudioJobStatus('Không thể tạo audio: thiếu kết nối API hoặc chương đang đọc.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobSnapshot(null);
-    setAudioTtsSnapshot(null);
-    setAudioJobStatus('Đang gửi job tạo audio...');
-    void apiClient.startTtsJob(activeBookId, [selectedChapterId])
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audio');
-        setAudioJobStatus(`Đã tạo job audio ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tạo audio chương. Kiểm tra cấu hình TTS.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function startReaderBookAudioJob(): void {
-    if (!apiClient || !activeBookId) {
-      setAudioJobStatus('Không thể tạo audiobook: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobSnapshot(null);
-    setAudioTtsSnapshot(null);
-    setAudioJobStatus('Đang gửi job tạo audiobook...');
-    void apiClient.startBookTtsJob(activeBookId, { limit: 200 })
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audiobook');
-        setAudioJobStatus(`Đã tạo job audiobook ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tạo audiobook. Kiểm tra cấu hình TTS.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function retryReaderAudioChunks(): void {
-    if (!apiClient || !audioJobId) {
-      setAudioJobError('Không thể retry: chưa có job audio để chạy lại.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobError('');
-    setAudioJobStatus('Đang gửi retry TTS...');
-    void apiClient.retryTtsJob(audioJobId)
-      .then((job) => {
-        setAudioJobId(job.job_id);
-        setAudioJobKind('audio');
-        setAudioJobStatus(`Đã gửi retry TTS ${job.job_id.slice(0, 8)}. Mở Jobs để theo dõi.`);
-        setAudioJobSnapshot(null);
-        setAudioTtsSnapshot(null);
-        setMarksError('');
-        refreshReaderAudioJobStatus(job.job_id);
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể retry chunk lỗi. Mở trang Tác vụ để kiểm tra.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function downloadReaderAudiobookExport(): void {
-    if (!apiClient || !activeBookId) {
-      setAudioJobStatus('Không thể tải audiobook: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setAudioJobLoading(true);
-    setAudioJobStatus('Đang xuất audiobook M4B...');
-    void apiClient.downloadAudiobookExport(activeBookId, 'm4b')
-      .then((download) => {
-        triggerBrowserDownload(download.blob, download.filename);
-        setAudioJobStatus(`Đã tải ${download.filename}`);
-        setMarksError('');
-      })
-      .catch((error: unknown) => {
-        setAudioJobStatus('');
-        const friendlyError = audioErrorFromUnknown(error, 'Không thể tải audiobook M4B. Hãy tạo audiobook trước.');
-        setAudioJobError(friendlyError);
-        setMarksError(friendlyError);
-      })
-      .finally(() => setAudioJobLoading(false));
-  }
-
-  function cacheCurrentChapterOffline(): void {
-    if (!apiClient || !activeBookId || !selectedChapter) {
-      setOfflineCacheStatus('Không thể cache chương: thiếu kết nối API hoặc chương đang đọc.');
-      return;
-    }
-    if (!selectedChapter.has_translation) {
-      setOfflineCacheStatus('Chỉ cache offline được chương đã có bản dịch.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang tải Chương ${selectedChapter.chapter_number} để đọc offline...`);
-    void cacheChapterForOffline({
-      audioUrl: audioStreamUrl,
-      bookId: activeBookId,
-      chapter: selectedChapter,
-      client: apiClient,
-    })
-      .then((summary) => {
-        setOfflineCacheStatus([
-          `Đã tải Chương ${selectedChapter.chapter_number} offline`,
-          `${summary.assetsCached}/${summary.assetsTotal} asset`,
-          `${summary.audioCached}/${summary.audioTotal} audio`,
-        ].join(' · '));
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to cache chapter offline');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function clearCurrentChapterOfflineCache(): void {
-    if (!activeBookId || !selectedChapterId || !selectedChapter) {
-      setOfflineCacheStatus('Không thể xóa cache chương: chưa chọn chương.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang xóa cache Chương ${selectedChapter.chapter_number}...`);
-    void removeCachedChapterAsync(activeBookId, selectedChapterId)
-      .then(() => {
-        removeReaderOfflineManifestChapter(activeBookId, selectedChapterId);
-        setOfflineManifest(loadReaderOfflineManifest(activeBookId));
-        setOfflineCacheStatus(`Đã xóa cache offline Chương ${selectedChapter.chapter_number}.`);
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to clear chapter offline cache');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function cacheCurrentBookOffline(): void {
-    if (!apiClient || !activeBookId) {
-      setOfflineCacheStatus('Không thể cache offline: thiếu kết nối API hoặc truyện đang đọc.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus(`Đang cache offline 0/${translatedChapters.length} chương...`);
-    void cacheBookForOffline({
-      bookId: activeBookId,
-      chapters: translatedChapters,
-      client: apiClient,
-      coverUrl: selectedBook?.cover_url ?? null,
-      onProgress: (progress) => {
-        setOfflineCacheStatus(`Đang cache offline ${progress.chaptersCached}/${progress.chaptersTotal} chương...`);
-      },
-    })
-      .then((summary) => {
-        setOfflineCacheStatus([
-          `Đã cache offline ${summary.chaptersCached}/${summary.chaptersTotal} chương`,
-          `${summary.assetsCached}/${summary.assetsTotal} asset`,
-          `${summary.audioCached}/${summary.audioTotal} audio`,
-          summary.dictionaryCached ? 'đã cache từ điển' : 'chưa cache từ điển',
-        ].join(' · '));
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to cache book offline');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
-  function clearCurrentBookOfflineCache(): void {
-    if (!activeBookId) {
-      setOfflineCacheStatus('Không thể xóa cache offline: chưa chọn truyện.');
-      return;
-    }
-
-    setOfflineCacheLoading(true);
-    setOfflineCacheStatus('Đang xóa cache offline...');
-    void removeCachedBookAsync(activeBookId)
-      .then(() => {
-        removeReaderOfflineManifest(activeBookId);
-        setOfflineManifest(null);
-        setOfflineCacheStatus('Đã xóa cache offline của truyện này.');
-        setMarksError('');
-        setReaderCacheVersion((current) => current + 1);
-      })
-      .catch((error: unknown) => {
-        setOfflineCacheStatus('');
-        setMarksError(error instanceof Error ? error.message : 'Failed to clear book offline cache');
-      })
-      .finally(() => setOfflineCacheLoading(false));
-  }
-
   function loadReaderXray(mode = xraySpoilerMode): void {
     setXrayLoading(true);
     setXrayError('');
@@ -3657,12 +3424,6 @@ export default function ReaderView({
     if (nextChapter) handleSelectChapter(nextChapter.id);
   }
 
-  function handleAudioNextChapter(): void {
-    if (!nextAudioChapter) return;
-    setAudioOpen(true);
-    handleSelectChapter(nextAudioChapter.id, { keepAudioOpen: true });
-  }
-
   function handleJumpToMark(item: ReaderMarkPanelItem): void {
     setPendingParagraphJump({
       charOffset: item.charStart,
@@ -3689,6 +3450,81 @@ export default function ReaderView({
     }
   }
 
+  const chromeTitle: ReaderChromeTitle = {
+    bookTitle: selectedBook?.title || 'Đọc truyện',
+    chapterTitle: activeChapterTitle,
+    cover: selectedBook && readerCoverUrl
+      ? { alt: `Bìa ${selectedBook.title}`, src: readerCoverUrl }
+      : undefined,
+    offlineAvailable: currentChapterAvailableOffline,
+  };
+  const chromeNavigation: ReaderChromeNavigation = {
+    bookProgressLabel,
+    canGoNext,
+    canGoPrevious,
+    chapterCount: translatedChapters.length,
+    chapterNumber: selectedChapter?.chapter_number ?? null,
+    chapterPositionLabel: `${Math.max(currentPosition, 1).toLocaleString('vi-VN')} / ${Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}`,
+    locationLabel,
+    progressLabel,
+    progressPercent,
+    timeRemainingLabel,
+    wordsRemainingLabel,
+  };
+  const chromeActions: ReaderChromeActions = {
+    bookmarked,
+    onExit: exitReader,
+    onNext: handleNextPageOrChapter,
+    onOpenSearch: () => {
+      setReaderSearchOpen(true);
+      setTocOpen(false);
+      setMoreOpen(false);
+      setChromeVisible(true);
+    },
+    onOpenSettings: () => setSettingsOpen(true),
+    onOpenToc: () => setTocOpen(true),
+    onPrevious: handlePreviousPageOrChapter,
+    onToggleBookmark: toggleBookmark,
+    onToggleMore: () => setMoreOpen((current) => !current),
+  };
+  const quickModes: ReaderQuickModeControls = {
+    rawAvailable: textModeCapabilities.rawAvailable,
+    rawCollapsedAvailable: textModeCapabilities.rawCollapsedAvailable,
+    splitAvailable: textModeCapabilities.splitAvailable,
+    value: readerTextMode,
+    onChange: setReaderTextMode,
+  };
+  const quickSettings: ReaderQuickSettingsControls = {
+    audioAvailable: readerAudio.state.canPlay,
+    audioBusy: readerAudio.state.jobLoading,
+    autoScrollEnabled,
+    canAutoScroll: hasReadableChapterContent,
+    open: settingsOpen,
+    value: readerSettings,
+    onAudioAction: () => {
+      if (readerAudio.state.canPlay) {
+        readerAudio.actions.open();
+        return;
+      }
+      void readerAudio.actions.startChapterJob();
+    },
+    onAutoScrollChange: (enabled) => {
+      if (enabled && readerSettings.readingMode !== 'scroll') {
+        updateReaderSettings({ readingMode: 'scroll' });
+      }
+      setAutoScrollEnabled(enabled);
+    },
+    onClose: () => setSettingsOpen(false),
+    onOpen: () => setSettingsOpen(true),
+    onToggleAutoScroll: () => {
+      if (readerSettings.readingMode !== 'scroll') {
+        updateReaderSettings({ readingMode: 'scroll' });
+      }
+      setAutoScrollEnabled((current) => !current);
+    },
+    onUpdate: updateReaderSettings,
+  };
+
   return (
     <section
       aria-label="Trang đọc truyện"
@@ -3698,135 +3534,37 @@ export default function ReaderView({
       data-theme={readerSettings.theme}
     >
       <h2 className="sr-only">Đọc truyện</h2>
-      <header className="reader-top-bar" data-visible={chromeVisible}>
-        <button
-          aria-label="Quay lại thư viện"
-          className="reader-icon-button"
-          onClick={onBackToLibrary}
-          title="Quay lại thư viện"
-          type="button"
-        >
-          <ArrowLeft aria-hidden="true" size={22} />
-        </button>
+      <ReaderChromeTop
+        actions={chromeActions}
+        navigation={chromeNavigation}
+        title={chromeTitle}
+        visible={chromeVisible}
+      />
 
-        <button
-          aria-label="Mục lục"
-          className="reader-icon-button"
-          disabled={translatedChapters.length === 0}
-          onClick={() => setTocOpen(true)}
-          title="Mục lục"
-          type="button"
-        >
-          <List aria-hidden="true" size={22} />
-        </button>
+      <ReaderTextModeSwitcher modes={quickModes} visible={chromeVisible} />
 
-        <div className="reader-top-title">
-          {selectedBook && readerCoverUrl ? (
-            <img
-              alt={`Bìa ${selectedBook.title}`}
-              className="reader-top-cover"
-              src={readerCoverUrl}
-            />
-          ) : null}
-          <div>
-            <strong>{selectedBook?.title || 'Đọc truyện'}</strong>
-            <span>{activeChapterTitle}</span>
-          </div>
-          {currentChapterAvailableOffline ? (
-            <span aria-label="Có sẵn offline" className="reader-offline-badge">Offline</span>
-          ) : null}
-        </div>
-
-        <button
-          aria-label="Tìm kiếm"
-          className="reader-icon-button"
-          disabled={translatedChapters.length === 0}
-          onClick={() => {
-            setReaderSearchOpen(true);
-            setTocOpen(false);
-            setMoreOpen(false);
-            setChromeVisible(true);
-          }}
-          title="Tìm kiếm"
-          type="button"
-        >
-          <Search aria-hidden="true" size={22} />
-        </button>
-
-        <button
-          aria-label="Đánh dấu trang"
-          aria-pressed={bookmarked}
-          className="reader-icon-button"
-          onClick={toggleBookmark}
-          title="Đánh dấu trang"
-          type="button"
-        >
-          <Bookmark aria-hidden="true" fill={bookmarked ? 'currentColor' : 'none'} size={22} />
-        </button>
-
-        <button
-          aria-label="Cài đặt chữ"
-          className="reader-icon-button reader-type-button"
-          onClick={() => setSettingsOpen(true)}
-          title="Cài đặt chữ"
-          type="button"
-        >
-          <Type aria-hidden="true" size={18} />
-          <span>Aa</span>
-        </button>
-
-        <button
-          aria-label="Thêm tùy chọn"
-          className="reader-icon-button"
-          onClick={() => setMoreOpen((current) => !current)}
-          title="Thêm tùy chọn"
-          type="button"
-        >
-          <MoreVertical aria-hidden="true" size={22} />
-        </button>
-      </header>
-
-      <div aria-label="Điều hướng chương nhanh" className="reader-reference-chapter-nav" data-visible={chromeVisible}>
-        <button disabled={!canGoPrevious} onClick={handlePreviousPageOrChapter} type="button">‹ Chương trước</button>
-        <button disabled={translatedChapters.length === 0} onClick={() => setTocOpen(true)} type="button">
-          Chương {selectedChapter?.chapter_number ?? '-'} / {Math.max(translatedChapters.length, 1).toLocaleString('vi-VN')}
-        </button>
-        <button disabled={!canGoNext} onClick={handleNextPageOrChapter} type="button">Chương sau ›</button>
-      </div>
-
-      <div aria-label="Chế độ nội dung" className="reader-text-mode-switcher" data-visible={chromeVisible} role="group">
-        <button
-          aria-pressed={readerTextMode === 'translation'}
-          onClick={() => setReaderTextMode('translation')}
-          type="button"
-        >
-          Bản dịch
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'raw'}
-          disabled={!rawContentAvailable}
-          onClick={() => setReaderTextMode('raw')}
-          title={rawContentAvailable ? 'Đọc raw/source tiếng Trung' : 'Chương này chưa có raw/source text'}
-          type="button"
-        >
-          Raw
-        </button>
-        <button
-          aria-pressed={readerTextMode === 'split'}
-          disabled={!rawContentAvailable}
-          onClick={() => setReaderTextMode('split')}
-          title={rawContentAvailable ? 'Đọc song song raw và bản dịch' : 'Chương này chưa có raw/source text'}
-          type="button"
-        >
-          Song song
-        </button>
-      </div>
+      <ReaderAudioSummary audio={readerAudio} visible={chromeVisible} />
 
       {moreOpen ? (
-        <div aria-label="Tùy chọn đọc" className="reader-more-popover" role="dialog">
+        <div
+          className="reader-more-backdrop"
+          onClick={(event) => {
+            if (event.currentTarget === event.target) setMoreOpen(false);
+          }}
+          role="presentation"
+        >
+        <div
+          aria-label="Tùy chọn đọc"
+          aria-modal="true"
+          className="reader-more-popover"
+          ref={moreDialogRef}
+          role="dialog"
+          tabIndex={-1}
+        >
           <label>
             <span>Chọn truyện</span>
             <select
+              data-dialog-initial-focus
               disabled={books.length === 0}
               onChange={(event) => {
                 onSelectBook(Number(event.target.value));
@@ -3867,96 +3605,55 @@ export default function ReaderView({
           </button>
           <button
             className="reader-menu-action"
-            disabled={!canPlayAudio}
+            disabled={!readerAudio.state.canPlay}
             onClick={() => {
-              setAudioOpen(true);
+              readerAudio.actions.open();
               setMoreOpen(false);
             }}
             type="button"
           >
             <Volume2 aria-hidden="true" size={16} />
-            {canPlayAudio ? 'Nghe audio chương' : 'Chưa có audio'}
+            {readerAudio.state.canPlay ? 'Nghe audio chương' : 'Chưa có audio'}
           </button>
-          {canPlayAudio ? (
-            <a className="reader-menu-action" href={audioDownloadUrl}>
+          {readerAudio.state.canPlay ? (
+            <a className="reader-menu-action" href={readerAudio.playback.downloadUrl}>
               <Download aria-hidden="true" size={16} />
               Tải MP3 chương
             </a>
           ) : null}
-          {!canPlayAudio ? (
+          {!readerAudio.state.canPlay ? (
             <button
+              aria-label="Tạo audio chương từ tùy chọn"
               className="reader-menu-action"
-              disabled={!apiClient || !activeBookId || !selectedChapterId || audioJobLoading}
-              onClick={startReaderAudioJob}
+              disabled={!readerAudio.state.canStartChapterJob}
+              onClick={() => { void readerAudio.actions.startChapterJob(); }}
               type="button"
             >
               <Volume2 aria-hidden="true" size={16} />
-              {audioJobLoading ? 'Đang tạo audio...' : 'Tạo audio chương'}
+              {readerAudio.state.jobLoading ? 'Đang tạo audio...' : 'Tạo audio chương'}
             </button>
           ) : null}
           <button
             className="reader-menu-action"
-            disabled={!apiClient || !activeBookId || audioJobLoading}
-            onClick={startReaderBookAudioJob}
+            disabled={!readerAudio.state.canStartBookJob}
+            onClick={() => {
+              readerAudio.actions.requestBookJob();
+              setMoreOpen(false);
+            }}
             type="button"
           >
             <Volume2 aria-hidden="true" size={16} />
-            {audioJobLoading ? 'Đang tạo audiobook...' : 'Tạo audiobook còn thiếu'}
+            {readerAudio.state.jobLoading ? 'Đang tạo audiobook...' : 'Tạo audiobook còn thiếu'}
           </button>
           <button
             className="reader-menu-action"
-            disabled={!apiClient || !activeBookId || audioJobLoading}
-            onClick={downloadReaderAudiobookExport}
+            disabled={!apiClient || !activeBookId || readerAudio.state.jobLoading}
+            onClick={() => { void readerAudio.actions.downloadAudiobook(); }}
             type="button"
           >
             <Download aria-hidden="true" size={16} />
             Tải audiobook M4B
           </button>
-          {(audioJobId || audioJobStatus || audioJobError) ? (
-            <section aria-label="Trạng thái audio" className="reader-audio-job-status" role="status">
-              <div className="reader-audio-job-header">
-                <strong>{audioJobId ? `Job ${audioJobKind} ${shortJobId(audioJobId)}` : 'Audio job'}</strong>
-                {audioStatusValue ? <span>{audioStatusValue}</span> : null}
-              </div>
-              {audioProgressPercent !== null ? (
-                <div className="reader-audio-job-progress">
-                  <progress aria-label="Tiến độ job audio" max="100" value={audioProgressPercent} />
-                  <span>{audioProgressPercent}%</span>
-                </div>
-              ) : null}
-              {audioJobStatus ? <p className="reader-export-status">{audioJobStatus}</p> : null}
-              {(audioTotalChunks > 0 || audioFailedChunks > 0) ? (
-                <div className="reader-audio-job-meta">
-                  {audioTotalChunks > 0 ? <span>{audioCompletedChunks}/{audioTotalChunks} chunks</span> : null}
-                  {audioFailedChunks > 0 ? <span>{audioFailedChunks} chunk lỗi</span> : null}
-                </div>
-              ) : null}
-              {audioFailureMessage ? <p className="reader-export-status status-error">{audioFailureMessage}</p> : null}
-              {audioJobId ? (
-                <div className="reader-audio-job-actions">
-                  <button
-                    className="reader-menu-action"
-                    disabled={audioJobRefreshing}
-                    onClick={() => refreshReaderAudioJobStatus()}
-                    type="button"
-                  >
-                    {audioJobRefreshing ? 'Đang làm mới...' : 'Làm mới audio job'}
-                  </button>
-                  {canRetryAudioChunks ? (
-                    <button
-                      className="reader-menu-action"
-                      disabled={audioJobLoading}
-                      onClick={retryReaderAudioChunks}
-                      type="button"
-                    >
-                      Chạy lại chunk lỗi
-                    </button>
-                  ) : null}
-                </div>
-              ) : null}
-            </section>
-          ) : null}
-          {audioPlaylistError ? <p className="reader-export-status status-error">{audioPlaylistError}</p> : null}
           <div className="reader-export-format-group" aria-label="Phạm vi xuất dấu đọc" role="group">
             {readerAnnotationExportScopes.map((scope) => (
               <button
@@ -4081,6 +3778,10 @@ export default function ReaderView({
           {annotationExportStatus ? (
             <p className="reader-export-status">{annotationExportStatus}</p>
           ) : null}
+          <p className="reader-offline-cache-warning">
+            Cache offline chỉ lưu những chương/audio bạn tải thủ công. Novel-TNN sẽ xóa nội dung Reader riêng tư
+            khi bạn đăng xuất; bạn cũng có thể dùng các nút bên dưới để xóa sớm hơn.
+          </p>
           <button
             className="reader-menu-action"
             disabled={!apiClient || !activeBookId || !selectedChapter || !selectedChapter.has_translation || offlineCacheLoading}
@@ -4200,7 +3901,13 @@ export default function ReaderView({
           ) : null}
           {marksError ? <p className="reader-sync-error">{marksError}</p> : null}
         </div>
+        </div>
       ) : null}
+
+      <ReaderAudioFeatureBoundary
+        active={readerAudio.state.open || readerAudio.state.bulkConfirmOpen}
+        audio={readerAudio}
+      />
 
       <main
         aria-label="Vùng đọc chính"
@@ -4267,8 +3974,8 @@ export default function ReaderView({
             readerStyle={readerStyle}
             richBlocks={richBlocks}
             selectedChapter={selectedChapter}
-            textError={textError}
-            textState={textState}
+            textError={readerTextError}
+            textState={readerTextState}
             theme={readerSettings.theme}
             visibleParagraphs={visibleParagraphs}
             visibleRichBlocks={visibleRichBlocks}
@@ -4286,8 +3993,8 @@ export default function ReaderView({
             paragraphs={rawParagraphs}
             readerStyle={readerStyle}
             selectedChapter={selectedChapter}
-            textError={textError}
-            textState={textState}
+            textError={readerTextError}
+            textState={readerTextState}
             theme={readerSettings.theme}
             width={readerSettings.width}
             onToggleChrome={() => setChromeVisible((current) => !current)}
@@ -4300,8 +4007,8 @@ export default function ReaderView({
               paragraphs={rawParagraphs}
               readerStyle={readerStyle}
               selectedChapter={selectedChapter}
-              textError={textError}
-              textState={textState}
+              textError={readerTextError}
+              textState={readerTextState}
               theme={readerSettings.theme}
               width={readerSettings.width}
               onToggleChrome={() => setChromeVisible((current) => !current)}
@@ -4319,11 +4026,61 @@ export default function ReaderView({
               readerStyle={readerStyle}
               richBlocks={richBlocks}
               selectedChapter={selectedChapter}
-              textError={textError}
-              textState={textState}
+              textError={readerTextError}
+              textState={readerTextState}
               theme={readerSettings.theme}
               visibleParagraphs={paragraphs.map((paragraph, index) => ({ index, paragraph }))}
               visibleRichBlocks={richBlocks}
+              width={readerSettings.width}
+              onCaptureSelection={captureReaderSelection}
+              onOpenNote={openNoteEditor}
+              onRichMediaLoad={measureViewportPagesNow}
+              onToggleChrome={() => setChromeVisible((current) => !current)}
+              onToggleHighlight={toggleHighlight}
+            />
+          </div>
+        ) : null}
+        {readerTextMode === 'raw-collapsed' ? (
+          <ReaderCollapsedRawSurface
+            fontFamily={readerSettings.fontFamily}
+            rawParagraphs={rawParagraphs}
+            readerStyle={readerStyle}
+            selectedChapter={selectedChapter}
+            textError={readerTextError}
+            textState={readerTextState}
+            theme={readerSettings.theme}
+            translatedParagraphs={paragraphs}
+            width={readerSettings.width}
+            onToggleChrome={() => setChromeVisible((current) => !current)}
+          />
+        ) : null}
+        {readerTextMode === 'qa-overlay' ? (
+          <div className="reader-qa-overlay-stack">
+            <ReaderQaSummaryPanel
+              error={qaError}
+              report={qaReport}
+              state={qaState}
+            />
+            <ReaderTextSurface
+              ariaLabel="Bản dịch tiếng Việt với QA overlay"
+              fontFamily={readerSettings.fontFamily}
+              hasRichContent={hasRichContent}
+              hasTitleOnlyImportContent={hasTitleOnlyImportContent}
+              highlightedParagraphs={highlightedParagraphs}
+              instantMode={readerSettings.instantMode}
+              isPaginatedMode={false}
+              notesByParagraph={notesByParagraph}
+              paragraphs={paragraphs}
+              qaBadgesByParagraph={qaBadgesByParagraph}
+              readerStyle={readerStyle}
+              richBlocks={richBlocks}
+              selectedChapter={selectedChapter}
+              showQaOverlay
+              textError={readerTextError}
+              textState={readerTextState}
+              theme={readerSettings.theme}
+              visibleParagraphs={visibleParagraphs}
+              visibleRichBlocks={visibleRichBlocks}
               width={readerSettings.width}
               onCaptureSelection={captureReaderSelection}
               onOpenNote={openNoteEditor}
@@ -4348,136 +4105,24 @@ export default function ReaderView({
         onClose={clearReaderSelection}
       />
 
-      <ReaderProgressBar
-        bookProgressLabel={bookProgressLabel}
-        canGoNext={canGoNext}
-        canGoPrevious={canGoPrevious}
-        locationLabel={locationLabel}
-        progressLabel={progressLabel}
-        progressPercent={progressPercent}
-        timeRemainingLabel={timeRemainingLabel}
+      <ReaderChromeBottom actions={chromeActions} navigation={chromeNavigation} visible={chromeVisible} />
+
+      <ReaderQuickActionBar
+        settings={quickSettings}
         visible={chromeVisible}
-        wordsRemainingLabel={wordsRemainingLabel}
-        onNext={handleNextPageOrChapter}
-        onPrevious={handlePreviousPageOrChapter}
+        onOpenToc={chromeActions.onOpenToc}
       />
 
-      <div aria-label="Công cụ đọc nhanh" className="reader-reference-actions" data-visible={chromeVisible}>
-        <button aria-label="Mở mục lục đọc" onClick={() => setTocOpen(true)} type="button">
-          <List aria-hidden="true" size={16} />
-          Mục lục
-        </button>
-        <button
-          aria-pressed={readerSettings.instantMode}
-          onClick={() => updateReaderSettings({ instantMode: !readerSettings.instantMode })}
-          type="button"
-        >
-          <BookOpenText aria-hidden="true" size={16} />
-          Tối ưu đọc
-        </button>
-        <button
-          aria-pressed={readerSettings.readingMode === 'scroll'}
-          onClick={() => updateReaderSettings({ readingMode: readerSettings.readingMode === 'scroll' ? 'paginated' : 'scroll' })}
-          type="button"
-        >
-          <ScrollText aria-hidden="true" size={16} />
-          Cuộn đọc
-        </button>
-        <button
-          aria-pressed={autoScrollEnabled}
-          disabled={!hasReadableChapterContent}
-          onClick={() => {
-            if (readerSettings.readingMode !== 'scroll') {
-              updateReaderSettings({ readingMode: 'scroll' });
-            }
-            setAutoScrollEnabled((current) => !current);
-          }}
-          type="button"
-        >
-          <Volume2 aria-hidden="true" size={16} />
-          Tự động cuộn
-        </button>
-        <button onClick={() => setSettingsOpen(true)} type="button">
-          <Type aria-hidden="true" size={16} />
-          Cài đặt
-        </button>
-      </div>
-
-      <ReaderAudioBar
-        autoNext={audioAutoNext}
-        chapterTitle={activeChapterTitle}
-        downloadUrl={audioDownloadUrl}
-        hasNextChapter={Boolean(nextAudioChapter)}
-        open={audioOpen && Boolean(audioPlaybackUrl)}
-        resumeOnSourceChange={audioAutoNext}
-        streamUrl={audioPlaybackUrl}
-        onAutoNextChange={setAudioAutoNext}
-        onClose={() => setAudioOpen(false)}
-        onNextChapter={handleAudioNextChapter}
+      <ReaderTocSheet
+        author={selectedBook?.author}
+        chapters={chapters}
+        currentChapterId={selectedChapterId}
+        open={tocOpen}
+        previews={tocChapterPreviews}
+        title={selectedBook?.title || 'Truyện đã dịch'}
+        onClose={() => setTocOpen(false)}
+        onSelectChapter={handleSelectChapter}
       />
-
-      {tocOpen ? (
-        <div className="reader-drawer-backdrop">
-          <aside aria-label="Mục lục" className="reader-toc-drawer" role="dialog">
-            <header className="reader-drawer-header">
-              <div>
-                <p className="section-label">Mục lục</p>
-                <h2>{selectedBook?.title || 'Truyện đã dịch'}</h2>
-                {selectedBook?.author ? <span>{selectedBook.author}</span> : null}
-                <span>{chapterCountLabel}</span>
-              </div>
-              <button
-                aria-label="Đóng mục lục"
-                className="reader-icon-button"
-                onClick={() => setTocOpen(false)}
-                title="Đóng mục lục"
-                type="button"
-              >
-                <X aria-hidden="true" size={22} />
-              </button>
-            </header>
-
-            <label className="reader-drawer-search">
-              <span>{searchOpen ? 'Tìm trong mục lục' : 'Tìm trong mục lục'}</span>
-              <input
-                aria-label="Tìm trong mục lục"
-                autoFocus={searchOpen}
-                onChange={(event) => setChapterQuery(event.target.value)}
-                placeholder="Số chương hoặc tên chương"
-                type="search"
-                value={chapterQuery}
-              />
-            </label>
-
-            <div className="reader-toc-list reader-drawer-list">
-              {visibleChapters.map((chapter) => {
-                const selected = chapter.id === selectedChapterId;
-                const preview = tocChapterPreviews.get(chapter.id);
-                return (
-                  <button
-                    aria-current={selected ? 'true' : undefined}
-                    aria-label={`Ch. ${chapter.chapter_number} ${chapter.title}`}
-                    key={chapter.id}
-                    onClick={() => handleSelectChapter(chapter.id)}
-                    type="button"
-                  >
-                    <span>Ch. {chapter.chapter_number}</span>
-                    <strong>{chapter.title}</strong>
-                    {preview ? (
-                      <small className="reader-toc-preview">
-                        <span>{preview.wordLabel}</span>
-                        <span>{preview.timeLabel}</span>
-                        <span data-state={preview.readingState}>{preview.stateLabel}</span>
-                      </small>
-                    ) : null}
-                  </button>
-                );
-              })}
-              {visibleChapters.length === 0 ? <p>Không tìm thấy chương.</p> : null}
-            </div>
-          </aside>
-        </div>
-      ) : null}
 
       <ReaderMarksPanel
         exportError={marksError}
@@ -4544,12 +4189,7 @@ export default function ReaderView({
         onSpoilerModeChange={updateReaderXraySpoilerMode}
       />
 
-      <ReaderSettingsSheet
-        open={settingsOpen}
-        settings={readerSettings}
-        onClose={() => setSettingsOpen(false)}
-        onUpdate={updateReaderSettings}
-      />
+      <ReaderQuickSettingsSheet modes={quickModes} settings={quickSettings} />
 
       {noteDraft ? (
         <div className="reader-sheet-backdrop">

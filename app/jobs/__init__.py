@@ -1,2 +1,1 @@
 """Local job command helpers."""
-

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from typing import Any
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urldefrag
 import zipfile
@@ -20,6 +21,7 @@ from app.database.db import (
     get_book_by_id,
     get_book_by_title,
     get_chapter,
+    list_chapters,
     record_ebook_import_run,
     update_book,
     update_chapter_paths,
@@ -41,6 +43,69 @@ GARBAGE_DOCUMENT_MARKERS = ("cover", "titlepage", "toc", "contents", "copyright"
 SUSPECT_DOCUMENT_MARKERS = ("titlepage", "part0000")
 MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_BOOK_ASSET_BYTES = 50 * 1024 * 1024
+MAX_EPUB_MEMBERS = 10_000
+MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_EPUB_MEMBER_BYTES = 128 * 1024 * 1024
+MAX_EPUB_DOCUMENT_BYTES = 16 * 1024 * 1024
+MAX_EPUB_COMPRESSION_RATIO = 250.0
+EPUB_READ_CHUNK_BYTES = 64 * 1024
+
+
+class ExistingBookConfirmationRequired(ValueError):
+    pass
+
+
+def _validate_epub_archive(epub: zipfile.ZipFile) -> None:
+    members = epub.infolist()
+    if len(members) > MAX_EPUB_MEMBERS:
+        raise ValueError("EPUB contains too many files")
+    total_uncompressed = 0
+    for member in members:
+        normalized_name = member.filename.replace("\\", "/")
+        member_path = PurePosixPath(normalized_name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise ValueError("EPUB contains an unsafe member path")
+        if member.flag_bits & 0x1:
+            raise ValueError("Encrypted EPUB members are not supported")
+        if member.is_dir():
+            continue
+        if member.file_size < 0 or member.compress_size < 0:
+            raise ValueError("EPUB contains invalid member sizes")
+        if member.file_size > MAX_EPUB_MEMBER_BYTES:
+            raise ValueError("EPUB member exceeds the size limit")
+        total_uncompressed += member.file_size
+        if total_uncompressed > MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError("EPUB uncompressed size exceeds the limit")
+        if member.file_size:
+            ratio = member.file_size / max(1, member.compress_size)
+            if ratio > MAX_EPUB_COMPRESSION_RATIO:
+                raise ValueError("EPUB member compression ratio exceeds the limit")
+
+
+def _read_epub_member_bounded(
+    epub: zipfile.ZipFile,
+    member_name: str,
+    *,
+    max_bytes: int,
+    kind: str,
+) -> bytes:
+    member = epub.getinfo(member_name)
+    if member.is_dir():
+        raise ValueError(f"EPUB {kind} is not a file")
+    if member.file_size > max_bytes:
+        raise ValueError(f"EPUB {kind} exceeds the size limit")
+    chunks: list[bytes] = []
+    total = 0
+    with epub.open(member, "r") as source:
+        while True:
+            chunk = source.read(min(EPUB_READ_CHUNK_BYTES, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"EPUB {kind} exceeds the size limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _normalize_page_break_token(value: str | None) -> str:
@@ -780,7 +845,12 @@ class EbookImportService:
             return []
         seen_paths.add(css_path)
         try:
-            css = epub.read(css_path).decode("utf-8", errors="ignore")
+            css = _read_epub_member_bounded(
+                epub,
+                css_path,
+                max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                kind="stylesheet",
+            ).decode("utf-8", errors="ignore")
         except KeyError:
             return []
 
@@ -850,13 +920,18 @@ class EbookImportService:
         duplicate_strategy: str = "skip",
         split_mode: str = "auto",
         original_filename: str = "",
+        confirmed_existing_book_id: int | None = None,
     ) -> dict:
         if duplicate_strategy not in {"error", "skip", "overwrite"}:
             raise ValueError("duplicate_strategy must be one of: error, skip, overwrite")
 
         parsed = self._parse(file_path, split_mode=split_mode, original_filename=original_filename)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        self._assert_existing_book_confirmed(match, confirmed_existing_book_id)
         self._raise_if_unreadable(parsed)
-        book_id = self._resolve_book_id(parsed, target_book_id)
+        book_id = match["existing_book_id"]
+        if book_id is None:
+            book_id = add_book(self.db_path, parsed.title, parsed.author, "ebook", "")
         cover_path, cover_url = self._save_cover(parsed, "", f"book_{book_id}")
         if cover_path:
             update_book(self.db_path, book_id, cover_path=cover_path)
@@ -940,7 +1015,8 @@ class EbookImportService:
         target_book_id: int | None,
         duplicate_strategy: str,
     ) -> dict:
-        book_id = self._existing_book_id(parsed, target_book_id)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        book_id = match["existing_book_id"]
         duplicate_count = 0
         if book_id is not None:
             for chapter in parsed.chapters:
@@ -963,7 +1039,50 @@ class EbookImportService:
             "would_skip": would_skip,
             "would_overwrite": would_overwrite,
             "would_error": would_error,
+            **match,
         }
+
+    def _book_match_for_parsed(self, parsed: ParsedEbook, target_book_id: int | None) -> dict[str, Any]:
+        if target_book_id is not None:
+            book = get_book_by_id(self.db_path, target_book_id)
+            if not book:
+                raise ValueError(f"Book {target_book_id} not found")
+            reason = "selected"
+        else:
+            book = get_book_by_title(self.db_path, parsed.title)
+            reason = "title" if book else "new"
+        existing_id = int(book["id"]) if book else None
+        return {
+            "existing_book_id": existing_id,
+            "existing_book_title": str(book.get("title") or parsed.title) if book else "",
+            "existing_chapter_count": len(list_chapters(self.db_path, existing_id)) if existing_id else 0,
+            "book_match_reason": reason,
+            "requires_existing_book_confirmation": existing_id is not None,
+        }
+
+    def _assert_existing_book_confirmed(
+        self,
+        match: dict[str, Any],
+        confirmed_existing_book_id: int | None,
+    ) -> None:
+        existing_id = match["existing_book_id"]
+        if existing_id is not None and confirmed_existing_book_id != existing_id:
+            raise ExistingBookConfirmationRequired(
+                "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+            )
+
+    def validate_existing_book_confirmation(
+        self,
+        file_path: Path,
+        *,
+        target_book_id: int | None,
+        split_mode: str,
+        original_filename: str,
+        confirmed_existing_book_id: int | None,
+    ) -> None:
+        parsed = self._parse(file_path, split_mode=split_mode, original_filename=original_filename)
+        match = self._book_match_for_parsed(parsed, target_book_id)
+        self._assert_existing_book_confirmed(match, confirmed_existing_book_id)
 
     def _warnings_with_content_quality(
         self,
@@ -991,26 +1110,6 @@ class EbookImportService:
             "Ebook này gần như chỉ có tên chương/ảnh minh họa, không có nội dung chữ để đọc hoặc dịch. "
             "Hãy dùng EPUB/TXT/HTML có text thật, hoặc chạy OCR trước rồi import lại."
         )
-
-    def _existing_book_id(self, parsed: ParsedEbook, target_book_id: int | None) -> int | None:
-        if target_book_id is not None:
-            if not get_book_by_id(self.db_path, target_book_id):
-                raise ValueError(f"Book {target_book_id} not found")
-            return target_book_id
-
-        existing = get_book_by_title(self.db_path, parsed.title)
-        return int(existing["id"]) if existing else None
-
-    def _resolve_book_id(self, parsed: ParsedEbook, target_book_id: int | None) -> int:
-        if target_book_id is not None:
-            if not get_book_by_id(self.db_path, target_book_id):
-                raise ValueError(f"Book {target_book_id} not found")
-            return target_book_id
-
-        existing = get_book_by_title(self.db_path, parsed.title)
-        if existing:
-            return int(existing["id"])
-        return add_book(self.db_path, parsed.title, parsed.author, "ebook", "")
 
     def _write_raw_chapter(self, book_title: str, chapter: ParsedEbookChapter) -> Path:
         raw_dir = self.data_dir / "raw"
@@ -1321,7 +1420,13 @@ class EbookImportService:
         original_filename: str,
     ) -> ParsedEbook:
         with zipfile.ZipFile(file_path) as epub:
-            container = ET.fromstring(epub.read("META-INF/container.xml"))
+            _validate_epub_archive(epub)
+            container = ET.fromstring(_read_epub_member_bounded(
+                epub,
+                "META-INF/container.xml",
+                max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                kind="container document",
+            ))
             rootfile = next(
                 (
                     _attr(element, "full-path")
@@ -1333,7 +1438,12 @@ class EbookImportService:
             if not rootfile:
                 raise ValueError("EPUB container rootfile not found")
 
-            opf_root = ET.fromstring(epub.read(rootfile))
+            opf_root = ET.fromstring(_read_epub_member_bounded(
+                epub,
+                rootfile,
+                max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                kind="package document",
+            ))
             title = _xml_text(opf_root, "title") or _display_filename_stem(original_filename or file_path.name)
             author = _xml_text(opf_root, "creator")
             language = _xml_text(opf_root, "language")
@@ -1458,7 +1568,12 @@ class EbookImportService:
             source_path = Path(_split_href_fragment(href)[0]).stem
             source_zip_path = _join_zip_path(rootfile, href)
             try:
-                content = epub.read(source_zip_path)
+                content = _read_epub_member_bounded(
+                    epub,
+                    source_zip_path,
+                    max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                    kind="chapter document",
+                )
             except KeyError:
                 warnings.append(_warning("missing_document", f"Không tìm thấy file EPUB: {href}"))
                 continue
@@ -1527,7 +1642,12 @@ class EbookImportService:
         if not nav_item:
             return []
         try:
-            nav_root = ET.fromstring(epub.read(_join_zip_path(rootfile, nav_item.href)))
+            nav_root = ET.fromstring(_read_epub_member_bounded(
+                epub,
+                _join_zip_path(rootfile, nav_item.href),
+                max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                kind="navigation document",
+            ))
         except (KeyError, ET.ParseError):
             return []
 
@@ -1573,7 +1693,12 @@ class EbookImportService:
         if toc_item is None:
             return []
         try:
-            ncx_root = ET.fromstring(epub.read(_join_zip_path(rootfile, toc_item.href)))
+            ncx_root = ET.fromstring(_read_epub_member_bounded(
+                epub,
+                _join_zip_path(rootfile, toc_item.href),
+                max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                kind="table of contents document",
+            ))
         except (KeyError, ET.ParseError):
             return []
 
@@ -1630,7 +1755,12 @@ class EbookImportService:
                 end_fragment = next_entry.fragment
             try:
                 source_zip_path = _join_zip_path(rootfile, entry.href)
-                content = epub.read(source_zip_path)
+                content = _read_epub_member_bounded(
+                    epub,
+                    source_zip_path,
+                    max_bytes=MAX_EPUB_DOCUMENT_BYTES,
+                    kind="chapter document",
+                )
             except KeyError:
                 warnings.append(_warning("toc_unmapped", f"Không tìm thấy chapter từ mục lục: {entry.title or entry.href}"))
                 continue
@@ -1778,7 +1908,12 @@ class EbookImportService:
         if not cover_item:
             return None
         try:
-            content = epub.read(_join_zip_path(rootfile, cover_item.href))
+            content = _read_epub_member_bounded(
+                epub,
+                _join_zip_path(rootfile, cover_item.href),
+                max_bytes=MAX_INLINE_IMAGE_BYTES,
+                kind="cover asset",
+            )
         except KeyError:
             return None
         if not content:
@@ -1798,8 +1933,13 @@ class EbookImportService:
                 continue
             asset_path = _join_zip_path(rootfile, item.href)
             try:
-                content = epub.read(asset_path)
-            except KeyError:
+                content = _read_epub_member_bounded(
+                    epub,
+                    asset_path,
+                    max_bytes=MAX_INLINE_IMAGE_BYTES,
+                    kind="book asset",
+                )
+            except (KeyError, ValueError):
                 continue
             if not content or len(content) > MAX_INLINE_IMAGE_BYTES:
                 continue

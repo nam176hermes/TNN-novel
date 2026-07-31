@@ -143,7 +143,7 @@ describe('WorkbenchView', () => {
     expect(workbench).toHaveAttribute('data-mobile-section', 'editor');
     await userEvent.click(screen.getByRole('tab', { name: 'Trợ lý' }));
     expect(workbench).toHaveAttribute('data-mobile-section', 'assist');
-    await userEvent.click(screen.getByRole('tab', { name: 'Editor' }));
+    await userEvent.click(screen.getByRole('tab', { name: 'Nội dung' }));
     expect(workbench).toHaveAttribute('data-mobile-section', 'editor');
   });
 

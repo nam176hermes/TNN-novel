@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClient } from '../api/client';
+import { ApiClient, ApiError } from '../api/client';
 import {
   clearToken,
-  loadRefreshToken,
   loadToken,
-  saveSessionTokens,
+  saveToken,
 } from './session';
 import { formatError } from './types';
 
+async function withBrowserRefreshLock<T>(operation: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+  if (!locks) return operation();
+  return locks.request('novel-tnn-auth-refresh', { mode: 'exclusive' }, operation);
+}
+
 export function useSession(apiBaseUrl: string, authDisabled = false) {
   const [token, setToken] = useState(() => (authDisabled ? '' : loadToken()));
-  const [isRestoring, setIsRestoring] = useState(() => !authDisabled && Boolean(loadRefreshToken()));
+  const [isRestoring, setIsRestoring] = useState(() => !authDisabled && !loadToken());
   const [loginError, setLoginError] = useState('');
   const refreshInFlightRef = useRef<Promise<boolean> | null>(null);
 
@@ -22,19 +27,24 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
 
   const refreshSession = useCallback(async (): Promise<boolean> => {
     if (authDisabled) return true;
-    const refreshToken = loadRefreshToken();
-    if (!refreshToken) return false;
     if (refreshInFlightRef.current) return refreshInFlightRef.current;
 
-    const refreshPromise = (async () => {
+    const refreshPromise = withBrowserRefreshLock(async () => {
       const refreshClient = new ApiClient(apiBaseUrl);
       try {
-        const response = await refreshClient.refresh(refreshToken);
-        saveSessionTokens(response.access_token, response.refresh_token);
+        const response = await refreshClient.refresh();
+        saveToken(response.access_token);
         setToken(response.access_token);
         setLoginError('');
         return true;
       } catch (error) {
+        if (!(error instanceof ApiError)
+          && typeof navigator !== 'undefined'
+          && navigator.onLine === false
+          && loadToken()) {
+          setLoginError('');
+          return true;
+        }
         clearToken();
         setToken('');
         setLoginError('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
@@ -43,7 +53,7 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
         setIsRestoring(false);
         refreshInFlightRef.current = null;
       }
-    })();
+    });
 
     refreshInFlightRef.current = refreshPromise;
     return refreshPromise;
@@ -55,7 +65,7 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
       setLoginError('');
       return;
     }
-    if (!loadRefreshToken()) {
+    if (loadToken()) {
       setIsRestoring(false);
       return;
     }
@@ -74,7 +84,7 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
       }
       try {
         const response = await client.login(username, password);
-        saveSessionTokens(response.access_token, response.refresh_token);
+        saveToken(response.access_token);
         setToken(response.access_token);
       } catch (error) {
         setLoginError(formatError(error));
@@ -111,15 +121,8 @@ export function useSession(apiBaseUrl: string, authDisabled = false) {
       setLoginError('');
       return;
     }
-    if (loadRefreshToken()) {
-      setIsRestoring(true);
-      void refreshSession();
-      return;
-    }
-    clearToken();
-    setToken('');
-    setIsRestoring(false);
-    setLoginError('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+    setIsRestoring(true);
+    void refreshSession();
   }, [authDisabled, refreshSession]);
 
   return {

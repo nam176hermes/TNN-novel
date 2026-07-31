@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import Optional
 
@@ -379,5 +380,17 @@ async def cache_clear_endpoint():
 
 
 # Run the server
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
 def start_server(host: str = "127.0.0.1", port: int = 8000):
+    if not _is_loopback_host(host):
+        raise ValueError("The legacy dashboard is local-only; use the authenticated Mobile API for remote access")
     uvicorn.run(app, host=host, port=port)

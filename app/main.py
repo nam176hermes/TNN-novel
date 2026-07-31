@@ -78,6 +78,14 @@ def _ensure_data_dir() -> Path:
     return data_dir
 
 
+@app.callback()
+def initialize_cli_database(ctx: typer.Context) -> None:
+    if not ctx.invoked_subcommand or ctx.invoked_subcommand == "init":
+        return
+    data_dir = _ensure_data_dir()
+    init_db(data_dir / "pipeline.db")
+
+
 @app.command("init")
 def init_cmd(
     force: bool = typer.Option(False, "--force", "-f", help="Re-initialize even if DB exists"),
@@ -538,6 +546,8 @@ def dashboard_cmd(
     port: int = typer.Option(8000, "--port", "-p", help="Server port"),
 ) -> None:
     """Start the local web dashboard."""
+    if host not in {"127.0.0.1", "::1", "localhost"} and not host.endswith(".localhost"):
+        raise typer.BadParameter("The legacy dashboard is local-only; use the authenticated Mobile API for remote access")
     console.print(f"[blue]Starting dashboard on http://{host}:{port}[/blue]")
     console.print(f"  API docs: http://{host}:{port}/docs")
     console.print("[dim]Press Ctrl+C to stop.[/dim]")

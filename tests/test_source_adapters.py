@@ -113,8 +113,8 @@ def test_source_capabilities_map_policies_to_available_adapters() -> None:
     assert capabilities["69shuba"]["extraction"] == "selector"
     assert capabilities["22biqu"]["adapter_id"] == "biquge"
     assert capabilities["22biqu"]["domains"] == ["22biqu.com"]
-    assert capabilities["kakuyomu"]["adapter_id"] == "generic_html"
-    assert capabilities["kakuyomu"]["extraction"] == "generic"
+    assert capabilities["kakuyomu"]["adapter_id"] == "kakuyomu"
+    assert capabilities["kakuyomu"]["extraction"] == "selector"
 
 
 def test_validate_public_http_url_rejects_non_allowlisted_domains() -> None:
@@ -254,6 +254,8 @@ def test_fetch_public_html_rejects_redirect_to_different_source(monkeypatch: pyt
         headers = {"Location": "https://www.biquge.tw/book/1/"}
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
@@ -276,13 +278,18 @@ def test_fetch_public_html_reports_cloudflare_challenge_as_blocked_source(
             raise AssertionError("blocked responses should be handled before raise_for_status")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
     monkeypatch.setattr(source_adapters.requests, "Session", FakeSession)
 
     with pytest.raises(SourceBlockedError, match="Cloudflare challenge"):
-        source_adapters.fetch_public_html("https://www.69shuba.com/book/58851.htm")
+        source_adapters.fetch_public_html(
+            "https://www.69shuba.com/book/58851.htm",
+            allow_browser_fallback=False,
+        )
 
 
 def test_fetch_public_html_decodes_gbk_meta_charset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -303,6 +310,8 @@ def test_fetch_public_html_decodes_gbk_meta_charset(monkeypatch: pytest.MonkeyPa
             yield html.encode("gb18030")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 
@@ -331,6 +340,8 @@ def test_fetch_public_html_prefers_apparent_gbk_over_latin1_response_encoding(
             yield html.encode("gb18030")
 
     class FakeSession:
+        def __init__(self):
+            self.cookies = type("C", (), {"get_dict": lambda s: {}, "set": lambda s, *a, **kw: None})()
         def get(self, *args, **kwargs):
             return FakeResponse()
 

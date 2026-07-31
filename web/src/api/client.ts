@@ -16,9 +16,17 @@ import type {
   ExportDownload,
   ExportFormat,
   ExportResponse,
+  SystemBackupItem,
+  SystemBackupJobStart,
+  SystemBackupList,
+  SystemBackupRequest,
   GlossaryTerm,
   GlossaryTermUpdate,
   ImportFileRequest,
+  ImportJobAccepted,
+  ImportJobEvent,
+  ImportJobEventStream,
+  ImportJobSnapshot,
   ImportPasteRequest,
   ImportResponse,
   ImportUrlRequest,
@@ -28,6 +36,7 @@ import type {
   JobLogEntry,
   JobStartResponse,
   JobStatus,
+  JobEventSubscriptionOptions,
   Provider,
   ProviderDefaults,
   ProviderTestResult,
@@ -55,6 +64,12 @@ import type {
   ReaderXrayEnrichOptions,
   ReaderXrayResponse,
   ReaderXraySpoilerMode,
+  ManagedSource,
+  ManagedSourceImportSummary,
+  ManagedSourceList,
+  ManagedSourceQuery,
+  ManagedSourceTestResult,
+  ManagedSourceUpdateRequest,
   SourceAdapterCandidate,
   SourceAdapterCandidateList,
   SourceCapability,
@@ -68,6 +83,10 @@ import type {
   TokenResponse,
   TranslatedBookSummary,
   TtsJobStatus,
+  URLFetchRequest,
+  URLFetchResponse,
+  WizardTextImportRequest,
+  WizardTextImportResult,
 } from './types';
 
 type ErrorPayload = {
@@ -82,13 +101,21 @@ export type ReaderBookSearchOptions = {
   wholeWord?: boolean;
 };
 
+export type ApiRequestOptions = {
+  signal?: AbortSignal;
+};
+
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: string;
+  readonly retryable: boolean;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code = '', retryable = false) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
+    this.retryable = retryable;
   }
 }
 
@@ -137,6 +164,28 @@ function filenameFromContentDisposition(value: string | null, fallback: string):
 
 const browserFetch: typeof fetch = (input, init) => fetch(input, { credentials: 'include', ...init });
 
+const CSRF_COOKIE_NAME = 'novel_csrf';
+
+function csrfTokenFromCookie(): string {
+  if (typeof document === 'undefined') return '';
+  const prefix = `${CSRF_COOKIE_NAME}=`;
+  const encoded = document.cookie
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix))
+    ?.slice(prefix.length) ?? '';
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return '';
+  }
+}
+
+function csrfHeaders(): Record<string, string> {
+  const token = csrfTokenFromCookie();
+  return token ? { 'X-CSRF-Token': token } : {};
+}
+
 export class ApiClient {
   token = '';
 
@@ -168,21 +217,43 @@ export class ApiClient {
     const status = response.status;
     const statusText = response.statusText ? ` ${response.statusText}` : '';
     const statusLabel = typeof status === 'number' && status > 0 ? ` (${status}${statusText})` : '';
-    const detail = await this.errorDetail(response);
-    const detailLabel = detail ? `: ${detail}` : '';
+    const error = await this.errorInfo(response);
+    const detailLabel = error.message ? `: ${error.message}` : '';
 
-    throw new ApiError(`${fallbackMessage}${statusLabel}${detailLabel}`, status);
+    throw new ApiError(
+      `${fallbackMessage}${statusLabel}${detailLabel}`,
+      status,
+      error.code,
+      error.retryable,
+    );
   }
 
   private async errorDetail(response: Response): Promise<string> {
+    return (await this.errorInfo(response)).message;
+  }
+
+  private async errorInfo(response: Response): Promise<{ message: string; code: string; retryable: boolean }> {
     try {
       const payload = (await response.json()) as ErrorPayload;
-      return formatDetail(payload.detail ?? payload.message ?? payload);
+      const detail = payload.detail;
+      if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+        const typed = detail as Record<string, unknown>;
+        return {
+          message: formatDetail(typed.message ?? detail),
+          code: typeof typed.code === 'string' ? typed.code : '',
+          retryable: typed.retryable === true,
+        };
+      }
+      return {
+        message: formatDetail(detail ?? payload.message ?? payload),
+        code: '',
+        retryable: false,
+      };
     } catch {
       try {
-        return (await response.text()).trim();
+        return { message: (await response.text()).trim(), code: '', retryable: false };
       } catch {
-        return '';
+        return { message: '', code: '', retryable: false };
       }
     }
   }
@@ -200,11 +271,10 @@ export class ApiClient {
     return data;
   }
 
-  async refresh(refreshToken: string): Promise<TokenResponse> {
+  async refresh(): Promise<TokenResponse> {
     const response = await this.fetcher(`${this.baseUrl}/api/auth/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      headers: csrfHeaders(),
     });
     await this.assertOk(response, 'Refresh failed');
 
@@ -216,7 +286,7 @@ export class ApiClient {
   async logout(): Promise<void> {
     const response = await this.fetcher(`${this.baseUrl}/api/auth/logout`, {
       method: 'POST',
-      headers: this.headers(),
+      headers: { ...this.headers(), ...csrfHeaders() },
     });
     await this.assertOk(response, 'Logout failed');
   }
@@ -319,6 +389,17 @@ export class ApiClient {
     return (await response.json()) as ImportResponse;
   }
 
+  async importWizardText(request: WizardTextImportRequest): Promise<WizardTextImportResult> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/wizard/text`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    await this.assertOk(response, 'Failed to import reviewed text');
+
+    return (await response.json()) as WizardTextImportResult;
+  }
+
   async previewTranslatedEbook(
     file: File,
     splitMode = 'auto',
@@ -401,6 +482,9 @@ export class ApiClient {
     if (request.targetBookId != null) {
       body.append('target_book_id', String(request.targetBookId));
     }
+    if (request.confirmedExistingBookId != null) {
+      body.append('confirmed_existing_book_id', String(request.confirmedExistingBookId));
+    }
     return body;
   }
 
@@ -439,6 +523,132 @@ export class ApiClient {
     return (await response.json()) as SourcePreview;
   }
 
+  async fetchSourceChapters(request: URLFetchRequest): Promise<URLFetchResponse> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/url/fetch`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    await this.assertOk(response, 'Failed to fetch source chapters');
+
+    return (await response.json()) as URLFetchResponse;
+  }
+
+  async createImportJob(request: URLFetchRequest): Promise<ImportJobAccepted> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    await this.assertOk(response, 'Failed to create import job');
+    return (await response.json()) as ImportJobAccepted;
+  }
+
+  async getImportJob(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load import job');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  async cancelImportJob(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to cancel import job');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  async retryFailedTasks(jobId: string): Promise<ImportJobSnapshot> {
+    const response = await this.fetcher(`${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/retry-failed`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to retry import tasks');
+    return (await response.json()) as ImportJobSnapshot;
+  }
+
+  async retryFailedImportTasks(jobId: string): Promise<ImportJobSnapshot> {
+    return this.retryFailedTasks(jobId);
+  }
+
+  subscribeJobEvents(
+    jobId: string,
+    onEvent: (event: ImportJobEvent) => void,
+    options: JobEventSubscriptionOptions = {},
+  ): ImportJobEventStream {
+    const controller = new AbortController();
+    const query = options.cursor != null ? `?cursor=${Math.max(0, Math.trunc(options.cursor))}` : '';
+    const headers = this.headers();
+    if (options.lastEventId != null) {
+      headers['Last-Event-ID'] = String(Math.max(0, Math.trunc(options.lastEventId)));
+    }
+    const done = (async () => {
+      try {
+        const response = await this.fetcher(
+          `${this.baseUrl}/api/import/jobs/${encodeURIComponent(jobId)}/events${query}`,
+          { headers, signal: controller.signal },
+        );
+        await this.assertOk(response, 'Failed to stream import job events');
+        if (!response.body) throw new ApiError('Import job event stream has no response body', response.status);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done: readerDone } = await reader.read();
+          if (readerDone) break;
+          buffer += decoder.decode(value, { stream: true });
+          buffer = this.consumeImportJobSseBlocks(buffer, onEvent);
+        }
+        buffer += decoder.decode();
+        this.consumeImportJobSseBlocks(`${buffer}\n\n`, onEvent);
+      } catch (error) {
+        if (
+          controller.signal.aborted &&
+          typeof error === 'object' &&
+          error !== null &&
+          'name' in error &&
+          error.name === 'AbortError'
+        ) {
+          return;
+        }
+        throw error;
+      }
+    })();
+    return { abort: () => controller.abort(), done };
+  }
+
+  openImportJobEventStream(
+    jobId: string,
+    onEvent: (event: ImportJobEvent) => void,
+    options: JobEventSubscriptionOptions = {},
+  ): ImportJobEventStream {
+    return this.subscribeJobEvents(jobId, onEvent, options);
+  }
+
+  private consumeImportJobSseBlocks(
+    input: string,
+    onEvent: (event: ImportJobEvent) => void,
+  ): string {
+    let buffer = input;
+    while (true) {
+      const boundary = buffer.match(/\r?\n\r?\n/);
+      if (!boundary || boundary.index == null) return buffer;
+      const block = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary[0].length);
+      if (!block || block.startsWith(':')) continue;
+      const data = block
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+      if (data) onEvent(JSON.parse(data) as ImportJobEvent);
+    }
+  }
+
   async getImportSources(): Promise<SourceCapability[]> {
     const response = await this.fetcher(`${this.baseUrl}/api/import/sources`, {
       headers: this.headers(),
@@ -456,6 +666,8 @@ export class ApiClient {
         tag: params.tag,
         domain: params.domain,
         supported: params.supported,
+        status: params.status,
+        trust_level: params.trust_level,
         page: params.page ? String(params.page) : undefined,
         page_size: params.page_size ? String(params.page_size) : undefined,
       }),
@@ -477,6 +689,88 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to check source catalog entry');
 
     return (await response.json()) as SourceCatalogHealthResult;
+  }
+
+  async importManagedSources(entryIds: string[]): Promise<ManagedSourceImportSummary> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/import-catalog`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entry_ids: entryIds }),
+    });
+    await this.assertOk(response, 'Failed to import selected sources');
+
+    return (await response.json()) as ManagedSourceImportSummary;
+  }
+
+  async getManagedSources(params: ManagedSourceQuery = {}): Promise<ManagedSourceList> {
+    const query = new URLSearchParams(
+      compactParams({
+        query: params.query,
+        status: params.status,
+        trust_level: params.trust_level,
+        language: params.language,
+        page: params.page ? String(params.page) : undefined,
+        page_size: params.page_size ? String(params.page_size) : undefined,
+      }),
+    );
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    const response = await this.fetcher(`${this.baseUrl}/api/sources${suffix}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load managed sources');
+
+    return (await response.json()) as ManagedSourceList;
+  }
+
+  async getManagedSource(sourceId: string): Promise<ManagedSource> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/${encodeURIComponent(sourceId)}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load managed source');
+
+    return (await response.json()) as ManagedSource;
+  }
+
+  async updateManagedSource(sourceId: string, payload: ManagedSourceUpdateRequest): Promise<ManagedSource> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/${encodeURIComponent(sourceId)}`, {
+      method: 'PATCH',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await this.assertOk(response, 'Failed to update managed source');
+
+    return (await response.json()) as ManagedSource;
+  }
+
+  async testManagedSource(sourceId: string): Promise<ManagedSourceTestResult> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/${encodeURIComponent(sourceId)}/test`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to test source');
+
+    return (await response.json()) as ManagedSourceTestResult;
+  }
+
+  async verifyManagedSource(sourceId: string): Promise<ManagedSource> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/${encodeURIComponent(sourceId)}/verify`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to verify source');
+
+    return (await response.json()) as ManagedSource;
+  }
+
+  async setManagedSourceStatus(sourceId: string, status: 'BROKEN' | 'BLOCKED' | 'NEEDS_REVIEW'): Promise<ManagedSource> {
+    const response = await this.fetcher(`${this.baseUrl}/api/sources/${encodeURIComponent(sourceId)}/status`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    await this.assertOk(response, 'Failed to update source status');
+
+    return (await response.json()) as ManagedSource;
   }
 
   async createSourceAdapterCandidate(entryId: string, sampleUrl = ''): Promise<SourceAdapterCandidate> {
@@ -524,9 +818,10 @@ export class ApiClient {
     return (await response.json()) as JobStartResponse;
   }
 
-  async getChapterSource(bookId: number, chapterId: number): Promise<string> {
+  async getChapterSource(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<string> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/source`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (!response.ok && response.status === 404) {
       const detail = await this.errorDetail(response);
@@ -542,9 +837,10 @@ export class ApiClient {
     return data.text;
   }
 
-  async getChapterTranslation(bookId: number, chapterId: number): Promise<string | null> {
+  async getChapterTranslation(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<string | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/translation`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 404) return null;
     await this.assertOk(response, 'Failed to load chapter translation');
@@ -553,9 +849,10 @@ export class ApiClient {
     return data.text;
   }
 
-  async getChapterContent(bookId: number, chapterId: number): Promise<{ text: string; html: string } | null> {
+  async getChapterContent(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<{ text: string; html: string } | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/content`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 404) return null;
     await this.assertOk(response, 'Failed to load chapter content');
@@ -1040,6 +1337,40 @@ export class ApiClient {
     };
   }
 
+  async listSystemBackups(): Promise<SystemBackupList> {
+    const response = await this.fetcher(`${this.baseUrl}/api/system/backups`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load system backups');
+    return (await response.json()) as SystemBackupList;
+  }
+
+  async createSystemBackup(payload: SystemBackupRequest = {}): Promise<SystemBackupJobStart> {
+    const response = await this.fetcher(`${this.baseUrl}/api/system/backups`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await this.assertOk(response, 'Failed to create system backup');
+    return (await response.json()) as SystemBackupJobStart;
+  }
+
+  async downloadSystemBackup(filename: string): Promise<ExportDownload> {
+    const response = await this.fetcher(`${this.baseUrl}/api/system/backups/${encodeURIComponent(filename)}/download`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to download system backup');
+    const blob = await response.blob();
+    return {
+      blob,
+      filename: filenameFromContentDisposition(
+        response.headers.get('content-disposition'),
+        filename,
+      ),
+      mediaType: response.headers.get('content-type') ?? blob.type,
+    };
+  }
+
   async importReaderAnnotations(
     bookId: number,
     annotations: ReaderAnnotationImportItem[],
@@ -1239,9 +1570,10 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to cancel job');
   }
 
-  async getQaReport(bookId: number, chapterId: number): Promise<QaReport | null> {
+  async getQaReport(bookId: number, chapterId: number, options: ApiRequestOptions = {}): Promise<QaReport | null> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/qa`, {
       headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     if (response.status === 204 || response.status === 404) return null;
     await this.assertOk(response, 'Failed to load QA report');

@@ -71,7 +71,7 @@ In Flutter app Settings:
 - Save → Check → should show "Online"
 
 ## Important notes
-- Cloudflare Universal SSL covers `*.tradingcompanydirect.com` only (one level). 
+- Cloudflare Universal SSL covers `*.tradingcompanydirect.com` only (one level).
   Do NOT use `*.sub.tradingcompanydirect.com` (two levels) — TLS handshake will fail.
 - Cloudflare terminates TLS. Backend runs plain HTTP on localhost:7860.
 - Tunnel auto-reconnects on restart. Add to systemd/cron for persistence.

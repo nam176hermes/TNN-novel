@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# shellcheck disable=SC1091
+source "$ROOT/scripts/lib/python.sh"
+
 if [[ -f "$ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -11,10 +14,7 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="${PYTHON_BIN_FALLBACK:-python3}"
-fi
+PYTHON_BIN="$(resolve_python_bin "$ROOT")"
 
 DATA_DIR_VALUE="${DATA_DIR:-data}"
 if [[ "$DATA_DIR_VALUE" = /* ]]; then

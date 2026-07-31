@@ -18,6 +18,8 @@ describe('PWA public assets', () => {
       background_color?: string;
       display?: string;
       icons?: Array<{ purpose?: string; sizes?: string; src?: string; type?: string }>;
+      id?: string;
+      lang?: string;
       name?: string;
       orientation?: string;
       short_name?: string;
@@ -27,6 +29,8 @@ describe('PWA public assets', () => {
 
     expect(manifest.name).toBe('Novel-TNN Translator');
     expect(manifest.short_name).toBe('Novel-TNN');
+    expect(manifest.id).toBe('/');
+    expect(manifest.lang).toBe('vi');
     expect(manifest.display).toBe('standalone');
     expect(manifest.start_url).toBe('/');
     expect(manifest.orientation).toBe('portrait');
@@ -43,6 +47,8 @@ describe('PWA public assets', () => {
   it('ships an offline fallback page without pretending private books are available offline', () => {
     expect(offlineHtml).toContain('Novel-TNN');
     expect(offlineHtml).toContain('offline');
-    expect(offlineHtml).toContain('Cached chapters only');
+    expect(offlineHtml).toContain('Bạn đang offline');
+    expect(offlineHtml).toContain('Chỉ chương/audio đã cache thủ công');
+    expect(offlineHtml).toContain('Thử kết nối lại');
   });
 });
