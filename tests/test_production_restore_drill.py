@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -11,6 +12,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "production_restore_drill.sh"
+RUNBOOKS = (
+    ROOT / "docs" / "production-backup-restore-runbook.md",
+    ROOT / "docs" / "operations" / "runtime-alerts-and-rollback.md",
+)
 PINNED_IMAGE = "novel-pipeline-api@sha256:" + "a" * 64
 MALICIOUS_IMAGE = "--env=IGNORED@sha256:" + "a" * 64
 
@@ -19,6 +24,7 @@ def _validate_config(
     backup_dir: Path,
     *,
     prepare_data_dir: bool = True,
+    prepare_drill_root: bool = True,
     prepare_receipt_dir: bool = True,
     **overrides: str,
 ) -> subprocess.CompletedProcess[str]:
@@ -27,10 +33,14 @@ def _validate_config(
         (production_root / "data").mkdir(parents=True, exist_ok=True)
     if prepare_receipt_dir:
         (production_root / "data" / "logs" / "runtime").mkdir(parents=True, exist_ok=True)
+    drill_root = backup_dir.parent / "drills"
+    if prepare_drill_root:
+        drill_root.mkdir(mode=0o700, exist_ok=True)
+        drill_root.chmod(0o700)
     environment = {
         **os.environ,
         "BACKUP_LOCAL_DIR": str(backup_dir),
-        "BACKUP_DRILL_ROOT": str(backup_dir.parent / "drills"),
+        "BACKUP_DRILL_ROOT": str(drill_root),
         "BACKUP_IMAGE": PINNED_IMAGE,
         "RECOVERY_PRODUCER_VERSION": "runtime-hardening-20260718-r1",
         "BACKUP_PASSPHRASE": "test-only-passphrase",
@@ -52,7 +62,7 @@ def test_restore_runner_rejects_missing_passphrase_before_creating_a_drill(tmp_p
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
 
-    result = _validate_config(backup_dir, BACKUP_PASSPHRASE="")
+    result = _validate_config(backup_dir, prepare_drill_root=False, BACKUP_PASSPHRASE="")
 
     assert result.returncode == 2
     assert "BACKUP_PASSPHRASE" in result.stderr
@@ -175,6 +185,10 @@ def test_restore_runner_rejects_a_drill_root_in_the_live_data_tree(
     backup_dir.mkdir()
     data_dir = tmp_path / "production" / "data"
     drill_root = data_dir if drill_location == "equal" else data_dir / "restore-drills"
+    (data_dir / "logs" / "runtime").mkdir(parents=True)
+    data_dir.chmod(0o700)
+    if drill_location == "descendant":
+        drill_root.mkdir(mode=0o700)
 
     result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(drill_root))
 
@@ -196,19 +210,142 @@ def test_restore_runner_rejects_an_existing_drill_root_symlinked_into_live_data(
     result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(supplied_drill_root))
 
     assert result.returncode == 2
-    assert "BACKUP_DRILL_ROOT must be outside RESTORE_DATA_DIR" in result.stderr
+    assert "canonical non-symlink directory" in result.stderr
 
 
 def test_restore_runner_accepts_a_canonical_sibling_drill_root(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
     drill_root = tmp_path / "restore-drills"
-    drill_root.mkdir()
+    drill_root.mkdir(mode=0o700)
 
     result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(drill_root))
 
     assert result.returncode == 0, result.stderr
     assert "restore drill configuration validated" in result.stdout
+
+
+def test_restore_runner_rejects_a_missing_drill_root_before_it_can_be_swapped_into_live_data(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    data_dir = tmp_path / "production" / "data"
+    receipt_dir = data_dir / "logs" / "runtime"
+    receipt_dir.mkdir(parents=True)
+    drill_root = tmp_path / "missing-drills"
+    production_env = tmp_path / "production.env"
+    production_env.write_text("", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' restored-20260724-120000\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    before = sorted(path.relative_to(data_dir) for path in data_dir.rglob("*"))
+    command = f"""source {shlex.quote(str(RUNNER))}
+BACKUP_LOCAL_DIR={shlex.quote(str(backup_dir))}
+BACKUP_DRILL_ROOT={shlex.quote(str(drill_root))}
+BACKUP_IMAGE={shlex.quote(PINNED_IMAGE)}
+BACKUP_PASSPHRASE=test-passphrase
+PRODUCTION_ENV={shlex.quote(str(production_env))}
+RESTORE_ARTIFACT_SOURCE_ROOT={shlex.quote(str(data_dir.parent))}
+RESTORE_DATA_DIR={shlex.quote(str(data_dir))}
+RECOVERY_RECEIPT_DIR={shlex.quote(str(receipt_dir))}
+RECOVERY_PRODUCER_VERSION=release-a
+validate_config
+ln -s -- "$RESTORE_DATA_DIR" "$BACKUP_DRILL_ROOT"
+restore_into_new_drill novel-pipeline-backup-20260724-120000.tar.gz.enc >/dev/null
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=ROOT,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "BACKUP_DRILL_ROOT must be an existing" in result.stderr
+    assert sorted(path.relative_to(data_dir) for path in data_dir.rglob("*")) == before
+
+
+def test_restore_runner_rejects_existing_drill_root_substitution_without_touching_live_data(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    data_dir = tmp_path / "production" / "data"
+    receipt_dir = data_dir / "logs" / "runtime"
+    receipt_dir.mkdir(parents=True)
+    drill_root = tmp_path / "drills"
+    drill_root.mkdir(mode=0o700)
+    held_root = tmp_path / "original-drills"
+    production_env = tmp_path / "production.env"
+    production_env.write_text("", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' restored-20260724-120000\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    before = sorted(path.relative_to(data_dir) for path in data_dir.rglob("*"))
+    command = f"""source {shlex.quote(str(RUNNER))}
+BACKUP_LOCAL_DIR={shlex.quote(str(backup_dir))}
+BACKUP_DRILL_ROOT={shlex.quote(str(drill_root))}
+BACKUP_IMAGE={shlex.quote(PINNED_IMAGE)}
+BACKUP_PASSPHRASE=test-passphrase
+PRODUCTION_ENV={shlex.quote(str(production_env))}
+RESTORE_ARTIFACT_SOURCE_ROOT={shlex.quote(str(data_dir.parent))}
+RESTORE_DATA_DIR={shlex.quote(str(data_dir))}
+RECOVERY_RECEIPT_DIR={shlex.quote(str(receipt_dir))}
+RECOVERY_PRODUCER_VERSION=release-a
+validate_config
+mv -- "$BACKUP_DRILL_ROOT" {shlex.quote(str(held_root))}
+ln -s -- "$RESTORE_DATA_DIR" "$BACKUP_DRILL_ROOT"
+restore_into_new_drill novel-pipeline-backup-20260724-120000.tar.gz.enc >/dev/null
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=ROOT,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "BACKUP_DRILL_ROOT identity changed" in result.stderr
+    assert sorted(path.relative_to(data_dir) for path in data_dir.rglob("*")) == before
+
+
+def test_recovery_runbook_bash_blocks_are_fail_fast_and_syntax_valid() -> None:
+    checked_blocks = 0
+    for document in RUNBOOKS:
+        content = document.read_text(encoding="utf-8")
+        blocks = re.findall(r"^```bash\n(.*?)^```$", content, flags=re.MULTILINE | re.DOTALL)
+        assert blocks, document
+        for block_number, block in enumerate(blocks, start=1):
+            checked_blocks += 1
+            assert block.splitlines()[0] == "set -euo pipefail", (
+                f"{document}: bash block {block_number} lacks fail-fast semantics"
+            )
+            result = subprocess.run(
+                ["bash", "-n"],
+                input=block,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert result.returncode == 0, f"{document}: bash block {block_number}: {result.stderr}"
+    assert checked_blocks == 13
 
 
 def test_restore_static_validation_does_not_inspect_or_create_the_private_receipt_path(
@@ -236,7 +373,7 @@ def test_restore_static_validation_does_not_inspect_or_create_the_private_receip
     assert result.returncode == 0, result.stderr
     assert "restore drill configuration validated" in result.stdout
     assert not (tmp_path / "production" / "data" / "logs").exists()
-    assert not (tmp_path / "drills").exists()
+    assert list((tmp_path / "drills").iterdir()) == []
     assert not marker.exists()
 
 
@@ -485,7 +622,7 @@ def test_every_restore_docker_run_terminates_options_before_the_image_operand(
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
     drill_root = tmp_path / "drills"
-    drill_root.mkdir()
+    drill_root.mkdir(mode=0o700)
     restored_dir = tmp_path / "restored-20260724-120000"
     restored_dir.mkdir()
     production_env = tmp_path / "production.env"
@@ -528,6 +665,7 @@ RESTORE_DATA_DIR={shlex.quote(str(data_dir))}
 RECOVERY_RECEIPT_DIR={shlex.quote(str(receipt_dir))}
 RECOVERY_PRODUCER_VERSION=release-a
 RESTORE_DATA_ROOT_IDENTITY="$(stat --format='%d:%i' -- "$RESTORE_DATA_DIR")"
+BACKUP_DRILL_ROOT_IDENTITY="$(stat --format='%d:%i' -- "$BACKUP_DRILL_ROOT")"
 verify_recovery_publisher_contract
 restore_into_new_drill novel-pipeline-backup-20260724-120000.tar.gz.enc >/dev/null
 validate_restored_db_and_artifacts {shlex.quote(str(restored_dir))} {shlex.quote(str(report_path))}
@@ -701,7 +839,7 @@ def test_restore_validation_succeeds_before_publication_failure_and_preserves_pr
     production_root = tmp_path / "production"
     receipt_dir = production_root / "data" / "logs" / "runtime"
     backup_dir.mkdir()
-    drill_root.mkdir()
+    drill_root.mkdir(mode=0o700)
     receipt_dir.mkdir(parents=True)
     previous_receipt = b"previous-restore-receipt\n"
     receipt_path = receipt_dir / "restore-drill.receipt.json"
@@ -717,7 +855,12 @@ validate_config() {{ :; }}
 verify_recovery_publisher_contract() {{ printf '%s\\n' preflight >>{shlex.quote(str(event_log))}; }}
 select_archive() {{ printf '%s\\n' novel-pipeline-backup-20260725-120000.tar.gz.enc; }}
 verify_backup_input() {{ printf '%s\\n' verify >>{shlex.quote(str(event_log))}; }}
-restore_into_new_drill() {{ printf '%s\\n' restore >>{shlex.quote(str(event_log))}; printf '%s\\n' {shlex.quote(str(restored_dir))}; }}
+restore_into_new_drill() {{
+  printf '%s\\n' restore >>{shlex.quote(str(event_log))}
+  printf '%s\\n' {shlex.quote(str(restored_dir))}
+  printf '%s\\n' 1:2
+}}
+verify_drill_directory_identity() {{ :; }}
 validate_restored_db_and_artifacts() {{
   printf '%s\\n' db >>{shlex.quote(str(event_log))}
   printf '%s\\n' '{{"artifact_paths_scanned": 0}}' >"$2"

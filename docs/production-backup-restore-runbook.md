@@ -19,8 +19,10 @@ Default policy:
 
 The runner deletes only expired files whose names match
 `novel-pipeline-backup-*.tar.gz.enc` and their matching sidecar/checksum files.
-It never removes a drill directory. Drill cleanup requires separate operator
-approval.
+It never removes populated drill data or evidence. If pathname identity changes
+during descriptor-backed creation, it attempts only to remove the newly created
+empty child relative to the held root descriptor. Any other drill cleanup
+requires separate operator approval.
 
 ## One-time secure configuration
 
@@ -33,9 +35,11 @@ domain or a custom domain to backup data.
 Create the private configuration from the tracked template:
 
 ```bash
+set -euo pipefail
 install -d -m 700 "$HOME/.config/novel-tnn"
 install -m 600 deploy/production/backup.env.example \
   "$HOME/.config/novel-tnn/backup.env"
+install -d -m 0700 "$HOME/Novel-TNN-restore-drills"
 ```
 
 Set these values in the external file:
@@ -67,6 +71,7 @@ Provision the dedicated receipt directory without granting the API access to
 the archive tree:
 
 ```bash
+set -euo pipefail
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /home/thenam176/Novel-TNN/data/logs/runtime
 ```
@@ -78,35 +83,83 @@ as `wrong_release` by the authenticated runtime status endpoints.
 
 ## Stage the schedule with the timer stopped
 
-Stop and disable the timer before replacing any recovery runner, unit, drop-in,
-or external configuration. Capture the currently deployed bytes first. Keep
-the printed rollback directory for the entire rollout and incident-review
-window:
+Stop both the timer and its service and prove both are inactive before creating
+the staging snapshot or replacing any recovery runner, unit, drop-in, or
+external configuration. Capture and hash the complete currently deployed state
+first. Keep the printed rollback directory for the entire rollout and
+incident-review window:
 
 ```bash
-systemctl --user disable --now novel-tnn-backup.timer
+set -euo pipefail
+
+recovery_units=(
+  novel-tnn-backup.service
+  novel-tnn-backup.timer
+  novel-tnn-restore-drill.service
+)
+systemctl --user stop novel-tnn-backup.timer novel-tnn-backup.service
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  state="$(systemctl --user show "$unit" --property=ActiveState --value)"
+  [[ "$state" == "inactive" ]] || { printf '%s is %s, expected inactive\n' "$unit" "$state" >&2; exit 1; }
+done
+systemctl --user disable novel-tnn-backup.timer
 
 export RECOVERY_ROLLBACK_DIR="$HOME/.local/state/novel-tnn/recovery-rollout-$(date -u +%Y%m%dT%H%M%SZ)"
+umask 077
 install -d -m 0700 \
   "$RECOVERY_ROLLBACK_DIR/runners" \
   "$RECOVERY_ROLLBACK_DIR/systemd-user"
-install -m 0755 \
-  /home/thenam176/Novel-TNN/scripts/production_backup.sh \
-  /home/thenam176/Novel-TNN/scripts/production_restore_drill.sh \
-  "$RECOVERY_ROLLBACK_DIR/runners/"
-install -m 0600 "$HOME/.config/novel-tnn/backup.env" \
-  "$RECOVERY_ROLLBACK_DIR/backup.env"
 
-for unit in novel-tnn-backup.service novel-tnn-backup.timer novel-tnn-restore-drill.service; do
+for runner in production_backup.sh production_restore_drill.sh; do
+  deployed="/home/thenam176/Novel-TNN/scripts/$runner"
+  [[ -f "$deployed" && ! -L "$deployed" ]] || { printf 'unsafe runner: %s\n' "$runner" >&2; exit 1; }
+  install -m 0755 "$deployed" "$RECOVERY_ROLLBACK_DIR/runners/$runner"
+done
+
+private_env="$HOME/.config/novel-tnn/backup.env"
+[[ -f "$private_env" && ! -L "$private_env" ]] || { printf 'backup.env is not a regular file\n' >&2; exit 1; }
+[[ "$(stat --format='%u:%a' -- "$private_env")" == "$(id -u):600" ]] \
+  || { printf 'backup.env must be invoking-UID owned mode 0600\n' >&2; exit 1; }
+install -m 0600 "$private_env" "$RECOVERY_ROLLBACK_DIR/backup.env"
+
+: >"$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"
+for unit in "${recovery_units[@]}"; do
   unit_path="$HOME/.config/systemd/user/$unit"
   drop_in_path="${unit_path}.d"
-  if [[ -f "$unit_path" ]]; then
-    cp -a -- "$unit_path" "$RECOVERY_ROLLBACK_DIR/systemd-user/"
-  fi
+  [[ -f "$unit_path" && ! -L "$unit_path" ]] || { printf 'unsafe or missing unit: %s\n' "$unit" >&2; exit 1; }
+  install -m 0644 "$unit_path" "$RECOVERY_ROLLBACK_DIR/systemd-user/$unit"
   if [[ -d "$drop_in_path" ]]; then
+    [[ ! -L "$drop_in_path" ]] || { printf 'symlinked drop-in directory: %s\n' "$unit" >&2; exit 1; }
+    if find "$drop_in_path" -type l -print -quit | grep -q .; then
+      printf 'symlink in drop-ins: %s\n' "$unit" >&2
+      exit 1
+    fi
     cp -a -- "$drop_in_path" "$RECOVERY_ROLLBACK_DIR/systemd-user/"
+    printf '%s drop-in=present\n' "$unit" >>"$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"
+  else
+    [[ ! -e "$drop_in_path" && ! -L "$drop_in_path" ]] \
+      || { printf 'invalid drop-in path: %s\n' "$unit" >&2; exit 1; }
+    printf '%s drop-in=absent\n' "$unit" >>"$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"
   fi
 done
+
+(
+  cd "$RECOVERY_ROLLBACK_DIR"
+  find backup.env rollback-presence.txt runners systemd-user -type f -print0 \
+    | sort -z \
+    | xargs -0 sha256sum
+) >"$RECOVERY_ROLLBACK_DIR/SHA256SUMS"
+chmod 0600 "$RECOVERY_ROLLBACK_DIR/SHA256SUMS" "$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"
+(cd "$RECOVERY_ROLLBACK_DIR" && sha256sum --check SHA256SUMS)
+
+set -a
+. "$RECOVERY_ROLLBACK_DIR/backup.env"
+set +a
+backup_image_pattern='^([a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$'
+[[ "$BACKUP_IMAGE" != -* && "$BACKUP_IMAGE" =~ $backup_image_pattern ]] \
+  || { printf 'frozen BACKUP_IMAGE is not digest pinned\n' >&2; exit 1; }
+[[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+  || { printf 'frozen RECOVERY_PRODUCER_VERSION is invalid\n' >&2; exit 1; }
 printf 'rollback directory: %s\n' "$RECOVERY_ROLLBACK_DIR"
 ```
 
@@ -114,6 +167,14 @@ Deploy only clean committed runner bytes and reviewed units, but do not enable
 or start the timer. The timer must remain stopped through every gate below:
 
 ```bash
+set -euo pipefail
+systemctl --user stop novel-tnn-backup.timer novel-tnn-backup.service
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  state="$(systemctl --user show "$unit" --property=ActiveState --value)"
+  [[ "$state" == "inactive" ]] || { printf '%s is %s, expected inactive\n' "$unit" "$state" >&2; exit 1; }
+done
+systemctl --user disable novel-tnn-backup.timer
+
 chmod 0755 scripts/production_backup.sh scripts/production_restore_drill.sh
 install -d -m 0700 "$HOME/.config/systemd/user"
 install -m 0644 deploy/systemd/user/novel-tnn-backup.service \
@@ -121,7 +182,10 @@ install -m 0644 deploy/systemd/user/novel-tnn-backup.service \
   deploy/systemd/user/novel-tnn-restore-drill.service \
   "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
-systemctl --user disable --now novel-tnn-backup.timer
+systemctl --user stop novel-tnn-backup.timer novel-tnn-backup.service
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
 ```
 
 Load the private configuration into the operator shell without printing it,
@@ -129,6 +193,10 @@ then run both static validations. These commands perform no network or Docker
 operation:
 
 ```bash
+set -euo pipefail
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
 set -a
 . "$HOME/.config/novel-tnn/backup.env"
 set +a
@@ -140,6 +208,10 @@ Run the image-owned publisher preflight while the timer remains stopped. It
 receives no backup credentials and has no network:
 
 ```bash
+set -euo pipefail
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
 BACKUP_DATA_ROOT_IDENTITY="$(stat --format='%d:%i' -- "$BACKUP_DATA_DIR")"
 docker run --rm --network none --user 10001:10001 \
   --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data-root,readonly" \
@@ -166,8 +238,15 @@ the timer. Each runner repeats the image-owned preflight before processing an
 archive:
 
 ```bash
+set -euo pipefail
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
 /home/thenam176/Novel-TNN/scripts/production_backup.sh
 /home/thenam176/Novel-TNN/scripts/production_restore_drill.sh
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
 ```
 
 Success requires all of the following:
@@ -197,10 +276,22 @@ the archive leaves the host.
 ## Isolated restore drill
 
 The restore drill selects the newest encrypted archive, verifies its local
-checksum/READY metadata, creates a fresh directory below
-`$HOME/Novel-TNN-restore-drills`, and never writes to live data.
-Static validation rejects a drill root equal to or below the canonical live
-data directory, including an existing symlink alias into that tree.
+checksum/READY metadata, and creates a fresh directory below the already
+existing `$HOME/Novel-TNN-restore-drills` without writing to live data. The
+configured root must be canonical, contain no symlink component, be owned by
+the invoking UID, and have exact mode `0700`; it is never created by the
+runner. Static validation rejects a drill root equal to or below the canonical
+live data directory.
+
+Creation opens the validated root with `O_DIRECTORY|O_NOFOLLOW`, creates the
+random child relative to that descriptor, and checks root and child
+device/inode identity before and after pathname-based use. A Docker daemon does
+not inherit the operator process's directory descriptor, so a portable
+descriptor-backed bind mount is not available without daemon-specific
+assumptions. Exact owner/mode checks prevent other UIDs from substituting the
+path; an attacker already running as the same UID remains inside the documented
+host-account trust boundary and could still race between a final identity check
+and daemon pathname resolution.
 
 It validates:
 
@@ -219,6 +310,7 @@ Verify both receipts are fresh for the reviewed producer version before the
 timer is enabled:
 
 ```bash
+set -euo pipefail
 .venv/bin/python - "$BACKUP_DATA_DIR" "$RECOVERY_PRODUCER_VERSION" <<'PY'
 from pathlib import Path
 import sys
@@ -241,7 +333,12 @@ may the timer be enabled and started. Verify that systemd computed a real next
 elapse time:
 
 ```bash
+set -euo pipefail
 systemctl --user enable --now novel-tnn-backup.timer
+systemctl --user is-enabled --quiet novel-tnn-backup.timer
+[[ "$(systemctl --user show novel-tnn-backup.timer --property=ActiveState --value)" == "active" ]]
+backup_service_state="$(systemctl --user show novel-tnn-backup.service --property=ActiveState --value)"
+[[ -n "$backup_service_state" && "$backup_service_state" != "failed" ]]
 next_elapse="$(systemctl --user show novel-tnn-backup.timer \
   --property=NextElapseUSecRealtime --value)"
 [[ -n "$next_elapse" && "$next_elapse" != "n/a" ]]
@@ -261,10 +358,55 @@ runner, config, units, and drop-ins, then restore the frozen runner bytes,
 `BACKUP_IMAGE`, `RECOVERY_PRODUCER_VERSION`, and systemd state:
 
 ```bash
-systemctl --user disable --now novel-tnn-backup.timer
-
+set -euo pipefail
 export RECOVERY_ROLLBACK_DIR=/home/thenam176/.local/state/novel-tnn/recovery-rollout-YYYYMMDDTHHMMSSZ
-rollback_attempt="$RECOVERY_ROLLBACK_DIR/rejected-$(date -u +%Y%m%dT%H%M%SZ)"
+
+systemctl --user stop novel-tnn-backup.timer novel-tnn-backup.service
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  state="$(systemctl --user show "$unit" --property=ActiveState --value)"
+  [[ "$state" == "inactive" ]] || { printf '%s is %s, expected inactive\n' "$unit" "$state" >&2; exit 1; }
+done
+
+[[ -d "$RECOVERY_ROLLBACK_DIR" && ! -L "$RECOVERY_ROLLBACK_DIR" ]]
+[[ "$(stat --format='%u:%a' -- "$RECOVERY_ROLLBACK_DIR")" == "$(id -u):700" ]]
+[[ -f "$RECOVERY_ROLLBACK_DIR/SHA256SUMS" && ! -L "$RECOVERY_ROLLBACK_DIR/SHA256SUMS" ]]
+[[ -f "$RECOVERY_ROLLBACK_DIR/rollback-presence.txt" && ! -L "$RECOVERY_ROLLBACK_DIR/rollback-presence.txt" ]]
+(cd "$RECOVERY_ROLLBACK_DIR" && sha256sum --check SHA256SUMS)
+
+for runner in production_backup.sh production_restore_drill.sh; do
+  frozen="$RECOVERY_ROLLBACK_DIR/runners/$runner"
+  [[ -f "$frozen" && ! -L "$frozen" && "$(stat --format='%a' -- "$frozen")" == "755" ]]
+done
+frozen_env="$RECOVERY_ROLLBACK_DIR/backup.env"
+[[ -f "$frozen_env" && ! -L "$frozen_env" ]]
+[[ "$(stat --format='%u:%a' -- "$frozen_env")" == "$(id -u):600" ]]
+set -a
+. "$frozen_env"
+set +a
+frozen_backup_image="$BACKUP_IMAGE"
+frozen_producer_version="$RECOVERY_PRODUCER_VERSION"
+backup_image_pattern='^([a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$'
+[[ "$frozen_backup_image" != -* && "$frozen_backup_image" =~ $backup_image_pattern ]]
+[[ "$frozen_producer_version" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]
+
+for unit in novel-tnn-backup.service novel-tnn-backup.timer novel-tnn-restore-drill.service; do
+  frozen_unit="$RECOVERY_ROLLBACK_DIR/systemd-user/$unit"
+  [[ -f "$frozen_unit" && ! -L "$frozen_unit" && "$(stat --format='%a' -- "$frozen_unit")" == "644" ]]
+  if grep -Fxq "$unit drop-in=present" "$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"; then
+    frozen_drop_in="${frozen_unit}.d"
+    [[ -d "$frozen_drop_in" && ! -L "$frozen_drop_in" ]]
+    ! find "$frozen_drop_in" -type l -print -quit | grep -q .
+  elif grep -Fxq "$unit drop-in=absent" "$RECOVERY_ROLLBACK_DIR/rollback-presence.txt"; then
+    [[ ! -e "${frozen_unit}.d" && ! -L "${frozen_unit}.d" ]]
+  else
+    printf 'rollback presence is incomplete for %s\n' "$unit" >&2
+    exit 1
+  fi
+done
+
+systemctl --user disable novel-tnn-backup.timer
+umask 077
+rollback_attempt="$(mktemp -d "$RECOVERY_ROLLBACK_DIR/rejected-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 install -d -m 0700 "$rollback_attempt/runners" "$rollback_attempt/systemd-user"
 
 for runner in production_backup.sh production_restore_drill.sh; do
@@ -273,8 +415,7 @@ for runner in production_backup.sh production_restore_drill.sh; do
   install -m 0755 "$RECOVERY_ROLLBACK_DIR/runners/$runner" "$deployed"
 done
 
-install -m 0600 "$HOME/.config/novel-tnn/backup.env" \
-  "$rollback_attempt/backup.env"
+cp -a -- "$HOME/.config/novel-tnn/backup.env" "$rollback_attempt/backup.env"
 install -m 0600 "$RECOVERY_ROLLBACK_DIR/backup.env" \
   "$HOME/.config/novel-tnn/backup.env"
 
@@ -297,9 +438,24 @@ for unit in novel-tnn-backup.service novel-tnn-backup.timer novel-tnn-restore-dr
 done
 
 systemctl --user daemon-reload
-systemctl --user disable --now novel-tnn-backup.timer
-awk -F= '$1 == "BACKUP_IMAGE" || $1 == "RECOVERY_PRODUCER_VERSION" {print}' \
-  "$HOME/.config/novel-tnn/backup.env"
+systemctl --user stop novel-tnn-backup.timer novel-tnn-backup.service
+systemctl --user disable novel-tnn-backup.timer
+for unit in novel-tnn-backup.timer novel-tnn-backup.service; do
+  [[ "$(systemctl --user show "$unit" --property=ActiveState --value)" == "inactive" ]]
+done
+
+for runner in production_backup.sh production_restore_drill.sh; do
+  cmp --silent "$RECOVERY_ROLLBACK_DIR/runners/$runner" \
+    "/home/thenam176/Novel-TNN/scripts/$runner"
+done
+cmp --silent "$RECOVERY_ROLLBACK_DIR/backup.env" "$HOME/.config/novel-tnn/backup.env"
+set -a
+. "$HOME/.config/novel-tnn/backup.env"
+set +a
+[[ "$BACKUP_IMAGE" == "$frozen_backup_image" ]]
+[[ "$RECOVERY_PRODUCER_VERSION" == "$frozen_producer_version" ]]
+printf 'rollback snapshot retained: %s\nrejected rollout retained: %s\n' \
+  "$RECOVERY_ROLLBACK_DIR" "$rollback_attempt"
 ```
 
 Do not automatically delete or overwrite receipts, archives, restored drill
