@@ -1,0 +1,5 @@
+services:
+  api:
+    image: novel-pipeline-api:reader-context-lock-production-20260730-r1
+  import-worker:
+    image: novel-pipeline-import-worker:reader-context-lock-production-20260730-r1
