@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chapter, JobStatus, TtsJobStatus } from '../../api/types';
-import { useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
+import { friendlyAudioError, useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
 
 const chapters: Chapter[] = [
   { id: 101, book_id: 42, chapter_number: 1, title: 'Sơn biên tiểu thôn', status: 'translated', audio_path: null, has_translation: true },
@@ -61,6 +61,14 @@ function deferred<T>() {
 }
 
 describe('useReaderAudio', () => {
+  it('keeps GPU-only recovery guidance and never recommends CPU synthesis', () => {
+    const message = friendlyAudioError('GPU is required but unavailable. Configure TTS_DEVICE=cpu');
+
+    expect(message).toContain('GPU');
+    expect(message).toContain('CUDA');
+    expect(message.toLowerCase()).not.toContain('cpu');
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();

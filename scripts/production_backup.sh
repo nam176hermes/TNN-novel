@@ -61,8 +61,6 @@ validate_config() {
   require_absolute_path BACKUP_LOCAL_DIR
   require_absolute_path RECOVERY_RECEIPT_DIR
   [[ -d "$BACKUP_DATA_DIR" ]] || fail "BACKUP_DATA_DIR does not exist"
-  [[ -d "$RECOVERY_RECEIPT_DIR" && ! -L "$RECOVERY_RECEIPT_DIR" ]] \
-    || fail "RECOVERY_RECEIPT_DIR must be a real existing directory"
   [[ "$BACKUP_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] \
     || fail "BACKUP_IMAGE must be pinned by sha256 digest"
   [[ "$RECOVERY_PRODUCER_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
@@ -74,9 +72,9 @@ validate_config() {
   validate_r2_destination
 
   local data_root backup_root receipt_root
-  data_root="$(realpath -m "$BACKUP_DATA_DIR")"
-  backup_root="$(realpath -m "$BACKUP_LOCAL_DIR")"
-  receipt_root="$(realpath -e "$RECOVERY_RECEIPT_DIR")"
+  data_root="$(realpath -m -- "$BACKUP_DATA_DIR")"
+  backup_root="$(realpath -m -- "$BACKUP_LOCAL_DIR")"
+  receipt_root="$(realpath -m -- "$RECOVERY_RECEIPT_DIR")"
   [[ "$receipt_root" == "$data_root/logs/runtime" ]] \
     || fail "RECOVERY_RECEIPT_DIR must be the fixed data/logs/runtime directory"
   [[ "$backup_root" != "$data_root" && "$backup_root" != "$data_root"/* ]] \
@@ -91,6 +89,28 @@ verify_publisher_image_release() {
   )"
   [[ "$image_release" == "$RECOVERY_PRODUCER_VERSION" ]] \
     || fail "BACKUP_IMAGE release does not match RECOVERY_PRODUCER_VERSION"
+}
+
+verify_publisher_authority() {
+  docker run --rm --network none --user 10001:10001 \
+    --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
+    "$BACKUP_IMAGE" \
+    python -c '
+# publisher-authority-preflight
+import os
+import stat
+
+target = "/receipts"
+metadata = os.stat(target, follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("receipt publisher target is not a directory")
+if (metadata.st_uid, metadata.st_gid) != (10001, 10001):
+    raise SystemExit("receipt publisher target owner is invalid")
+if stat.S_IMODE(metadata.st_mode) != 0o700:
+    raise SystemExit("receipt publisher target mode is invalid")
+if not os.access(target, os.W_OK | os.X_OK):
+    raise SystemExit("receipt publisher lacks directory authority")
+'
 }
 
 run_container_backup() {
@@ -443,6 +463,7 @@ main() {
   command -v sha256sum >/dev/null || fail "sha256sum is required"
   curl --help all | grep --quiet -- '--aws-sigv4' || fail "curl with --aws-sigv4 support is required"
   verify_publisher_image_release
+  verify_publisher_authority
 
   umask 077
   install -d -m 0700 "$BACKUP_LOCAL_DIR"

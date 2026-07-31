@@ -574,6 +574,20 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   await expect(readerMore).toBeHidden();
   await expect(readerMoreTrigger).toBeFocused();
 
+  const readerSettingsTrigger = page.getByRole('button', { name: 'Cài đặt chữ', exact: true });
+  await readerSettingsTrigger.focus();
+  await page.keyboard.press('Enter');
+  const readerSettings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
+  const closeReaderSettings = readerSettings.getByRole('button', { name: 'Đóng cài đặt đọc' });
+  await expect(closeReaderSettings).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(readerSettings.getByLabel('Toàn màn hình')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(closeReaderSettings).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(readerSettings).toBeHidden();
+  await expect(readerSettingsTrigger).toBeFocused();
+
   const undersizedReaderButtons = await page.locator('button:visible').evaluateAll((buttons) => (
     buttons
       .map((button) => {
@@ -744,6 +758,67 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(filePreview).toHaveCSS('padding', '18px');
   await expect(filePreview).toHaveCSS('max-height', 'none');
   await expect(filePreview).toHaveCSS('overflow', 'visible');
+});
+
+test('mobile workflow viewport ends above the fixed navigation', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 360, height: 740 });
+  await authenticatedPage(page, state);
+
+  const mainBox = await page.locator('.workflow-main').boundingBox();
+  const navBox = await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' }).boundingBox();
+  expect(mainBox).not.toBeNull();
+  expect(navBox).not.toBeNull();
+  expect((mainBox?.y ?? 0) + (mainBox?.height ?? 0)).toBeLessThanOrEqual((navBox?.y ?? 0) + 1);
+});
+
+test('short desktop login keeps the install prompt outside the login panel', async ({ page }) => {
+  const state: MockState = { imported: false, translated: false, translateRequests: [] };
+  await installApiMock(page, state);
+  await page.setViewportSize({ width: 1280, height: 577 });
+  await page.goto('/');
+  await page.evaluate(() => {
+    const installEvent = new Event('beforeinstallprompt', { cancelable: true });
+    Object.defineProperties(installEvent, {
+      prompt: { value: async () => undefined },
+      userChoice: { value: Promise.resolve({ outcome: 'dismissed', platform: 'web' }) },
+    });
+    window.dispatchEvent(installEvent);
+  });
+
+  const prompt = page.locator('.pwa-install-prompt');
+  const loginPanel = page.locator('.login-panel');
+  await expect(prompt).toBeVisible();
+  await expect(loginPanel).toBeVisible();
+  const promptBox = await prompt.boundingBox();
+  const loginBox = await loginPanel.boundingBox();
+  expect(promptBox).not.toBeNull();
+  expect(loginBox).not.toBeNull();
+  const separated = Boolean(promptBox && loginBox && (
+    promptBox.x + promptBox.width <= loginBox.x
+    || promptBox.x >= loginBox.x + loginBox.width
+    || promptBox.y + promptBox.height <= loginBox.y
+    || promptBox.y >= loginBox.y + loginBox.height
+  ));
+  expect(separated).toBe(true);
+});
+
+test('@mobile-device runs the authenticated shell with a real touch-device profile', async ({ page, isMobile }) => {
+  test.skip(!isMobile, 'Requires the separately approved mobile-device Playwright project.');
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await authenticatedPage(page, state);
+
+  const deviceProfile = await page.evaluate(() => ({
+    coarse: window.matchMedia('(pointer: coarse)').matches,
+    touchPoints: navigator.maxTouchPoints,
+    width: window.innerWidth,
+  }));
+  expect(deviceProfile).toMatchObject({ coarse: true, width: 412 });
+  expect(deviceProfile.touchPoints).toBeGreaterThan(0);
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await expect(mobileNav).toBeVisible();
+  await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
 });
 
 test('visible mobile controls use the approved touch-target policy', async ({ page }) => {

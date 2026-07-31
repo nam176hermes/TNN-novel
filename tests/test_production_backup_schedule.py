@@ -16,8 +16,14 @@ RUNBOOK = ROOT / "docs" / "production-backup-restore-runbook.md"
 PINNED_IMAGE = "novel-pipeline-api@sha256:" + "a" * 64
 
 
-def _validate_config(data_dir: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
-    (data_dir / "logs" / "runtime").mkdir(parents=True, exist_ok=True)
+def _validate_config(
+    data_dir: Path,
+    *,
+    prepare_receipt: bool = True,
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
+    if prepare_receipt:
+        (data_dir / "logs" / "runtime").mkdir(parents=True, exist_ok=True)
     environment = {
         **os.environ,
         "BACKUP_DATA_DIR": str(data_dir),
@@ -62,6 +68,21 @@ def test_backup_runner_accepts_complete_safe_configuration(tmp_path: Path) -> No
 
     assert result.returncode == 0, result.stderr
     assert "backup configuration validated" in result.stdout
+
+
+def test_backup_static_validation_defers_private_receipt_authority_to_publisher(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    result = _validate_config(data_dir, prepare_receipt=False)
+
+    assert result.returncode == 0, result.stderr
+    content = RUNNER.read_text(encoding="utf-8")
+    assert '[[ -d "$RECOVERY_RECEIPT_DIR"' not in content
+    assert 'realpath -e "$RECOVERY_RECEIPT_DIR"' not in content
+    assert "verify_publisher_authority" in content
 
 
 def test_backup_runner_rejects_mutable_image_tag(tmp_path: Path) -> None:
@@ -194,6 +215,9 @@ with Path(sys.argv[1]).open("a", encoding="utf-8") as handle:
 PY
 if [[ "$*" == *NOVEL_RELEASE_ID* ]]; then
   printf '%s\\n' "$MOCK_IMAGE_RELEASE"
+  exit 0
+fi
+if [[ "$*" == *publisher-authority-preflight* ]]; then
   exit 0
 fi
 if [[ " $* " == *" scripts.record_restore_drill_status "* ]]; then

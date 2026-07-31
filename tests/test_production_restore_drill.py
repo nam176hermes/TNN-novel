@@ -11,10 +11,16 @@ RUNNER = ROOT / "scripts" / "production_restore_drill.sh"
 PINNED_IMAGE = "novel-pipeline-api@sha256:" + "a" * 64
 
 
-def _validate_config(backup_dir: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
+def _validate_config(
+    backup_dir: Path,
+    *,
+    prepare_receipt: bool = True,
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
     production_root = backup_dir.parent / "production"
     (production_root / "data").mkdir(parents=True)
-    (production_root / "data" / "logs" / "runtime").mkdir(parents=True)
+    if prepare_receipt:
+        (production_root / "data" / "logs" / "runtime").mkdir(parents=True)
     environment = {
         **os.environ,
         "BACKUP_LOCAL_DIR": str(backup_dir),
@@ -45,6 +51,21 @@ def test_restore_runner_rejects_missing_passphrase_before_creating_a_drill(tmp_p
     assert result.returncode == 2
     assert "BACKUP_PASSPHRASE" in result.stderr
     assert not (tmp_path / "drills").exists()
+
+
+def test_restore_static_validation_defers_private_receipt_authority_to_publisher(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+
+    result = _validate_config(backup_dir, prepare_receipt=False)
+
+    assert result.returncode == 0, result.stderr
+    content = RUNNER.read_text(encoding="utf-8")
+    assert '[[ -d "$RECOVERY_RECEIPT_DIR"' not in content
+    assert 'realpath -e "$RECOVERY_RECEIPT_DIR"' not in content
+    assert "verify_publisher_authority" in content
 
 
 def test_restore_checksum_metadata_must_name_the_selected_archive(tmp_path: Path) -> None:
