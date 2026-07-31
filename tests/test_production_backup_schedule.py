@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -333,6 +334,53 @@ main --upload-existing ../../invalid.tar.gz.enc
     assert not (tmp_path / "backups").exists()
 
 
+@pytest.mark.parametrize(
+    "archive_name",
+    [
+        "novel-pipeline-backup-20200230-120000.tar.gz.enc",
+        "novel-pipeline-backup-29990101-000000.tar.gz.enc",
+    ],
+)
+def test_backup_rejects_invalid_or_future_archive_timestamps_before_upload(
+    tmp_path: Path,
+    archive_name: str,
+) -> None:
+    side_effects = tmp_path / "side-effects"
+    command = f"""
+source {shlex.quote(str(RUNNER))}
+validate_config() {{ :; }}
+curl() {{ [[ "${{1:-}}" == "--help" ]] && printf '%s\n' '  --aws-sigv4 <provider>'; }}
+docker() {{ :; }}
+sha256sum() {{ :; }}
+verify_recovery_publisher_contract() {{ :; }}
+install() {{ :; }}
+verify_local_backup() {{ :; }}
+verify_existing_checksum() {{ printf '%s\n' checksum; }}
+upload_and_verify_remote() {{ printf '%s\n' upload >>{shlex.quote(str(side_effects))}; }}
+read_verified_checksum_hash() {{ printf '%064d\n' 0; }}
+rotate_remote_backups() {{ :; }}
+publish_recovery_receipt() {{ printf '%s\n' receipt >>{shlex.quote(str(side_effects))}; }}
+BACKUP_DATA_DIR={shlex.quote(str(tmp_path / "data"))} \
+BACKUP_LOCAL_DIR={shlex.quote(str(tmp_path / "backups"))} \
+BACKUP_IMAGE={shlex.quote(PINNED_IMAGE)} \
+RECOVERY_PRODUCER_VERSION=release-a \
+main --upload-existing {shlex.quote(archive_name)}
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=ROOT,
+        env=os.environ,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "archive timestamp is invalid or exceeds allowed clock skew" in result.stderr
+    assert not side_effects.exists()
+
+
 @pytest.mark.parametrize("arguments", [[], ["--upload-existing", "novel-pipeline-backup-20260724-120000.tar.gz.enc"]])
 def test_backup_preflight_failure_blocks_normal_and_existing_upload_side_effects(
     tmp_path: Path,
@@ -475,7 +523,7 @@ BACKUP_KEEP_LOCAL=14
 BACKUP_DATA_ROOT_IDENTITY="$(stat --format='%d:%i' -- "$BACKUP_DATA_DIR")"
 verify_recovery_publisher_contract
 run_container_backup >/dev/null
-publish_recovery_receipt sha256:{'a' * 64}
+publish_recovery_receipt sha256:{'a' * 64} 2020-01-02T03:04:05+00:00
 """
     result = subprocess.run(
         ["bash", "-c", command],
@@ -605,7 +653,7 @@ run_container_backup >/dev/null
 if [[ {shlex.quote(switch_before)} == publication ]]; then
   switch_root
 fi
-publish_recovery_receipt sha256:{'a' * 64}
+publish_recovery_receipt sha256:{'a' * 64} 2020-01-02T03:04:05+00:00
 """
     expected_identity = f"{data_dir.stat().st_dev}:{data_dir.stat().st_ino}"
     result = subprocess.run(
@@ -702,7 +750,15 @@ def test_production_backup_runbook_describes_current_multipart_and_resume_contra
 
 @pytest.mark.parametrize(
     "scenario",
-    ["success", "upload_existing", "rotation_failure", "release_mismatch", "remote_archive_corrupt", "publication_failure"],
+    [
+        "success",
+        "upload_existing",
+        "upload_existing_old",
+        "rotation_failure",
+        "release_mismatch",
+        "remote_archive_corrupt",
+        "publication_failure",
+    ],
 )
 def test_backup_runner_creates_and_verifies_an_encrypted_r2_copy(tmp_path: Path, scenario: str) -> None:
     data_dir = tmp_path / "data"
@@ -715,7 +771,7 @@ def test_backup_runner_creates_and_verifies_an_encrypted_r2_copy(tmp_path: Path,
     (data_dir / "chapter.txt").write_text("backup fixture", encoding="utf-8")
     local_dir = tmp_path / "local"
     upload_existing_name = ""
-    if scenario == "upload_existing":
+    if scenario in {"upload_existing", "upload_existing_old"}:
         import hashlib
 
         from scripts.ops import create_encrypted_backup
@@ -728,6 +784,16 @@ def test_backup_runner_creates_and_verifies_an_encrypted_r2_copy(tmp_path: Path,
             keep=14,
             record_event=False,
         )
+        if scenario == "upload_existing_old":
+            existing_sidecar = Path(f"{archive}.manifest.json")
+            old_archive = local_dir / "novel-pipeline-backup-20200102-030405.tar.gz.enc"
+            old_sidecar = Path(f"{old_archive}.manifest.json")
+            archive.rename(old_archive)
+            metadata = json.loads(existing_sidecar.read_text(encoding="utf-8"))
+            metadata["backup_filename"] = old_archive.name
+            existing_sidecar.rename(old_sidecar)
+            old_sidecar.write_text(json.dumps(metadata), encoding="utf-8")
+            archive = old_archive
         upload_existing_name = archive.name
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         (local_dir / f"{archive.name}.sha256").write_text(
@@ -946,7 +1012,7 @@ esac
         check=False,
     )
 
-    if scenario not in {"success", "upload_existing"}:
+    if scenario not in {"success", "upload_existing", "upload_existing_old"}:
         assert result.returncode != 0
         assert receipt_path.read_bytes() == previous_receipt
         if scenario == "release_mismatch":
@@ -972,8 +1038,12 @@ esac
         "remote_metadata_verified": 2,
         "remote_uploads_verified": 3,
     }
-    assert "novel-pipeline-backup-" not in json.dumps(receipt)
     archive = next(local_dir.glob("novel-pipeline-backup-*.tar.gz.enc"))
+    archive_timestamp = datetime.strptime(archive.name[22:37], "%Y%m%d-%H%M%S").replace(
+        tzinfo=timezone.utc
+    )
+    assert receipt["completed_at"] == archive_timestamp.isoformat()
+    assert "novel-pipeline-backup-" not in json.dumps(receipt)
     assert not list(local_dir.glob("novel-pipeline-backup-*.tar.gz"))
     assert (remote_dir / "novel-tnn-production" / archive.name).is_file()
     assert (remote_dir / "novel-tnn-production" / f"{archive.name}.manifest.json").is_file()
@@ -1024,6 +1094,7 @@ esac
     assert "scripts.verify_recovery_publisher" in "\n".join(publisher)
     assert "/preflight/" not in "\n".join(publisher)
     assert publisher[publisher.index("--output") + 1] == "/receipts/external-backup.receipt.json"
+    assert publisher[publisher.index("--completed-at") + 1] == archive_timestamp.isoformat()
     serialized_publisher = json.dumps(publisher)
     for forbidden in (
         "test-only-passphrase",

@@ -166,6 +166,51 @@ def test_restore_runner_rejects_data_roots_with_symlink_components(
     assert "canonical real directory without symlink components" in result.stderr
 
 
+@pytest.mark.parametrize("drill_location", ["equal", "descendant"])
+def test_restore_runner_rejects_a_drill_root_in_the_live_data_tree(
+    tmp_path: Path,
+    drill_location: str,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    data_dir = tmp_path / "production" / "data"
+    drill_root = data_dir if drill_location == "equal" else data_dir / "restore-drills"
+
+    result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(drill_root))
+
+    assert result.returncode == 2
+    assert "BACKUP_DRILL_ROOT must be outside RESTORE_DATA_DIR" in result.stderr
+
+
+def test_restore_runner_rejects_an_existing_drill_root_symlinked_into_live_data(
+    tmp_path: Path,
+) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    data_dir = tmp_path / "production" / "data"
+    aliased_drill_root = data_dir / "restore-drills"
+    aliased_drill_root.mkdir(parents=True)
+    supplied_drill_root = tmp_path / "drills-alias"
+    supplied_drill_root.symlink_to(aliased_drill_root, target_is_directory=True)
+
+    result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(supplied_drill_root))
+
+    assert result.returncode == 2
+    assert "BACKUP_DRILL_ROOT must be outside RESTORE_DATA_DIR" in result.stderr
+
+
+def test_restore_runner_accepts_a_canonical_sibling_drill_root(tmp_path: Path) -> None:
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    drill_root = tmp_path / "restore-drills"
+    drill_root.mkdir()
+
+    result = _validate_config(backup_dir, BACKUP_DRILL_ROOT=str(drill_root))
+
+    assert result.returncode == 0, result.stderr
+    assert "restore drill configuration validated" in result.stdout
+
+
 def test_restore_static_validation_does_not_inspect_or_create_the_private_receipt_path(
     tmp_path: Path,
 ) -> None:
@@ -746,3 +791,23 @@ def test_restore_status_publisher_requires_real_receipt_metadata(tmp_path: Path)
 
     with pytest.raises(TypeError):
         record_success(tmp_path / "receipt.json")
+
+
+def test_restore_status_publisher_rejects_a_timestamp_beyond_allowed_clock_skew(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timezone
+
+    from scripts.record_restore_drill_status import record_success
+
+    status_path = tmp_path / "runtime" / "restore-drill.status.json"
+    with pytest.raises(ValueError, match="completion timestamp exceeds allowed clock skew"):
+        record_success(
+            status_path,
+            archive_hash_id="sha256:" + "a" * 64,
+            validation_counts={"checksum_verified": 1},
+            producer_version="release-a",
+            completed_at=datetime(2999, 1, 1, tzinfo=timezone.utc),
+        )
+
+    assert not status_path.exists()

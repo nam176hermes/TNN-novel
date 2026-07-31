@@ -186,8 +186,33 @@ print(archive.name)
   printf '%s\n' "$archive_name"
 }
 
+archive_completed_at() {
+  local archive_name="$1"
+  .venv/bin/python - "$archive_name" <<'PY'
+from datetime import datetime, timedelta, timezone
+import re
+import sys
+
+match = re.fullmatch(
+    r"novel-pipeline-backup-(?P<stamp>[0-9]{8}-[0-9]{6})"
+    r"(?:-[A-Za-z0-9._-]+)?(?:-[a-f0-9]{12})?\.tar\.gz\.enc",
+    sys.argv[1],
+)
+if match is None:
+    raise SystemExit(1)
+try:
+    completed_at = datetime.strptime(match.group("stamp"), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
+except ValueError:
+    raise SystemExit(1) from None
+if completed_at > datetime.now(timezone.utc) + timedelta(seconds=300):
+    raise SystemExit(1)
+print(completed_at.isoformat())
+PY
+}
+
 publish_recovery_receipt() {
   local archive_hash_id="$1"
+  local completed_at="$2"
   if ! docker run --rm --network none --user 10001:10001 \
     --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data-root,readonly" \
     --mount "type=bind,src=${RECOVERY_RECEIPT_DIR},dst=/receipts" \
@@ -207,6 +232,7 @@ exec python "$@"
     --output /receipts/external-backup.receipt.json \
     --archive-hash-id "$archive_hash_id" \
     --producer-version "$RECOVERY_PRODUCER_VERSION" \
+    --completed-at "$completed_at" \
     --validation-count archive_verified=1 \
     --validation-count metadata_verified=1 \
     --validation-count checksum_verified=1 \
@@ -513,6 +539,12 @@ main() {
     printf 'backup configuration validated\n'
     return 0
   fi
+  local archive_name archive_path checksum_name checksum_hash completed_at
+  if [[ "$BACKUP_MODE" == "upload-existing" ]]; then
+    archive_name="$REQUESTED_ARCHIVE_NAME"
+    completed_at="$(archive_completed_at "$archive_name")" \
+      || fail "archive timestamp is invalid or exceeds allowed clock skew"
+  fi
   command -v curl >/dev/null || fail "curl is required"
   command -v docker >/dev/null || fail "docker is required"
   command -v sha256sum >/dev/null || fail "sha256sum is required"
@@ -521,11 +553,10 @@ main() {
 
   umask 077
   install -d -m 0700 "$BACKUP_LOCAL_DIR"
-  local archive_name archive_path checksum_name checksum_hash
-  if [[ "$BACKUP_MODE" == "upload-existing" ]]; then
-    archive_name="$REQUESTED_ARCHIVE_NAME"
-  else
+  if [[ "$BACKUP_MODE" != "upload-existing" ]]; then
     archive_name="$(run_container_backup)"
+    completed_at="$(archive_completed_at "$archive_name")" \
+      || fail "archive timestamp is invalid or exceeds allowed clock skew"
   fi
   archive_path="${BACKUP_LOCAL_DIR}/${archive_name}"
   verify_local_backup "$archive_path"
@@ -538,7 +569,7 @@ main() {
   checksum_hash="$(read_verified_checksum_hash "$archive_name")"
   [[ "$checksum_hash" =~ ^[a-f0-9]{64}$ ]] || fail "verified checksum is not a SHA-256 identifier"
   rotate_remote_backups
-  publish_recovery_receipt "sha256:${checksum_hash}"
+  publish_recovery_receipt "sha256:${checksum_hash}" "$completed_at"
   printf 'backup complete: %s\n' "$archive_name"
 }
 

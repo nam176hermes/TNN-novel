@@ -132,6 +132,107 @@ database errors.
 Never delete the current database, artifact tree, backup, or image during an
 application rollback. Retain the failed images until the incident is reviewed.
 
+### Recovery producer rollout and rollback
+
+The backup timer is a final rollout action, not a preflight mechanism. Keep it
+stopped through static config validation, the digest-pinned image-owned
+publisher preflight, one manual backup, one isolated restore drill, and fresh
+verification of both recovery receipts. Only then enable and start it and
+require a non-empty `NextElapseUSecRealtime`:
+
+```bash
+systemctl --user disable --now novel-tnn-backup.timer
+set -a
+. "$HOME/.config/novel-tnn/backup.env"
+set +a
+scripts/production_backup.sh --validate-config
+scripts/production_restore_drill.sh --validate-config
+
+BACKUP_DATA_ROOT_IDENTITY="$(stat --format='%d:%i' -- "$BACKUP_DATA_DIR")"
+docker run --rm --network none --user 10001:10001 \
+  --mount "type=bind,src=${BACKUP_DATA_DIR},dst=/data-root,readonly" \
+  --mount "type=bind,src=${BACKUP_DATA_DIR}/logs/runtime,dst=/receipts" \
+  -- "$BACKUP_IMAGE" \
+  python -m scripts.verify_recovery_publisher \
+  --data-root /data-root \
+  --receipt-dir /receipts \
+  --expected-release "$RECOVERY_PRODUCER_VERSION" \
+  --expected-data-root-identity "$BACKUP_DATA_ROOT_IDENTITY"
+
+scripts/production_backup.sh
+scripts/production_restore_drill.sh
+
+.venv/bin/python - "$BACKUP_DATA_DIR" "$RECOVERY_PRODUCER_VERSION" <<'PY'
+from pathlib import Path
+import sys
+from app.recovery_receipts import read_recovery_receipt
+
+for kind in ("external_backup", "restore_drill"):
+    result = read_recovery_receipt(Path(sys.argv[1]), kind, expected_release=sys.argv[2])
+    if result["state"] != "fresh":
+        raise SystemExit(f"{kind} receipt is not fresh")
+PY
+
+systemctl --user enable --now novel-tnn-backup.timer
+next_elapse="$(systemctl --user show novel-tnn-backup.timer \
+  --property=NextElapseUSecRealtime --value)"
+[[ -n "$next_elapse" && "$next_elapse" != "n/a" ]]
+printf 'NextElapseUSecRealtime=%s\n' "$next_elapse"
+systemctl --user list-timers novel-tnn-backup.timer
+```
+
+Before rollout, freeze both runner files, the three user units and their
+drop-ins, and mode-0600 `backup.env` in a mode-0700 rollback directory as shown
+in `docs/production-backup-restore-runbook.md`. That config snapshot is the
+authoritative rollback for both `BACKUP_IMAGE` and
+`RECOVERY_PRODUCER_VERSION`.
+
+If a recovery gate or the timer verification fails, execute this rollback with
+the pre-rollout directory. It preserves displaced state instead of deleting
+it:
+
+```bash
+systemctl --user disable --now novel-tnn-backup.timer
+export RECOVERY_ROLLBACK_DIR=/home/thenam176/.local/state/novel-tnn/recovery-rollout-YYYYMMDDTHHMMSSZ
+rollback_attempt="$RECOVERY_ROLLBACK_DIR/rejected-$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 0700 "$rollback_attempt/runners" "$rollback_attempt/systemd-user"
+
+for runner in production_backup.sh production_restore_drill.sh; do
+  deployed="/home/thenam176/Novel-TNN/scripts/$runner"
+  cp -a -- "$deployed" "$rollback_attempt/runners/"
+  install -m 0755 "$RECOVERY_ROLLBACK_DIR/runners/$runner" "$deployed"
+done
+install -m 0600 "$HOME/.config/novel-tnn/backup.env" "$rollback_attempt/backup.env"
+install -m 0600 "$RECOVERY_ROLLBACK_DIR/backup.env" "$HOME/.config/novel-tnn/backup.env"
+
+for unit in novel-tnn-backup.service novel-tnn-backup.timer novel-tnn-restore-drill.service; do
+  deployed="$HOME/.config/systemd/user/$unit"
+  if [[ -f "$deployed" ]]; then
+    mv -- "$deployed" "$rollback_attempt/systemd-user/"
+  fi
+  if [[ -d "${deployed}.d" ]]; then
+    mv -- "${deployed}.d" "$rollback_attempt/systemd-user/"
+  fi
+  if [[ -f "$RECOVERY_ROLLBACK_DIR/systemd-user/$unit" ]]; then
+    install -m 0644 "$RECOVERY_ROLLBACK_DIR/systemd-user/$unit" "$deployed"
+  fi
+  if [[ -d "$RECOVERY_ROLLBACK_DIR/systemd-user/${unit}.d" ]]; then
+    cp -a -- "$RECOVERY_ROLLBACK_DIR/systemd-user/${unit}.d" \
+      "$HOME/.config/systemd/user/"
+  fi
+done
+
+systemctl --user daemon-reload
+systemctl --user disable --now novel-tnn-backup.timer
+awk -F= '$1 == "BACKUP_IMAGE" || $1 == "RECOVERY_PRODUCER_VERSION" {print}' \
+  "$HOME/.config/novel-tnn/backup.env"
+```
+
+Do not automatically delete or overwrite recovery receipts, backup objects,
+restore-drill directories, validation reports, logs, rejected runner bytes,
+drop-ins, or images. There is no automatic evidence deletion. Any evidence
+cleanup requires separate operator approval.
+
 ## Recovery receipt contract
 
 Runtime reads only these fixed paths below `DATA_DIR`:
@@ -182,9 +283,9 @@ both to the intended API release ID. The producer does not receive API
 credentials or query the running service. If the running API uses another
 release, its bounded receipt reader classifies the result as `wrong_release`
 and emits the stable recovery alert.
-The publisher
-receives only the archive hash identifier, validation counts, producer version,
-and its fixed in-container output path. Backup secrets,
+The publisher receives only the archive hash identifier, validation counts,
+producer version, an optional bounded canonical UTC completion timestamp, and
+its fixed in-container output path. Backup secrets,
 R2 credentials, archive and report paths, and `production.env` are never passed
 to the publisher container.
 
@@ -201,5 +302,6 @@ version, and threshold.
 
 Keep the backup timer stopped until clean committed runner bytes and a reviewed
 helper-containing image have been deployed, both mandatory pins are explicit,
-and the image-owned preflight succeeds. An older image cannot run these
+the image-owned preflight succeeds, the manual backup and restore drill pass,
+and both receipts are freshly verified. An older image cannot run these
 runners.

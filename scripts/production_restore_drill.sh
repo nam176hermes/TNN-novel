@@ -84,6 +84,13 @@ validate_config() {
   require_safe_absolute_path RECOVERY_RECEIPT_DIR
   [[ -d "$BACKUP_LOCAL_DIR" ]] || fail "BACKUP_LOCAL_DIR does not exist"
   require_canonical_real_directory RESTORE_DATA_DIR RESTORE_DATA_ROOT_IDENTITY
+  local canonical_drill_root
+  canonical_drill_root="$(realpath --canonicalize-missing -- "${BACKUP_DRILL_ROOT%/}" 2>/dev/null)" \
+    || fail "BACKUP_DRILL_ROOT could not be canonically resolved"
+  [[ "$canonical_drill_root" != "$RESTORE_DATA_DIR" \
+    && "$canonical_drill_root" != "$RESTORE_DATA_DIR"/* ]] \
+    || fail "BACKUP_DRILL_ROOT must be outside RESTORE_DATA_DIR"
+  BACKUP_DRILL_ROOT="$canonical_drill_root"
   [[ "$BACKUP_IMAGE" != -* \
     && "$BACKUP_IMAGE" =~ ^([a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$ ]] \
     || fail "BACKUP_IMAGE must be a safe sha256-pinned Docker reference pinned by sha256 digest"
