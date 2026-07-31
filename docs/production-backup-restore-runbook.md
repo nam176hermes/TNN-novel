@@ -54,6 +54,13 @@ Set these values in the external file:
 - `RECOVERY_PRODUCER_VERSION`: the exact release ID embedded in that image and
   intended for the running API. Do not infer it from an image tag.
 
+Both values are mandatory. Existing installations must explicitly migrate
+`BACKUP_IMAGE` and `RECOVERY_PRODUCER_VERSION`; there is no legacy image
+fallback. Build the reviewed image from the clean committed source so it
+contains `scripts.verify_recovery_publisher`, then pin its exact digest. The
+runners execute the helper from that exact image and never mount a mutable host
+helper.
+
 Keep `BACKUP_DATA_DIR=/home/thenam176/Novel-TNN/data`, local output under
 `$HOME/.local/share/novel-tnn-backups`, and the current production image pin.
 Provision the dedicated receipt directory without granting the API access to
@@ -75,6 +82,11 @@ no network or Docker operation:
 /home/thenam176/Novel-TNN/scripts/production_backup.sh --validate-config
 ```
 
+The timer must remain stopped until clean committed runner bytes and the
+reviewed helper-containing image have both been deployed, the explicit image
+pin and producer release migration is complete, and the image-owned preflight
+succeeds.
+
 ## Install and enable the schedule
 
 ```bash
@@ -92,6 +104,13 @@ systemctl --user list-timers novel-tnn-backup.timer
 The timer runs daily at 03:15 with a bounded randomized delay and catches up
 after a missed WSL session. It uses `UMask=0077`; archive, sidecar, checksum,
 and external configuration are mode `0600`.
+
+Each recovery preflight mounts the full data root read-only to verify its
+captured device/inode identity and the `logs/runtime` path component by
+component. The receipt directory is mounted separately at `/receipts` and is
+the only writable recovery metadata mount. Normal backup creation also mounts
+the full data root read-only and rechecks its identity inside the same pinned
+image container immediately before archive creation.
 
 ## Backup verification
 

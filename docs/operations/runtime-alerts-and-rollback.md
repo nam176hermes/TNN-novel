@@ -169,14 +169,19 @@ failure leaves the previous receipt unchanged.
 `scripts/production_restore_drill.sh` publishes only after SQLite integrity,
 foreign-key, artifact, API readiness, and authenticated Reader checks succeed.
 Both producers publish through the pinned `BACKUP_IMAGE` as UID/GID
-`10001:10001`, with networking disabled and only the dedicated
-`DATA_DIR/logs/runtime` receipt directory mounted at `/receipts`. The directory
+`10001:10001`, with networking disabled. They mount the full data root read-only
+at `/data-root` for captured device/inode identity and component checks. The
+dedicated `DATA_DIR/logs/runtime` directory is mounted separately at
+`/receipts` and is the only writable recovery metadata mount. The directory
 must already exist, resolve to that fixed location, and be owned for UID 10001
-access. `RECOVERY_PRODUCER_VERSION` is mandatory and is verified against the
-image's embedded `NOVEL_RELEASE_ID`; operators must set both to the intended API
-release ID. The producer does not receive API credentials or query the running
-service. If the running API uses another release, its bounded receipt reader
-classifies the result as `wrong_release` and emits the stable recovery alert.
+access. The preflight helper comes from the exact digest-pinned reviewed image,
+not host source. `BACKUP_IMAGE` and `RECOVERY_PRODUCER_VERSION` are mandatory
+explicit configuration and must be migrated together; the producer version is
+verified against the image's embedded `NOVEL_RELEASE_ID`, and operators must set
+both to the intended API release ID. The producer does not receive API
+credentials or query the running service. If the running API uses another
+release, its bounded receipt reader classifies the result as `wrong_release`
+and emits the stable recovery alert.
 The publisher
 receives only the archive hash identifier, validation counts, producer version,
 and its fixed in-container output path. Backup secrets,
@@ -193,3 +198,8 @@ configuration, credentials, parser exceptions, or arbitrary receipt fields.
 Only authenticated metrics and system status expose the bounded derived state,
 age, safe completion timestamp, hash identifier, allowlisted counts, producer
 version, and threshold.
+
+Keep the backup timer stopped until clean committed runner bytes and a reviewed
+helper-containing image have been deployed, both mandatory pins are explicit,
+and the image-owned preflight succeeds. An older image cannot run these
+runners.
