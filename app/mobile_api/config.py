@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 
 from app.config import PROJECT_ROOT
@@ -24,8 +24,10 @@ def _parse_bool(value: str) -> bool:
 
 
 class MobileAPISettings(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+
     version: str = "0.1.0"
-    host: str = os.getenv("MOBILE_API_HOST", "0.0.0.0")
+    host: str = os.getenv("MOBILE_API_HOST", "127.0.0.1")
     port: int = int(os.getenv("MOBILE_API_PORT", "7860"))
     public_deploy: bool = _parse_bool(os.getenv("PUBLIC_DEPLOY", "0"))
     secret_key: str = os.getenv("MOBILE_API_SECRET", "dev-secret-change-in-production")
@@ -33,6 +35,9 @@ class MobileAPISettings(BaseModel):
     access_token_expire_minutes: int = int(os.getenv("MOBILE_API_ACCESS_MINUTES", "60"))
     refresh_token_expire_days: int = int(os.getenv("MOBILE_API_REFRESH_DAYS", "14"))
     asset_cookie_name: str = os.getenv("MOBILE_API_ASSET_COOKIE_NAME", "novel_asset_access")
+    refresh_cookie_name: str = os.getenv("MOBILE_API_REFRESH_COOKIE_NAME", "novel_refresh_session")
+    csrf_cookie_name: str = os.getenv("MOBILE_API_CSRF_COOKIE_NAME", "novel_csrf")
+    csrf_header_name: str = os.getenv("MOBILE_API_CSRF_HEADER_NAME", "X-CSRF-Token")
     upload_max_bytes: int = int(os.getenv("MOBILE_API_UPLOAD_MAX_BYTES", str(100 * 1024 * 1024)))
     admin_username: str = os.getenv("MOBILE_API_ADMIN_USERNAME", "admin")
     admin_password: str = os.getenv("MOBILE_API_ADMIN_PASSWORD", "change_me")
@@ -40,6 +45,84 @@ class MobileAPISettings(BaseModel):
     login_rate_limit_window_seconds: int = int(os.getenv("MOBILE_API_LOGIN_RATE_LIMIT_WINDOW_SECONDS", "300"))
     job_stale_after_seconds: int = int(os.getenv("JOB_STALE_AFTER_SECONDS", "300"))
     job_heartbeat_interval_seconds: float = float(os.getenv("JOB_HEARTBEAT_INTERVAL_SECONDS", "30"))
+    import_job_max_chapters: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_CHAPTERS", "200")),
+        gt=0,
+        le=5_000,
+    )
+    import_job_max_active_per_user: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_ACTIVE_PER_USER", "4")),
+        gt=0,
+        le=100,
+    )
+    import_job_max_retries_per_task: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_RETRIES_PER_TASK", "3")),
+        gt=0,
+        le=20,
+    )
+    import_job_max_bytes_per_chapter: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_BYTES_PER_CHAPTER", str(5 * 1024 * 1024))),
+        gt=0,
+    )
+    import_job_max_duration_seconds: int = Field(
+        default=int(os.getenv("IMPORT_JOB_MAX_DURATION_SECONDS", "3600")),
+        gt=0,
+    )
+    import_job_run_in_api: bool = _parse_bool(os.getenv("IMPORT_JOB_RUN_IN_API", "1"))
+    import_worker_poll_interval_seconds: float = Field(
+        default=float(os.getenv("IMPORT_WORKER_POLL_INTERVAL_SECONDS", "1")),
+        gt=0,
+        le=60,
+    )
+    import_worker_heartbeat_max_age_seconds: int = Field(
+        default=int(os.getenv("IMPORT_WORKER_HEARTBEAT_MAX_AGE_SECONDS", "45")),
+        gt=0,
+    )
+    source_circuit_failure_threshold: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_FAILURE_THRESHOLD", "3")),
+        gt=0,
+        le=100,
+    )
+    source_circuit_window_seconds: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_WINDOW_SECONDS", "60")),
+        gt=0,
+    )
+    source_circuit_cooldown_seconds: int = Field(
+        default=int(os.getenv("SOURCE_CIRCUIT_COOLDOWN_SECONDS", "30")),
+        gt=0,
+    )
+    auth_session_retention_days: int = Field(
+        default=int(os.getenv("AUTH_SESSION_RETENTION_DAYS", "30")),
+        gt=0,
+    )
+    auth_session_retention_max_rows: int = Field(
+        default=int(os.getenv("AUTH_SESSION_RETENTION_MAX_ROWS", "5000")),
+        gt=0,
+    )
+    auth_login_failure_retention_days: int = Field(
+        default=int(os.getenv("AUTH_LOGIN_FAILURE_RETENTION_DAYS", "30")),
+        gt=0,
+    )
+    auth_login_failure_retention_max_rows: int = Field(
+        default=int(os.getenv("AUTH_LOGIN_FAILURE_RETENTION_MAX_ROWS", "5000")),
+        gt=0,
+    )
+    operational_event_retention_days: int = Field(
+        default=int(os.getenv("OPERATIONAL_EVENT_RETENTION_DAYS", "90")),
+        gt=0,
+    )
+    operational_event_retention_max_rows: int = Field(
+        default=int(os.getenv("OPERATIONAL_EVENT_RETENTION_MAX_ROWS", "50000")),
+        gt=0,
+    )
+    operational_retention_batch_size: int = Field(
+        default=int(os.getenv("OPERATIONAL_RETENTION_BATCH_SIZE", "500")),
+        gt=0,
+    )
+    operational_retention_interval_seconds: int = Field(
+        default=int(os.getenv("OPERATIONAL_RETENTION_INTERVAL_SECONDS", "21600")),
+        gt=0,
+    )
     disable_auth: bool = _parse_bool(os.getenv("MOBILE_API_DISABLE_AUTH", "0"))
     allow_public_auth_bypass: bool = _parse_bool(os.getenv("MOBILE_API_ALLOW_PUBLIC_AUTH_BYPASS", "0"))
     cors_origins: list[str] = _parse_cors_origins(
@@ -86,13 +169,23 @@ def _is_broad_public_cors_origin(origin: str) -> bool:
     return not value.startswith("https://")
 
 
+def _is_non_loopback_bind(host: str) -> bool:
+    value = host.strip().lower().strip("[]")
+    return value not in {"", "localhost", "127.0.0.1", "::1"} and not value.endswith(".localhost")
+
+
 def validate_public_deploy_settings(settings: MobileAPISettings | None = None) -> list[str]:
     """Return PUBLIC_DEPLOY safety violations for externally exposed instances."""
     resolved = settings or mobile_settings
-    if not resolved.public_deploy:
+    externally_bound = _is_non_loopback_bind(resolved.host)
+    if not resolved.public_deploy and not externally_bound:
         return []
 
     errors: list[str] = []
+    if externally_bound and not resolved.public_deploy:
+        errors.append("PUBLIC_DEPLOY=1 is required when MOBILE_API_HOST is not loopback")
+    if resolved.algorithm.strip().upper() != "HS256":
+        errors.append("JWT signing algorithm must remain HS256; ECDSA algorithms are not supported")
     secret = resolved.secret_key.strip()
     if secret.lower() in _DEV_SECRET_VALUES or len(secret) < 32:
         errors.append("MOBILE_API_SECRET must be a long random secret when PUBLIC_DEPLOY=1")

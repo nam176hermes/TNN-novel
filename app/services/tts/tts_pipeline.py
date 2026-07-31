@@ -36,9 +36,11 @@ from app.services.tts.f5_vietnamese_engine import (
     VoiceConfig,
     stable_audio_cache_key,
 )
+from app.services.tts.availability import is_f5_provider, require_tts_runtime_available
 from app.services.tts.text_normalizer import normalize_text
 from app.translation.idiom_correction import clean_translation_layout
 from app.utils.asyncio_bridge import run_coro_sync
+from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,7 @@ class TTSPipeline:
         self.data_dir = data_dir or settings.resolved_data_dir
         self.engine_factory = engine_factory
         self.legacy_fallback = legacy_fallback
+        self.legacy_artifact_root = settings.artifact_legacy_root
 
     def generate_chapter(
         self,
@@ -136,6 +139,8 @@ class TTSPipeline:
         text = self._read_translated_text(chapter)
         if not text.strip():
             raise ValueError("Chapter has no translated text for TTS")
+        if is_f5_provider(settings.tts_provider):
+            require_tts_runtime_available(provider=settings.tts_provider)
 
         normalized = normalize_text(text, backend=settings.tts_normalizer)
         chunks = chunk_text(
@@ -184,7 +189,7 @@ class TTSPipeline:
             details={"book_id": book_id, "chapter_id": chapter_id, "provider": settings.tts_provider},
         )
 
-        chunk_paths: list[Path] = []
+        chunk_artifacts: list[tuple[TTSChunk, Path]] = []
         engine = self._build_engine(voice, model_config)
         try:
             for chunk in chunks:
@@ -194,15 +199,15 @@ class TTSPipeline:
                 existing = self._get_chunk(job_id, chunk.chunk_index)
                 existing_path = self._existing_completed_chunk_path(existing)
                 if resume and existing_path is not None:
-                    chunk_paths.append(existing_path)
+                    chunk_artifacts.append((chunk, existing_path))
                     continue
 
                 suffix = ".mp3" if settings.tts_provider.lower() == "edge_tts" else ".wav"
                 chunk_path = chunk_dir / f"chunk_{chunk.chunk_index:04d}{suffix}"
                 self._update_chunk(job_id, chunk.chunk_index, status="running", error_message="")
                 produced_path = self._synthesize_and_qa(engine, chunk, chunk_path, voice)
-                chunk_paths.append(produced_path)
-                progress = int((len(chunk_paths) / len(chunks)) * 85)
+                chunk_artifacts.append((chunk, produced_path))
+                progress = int((len(chunk_artifacts) / len(chunks)) * 85)
                 self._update_job(job_id, status="running", progress=progress, error_message="")
                 if progress_callback:
                     progress_callback(progress, f"TTS chunk {chunk.chunk_index + 1}/{len(chunks)}")
@@ -211,6 +216,8 @@ class TTSPipeline:
                 self.cancel_job(job_id)
                 return self._write_report(job_id)
 
+            self._validate_chunk_outputs(job_id, chunk_artifacts, expected_count=len(chunks))
+            chunk_paths = [path for _, path in chunk_artifacts]
             metadata = AudioMetadata(
                 title=f"{book['title']} - Chương {chapter['chapter_number']}",
                 author=str(book.get("author") or ""),
@@ -223,6 +230,7 @@ class TTSPipeline:
                 metadata=metadata,
                 sample_rate=settings.tts_audio_sample_rate,
             )
+            self._validate_final_output(output_path, text=normalized.text, label="chapter MP3")
             update_chapter_paths(self.db_path, chapter_id, audio_path=output_path, status="audio_done")
             self._update_job(job_id, status="completed", progress=100, output_mp3_path=str(output_path), error_message="")
             record_operational_event(
@@ -319,6 +327,7 @@ class TTSPipeline:
         if str(job.get("status") or "") == "completed":
             job["error_message"] = ""
         job["chunks"] = chunks
+        job["audio_summary"] = self._build_audio_summary(job, chunks)
         return job
 
     def get_download_path(self, job_id: str, output_format: str = "mp3") -> Path | None:
@@ -326,8 +335,7 @@ class TTSPipeline:
         if not job:
             return None
         key = "output_m4b_path" if output_format.lower() == "m4b" else "output_mp3_path"
-        path = Path(str(job.get(key) or ""))
-        return path if path.exists() else None
+        return self._resolved_output_path(job.get(key))
 
     def generate_book_m4b(self, book_id: int, *, job_id: str = "") -> Path:
         book = get_book_by_id(self.db_path, book_id)
@@ -339,17 +347,29 @@ class TTSPipeline:
             list_chapters(self.db_path, book_id),
             key=lambda item: int(item.get("chapter_number") or 0),
         )
-        chapter_paths = [
-            Path(ch["audio_path"])
-            for ch in chapter_rows
-            if ch.get("audio_path") and Path(ch["audio_path"]).exists()
-        ]
+        chapter_paths: list[Path] = []
+        for chapter in chapter_rows:
+            if not chapter.get("audio_path"):
+                continue
+            try:
+                chapter_paths.append(
+                    require_artifact_file(
+                        chapter["audio_path"],
+                        artifact_class=ArtifactClass.AUDIO,
+                        data_root=self.data_dir,
+                        old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+                    )
+                )
+            except ArtifactPathError:
+                continue
         output_path = self.data_dir / "audio" / f"book{book_id}_{job_id or uuid.uuid4().hex[:8]}.m4b"
-        return merge_book_m4b(
+        result = merge_book_m4b(
             chapter_paths,
             output_path,
             metadata=AudioMetadata(title=str(book.get("title") or ""), author=str(book.get("author") or ""), source_book=str(book.get("title") or "")),
         )
+        self._validate_output_file(result, "book M4B")
+        return result
 
     def _build_engine(self, voice: VoiceConfig, model_config: F5VietnameseConfig):
         if self.engine_factory is not None:
@@ -458,8 +478,14 @@ class TTSPipeline:
         path_value = chapter.get("translated_text_path")
         if not path_value:
             return ""
-        path = Path(path_value)
-        if not path.exists():
+        try:
+            path = require_artifact_file(
+                path_value,
+                artifact_class=ArtifactClass.TRANSLATED,
+                data_root=self.data_dir,
+                old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+            )
+        except ArtifactPathError:
             return ""
         return clean_translation_layout(path.read_text(encoding="utf-8"))
 
@@ -561,8 +587,8 @@ class TTSPipeline:
         if not row or row.get("status") != "completed":
             return None
         for key in ("wav_path", "mp3_path"):
-            path = Path(str(row.get(key) or ""))
-            if path.exists():
+            path = self._resolved_output_path(row.get(key))
+            if path is not None:
                 return path
         return None
 
@@ -639,8 +665,117 @@ class TTSPipeline:
             conn.execute(f"UPDATE tts_jobs SET {', '.join(fields)} WHERE id = ?", params)
             conn.commit()
 
+    def _validate_chunk_outputs(
+        self,
+        job_id: str,
+        chunk_artifacts: list[tuple[TTSChunk, Path]],
+        *,
+        expected_count: int,
+    ) -> None:
+        if len(chunk_artifacts) != expected_count:
+            raise TTSEngineError(f"TTS job produced {len(chunk_artifacts)}/{expected_count} chunk files before merge")
+        for chunk, path in chunk_artifacts:
+            if not path.exists():
+                error = "Chunk audio file is missing before merge"
+                self._update_chunk(job_id, chunk.chunk_index, status="failed", error_message=error)
+                raise TTSEngineError(error)
+            if path.stat().st_size <= 0:
+                path.unlink(missing_ok=True)
+                error = "Chunk audio file is empty before merge"
+                self._update_chunk(job_id, chunk.chunk_index, status="failed", error_message=error)
+                raise TTSEngineError(error)
+
+    def _validate_output_file(self, path: Path, label: str) -> None:
+        if not path.exists():
+            raise TTSEngineError(f"{label} was not created")
+        if path.stat().st_size <= 0:
+            path.unlink(missing_ok=True)
+            raise TTSEngineError(f"{label} is empty")
+
+    def _resolved_output_path(self, value: Any) -> Path | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            path = require_artifact_file(
+                raw,
+                artifact_class=ArtifactClass.AUDIO,
+                data_root=self.data_dir,
+                old_root=getattr(self, "legacy_artifact_root", settings.artifact_legacy_root),
+            )
+        except ArtifactPathError:
+            return None
+        if path.stat().st_size <= 0:
+            return None
+        return path
+
+    def _validate_final_output(self, path: Path, *, text: str, label: str) -> AudioQAResult:
+        self._validate_output_file(path, label)
+        if not settings.tts_enable_qa:
+            return AudioQAResult(True)
+        result = analyze_audio(path, text=text)
+        if not result.passed:
+            path.unlink(missing_ok=True)
+            raise TTSEngineError(result.error or f"{label} failed audio QA")
+        return result
+
+    def _build_audio_summary(self, job: dict[str, Any], chunks: list[dict[str, Any]]) -> dict[str, Any]:
+        completed_chunks = 0
+        failed_chunks = 0
+        missing_chunk_files = 0
+        qa_warning_count = 0
+        warnings: list[str] = []
+        for chunk in chunks:
+            status = str(chunk.get("status") or "")
+            if status == "completed":
+                completed_chunks += 1
+            if status in {"failed", "qa_failed"}:
+                failed_chunks += 1
+            if status == "completed" and self._existing_completed_chunk_path(chunk) is None:
+                missing_chunk_files += 1
+            qa_report = chunk.get("qa_report")
+            if isinstance(qa_report, dict):
+                chunk_warnings = qa_report.get("warnings")
+                if isinstance(chunk_warnings, list):
+                    qa_warning_count += len(
+                        [warning for warning in chunk_warnings if isinstance(warning, str) and warning.strip()]
+                    )
+
+        output_mp3_path = self._resolved_output_path(job.get("output_mp3_path"))
+        output_m4b_path = self._resolved_output_path(job.get("output_m4b_path"))
+        output_mp3_ready = output_mp3_path is not None
+        output_m4b_ready = output_m4b_path is not None
+        if missing_chunk_files:
+            warnings.append(f"{missing_chunk_files} completed chunk file is missing")
+        if failed_chunks:
+            warnings.append(f"{failed_chunks} chunk failed or needs retry")
+        if qa_warning_count:
+            warnings.append(f"Audio QA reported {qa_warning_count} warning(s)")
+        if str(job.get("status") or "") == "completed" and not output_mp3_ready:
+            warnings.append("Final chapter MP3 is missing or empty")
+        if str(job.get("output_m4b_path") or "") and not output_m4b_ready:
+            warnings.append("Final M4B artifact is missing or empty")
+
+        return {
+            "expected_chunk_count": len(chunks),
+            "completed_chunk_count": completed_chunks,
+            "failed_chunk_count": failed_chunks,
+            "missing_chunk_file_count": missing_chunk_files,
+            "qa_warning_count": qa_warning_count,
+            "output_mp3_ready": output_mp3_ready,
+            "output_mp3_size_bytes": output_mp3_path.stat().st_size if output_mp3_path is not None else 0,
+            "output_m4b_ready": output_m4b_ready,
+            "output_m4b_size_bytes": output_m4b_path.stat().st_size if output_m4b_path is not None else 0,
+            "warnings": warnings,
+        }
+
     def _fail_job(self, job_id: str, exc: BaseException) -> None:
         safe = _safe_error(exc)
+        with get_connection(self.db_path) as conn:
+            row = conn.execute("SELECT status FROM tts_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row and str(row["status"] or "") == "cancelled":
+            logger.info("TTS job %s remained cancelled after provider error: %s", job_id, safe)
+            return
         logger.exception("TTS job %s failed", job_id)
         self._update_job(job_id, status="failed", error_message=safe)
         record_operational_event(

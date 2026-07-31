@@ -588,8 +588,23 @@ def _build_translation_prompt(
                 return True
         return False
 
-    relevant = {k: v for k, v in glossary.items() if k in chunk or crosses_boundary(k)}
-    glossary_text = "\n".join([f"{src}: {tgt}" for src, tgt in relevant.items()]) if relevant else "(none)"
+    relevant_items = [
+        (str(k), str(v))
+        for k, v in glossary.items()
+        if k and v and (str(k) in chunk or crosses_boundary(str(k)))
+    ]
+    relevant_items.sort(key=lambda item: (-len(item[0]), item[0]))
+    bounded_items: list[tuple[str, str]] = []
+    used_chars = 0
+    for src, tgt in relevant_items:
+        line_len = len(src) + len(tgt) + 4
+        if bounded_items and used_chars + line_len > 2200:
+            continue
+        bounded_items.append((src, tgt))
+        used_chars += line_len
+        if len(bounded_items) >= 40:
+            break
+    glossary_text = "\n".join([f"{src}: {tgt}" for src, tgt in bounded_items]) if bounded_items else "(none)"
     name_map = name_map or {}
     name_text = "\n".join(
         [f"{src} -> {tgt}" for src, tgt in name_map.items() if src in chunk or crosses_boundary(src)]
@@ -976,17 +991,17 @@ def translate_chapter(
                 raise TranslationError("Translation cancelled by user")
             # New: QuickTranslator deterministic pre-processing for this chunk
             protected_spans = get_protected_spans(chunk, name_map)
-            
+
             # Apply template rules to chunk (respecting protected name spans)
             templated_chunk = template_engine.apply(
                 chunk, lexicon=lexicon, protected_spans=protected_spans
             )
-            
+
             # Run deterministic pretranslate for guide text (not replacing source)
             pretranslated_text, pretokens = pretranslate(
                 templated_chunk, lexicon, prioritize_names=True, check_longest=True
             )
-            
+
             # Build deterministic guide: show which terms are locked
             locked_terms = [t for t in pretokens if t.kind in ("name", "phrase")]
             if locked_terms:
@@ -996,10 +1011,10 @@ def translate_chapter(
                 deterministic_guide = "\n".join(guide_lines)
             else:
                 deterministic_guide = "(none)"
-            
+
             # Apply glossary pre-substitution: replace exact terms with source【target】 format
             processed_chunk = _pre_substitute_glossary_terms(chunk, glossary)
-            
+
             # Exact cache hit on processed chunk
             if use_cache:
                 cached = get_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model))

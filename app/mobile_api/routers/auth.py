@@ -24,7 +24,6 @@ from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.schemas import (
     ErrorResponse,
     LoginRequest,
-    RefreshTokenRequest,
     TokenResponse,
     UserResponse,
 )
@@ -35,6 +34,13 @@ from app.mobile_api.security import (
     decode_token,
     hash_refresh_token,
     refresh_token_expires_at,
+)
+from app.mobile_api.session_cookies import (
+    clear_refresh_session_cookies,
+    new_csrf_token,
+    refresh_token_from_request,
+    require_csrf,
+    set_refresh_session_cookies,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -161,7 +167,14 @@ async def login(form_data: LoginRequest, request: Request, response: Response):
         )
     login_rate_limiter.reset(rate_limit_key)
     session_id, access_token, refresh_token, user_id = _create_session_tokens(user.username, request)
-    set_asset_access_cookie(response, access_token, secure=is_public_request(request))
+    secure = is_public_request(request)
+    set_asset_access_cookie(response, access_token, secure=secure)
+    set_refresh_session_cookies(
+        response,
+        refresh_token,
+        csrf_token=new_csrf_token(),
+        secure=secure,
+    )
     record_audit_event(
         event_type="session_create",
         severity="info",
@@ -182,7 +195,7 @@ async def login(form_data: LoginRequest, request: Request, response: Response):
         owner_user_id=user_id,
         details={"username": user.username, "result": "success"},
     )
-    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+    return TokenResponse(access_token=access_token)
 
 
 @router.post("/logout", response_model=dict)
@@ -190,7 +203,9 @@ async def logout(request: Request, response: Response, current_user: dict = Depe
     """Logout user (client should discard tokens)."""
     session_id = current_user.get("session_id", "")
     revoked = revoke_auth_session(get_db_path(), session_id)
-    clear_asset_access_cookie(response, secure=is_public_request(request))
+    secure = is_public_request(request)
+    clear_asset_access_cookie(response, secure=secure)
+    clear_refresh_session_cookies(response, secure=secure)
     record_audit_event(
         event_type="session_revoke",
         severity="info",
@@ -220,7 +235,9 @@ async def logout_all(request: Request, response: Response, current_user: dict = 
     """Revoke all active sessions for the single operator."""
     username = current_user.get("username", "")
     revoked = revoke_auth_sessions_for_username(get_db_path(), username)
-    clear_asset_access_cookie(response, secure=is_public_request(request))
+    secure = is_public_request(request)
+    clear_asset_access_cookie(response, secure=secure)
+    clear_refresh_session_cookies(response, secure=secure)
     record_audit_event(
         event_type="session_revoke",
         severity="info",
@@ -252,10 +269,17 @@ async def read_current_user(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/refresh", response_model=TokenResponse, responses={401: {"model": ErrorResponse}})
-async def refresh_token(token_request: RefreshTokenRequest, request: Request, response: Response):
+async def refresh_token(request: Request, response: Response):
     """Refresh access token using refresh token."""
+    current_refresh_token = refresh_token_from_request(request)
+    if not current_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "refresh_required", "message": "Session refresh is unavailable"},
+        )
+    require_csrf(request)
     try:
-        payload = decode_token(token_request.refresh_token)
+        payload = decode_token(current_refresh_token)
     except ValueError:
         record_audit_event(
             event_type="session_refresh_rejected",
@@ -300,7 +324,7 @@ async def refresh_token(token_request: RefreshTokenRequest, request: Request, re
     rotate_status, session = rotate_auth_session_refresh(
         get_db_path(),
         session_id=session_id,
-        current_refresh_token_hash=hash_refresh_token(token_request.refresh_token),
+        current_refresh_token_hash=hash_refresh_token(current_refresh_token),
         next_refresh_token_hash=hash_refresh_token(next_refresh_token),
         next_expires_at=next_expires_at.isoformat(),
     )
@@ -334,7 +358,14 @@ async def refresh_token(token_request: RefreshTokenRequest, request: Request, re
         session_id=session_id,
         token_id=uuid4().hex,
     )
-    set_asset_access_cookie(response, access_token, secure=is_public_request(request))
+    secure = is_public_request(request)
+    set_asset_access_cookie(response, access_token, secure=secure)
+    set_refresh_session_cookies(
+        response,
+        next_refresh_token,
+        csrf_token=new_csrf_token(),
+        secure=secure,
+    )
     record_audit_event(
         event_type="session_refresh_success",
         severity="info",
@@ -349,4 +380,4 @@ async def refresh_token(token_request: RefreshTokenRequest, request: Request, re
             "result": "success",
         },
     )
-    return TokenResponse(access_token=access_token, refresh_token=next_refresh_token)
+    return TokenResponse(access_token=access_token)

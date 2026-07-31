@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from app.mobile_api.audit import record_audit_event
-from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.schemas import ExportRequest, ExportResponse
 from app.mobile_api.services.export_service import ExportService
 from app.mobile_api.services.pipeline_service import PipelineService
@@ -27,10 +27,9 @@ def _export_or_404(book_id: int, format: str, service: ExportService) -> dict:
         raise HTTPException(status_code=status, detail=message) from exc
 
 
-def _safe_export_response(result: dict, request: Request) -> dict:
+def _safe_export_response(result: dict, _request: Request) -> dict:
     payload = dict(result)
-    if is_public_request(request):
-        payload["path"] = ""
+    payload["path"] = ""
     return payload
 
 
@@ -69,7 +68,9 @@ async def export_book(
         request=http_request,
         details={"book_id": book_id, "format": request.format, "resource_type": "book_export", "result": "success"},
     )
-    return _safe_export_response(result, http_request)
+    payload = _safe_export_response(result, http_request)
+    payload["download_url"] = f"/api/books/{book_id}/exports/{request.format}/download"
+    return payload
 
 
 @router.get("/audiobook/{format}/download")
@@ -80,7 +81,7 @@ async def download_audiobook_export(
     service: ExportService = Depends(get_export_service),
 ):
     """Create and download an audiobook export for a book with chapter audio."""
-    result = _audiobook_export_or_404(book_id, format, service)
+    result = await asyncio.to_thread(_audiobook_export_or_404, book_id, format, service)
     path = Path(result["path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="Export file not found")

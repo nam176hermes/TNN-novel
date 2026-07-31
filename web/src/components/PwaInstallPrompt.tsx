@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { Download, Smartphone, X } from 'lucide-react';
 
 export const PWA_INSTALL_DISMISSED_STORAGE_KEY = 'novel-pwa-install-dismissed-v1';
+export const PWA_INSTALL_LATER_SESSION_KEY = 'novel-pwa-install-later-session-v1';
+const MANUAL_INSTALL_HINT_DELAY_MS = 600;
 
 type BeforeInstallPromptEvent = Event & {
   prompt(): Promise<void>;
@@ -16,6 +18,14 @@ function browserStorage(): Storage | null {
   }
 }
 
+function browserSessionStorage(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
 function isStandaloneDisplay(): boolean {
   const navigatorWithStandalone = navigator as Navigator & { standalone?: boolean };
   return Boolean(
@@ -25,22 +35,29 @@ function isStandaloneDisplay(): boolean {
 }
 
 function installWasDismissed(): boolean {
-  return browserStorage()?.getItem(PWA_INSTALL_DISMISSED_STORAGE_KEY) === '1';
+  return browserStorage()?.getItem(PWA_INSTALL_DISMISSED_STORAGE_KEY) === '1'
+    || browserSessionStorage()?.getItem(PWA_INSTALL_LATER_SESSION_KEY) === '1';
 }
 
 function rememberInstallDismissal(): void {
   browserStorage()?.setItem(PWA_INSTALL_DISMISSED_STORAGE_KEY, '1');
 }
 
+function rememberInstallLater(): void {
+  browserSessionStorage()?.setItem(PWA_INSTALL_LATER_SESSION_KEY, '1');
+}
+
 export default function PwaInstallPrompt() {
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [hidden, setHidden] = useState(() => installWasDismissed() || isStandaloneDisplay());
+  const [showManualInstructions, setShowManualInstructions] = useState(false);
 
   useEffect(() => {
     if (hidden) return undefined;
 
     function handleBeforeInstallPrompt(event: Event): void {
       event.preventDefault();
+      setShowManualInstructions(false);
       setInstallPrompt(event as BeforeInstallPromptEvent);
     }
 
@@ -48,7 +65,13 @@ export default function PwaInstallPrompt() {
     return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
   }, [hidden]);
 
-  if (hidden || !installPrompt) return null;
+  useEffect(() => {
+    if (hidden || installPrompt) return undefined;
+    const timer = window.setTimeout(() => setShowManualInstructions(true), MANUAL_INSTALL_HINT_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [hidden, installPrompt]);
+
+  if (hidden || (!installPrompt && !showManualInstructions)) return null;
 
   async function installApp(): Promise<void> {
     if (!installPrompt) return;
@@ -58,6 +81,12 @@ export default function PwaInstallPrompt() {
       setHidden(true);
       setInstallPrompt(null);
     }
+  }
+
+  function hideInstallPrompt(): void {
+    rememberInstallLater();
+    setHidden(true);
+    setInstallPrompt(null);
   }
 
   function dismissInstallPrompt(): void {
@@ -74,18 +103,25 @@ export default function PwaInstallPrompt() {
       <div>
         <strong>Cài Novel-TNN</strong>
         <p>
-          Cài Novel-TNN lên Android Chrome hoặc desktop để mở dạng standalone. Import, dịch, TTS và export vẫn cần backend.
+          {installPrompt
+            ? 'Mở nhanh hơn và đọc các chương đã lưu khi mất mạng.'
+            : 'Mở menu trình duyệt rồi chọn “Thêm vào màn hình chính” để cài ứng dụng.'}
         </p>
       </div>
       <div className="pwa-install-actions">
-        <button className="secondary-action" onClick={dismissInstallPrompt} type="button">
+        <button className="secondary-action" onClick={hideInstallPrompt} type="button">
           <X aria-hidden="true" size={15} />
           Để sau
         </button>
-        <button className="primary-action" onClick={() => void installApp()} type="button">
-          <Download aria-hidden="true" size={15} />
-          Cài app
+        <button className="secondary-action pwa-never-remind" onClick={dismissInstallPrompt} type="button">
+          Không nhắc lại
         </button>
+        {installPrompt ? (
+          <button className="primary-action" onClick={() => void installApp()} type="button">
+            <Download aria-hidden="true" size={15} />
+            Cài đặt ngay
+          </button>
+        ) : null}
       </div>
     </section>
   );

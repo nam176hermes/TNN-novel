@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS books (
     author TEXT DEFAULT '',
     source TEXT DEFAULT 'manual',
     source_url TEXT DEFAULT '',
+    canonical_source_url TEXT DEFAULT '',
     cover_path TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS chapters (
     chapter_number INTEGER NOT NULL,
     title TEXT NOT NULL,
     source_url TEXT DEFAULT '',
+    canonical_chapter_url TEXT DEFAULT '',
     adapter_id TEXT DEFAULT '',
     raw_text_path TEXT,
     cleaned_text_path TEXT,
@@ -26,6 +28,10 @@ CREATE TABLE IF NOT EXISTS chapters (
     content_html_path TEXT,
     audio_path TEXT,
     source_hash TEXT DEFAULT '',
+    content_hash TEXT DEFAULT '',
+    source_updated_at TEXT DEFAULT '',
+    last_import_operation TEXT DEFAULT '',
+    content_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT DEFAULT 'imported',
     imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     translated_at TIMESTAMP,
@@ -41,6 +47,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chapters_active_number
 CREATE INDEX IF NOT EXISTS idx_chapters_active_source_hash
     ON chapters(book_id, source_hash)
     WHERE deleted_at IS NULL AND source_hash != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chapters_active_canonical_identity
+    ON chapters(book_id, adapter_id, canonical_chapter_url)
+    WHERE deleted_at IS NULL
+      AND adapter_id != ''
+      AND canonical_chapter_url != '';
 
 CREATE TABLE IF NOT EXISTS reader_progress (
     book_id INTEGER PRIMARY KEY,
@@ -188,8 +199,15 @@ CREATE TABLE IF NOT EXISTS glossary_terms (
     locked INTEGER DEFAULT 0,
     genre TEXT DEFAULT '',
     term_type TEXT DEFAULT 'term',
+    alternatives TEXT DEFAULT '',
+    gender TEXT DEFAULT '',
+    first_seen_chapter_id INTEGER DEFAULT 0,
+    first_seen_chapter_number INTEGER DEFAULT 0,
+    review_status TEXT DEFAULT '',
+    source_context TEXT DEFAULT '',
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT '',
     UNIQUE(book_id, source_term)
 );
 
@@ -227,8 +245,20 @@ CREATE TABLE IF NOT EXISTS qa_reports (
     glossary_score REAL DEFAULT 0,
     audiobook_score REAL DEFAULT 0,
     verdict TEXT DEFAULT 'UNKNOWN',
+    job_id TEXT DEFAULT '',
+    overall_status TEXT DEFAULT 'NOT_RUN',
+    missing_paragraph_warning INTEGER DEFAULT 0,
+    chinese_leakage_count INTEGER DEFAULT 0,
+    name_consistency_status TEXT DEFAULT 'NOT_RUN',
+    term_consistency_status TEXT DEFAULT 'NOT_RUN',
+    length_ratio REAL DEFAULT 0,
+    repetition_warning INTEGER DEFAULT 0,
+    style_warnings TEXT DEFAULT '[]',
+    glossary_violations TEXT DEFAULT '[]',
+    suggested_fixes TEXT DEFAULT '[]',
     report_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT '',
     FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
 );
 
@@ -445,6 +475,92 @@ CREATE TABLE IF NOT EXISTS job_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(job_id, id DESC);
 
+-- P05 import work is intentionally persisted separately from the existing
+-- mobile_jobs runner so it can be introduced without changing that worker.
+CREATE TABLE IF NOT EXISTS import_jobs (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    book_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'queued',
+    total INTEGER NOT NULL DEFAULT 0,
+    queued_count INTEGER NOT NULL DEFAULT 0,
+    running_count INTEGER NOT NULL DEFAULT 0,
+    succeeded_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    cancelled_count INTEGER NOT NULL DEFAULT 0,
+    waiting_retry_count INTEGER NOT NULL DEFAULT 0,
+    verification_required_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    error_summary TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_created
+    ON import_jobs(owner_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_owner_status
+    ON import_jobs(owner_user_id, status);
+
+CREATE TABLE IF NOT EXISTS chapter_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    canonical_identity TEXT NOT NULL,
+    canonical_chapter_url TEXT NOT NULL,
+    chapter_number INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    stage TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    fetch_method TEXT NOT NULL DEFAULT '',
+    text_length INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL DEFAULT '',
+    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    book_id INTEGER,
+    chapter_id INTEGER,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(job_id, canonical_identity),
+    FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL,
+    FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_job_status
+    ON chapter_tasks(job_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_next_attempt
+    ON chapter_tasks(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_chapter_tasks_lease_expiry
+    ON chapter_tasks(status, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS import_job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    task_id INTEGER,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id, sequence),
+    FOREIGN KEY (job_id) REFERENCES import_jobs(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES chapter_tasks(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_job_events_job_sequence
+    ON import_job_events(job_id, sequence ASC);
+
 CREATE TABLE IF NOT EXISTS tts_jobs (
     id TEXT PRIMARY KEY,
     book_id INTEGER NOT NULL,
@@ -592,4 +708,49 @@ CREATE INDEX IF NOT EXISTS idx_source_adapter_candidates_entry ON source_adapter
 CREATE INDEX IF NOT EXISTS idx_source_adapter_candidates_domain ON source_adapter_candidates(domain);
 CREATE INDEX IF NOT EXISTS idx_source_adapter_candidates_status ON source_adapter_candidates(status);
 CREATE INDEX IF NOT EXISTS idx_source_adapter_candidates_created ON source_adapter_candidates(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS managed_sources (
+    id TEXT PRIMARY KEY,
+    catalog_entry_id TEXT DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    base_url TEXT NOT NULL DEFAULT '',
+    domain TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT 'zh-CN',
+    parser_type TEXT NOT NULL DEFAULT 'policy_supported',
+    parser_config_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'NEEDS_REVIEW',
+    trust_level TEXT NOT NULL DEFAULT 'MANUAL_ONLY',
+    supported_source_id TEXT DEFAULT '',
+    last_test_status TEXT DEFAULT '',
+    last_tested_at TEXT DEFAULT '',
+    last_successful_fetch_at TEXT DEFAULT '',
+    last_error TEXT DEFAULT '',
+    rate_limit_requests_per_minute INTEGER DEFAULT 6,
+    rate_limit_delay_ms INTEGER DEFAULT 8000,
+    max_concurrent_requests INTEGER DEFAULT 1,
+    cooldown_after_error_seconds INTEGER DEFAULT 900,
+    notes TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(catalog_entry_id),
+    UNIQUE(base_url)
+);
+CREATE INDEX IF NOT EXISTS idx_managed_sources_catalog_entry ON managed_sources(catalog_entry_id);
+CREATE INDEX IF NOT EXISTS idx_managed_sources_domain ON managed_sources(domain);
+CREATE INDEX IF NOT EXISTS idx_managed_sources_status ON managed_sources(status);
+CREATE INDEX IF NOT EXISTS idx_managed_sources_trust ON managed_sources(trust_level);
+CREATE INDEX IF NOT EXISTS idx_managed_sources_updated ON managed_sources(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS managed_source_tests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT DEFAULT '',
+    http_status INTEGER,
+    final_url TEXT DEFAULT '',
+    tested_at TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_managed_source_tests_source ON managed_source_tests(source_id);
+CREATE INDEX IF NOT EXISTS idx_managed_source_tests_tested ON managed_source_tests(tested_at DESC);
 """

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from zipfile import ZipFile
 
 import httpx
@@ -71,6 +72,45 @@ def test_export_service_creates_txt_docx_and_epub(temp_db_path: Path, tmp_path: 
 
     assert Path(epub["path"]).exists()
     assert Path(epub["path"]).stat().st_size > 0
+
+
+def test_export_service_sanitizes_export_filename(temp_db_path: Path, tmp_path: Path) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "../../Phàm Nhân:*?", author="Tác giả", source="manual")
+    translated_dir = tmp_path / "translated"
+    translated_dir.mkdir(parents=True, exist_ok=True)
+    translation = translated_dir / "chapter-1.txt"
+    translation.write_text("Bản dịch", encoding="utf-8")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chương 1")
+    update_chapter_paths(temp_db_path, chapter_id, translated_text_path=translation, status="translated")
+    service = make_export_service(temp_db_path, tmp_path)
+
+    exported = service.export_book(book_id, "txt")
+
+    assert exported["filename"] == "Ph_m_Nh_n.txt"
+
+
+def test_export_service_resolves_legacy_translated_path(temp_db_path: Path, tmp_path: Path) -> None:
+    init_db(temp_db_path)
+    translated = tmp_path / "translated" / "chapter.txt"
+    translated.parent.mkdir(parents=True)
+    translated.write_text("Bản dịch được phục hồi", encoding="utf-8")
+    book_id = add_book(temp_db_path, "Legacy Export")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
+    old_root = Path("/legacy/novel-pipeline")
+    update_chapter_paths(
+        temp_db_path,
+        chapter_id,
+        translated_text_path=old_root / "data/translated/chapter.txt",
+        status="translated",
+    )
+    service = make_export_service(temp_db_path, tmp_path)
+    service.pipeline.legacy_artifact_root = old_root
+
+    exported = service.export_book(book_id, "txt")
+
+    assert exported["chapter_count"] == 1
+    assert "Bản dịch được phục hồi" in Path(exported["path"]).read_text(encoding="utf-8")
 
 
 def test_export_service_embeds_book_cover_in_epub(temp_db_path: Path, tmp_path: Path) -> None:
@@ -161,6 +201,29 @@ def test_export_service_creates_m4b_audiobook(temp_db_path: Path, tmp_path: Path
     }
 
 
+def test_export_m4b_uses_isolated_concat_file_and_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.export.m4b_exporter import export_m4b
+
+    chapter = tmp_path / "chapter.mp3"
+    chapter.write_bytes(b"audio")
+    output_path = tmp_path / "exports" / "book.m4b"
+    commands: list[tuple[list[str], dict]] = []
+
+    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
+        commands.append((command, kwargs))
+        Path(command[-1]).write_bytes(b"m4b")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("app.export.m4b_exporter.subprocess.run", fake_run)
+
+    assert export_m4b("Book", "Author", [{"chapter_number": 1, "audio_path": str(chapter)}], output_path) == output_path
+    command, kwargs = commands[0]
+    concat_path = Path(command[command.index("-i") + 1])
+    assert concat_path.name != "m4b_concat.txt"
+    assert command[-1] == str(output_path)
+    assert kwargs["timeout"] == 600
+
+
 @pytest.mark.asyncio
 async def test_export_download_endpoint_returns_file(temp_db_path: Path, tmp_path: Path) -> None:
     book_id = seed_translated_book(temp_db_path, tmp_path)
@@ -182,6 +245,22 @@ async def test_export_download_endpoint_returns_file(temp_db_path: Path, tmp_pat
     assert response.headers["content-type"].startswith("text/plain")
     assert "attachment" in response.headers["content-disposition"]
     assert "Lập tức" in response.text
+
+
+@pytest.mark.asyncio
+async def test_export_download_endpoint_requires_authentication(temp_db_path: Path, tmp_path: Path) -> None:
+    book_id = seed_translated_book(temp_db_path, tmp_path)
+    service = make_export_service(temp_db_path, tmp_path)
+    app.dependency_overrides[exports_router.get_export_service] = lambda: service
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/api/books/{book_id}/exports/txt/download")
+    finally:
+        app.dependency_overrides.pop(exports_router.get_export_service, None)
+
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -208,6 +287,7 @@ async def test_audiobook_export_download_endpoint_returns_m4b(
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            unauthenticated = await client.get(f"/api/books/{book_id}/exports/audiobook/m4b/download")
             headers = await auth_headers(client)
             response = await client.get(
                 f"/api/books/{book_id}/exports/audiobook/m4b/download",
@@ -216,6 +296,7 @@ async def test_audiobook_export_download_endpoint_returns_m4b(
     finally:
         app.dependency_overrides.pop(exports_router.get_export_service, None)
 
+    assert unauthenticated.status_code == 401
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("audio/mp4")
     assert "attachment" in response.headers["content-disposition"]

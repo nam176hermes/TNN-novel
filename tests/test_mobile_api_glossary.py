@@ -115,3 +115,31 @@ async def test_glossary_api_hides_weak_terms_and_prioritizes_reviewable_terms(
     assert with_weak_response.status_code == 200
     source_terms_with_weak = [item["source_term"] for item in with_weak_response.json()["items"]]
     assert {"他", "然后", "无译词"}.issubset(set(source_terms_with_weak))
+
+
+@pytest.mark.asyncio
+async def test_glossary_export_includes_review_metadata(glossary_api_db: Path) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    put_glossary_term(
+        glossary_api_db,
+        book_id,
+        "筑基",
+        "Trúc Cơ",
+        approved=1,
+        locked=1,
+        review_status="APPROVED",
+        source_context="第十章",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        response = await client.get(f"/api/glossary/export?book_id={book_id}&format=json", headers=headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    term = payload["terms"][0]
+    assert term["review_status"] == "APPROVED"
+    assert term["locked"] == 1
+    assert term["source_context"] == "第十章"

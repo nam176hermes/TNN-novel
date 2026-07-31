@@ -251,6 +251,7 @@ def test_blank_core_default_provider_row_gets_backfilled(tmp_path: Path) -> None
     conn.commit()
     conn.close()
 
+    init_db(db_path)
     providers = list_model_providers(db_path)
     deepseek = next(item for item in providers if item["id"] == "deepseek")
 

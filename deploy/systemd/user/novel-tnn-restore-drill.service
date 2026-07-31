@@ -1,0 +1,13 @@
+[Unit]
+Description=Novel-TNN isolated encrypted backup restore drill
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=%h/.local/share %h/Novel-TNN-restore-drills
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Novel-TNN
+EnvironmentFile=%h/.config/novel-tnn/backup.env
+ExecStart=%h/Novel-TNN/scripts/production_restore_drill.sh
+UMask=0077
+TimeoutStartSec=infinity

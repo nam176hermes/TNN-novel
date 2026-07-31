@@ -25,3 +25,13 @@ audit_results.txt
 audit_summary.txt
 test_translation_result.md
 translated_chapter_2.md
+.venv.audit-broken-backup
+.playwright-cli
+.superpowers
+.codex
+.claude
+docs/upgrade/review-*.diff
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

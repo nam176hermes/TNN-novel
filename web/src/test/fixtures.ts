@@ -80,6 +80,7 @@ export const fixtureGlossaryTerm: GlossaryTerm = {
   approved: 0,
   priority: 40,
   locked: 1,
+  review_status: 'NEEDS_REVIEW',
   genre: 'tien_hiep',
   term_type: 'realm',
 };

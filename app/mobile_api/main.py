@@ -1,6 +1,9 @@
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 import logging
 import os
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import PROJECT_ROOT
 from app.database.db import init_db
 from app.mobile_api.auth import get_auth_bypass_user
+from app.mobile_api.browser_headers import apply_browser_security_headers
 from app.mobile_api.config import assert_public_deploy_safe, auth_bypass_enabled, mobile_settings
 from app.mobile_api.dependencies import get_db_path, get_data_dir
 from app.mobile_api.private_cache import apply_private_no_store_headers
@@ -23,9 +27,12 @@ from app.mobile_api.private_assets import (
 )
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.session_auth import AccessTokenError, validate_access_token
+from app.mobile_api.services.retention_service import RetentionService, run_retention_loop
+from app.utils.stealth_browser import close_stealth_browser
 from app.mobile_api.routers import (
     auth_router,
     health_router,
+    backups_router,
     books_router,
     import_router,
     jobs_router,
@@ -35,9 +42,11 @@ from app.mobile_api.routers import (
     glossary_router,
     qa_router,
     providers_router,
+    sources_router,
     style_profiles_router,
     source_catalog_router,
     source_adapter_candidates_router,
+    operations_router,
 )
 
 PUBLIC_API_PATHS = {
@@ -96,6 +105,40 @@ def _prepare_runtime() -> None:
         init_captcha_solver(captcha_key, os.getenv("CAPTCHA_PROVIDER", "2captcha"))
 
 
+@asynccontextmanager
+async def _retention_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    existing_task = app.state.retention_task
+    if existing_task is not None and not existing_task.done():
+        raise RuntimeError("Retention maintenance task already running")
+
+    service = app.state.retention_service
+    if service is None:
+        service = RetentionService(get_db_path(), settings=mobile_settings)
+        app.state.retention_service = service
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        run_retention_loop(
+            service,
+            mobile_settings.operational_retention_interval_seconds,
+            stop_event,
+        ),
+        name="novel-operational-retention",
+    )
+    app.state.retention_stop_event = stop_event
+    app.state.retention_task = task
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        await close_stealth_browser()
+        app.state.retention_task = None
+        app.state.retention_stop_event = None
+
+
 def _mount_web_app(app: FastAPI) -> None:
     if not mobile_settings.serve_web:
         return
@@ -142,7 +185,7 @@ def _mount_private_asset_routes(app: FastAPI) -> None:
         return response
 
 
-def create_app() -> FastAPI:
+def create_app(*, retention_service: RetentionService | None = None) -> FastAPI:
     try:
         assert_public_deploy_safe(mobile_settings)
     except RuntimeError:
@@ -155,7 +198,11 @@ def create_app() -> FastAPI:
         docs_url=None if mobile_settings.public_deploy else "/docs",
         openapi_url=None if mobile_settings.public_deploy else "/openapi.json",
         redoc_url=None if mobile_settings.public_deploy else "/redoc",
+        lifespan=_retention_lifespan,
     )
+    app.state.retention_service = retention_service
+    app.state.retention_task = None
+    app.state.retention_stop_event = None
 
     # CORS for Flutter
     app.add_middleware(
@@ -241,9 +288,20 @@ def create_app() -> FastAPI:
         apply_private_no_store_headers(response.headers)
         return response
 
+    @app.middleware("http")
+    async def browser_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+        public_https = is_public_request(request) and (
+            request.url.scheme == "https" or forwarded_proto == "https"
+        )
+        apply_browser_security_headers(response.headers, public_https=public_https)
+        return response
+
     # Mount all routers
     app.include_router(auth_router)
     app.include_router(health_router)
+    app.include_router(backups_router)
     # Books router owns book, chapter, reader-state, reader-search, reader-AI, and X-Ray endpoints.
     app.include_router(books_router)
     app.include_router(import_router)
@@ -254,9 +312,11 @@ def create_app() -> FastAPI:
     app.include_router(glossary_router)
     app.include_router(qa_router)
     app.include_router(providers_router)
+    app.include_router(sources_router)
     app.include_router(style_profiles_router)
     app.include_router(source_catalog_router)
     app.include_router(source_adapter_candidates_router)
+    app.include_router(operations_router)
     _mount_private_asset_routes(app)
     _mount_web_app(app)
 

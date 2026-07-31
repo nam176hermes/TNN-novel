@@ -1,0 +1,10 @@
+# Rollback pin for the release immediately before runtime-hardening-20260718-r1.
+#
+# Image identities at release time:
+# - API:    sha256:6504ea9f6e950cd740768e8419a372dbd20def3ed29bd5b431046b2f22f9dd85
+# - Worker: sha256:f396b37673ae68321b2a7fe2db6c58cb655d0e1fa74a95b9d4d19f700beac8a6
+services:
+  api:
+    image: novel-pipeline-api:pre-runtime-hardening-20260718-r1
+  import-worker:
+    image: novel-pipeline-import-worker:pre-runtime-hardening-20260718-r1

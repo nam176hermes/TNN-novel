@@ -91,10 +91,9 @@ async def test_auth_endpoints():
         assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
         data = resp.json()
         assert "access_token" in data
-        assert "refresh_token" in data
+        assert "refresh_token" not in data
         assert data["token_type"] == "bearer"
         access_token = data["access_token"]
-        refresh_token = data["refresh_token"]
         print("✓ /auth/login works")
 
         # Test /me with token
@@ -110,7 +109,7 @@ async def test_auth_endpoints():
         # Test /auth/refresh
         resp = await client.post(
             "/api/auth/refresh",
-            json={"refresh_token": refresh_token},
+            headers={"X-CSRF-Token": client.cookies.get("novel_csrf")},
         )
         assert resp.status_code == 200
         data = resp.json()

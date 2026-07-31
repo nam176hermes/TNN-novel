@@ -3,7 +3,7 @@ import { Highlighter, StickyNote } from 'lucide-react';
 import type { Chapter } from '../../api/types';
 import { richBlockNeedsTextMirror, type ReaderRichBlock } from '../../state/readerRichContent';
 import type { LoadState } from '../../state/types';
-import type { ReaderFontFamily, ReaderTheme, ReaderWidth } from '../ReaderView';
+import type { ReaderFontFamily, ReaderTheme, ReaderWidth } from './types';
 
 export type ReaderVisibleRange = {
   charEnd?: number;
@@ -17,6 +17,13 @@ export type ReaderVisibleParagraph = ReaderVisibleRange & {
 
 export type ReaderVisibleRichBlock = ReaderRichBlock & ReaderVisibleRange;
 
+export type ReaderParagraphQaBadge = {
+  detail?: string;
+  key: string;
+  label: string;
+  tone?: 'fail' | 'warning';
+};
+
 export type ReaderTextSurfaceProps = {
   ariaLabel?: string;
   fontFamily: ReaderFontFamily;
@@ -27,9 +34,11 @@ export type ReaderTextSurfaceProps = {
   isPaginatedMode: boolean;
   notesByParagraph: Map<number, { note: string }>;
   paragraphs: string[];
+  qaBadgesByParagraph?: Map<number, ReaderParagraphQaBadge[]>;
   readerStyle: CSSProperties;
   richBlocks: ReaderRichBlock[];
   selectedChapter: Chapter | null;
+  showQaOverlay?: boolean;
   textError: string;
   textState: LoadState;
   theme: ReaderTheme;
@@ -81,6 +90,25 @@ function RichBlockText({ block }: { block: ReaderRichBlock }) {
   );
 }
 
+function ReaderQaBadges({ badges }: { badges: ReaderParagraphQaBadge[] }) {
+  if (badges.length === 0) return null;
+  return (
+    <div className="reader-qa-badges" role="list">
+      {badges.map((badge) => (
+        <span
+          className="reader-qa-badge"
+          data-tone={badge.tone ?? 'warning'}
+          key={badge.key}
+          role="listitem"
+          title={badge.detail}
+        >
+          {badge.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export default function ReaderTextSurface({
   ariaLabel = 'Nội dung đọc tiếng Việt',
   fontFamily,
@@ -91,9 +119,11 @@ export default function ReaderTextSurface({
   isPaginatedMode,
   notesByParagraph,
   paragraphs,
+  qaBadgesByParagraph = new Map(),
   readerStyle,
   richBlocks,
   selectedChapter,
+  showQaOverlay = false,
   textError,
   textState,
   theme,
@@ -153,18 +183,28 @@ export default function ReaderTextSurface({
         </header>
       ) : null}
 
-      {textState === 'loading' ? <p>Đang tải bản đọc...</p> : null}
+      {textState === 'loading' ? (
+        <div aria-label="Đang tải nội dung chương" className="reader-loading-skeleton" role="status">
+          {!selectedChapter ? <span className="reader-skeleton-title" /> : null}
+          {[92, 78, 96, 69, 88, 74].map((width, index) => (
+            <span key={`${width}-${index}`} style={{ '--reader-skeleton-width': `${width}%` } as CSSProperties} />
+          ))}
+          <small>Đang tải nội dung chương…</small>
+        </div>
+      ) : null}
       {textError ? (
         <p className="status-error" role="alert">
           {textError}
         </p>
       ) : null}
-      {!selectedChapter && textState !== 'loading' ? <p>Chọn một truyện đã dịch để bắt đầu đọc.</p> : null}
+      {!selectedChapter && textState !== 'loading' ? (
+        <p className="reader-empty-state">Chọn một truyện đã dịch để bắt đầu đọc.</p>
+      ) : null}
       {selectedChapter && textState !== 'loading' && paragraphs.length === 0 && richBlocks.length === 0 && !hasRichContent && !textError ? (
-        <p>Chưa có bản dịch tiếng Việt.</p>
+        <p className="reader-empty-state">Chưa có bản dịch tiếng Việt.</p>
       ) : null}
       {selectedChapter && textState !== 'loading' && hasTitleOnlyImportContent && !textError ? (
-        <p className="status-warning">File import của chương này chỉ có tiêu đề/ảnh, chưa có nội dung chữ để đọc.</p>
+        <p className="reader-empty-state status-warning">File import của chương này chỉ có tiêu đề/ảnh, chưa có nội dung chữ để đọc.</p>
       ) : null}
       {selectedChapter && textState !== 'loading' && hasRichContent && !textError ? (
         <div className={isPaginatedMode ? 'chapter-rich-page' : 'chapter-rich-content'}>
@@ -206,6 +246,9 @@ export default function ReaderTextSurface({
                   <StickyNote aria-hidden="true" size={16} />
                 </button>
               </div>
+            ) : null}
+            {showQaOverlay ? (
+              <ReaderQaBadges badges={qaBadgesByParagraph.get(block.index) ?? []} />
             ) : null}
             {notesByParagraph.has(block.index) ? (
               <button
@@ -261,6 +304,9 @@ export default function ReaderTextSurface({
                   <StickyNote aria-hidden="true" size={16} />
                 </button>
               </div>
+            ) : null}
+            {showQaOverlay ? (
+              <ReaderQaBadges badges={qaBadgesByParagraph.get(index) ?? []} />
             ) : null}
             {notesByParagraph.has(index) ? (
               <button

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as readerCacheModule from './readerCache';
 import {
+  READER_CACHE_UPDATED_EVENT,
   READER_CACHE_STORAGE_KEY,
   cacheReaderAudio,
   cacheReaderAssetsFromHtml,
@@ -92,6 +93,25 @@ describe('readerCache', () => {
       nextCached: true,
     });
     expect(estimateReaderCacheBytes(loadReaderCache(storage))).toBeGreaterThan(0);
+  });
+
+  it('emits the established cache-update event after a persisted cache change', () => {
+    const storage = createMemoryStorage();
+    const handleUpdate = vi.fn();
+    window.addEventListener(READER_CACHE_UPDATED_EVENT, handleUpdate);
+
+    try {
+      putCachedChapter({
+        bookId: 42,
+        chapterId: 101,
+        html: '',
+        sourceText: '',
+        text: 'Bản dịch',
+      }, storage);
+      expect(handleUpdate).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(READER_CACHE_UPDATED_EVENT, handleUpdate);
+    }
   });
 
   it('ignores invalid persisted cache payloads', () => {

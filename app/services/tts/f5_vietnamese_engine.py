@@ -12,8 +12,131 @@ from pathlib import Path
 from typing import Any
 
 from app.config import PROJECT_ROOT, settings
+from app.observability import StructuredEventLogger
+from app.services.tts.availability import require_tts_runtime_available
 
 logger = logging.getLogger(__name__)
+_events = StructuredEventLogger(logger)
+
+_UPSTREAM_CAPTURE_MAX_CHARS = 8192
+_UPSTREAM_CAPTURE_HEAD_CHARS = _UPSTREAM_CAPTURE_MAX_CHARS // 2
+_UPSTREAM_STAGES = frozenset({"load", "infer"})
+_UPSTREAM_STREAMS = frozenset({"stdout", "stderr"})
+_UPSTREAM_DIAGNOSTIC_RULES = (
+    (
+        "gpu_out_of_memory",
+        "CUDA GPU ran out of memory.",
+        ("cuda out of memory", "outofmemoryerror", "cublas_status_alloc_failed"),
+    ),
+    (
+        "gpu_unavailable",
+        "CUDA GPU runtime or driver is unavailable.",
+        (
+            "cuda is not available",
+            "no cuda gpu",
+            "no nvidia driver",
+            "cuda driver",
+            "driver version is insufficient",
+            "invalid device ordinal",
+            "torch not compiled with cuda",
+            "cuda initialization",
+        ),
+    ),
+    (
+        "model_file_missing",
+        "Model checkpoint or vocabulary file is unavailable.",
+        ("checkpoint not found", "model not found", "vocab not found", "filenotfounderror", "no such file or directory"),
+    ),
+    (
+        "model_load_failed",
+        "Model weights could not be loaded.",
+        (
+            "loading state_dict",
+            "failed to load model",
+            "failed to load checkpoint",
+            "missing key(s) in state_dict",
+            "unexpected key(s) in state_dict",
+            "safetensors",
+        ),
+    ),
+    (
+        "model_download_failed",
+        "Model artifact download failed.",
+        ("huggingface", "hf_hub_download", "repository not found", "401 client error", "403 client error"),
+    ),
+    (
+        "dependency_missing",
+        "A required TTS runtime dependency is unavailable.",
+        ("modulenotfounderror", "no module named"),
+    ),
+    (
+        "timeout",
+        "The upstream TTS operation timed out.",
+        ("timed out", "timeout"),
+    ),
+)
+
+
+class _BoundedOutputCapture(io.TextIOBase):
+    """Keep a bounded head and tail while upstream libraries write console output."""
+
+    def __init__(self, max_chars: int = _UPSTREAM_CAPTURE_MAX_CHARS) -> None:
+        super().__init__()
+        self.max_chars = max(2, int(max_chars))
+        self.head_chars = min(_UPSTREAM_CAPTURE_HEAD_CHARS, self.max_chars // 2)
+        self.tail_chars = self.max_chars - self.head_chars
+        self._head = ""
+        self._tail = ""
+        self.total_chars = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        text = str(value)
+        self.total_chars += len(text)
+        head_remaining = self.head_chars - len(self._head)
+        if head_remaining > 0:
+            self._head += text[:head_remaining]
+            text = text[head_remaining:]
+        if text:
+            self._tail = (self._tail + text)[-self.tail_chars :]
+        return len(value)
+
+    def getvalue(self) -> str:
+        return self._head + self._tail
+
+    @property
+    def truncated(self) -> bool:
+        return self.total_chars > len(self._head) + len(self._tail)
+
+
+def _classify_upstream_diagnostic(value: object) -> tuple[str, str]:
+    text = str(value or "")
+    if len(text) > _UPSTREAM_CAPTURE_MAX_CHARS:
+        half = _UPSTREAM_CAPTURE_MAX_CHARS // 2
+        text = text[:half] + text[-half:]
+    normalized = text.casefold()
+    for category, diagnostic, markers in _UPSTREAM_DIAGNOSTIC_RULES:
+        if any(marker in normalized for marker in markers):
+            return category, diagnostic
+    return "suppressed", "Upstream output was suppressed."
+
+
+def _emit_upstream_diagnostic(*, stage: str, stream: str, capture: _BoundedOutputCapture) -> None:
+    output = capture.getvalue()
+    if not output.strip():
+        return
+    category, diagnostic = _classify_upstream_diagnostic(output)
+    _events.emit(
+        "tts_upstream_diagnostic",
+        level=logging.DEBUG,
+        stage=stage if stage in _UPSTREAM_STAGES else "unknown",
+        stream=stream if stream in _UPSTREAM_STREAMS else "unknown",
+        category=category,
+        diagnostic=diagnostic,
+        truncated=capture.truncated,
+    )
 
 
 class TTSEngineError(RuntimeError):
@@ -116,17 +239,8 @@ def stable_audio_cache_key(
 
 
 def _resolve_device(requested: str) -> str:
-    requested = (requested or "cpu").lower()
-    if requested != "cuda":
-        return requested
-    try:
-        import torch  # type: ignore
-    except ImportError:
-        logger.warning("TTS_DEVICE=cuda requested but torch is unavailable; falling back to CPU")
-        return "cpu"
-    if not torch.cuda.is_available():
-        logger.warning("TTS_DEVICE=cuda requested but CUDA is unavailable; falling back to CPU")
-        return "cpu"
+    requested = (requested or "").strip().lower()
+    require_tts_runtime_available(provider="f5_vietnamese", device=requested)
     return "cuda"
 
 
@@ -139,15 +253,14 @@ def _resolve_project_path(value: str) -> str:
 
 @contextlib.contextmanager
 def _capture_upstream_output(label: str):
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    stdout = _BoundedOutputCapture()
+    stderr = _BoundedOutputCapture()
     try:
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             yield
     finally:
-        output = "\n".join(part.strip() for part in (stdout.getvalue(), stderr.getvalue()) if part.strip())
-        if output:
-            logger.debug("Captured F5-TTS %s output:\n%s", label, output[-4000:])
+        _emit_upstream_diagnostic(stage=label, stream="stdout", capture=stdout)
+        _emit_upstream_diagnostic(stage=label, stream="stderr", capture=stderr)
 
 
 class F5VietnameseEngine:
@@ -158,11 +271,11 @@ class F5VietnameseEngine:
     def _load(self):
         if self._engine is not None:
             return self._engine
+        device = _resolve_device(self.config.device)
         try:
             from f5_tts.api import F5TTS  # type: ignore
         except ImportError as exc:
             raise TTSDependencyError("F5-TTS is not installed. Install f5-tts and configure ViVoice before using local Vietnamese TTS.") from exc
-        device = _resolve_device(self.config.device)
         model_name, ckpt_file, vocab_file = self._resolve_model_files()
         try:
             with _capture_upstream_output("load"):
@@ -238,7 +351,7 @@ class F5VietnameseEngine:
             shutil.copy2(cache_path, output_wav_path)
             return output_wav_path
 
-        last_error: Exception | None = None
+        last_diagnostic = "Upstream output was suppressed."
         for attempt in range(max(1, self.config.retries + 1)):
             try:
                 self._infer_with_timeout(normalized_text, reference_audio, reference_text, output_wav_path)
@@ -247,10 +360,16 @@ class F5VietnameseEngine:
                     shutil.copy2(output_wav_path, cache_path)
                 return output_wav_path
             except Exception as exc:
-                last_error = exc
-                logger.warning("F5 TTS chunk attempt %s failed: %s", attempt + 1, exc)
+                category, last_diagnostic = _classify_upstream_diagnostic(exc)
+                _events.emit(
+                    "tts_chunk_attempt_failed",
+                    level=logging.WARNING,
+                    attempt=attempt + 1,
+                    category=category,
+                    diagnostic=last_diagnostic,
+                )
                 output_wav_path.unlink(missing_ok=True)
-        raise TTSEngineError(f"F5 TTS chunk failed after retries: {last_error}") from last_error
+        raise TTSEngineError(f"F5 TTS chunk failed after retries: {last_diagnostic}")
 
     def _infer_with_timeout(
         self,

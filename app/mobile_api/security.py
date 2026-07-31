@@ -5,12 +5,21 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError
 from passlib.context import CryptContext
 
 from app.mobile_api.config import mobile_settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+JWT_SIGNING_ALGORITHM = "HS256"
+
+
+def _jwt_algorithm() -> str:
+    configured = mobile_settings.algorithm.strip().upper()
+    if configured != JWT_SIGNING_ALGORITHM:
+        raise RuntimeError("JWT signing algorithm must remain HS256")
+    return JWT_SIGNING_ALGORITHM
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -35,7 +44,7 @@ def create_long_lived_token(data: dict, years: int = 10) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(days=365 * years)
     to_encode.update({"exp": expire, "type": "access"})
-    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=mobile_settings.algorithm)
+    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=_jwt_algorithm())
 
 
 def _token_id() -> str:
@@ -66,7 +75,7 @@ def create_access_token(
     to_encode.update({"exp": expire, "type": "access", "jti": token_id or _token_id()})
     if session_id:
         to_encode["sid"] = session_id
-    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=mobile_settings.algorithm)
+    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=_jwt_algorithm())
 
 
 def create_refresh_token(
@@ -82,11 +91,12 @@ def create_refresh_token(
     to_encode.update({"exp": expire, "type": "refresh", "jti": token_id or _token_id()})
     if session_id:
         to_encode["sid"] = session_id
-    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=mobile_settings.algorithm)
+    return jwt.encode(to_encode, mobile_settings.secret_key, algorithm=_jwt_algorithm())
 
 
 def decode_token(token: str) -> dict[str, Any]:
     try:
-        return jwt.decode(token, mobile_settings.secret_key, algorithms=[mobile_settings.algorithm])
-    except JWTError as exc:
+        algorithm = _jwt_algorithm()
+        return jwt.decode(token, mobile_settings.secret_key, algorithms=[algorithm])
+    except InvalidTokenError as exc:
         raise ValueError("Invalid token") from exc

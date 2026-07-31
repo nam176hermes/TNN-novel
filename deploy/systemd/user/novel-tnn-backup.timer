@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Novel-TNN encrypted off-site backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=novel-tnn-backup.service
+
+[Install]
+WantedBy=timers.target

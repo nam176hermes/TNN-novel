@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sqlite3
+import stat
+import tempfile
 
 from app.database.db import (
     add_book,
@@ -34,6 +37,15 @@ from app.database.db import (
     get_glossary_conflicts,
 )
 import app.database.db as db_mod
+
+
+def test_db_reexports_connection_function_object(temp_db_path: Path) -> None:
+    from app.database.connection import get_connection as repository_get_connection
+
+    assert db_mod.get_connection is repository_get_connection
+    with db_mod.get_connection(temp_db_path) as conn:
+        assert conn.row_factory is sqlite3.Row
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
 def test_add_and_get_book(temp_db_path: Path):
@@ -105,6 +117,51 @@ def test_init_db_seeds_style_profiles_and_glossary_metadata(temp_db_path: Path) 
     assert {"locked", "genre", "term_type", "priority"}.issubset(columns)
 
 
+def test_init_db_restricts_sqlite_file_permissions(
+    temp_db_path: Path,
+    monkeypatch,
+) -> None:
+    chmod_calls: list[tuple[Path, int]] = []
+
+    def record_chmod(path: Path, mode: int, *args, **kwargs) -> None:
+        chmod_calls.append((path, mode))
+
+    monkeypatch.setattr(Path, "chmod", record_chmod)
+    init_db(temp_db_path)
+
+    assert (temp_db_path, 0o660) in chmod_calls
+
+
+def test_recreated_sqlite_sidecars_keep_service_only_permissions() -> None:
+    """A later SQLite write must not recreate WAL/SHM with world access."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as root:
+        db_path = Path(root) / "sidecar-permissions.db"
+        wal_path = db_path.with_name(f"{db_path.name}-wal")
+        shm_path = db_path.with_name(f"{db_path.name}-shm")
+
+        original_umask = os.umask(0)
+        try:
+            with get_connection(db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("CREATE TABLE permission_sidecar_probe (id INTEGER PRIMARY KEY)")
+        finally:
+            os.umask(original_umask)
+
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o660
+        assert stat.S_IMODE(wal_path.stat().st_mode) == 0o660
+        assert stat.S_IMODE(shm_path.stat().st_mode) == 0o660
+
+
+def test_get_connection_does_not_change_the_process_umask(tmp_path: Path) -> None:
+    previous_umask = os.umask(0o022)
+    try:
+        get_connection(tmp_path / "process-umask.db").close()
+        observed_umask = os.umask(0o022)
+        assert observed_umask == 0o022
+    finally:
+        os.umask(previous_umask)
+
+
 def test_set_default_style_profile_keeps_single_default(temp_db_path: Path) -> None:
     init_db(temp_db_path)
 
@@ -168,6 +225,7 @@ def test_migrates_legacy_qa_reports_without_book_id(tmp_path: Path) -> None:
             """
         )
 
+    init_db(db_path)
     report = get_qa_report(db_path, 1, 10)
 
     assert report is not None
@@ -212,6 +270,7 @@ def test_soft_delete_releases_legacy_unique_chapter_number(tmp_path: Path) -> No
             """
         )
 
+    init_db(db_path)
     assert db_mod.soft_delete_chapter(db_path, 10) is True
     replacement_id = add_chapter(db_path, 1, 1, "Replacement Chapter")
 
@@ -312,6 +371,7 @@ def test_list_books_consolidates_existing_duplicate_book_keys(
     finally:
         raw_conn.close()
 
+    init_db(temp_db_path)
     visible_books = list_books(temp_db_path)
 
     assert [book["id"] for book in visible_books if book["title"] == "Thanh Sơn"] == [target_book_id]

@@ -25,6 +25,7 @@ from app.mobile_api.schemas import (
 )
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.upload_limits import read_upload_bytes_limited
+from app.storage.artifact_paths import ArtifactPathError, ResolutionStatus
 
 router = APIRouter(prefix="/api", tags=["books"])
 logger = logging.getLogger(__name__)
@@ -40,8 +41,30 @@ READER_DICTIONARY_MEDIA_TYPES = {
 }
 
 
+def _artifact_http_exception(exc: ArtifactPathError) -> HTTPException:
+    status_code = 403 if exc.status is ResolutionStatus.OUTSIDE_ALLOWED_ROOT else 404
+    return HTTPException(status_code=status_code, detail=str(exc))
+
+
 def get_pipeline():
     return PipelineService()
+
+
+def _safe_book_response(book: dict) -> dict:
+    payload = dict(book)
+    payload["cover_path"] = ""
+    return payload
+
+
+def _safe_chapter_response(chapter: dict) -> dict:
+    payload = dict(chapter)
+    for field in ("raw_text_path", "cleaned_text_path", "translated_text_path", "audio_path"):
+        payload[field] = "available" if payload.get(field) else None
+    content_path = str(payload.get("content_html_path") or "")
+    payload["content_html_path"] = (
+        content_path if content_path.startswith("/book-assets/") else "available" if content_path else None
+    )
+    return payload
 
 
 @router.get("/books", response_model=list[dict])
@@ -49,14 +72,14 @@ async def list_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     books = pipeline.list_books()
-    return books
+    return [_safe_book_response(book) for book in books]
 
 
 @router.get("/library/books", response_model=dict)
 async def list_translated_library_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
-    return {"books": pipeline.list_translated_book_summaries()}
+    return {"books": [_safe_book_response(book) for book in pipeline.list_translated_book_summaries()]}
 
 
 @router.post("/books", response_model=dict, status_code=201)
@@ -70,7 +93,7 @@ async def create_book(
         source=book.source,
         source_url=book.source_url,
     )
-    return pipeline.get_book(book_id)
+    return _safe_book_response(pipeline.get_book(book_id))
 
 
 @router.get("/books/{book_id}", response_model=dict)
@@ -81,7 +104,7 @@ async def get_book(
     book = pipeline.get_book(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.patch("/books/{book_id}", response_model=dict)
@@ -93,7 +116,7 @@ async def update_book(
     book = pipeline.update_book(book_id, **update.model_dump(exclude_unset=True))
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.post("/books/{book_id}/cover", response_model=dict)
@@ -117,7 +140,7 @@ async def update_book_cover(
 
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    return _safe_book_response(book)
 
 
 @router.delete("/books/{book_id}")
@@ -500,7 +523,7 @@ async def list_chapters(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
-    return pipeline.list_chapters(book_id)
+    return [_safe_chapter_response(chapter) for chapter in pipeline.list_chapters(book_id)]
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}", response_model=dict)
@@ -512,7 +535,7 @@ async def get_chapter(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    return chapter
+    return _safe_chapter_response(chapter)
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/source")
@@ -524,7 +547,12 @@ async def get_chapter_source(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    text = pipeline.get_chapter_source(chapter_id)
+    try:
+        text = pipeline.get_chapter_source(chapter_id)
+    except ArtifactPathError as exc:
+        if exc.status is ResolutionStatus.FILE_MISSING:
+            return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
+        raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
     return {"text": text, "chapter_id": chapter_id, "missing": False}
@@ -539,7 +567,12 @@ async def get_chapter_translation(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    text = pipeline.get_chapter_translation(chapter_id)
+    try:
+        text = pipeline.get_chapter_translation(chapter_id)
+    except ArtifactPathError as exc:
+        if exc.status is ResolutionStatus.FILE_MISSING:
+            return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
+        raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
     return {"text": text, "chapter_id": chapter_id, "missing": False}
@@ -554,7 +587,10 @@ async def get_chapter_content(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    content = pipeline.get_chapter_content(chapter_id)
+    try:
+        content = pipeline.get_chapter_content(chapter_id)
+    except ArtifactPathError as exc:
+        raise _artifact_http_exception(exc) from exc
     if content is None:
         raise HTTPException(status_code=404, detail="Translation not found")
     return {"chapter_id": chapter_id, **content}

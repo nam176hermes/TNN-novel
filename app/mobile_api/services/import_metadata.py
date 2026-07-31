@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 
+from app.ingestion.text_normalization import normalize_import_text, source_hash
 from app.utils.chinese_numbers import parse_chinese_number
-
-
-def source_hash(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
 def clean_book_title(title: str) -> str:
@@ -51,6 +47,7 @@ def detect_import_metadata(
     text: str = "",
     filename: str = "",
 ) -> dict:
+    text = normalize_import_text(text)
     detected_title = clean_book_title(title)
     detected_chapter_number = chapter_number if chapter_number and chapter_number > 0 else 1
     detected_chapter_title = chapter_title.strip()

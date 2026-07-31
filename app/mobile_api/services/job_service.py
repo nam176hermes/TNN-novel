@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 from app.database.db import (
     claim_mobile_job,
+    get_chapter_by_id,
     get_mobile_job,
     heartbeat_mobile_job_lease,
     list_mobile_jobs,
@@ -30,6 +31,7 @@ from app.ingestion.source_policies import chapter_url_matches_source_book, get_s
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.job_states import is_valid_job_state_transition, normalize_job_state, state_for_stage
+from app.services.tts.availability import require_tts_runtime_available
 from app.translation.ollama_client import is_retryable_provider_error
 from app.translation.presets import get_translation_preset
 
@@ -450,8 +452,24 @@ class JobTracker:
                 step=job.current_step,
                 message="Cancel requested",
             )
+        self.update_job(job_id, cancel_requested=True)
         # Cancel the asyncio task if it exists
         task = self._tasks.get(job_id)
+        if job.job_type == "backup":
+            # Backup creation runs in a worker thread, which asyncio task
+            # cancellation cannot stop. Let its cooperative callback observe
+            # this durable flag before the directory lock is released.
+            if task and not task.done():
+                return True
+            refreshed = self.get_job(job_id)
+            if refreshed and refreshed.status in {"queued", "pending", "retrying"}:
+                return self.update_job(
+                    job_id,
+                    status="cancelled",
+                    message="Job cancelled before claim",
+                    cancel_requested=True,
+                )
+            return True
         if task and not task.done():
             task.cancel()
             return True
@@ -884,6 +902,7 @@ class JobService:
         *,
         url: str,
         chapters: list[dict],
+        managed_source_id: str = "",
         title: str = "",
         author: str = "",
         source: str = "",
@@ -915,6 +934,7 @@ class JobService:
             len(chapters),
             {
                 "url": source_url,
+                "managed_source_id": managed_source_id,
                 "title": title,
                 "author": author,
                 "source": source,
@@ -1118,6 +1138,56 @@ class JobService:
                         )
                     if self._cancel_if_requested(job_id):
                         return
+                    db_chapter = get_chapter_by_id(self.pipeline.db_path, chapter_id)
+                    if db_chapter:
+                        try:
+                            from app.mobile_api.services.glossary_service import GlossaryService
+                            from app.mobile_api.services.qa_service import QAService
+
+                            self.tracker.update_job(
+                                job_id,
+                                status="running",
+                                progress=idx,
+                                message=f"Running glossary and QA follow-up for chapter {chapter_id}",
+                                current_step="QA_CHECKING",
+                            )
+                            extracted = await asyncio.to_thread(
+                                GlossaryService.from_db_path(self.pipeline.db_path).extract_chapter_terms,
+                                book_id,
+                                chapter_id,
+                            )
+                            qa_report = await asyncio.to_thread(
+                                QAService(self.pipeline).run_deterministic_qa,
+                                book_id,
+                                chapter_id,
+                                job_id,
+                            )
+                            record_job_log(
+                                self.pipeline.db_path,
+                                job_id=job_id,
+                                event_type="qa_completed",
+                                state="QA_CHECKING",
+                                step="QA_CHECKING",
+                                message="QA and glossary follow-up completed",
+                                details={
+                                    "chapter_id": chapter_id,
+                                    "overall_status": qa_report.get("overall_status"),
+                                    "warning_count": len(qa_report.get("issues") or []),
+                                    "glossary_candidates_created": extracted.get("created", 0),
+                                    "glossary_candidates_updated": extracted.get("updated", 0),
+                                },
+                            )
+                        except Exception:
+                            logger.exception("QA/glossary follow-up failed for job %s chapter %s", job_id, chapter_id)
+                            record_job_log(
+                                self.pipeline.db_path,
+                                job_id=job_id,
+                                event_type="qa_followup_failed",
+                                state="QA_CHECKING",
+                                step="QA_CHECKING",
+                                message="QA/glossary follow-up failed; translation remains saved",
+                                details={"chapter_id": chapter_id},
+                            )
                     if not resolved_preset_id:
                         elapsed_ms = int((time.monotonic() - started_at) * 1000)
                         self._update_stage_timing(
@@ -1218,6 +1288,8 @@ class JobService:
         rate: str = "-5%",
         volume: str = "+0%",
     ) -> str:
+        require_tts_runtime_available()
+
         # Determine target chapters with translations
         if chapter_ids:
             target_ids = chapter_ids

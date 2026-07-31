@@ -43,6 +43,7 @@ describe('ExportView', () => {
     );
 
     expect(screen.getByRole('heading', { name: 'Xuất file' })).toBeInTheDocument();
+    expect(screen.getByText('Xuất sách để đọc/nghe. Không phải backup hệ thống.')).toBeInTheDocument();
     expect(screen.getByLabelText('Book')).toHaveValue('1');
     expect(screen.getByText('2')).toBeInTheDocument();
 
@@ -64,7 +65,7 @@ describe('ExportView', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Hướng dẫn' }));
 
-    expect(screen.getByRole('region', { name: 'Hướng dẫn xuất file' })).toHaveTextContent('Chọn truyện đã có bản dịch');
+    expect(screen.getByRole('region', { name: 'Hướng dẫn xuất file' })).toHaveTextContent('Backup hệ thống nằm ở trang Trạng thái');
   });
 
   it('disables format buttons when selected book has no translations', () => {

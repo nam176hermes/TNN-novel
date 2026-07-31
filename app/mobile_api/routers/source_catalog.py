@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.database.db import (
     get_source_catalog_entry,
+    get_source_catalog_health_summary,
     insert_source_adapter_candidate,
     list_source_catalog_entries,
     record_source_catalog_health_check,
@@ -11,11 +12,13 @@ from app.database.db import (
 from app.ingestion.parser_candidates import create_parser_candidate
 from app.ingestion.source_health import check_source_health
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.auth import get_current_user
 from app.mobile_api.dependencies import get_db_path
 from app.mobile_api.schemas import (
     ParserCandidateCreateRequest,
     SourceAdapterCandidate,
     SourceCatalogHealthResponse,
+    SourceCatalogHealthSummary,
     SourceCatalogList,
 )
 
@@ -46,11 +49,15 @@ async def list_source_catalog(
     tag: str = Query(default="", max_length=32),
     domain: str = Query(default="", max_length=255),
     supported: str | None = Query(default=None, max_length=32),
+    status: str = Query(default="", max_length=32),
+    trust_level: str = Query(default="", max_length=32),
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=50, ge=1, le=200),
     page_size: int | None = Query(default=None, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
 ):
     """Return read-only metadata about known external source catalog entries."""
+    del current_user
     return _catalog_response(
         list_source_catalog_entries(
             get_db_path(),
@@ -58,6 +65,8 @@ async def list_source_catalog(
             tag=tag,
             domain=domain,
             supported=_parse_supported_filter(supported),
+            managed_status=status,
+            managed_trust_level=trust_level,
             page=page,
             per_page=page_size or per_page,
         )
@@ -70,23 +79,37 @@ async def list_source_catalog_slash(
     tag: str = Query(default="", max_length=32),
     domain: str = Query(default="", max_length=255),
     supported: str | None = Query(default=None, max_length=32),
+    status: str = Query(default="", max_length=32),
+    trust_level: str = Query(default="", max_length=32),
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=50, ge=1, le=200),
     page_size: int | None = Query(default=None, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
 ):
+    del current_user
     return await list_source_catalog(
         query=query,
         tag=tag,
         domain=domain,
         supported=supported,
+        status=status,
+        trust_level=trust_level,
         page=page,
         per_page=per_page,
         page_size=page_size,
     )
 
 
+@router.get("/health", response_model=SourceCatalogHealthSummary)
+async def source_catalog_health_summary(current_user: dict = Depends(get_current_user)):
+    """Return authenticated, aggregate health state for source operations."""
+    del current_user
+    return get_source_catalog_health_summary(get_db_path())
+
+
 @router.post("/{entry_id}/check", response_model=SourceCatalogHealthResponse)
-async def check_source_catalog_entry(entry_id: str, request: Request):
+async def check_source_catalog_entry(entry_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    del current_user
     db_path = get_db_path()
     entry = get_source_catalog_entry(db_path, entry_id)
     if entry is None:
@@ -117,7 +140,9 @@ async def create_source_catalog_parser_candidate(
     entry_id: str,
     request: Request,
     payload: ParserCandidateCreateRequest | None = None,
+    current_user: dict = Depends(get_current_user),
 ):
+    del current_user
     db_path = get_db_path()
     entry = get_source_catalog_entry(db_path, entry_id)
     if entry is None:

@@ -32,6 +32,10 @@ class AudioQAResult:
         }
 
 
+def ffprobe_available() -> bool:
+    return shutil.which("ffprobe") is not None
+
+
 def _probe_duration(path: Path) -> float:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -123,6 +127,8 @@ def analyze_audio(
             rms = 0
             peak = 0
             clipped_ratio = 0
+            if text and not ffprobe_available():
+                warnings.append("ffprobe unavailable; duration QA skipped")
     except (OSError, wave.Error, struct.error) as exc:
         return AudioQAResult(False, error=f"Audio QA failed: {exc}")
 

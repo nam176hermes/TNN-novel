@@ -1,17 +1,963 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import tarfile
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from scripts import ops
+
+
+class _FrozenBackupDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 7, 13, 20, 15, 30, tzinfo=tz)
+
+
+def _write_backup_sidecar(archive: Path, **overrides: object) -> Path:
+    payload: dict[str, object] = {
+        "backup_format_version": 2,
+        "created_at": "2026-07-12T10:00:00",
+        "encrypted": False,
+        "secrets_included": False,
+        "included_modules": ["database"],
+        "excluded_modules": ["secrets"],
+        "file_count": 1,
+        "total_size_bytes": 8,
+        "checksums": [{"path": "data/private.txt", "sha256": "a" * 64}],
+    }
+    payload.update(overrides)
+    sidecar = archive.with_suffix(archive.suffix + ops.BACKUP_MANIFEST_SUFFIX)
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    return sidecar
+
+
+def test_list_backups_never_opens_archives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    ready.write_bytes(b"artifact")
+    _write_backup_sidecar(ready)
+    missing = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    missing.write_bytes(b"large-content-is-irrelevant")
+    monkeypatch.setattr(ops.tarfile, "open", lambda *args, **kwargs: pytest.fail("listing opened archive"))
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[ready.name]["metadata_status"] == "READY"
+    assert items[missing.name]["metadata_status"] == "METADATA_MISSING"
+    assert "checksums" not in items[ready.name]["manifest"]
+    assert "private.txt" not in json.dumps(items)
+
+
+def test_list_backups_classifies_entries_independently(tmp_path: Path) -> None:
+    malformed = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    malformed.write_bytes(b"artifact")
+    malformed.with_suffix(malformed.suffix + ops.BACKUP_MANIFEST_SUFFIX).write_text("{", encoding="utf-8")
+
+    zero = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    zero.touch()
+
+    orphan_archive = tmp_path / "novel-pipeline-backup-20260712-080000.tar.gz"
+    _write_backup_sidecar(orphan_archive)
+
+    unsupported = tmp_path / "novel-pipeline-backup-20260712-070000.zip"
+    unsupported.write_bytes(b"zip")
+    (tmp_path / "notes.txt").write_text("ignore", encoding="utf-8")
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[malformed.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[zero.name]["metadata_status"] == "ARTIFACT_INVALID"
+    assert items[orphan_archive.name]["metadata_status"] == "ARTIFACT_MISSING"
+    assert items[unsupported.name]["metadata_status"] == "UNSUPPORTED_FORMAT"
+    assert "notes.txt" not in items
+    assert all(not item.get("download_url") for item in items.values())
+
+
+def test_list_backups_rejects_oversized_and_symlink_sidecars(tmp_path: Path) -> None:
+    oversized = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    oversized.write_bytes(b"artifact")
+    oversized_sidecar = oversized.with_suffix(oversized.suffix + ops.BACKUP_MANIFEST_SUFFIX)
+    oversized_sidecar.write_bytes(b"x" * (ops.MAX_BACKUP_SIDECAR_BYTES + 1))
+
+    linked = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    linked.write_bytes(b"artifact")
+    external = tmp_path / "external.json"
+    external.write_text("{}", encoding="utf-8")
+    linked.with_suffix(linked.suffix + ops.BACKUP_MANIFEST_SUFFIX).symlink_to(external)
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[oversized.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[linked.name]["metadata_status"] == "METADATA_INVALID"
+
+
+def test_list_backups_rejects_absolute_or_mismatched_sidecar_metadata(tmp_path: Path) -> None:
+    absolute = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    absolute.write_bytes(b"artifact")
+    _write_backup_sidecar(absolute, app_version="/home/private/build")
+    mismatched = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz"
+    mismatched.write_bytes(b"artifact")
+    _write_backup_sidecar(mismatched, backup_filename="different.tar.gz")
+
+    items = {item["filename"]: item for item in ops.list_backups(tmp_path)}
+
+    assert items[absolute.name]["metadata_status"] == "METADATA_INVALID"
+    assert items[mismatched.name]["metadata_status"] == "METADATA_INVALID"
+    assert "/home/private" not in json.dumps(items)
+
+
+def test_create_backup_writes_compact_sidecar(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("private", encoding="utf-8")
+
+    archive = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "backups",
+        record_event=False,
+    )
+
+    sidecar = ops.backup_sidecar_path(archive)
+    sidecar_text = sidecar.read_text(encoding="utf-8")
+    metadata = json.loads(sidecar_text)
+    assert metadata["sidecar_schema_version"] == 1
+    assert metadata["backup_filename"] == archive.name
+    assert metadata["archive_size_bytes"] == archive.stat().st_size
+    assert metadata["artifact_state"] == "READY"
+    assert "checksums" not in metadata
+    assert "chapter.txt" not in sidecar_text
+
+    with tarfile.open(archive, "r:gz") as handle:
+        internal = json.loads(handle.extractfile("manifest.json").read().decode("utf-8"))
+    assert internal["checksums"][0]["path"] == "data/chapter.txt"
+
+
+def test_create_backup_cancellation_does_not_publish_partial_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter-1.txt").write_text("first", encoding="utf-8")
+    (data_dir / "chapter-2.txt").write_text("second", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    cancel_flag = [False]
+
+    def record_progress(step: str) -> None:
+        if step == "writing":
+            cancel_flag[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            cancel_check=lambda: cancel_flag[0],
+            progress_callback=record_progress,
+        )
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_validation_failure_prevents_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    staging_modes: list[int] = []
+    real_chmod = Path.chmod
+
+    def record_staging_mode(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        if ".partial" in path.name:
+            staging_modes.append(mode)
+        real_chmod(path, mode, *args, **kwargs)
+
+    def fail_validation(archive_path: Path) -> dict[str, object]:
+        assert archive_path.parent.parent == backup_dir
+        raise ValueError("validation failed")
+
+    monkeypatch.setattr(Path, "chmod", record_staging_mode)
+    monkeypatch.setattr(ops, "_validate_backup_archive", fail_validation, raising=False)
+
+    with pytest.raises(ValueError, match="validation failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+    assert staging_modes == [0o700]
+
+
+def test_create_backup_cancellation_before_archive_publication_publishes_nothing(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    cancel_flag = [False]
+
+    def record_progress(step: str) -> None:
+        if step == "publishing":
+            cancel_flag[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            record_event=False,
+            cancel_check=lambda: cancel_flag[0],
+            progress_callback=record_progress,
+        )
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+
+
+def test_create_backup_sidecar_publication_failure_leaves_visible_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_publish = ops._publish_backup_file
+
+    def fail_final_sidecar_publication(source: Path, destination: Path) -> None:
+        if destination.parent == backup_dir and destination.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
+            raise OSError("sidecar publication failed")
+        real_publish(source, destination)
+
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_final_sidecar_publication)
+
+    with pytest.raises(OSError, match="sidecar publication failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    archives = list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))
+    assert len(archives) == 1
+    assert not ops.backup_sidecar_path(archives[0]).exists()
+    assert ops.list_backups(backup_dir)[0]["metadata_status"] == "METADATA_MISSING"
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_archive_publication_failure_publishes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_publish = ops._publish_backup_file
+
+    def fail_final_archive_publication(source: Path, destination: Path) -> None:
+        if destination.parent == backup_dir and destination.name.endswith(".tar.gz"):
+            raise OSError("archive publication failed")
+        real_publish(source, destination)
+
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_final_archive_publication)
+
+    with pytest.raises(OSError, match="archive publication failed"):
+        ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz")) == []
+    assert list(backup_dir.glob("*.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_backup_same_timestamp_collision_preserves_both_backups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first version", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second version", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+
+    first = ops.create_backup(data_dir=first_data, out_dir=backup_dir, record_event=False)
+    first_hash = ops.sha256_file(first)
+    first_sidecar = ops.backup_sidecar_path(first).read_bytes()
+    second = ops.create_backup(data_dir=second_data, out_dir=backup_dir, record_event=False)
+
+    assert first != second
+    assert first.name.startswith("novel-pipeline-backup-20260713-201530")
+    assert second.name.startswith("novel-pipeline-backup-20260713-201530")
+    assert ops.sha256_file(first) == first_hash
+    assert ops.backup_sidecar_path(first).read_bytes() == first_sidecar
+    assert first.is_file() and ops.backup_sidecar_path(first).is_file()
+    assert second.is_file() and ops.backup_sidecar_path(second).is_file()
+    assert len(list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))) == 2
+
+    first_restore = ops.restore_backup(first, tmp_path / "first-restore")
+    second_restore = ops.restore_backup(second, tmp_path / "second-restore")
+    assert (first_restore / "chapter.txt").read_text(encoding="utf-8") == "first version"
+    assert (second_restore / "chapter.txt").read_text(encoding="utf-8") == "second version"
+
+
+def test_create_backup_collision_sidecar_publication_failure_inherits_no_stale_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first version", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second version with different size", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+
+    first = ops.create_backup(data_dir=first_data, out_dir=backup_dir, record_event=False)
+    first_hash = ops.sha256_file(first)
+    first_sidecar = ops.backup_sidecar_path(first).read_bytes()
+
+    def fail_sidecar_publication(source: Path, destination: Path) -> None:
+        if destination.name.endswith(ops.BACKUP_MANIFEST_SUFFIX):
+            raise OSError("sidecar publication failed")
+        os.link(source, destination)
+        source.unlink()
+
+    monkeypatch.setattr(ops, "_publish_backup_file", fail_sidecar_publication, raising=False)
+
+    with pytest.raises(OSError, match="sidecar publication failed"):
+        ops.create_backup(data_dir=second_data, out_dir=backup_dir, record_event=False)
+
+    archives = list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))
+    assert len(archives) == 2
+    second = next(path for path in archives if path != first)
+    assert ops.sha256_file(first) == first_hash
+    assert ops.backup_sidecar_path(first).read_bytes() == first_sidecar
+    assert not ops.backup_sidecar_path(second).exists()
+    items = {item["filename"]: item for item in ops.list_backups(backup_dir)}
+    assert items[first.name]["metadata_status"] == "READY"
+    assert items[second.name]["metadata_status"] == "METADATA_MISSING"
+
+
+def test_encryption_failure_does_not_publish_encrypted_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    archive = ops.create_backup(data_dir=data_dir, out_dir=backup_dir, record_event=False)
+
+    def fail_encryption(command: list[str], **_: object) -> None:
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"partial encrypted output")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fail_encryption)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        ops.encrypt_backup_archive(archive, passphrase="secret")
+
+    assert list(backup_dir.glob("novel-pipeline-backup-*.tar.gz.enc")) == []
+    assert list(backup_dir.glob("*.tar.gz.enc.manifest.json")) == []
+    assert list(backup_dir.glob("*.partial*")) == []
+    assert list(backup_dir.glob("*.tmp")) == []
+
+
+def test_create_encrypted_backup_is_unlistable_and_undownloadable_until_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    encryption_started = threading.Event()
+    release_encryption = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def blocked_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        encryption_started.set()
+        assert release_encryption.wait(timeout=5)
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def run_backup() -> None:
+        try:
+            outcome["path"] = ops.create_encrypted_backup(
+                data_dir=data_dir,
+                out_dir=backup_dir,
+                passphrase="test passphrase",
+                record_event=False,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion reports worker failures
+            outcome["error"] = exc
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", blocked_encryption)
+
+    worker = threading.Thread(target=run_backup)
+    worker.start()
+    assert encryption_started.wait(timeout=5)
+
+    staged_plain = next(backup_dir.glob(".*/*.tar.gz"))
+    service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
+    assert ops.list_backups(backup_dir) == []
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(staged_plain.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(f"{staged_plain.name}.enc")
+
+    release_encryption.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    encrypted_path = outcome["path"]
+    assert isinstance(encrypted_path, Path)
+    assert encrypted_path.parent == backup_dir
+    assert encrypted_path.name.endswith(".tar.gz.enc")
+    assert sorted(path.name for path in backup_dir.iterdir()) == sorted(
+        [encrypted_path.name, ops.backup_sidecar_path(encrypted_path).name]
+    )
+    item = ops.list_backups(backup_dir)[0]
+    assert item["metadata_status"] == "READY"
+    assert item["encrypted"] is True
+    assert item["secrets_included"] is True
+
+
+def test_create_encrypted_backup_failure_and_cancellation_leave_live_directory_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+
+    def fail_encryption(command: list[str], **_: object) -> None:
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"partial")
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fail_encryption)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+    assert list(backup_dir.iterdir()) == []
+
+    cancel = [False]
+
+    def cancel_during_encryption(step: str) -> None:
+        if step == "encrypting":
+            cancel[0] = True
+
+    with pytest.raises(ops.BackupCancelled):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+            cancel_check=lambda: cancel[0],
+            progress_callback=cancel_during_encryption,
+        )
+    assert list(backup_dir.iterdir()) == []
+
+
+def test_create_encrypted_backup_collision_preserves_ready_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    first_data = tmp_path / "first-data"
+    second_data = tmp_path / "second-data"
+    first_data.mkdir()
+    second_data.mkdir()
+    (first_data / "chapter.txt").write_text("first", encoding="utf-8")
+    (second_data / "chapter.txt").write_text("second", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops, "datetime", _FrozenBackupDateTime)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+
+    first = ops.create_encrypted_backup(
+        data_dir=first_data,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+    second = ops.create_encrypted_backup(
+        data_dir=second_data,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+
+    assert first != second
+    assert first.is_file() and second.is_file()
+    assert len(list(backup_dir.glob("novel-pipeline-backup-*.tar.gz.enc"))) == 2
+    for item in ops.list_backups(backup_dir):
+        assert item["metadata_status"] == "READY"
+        assert item["encrypted"] is True
+        assert item["secrets_included"] is True
+
+
+@pytest.mark.parametrize("failed_source", ["sidecar", "archive"])
+def test_create_encrypted_backup_rolls_back_final_link_when_source_unlink_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_source: str,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_unlink = Path.unlink
+    failure_injected = False
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def fail_final_publication_source_unlink(
+        path: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal failure_injected
+        is_final_publication_source = (
+            path.parent.parent == backup_dir
+            and path.parent.name.endswith(".tar.gz.enc.partial")
+        )
+        is_sidecar = path.name.endswith(ops.BACKUP_MANIFEST_SUFFIX)
+        matches_requested_source = is_sidecar if failed_source == "sidecar" else not is_sidecar
+        if is_final_publication_source and matches_requested_source and not failure_injected:
+            failure_injected = True
+            raise OSError(f"{failed_source} source unlink failed")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+    monkeypatch.setattr(Path, "unlink", fail_final_publication_source_unlink)
+
+    with pytest.raises(OSError, match=f"{failed_source} source unlink failed"):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+
+    assert failure_injected is True
+    assert list(backup_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("failed_cleanup", ["final-reservation", "private-root"])
+def test_create_encrypted_backup_cleanup_failure_does_not_overturn_ready_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_cleanup: str,
+) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_rmtree = shutil.rmtree
+    cleanup_failure_injected = False
+
+    def fake_encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def fail_selected_cleanup(path: str | Path, *args: object, **kwargs: object) -> None:
+        nonlocal cleanup_failure_injected
+        cleanup_path = Path(path)
+        is_final_reservation = (
+            cleanup_path.parent == backup_dir
+            and cleanup_path.name.endswith(".tar.gz.enc.partial")
+        )
+        is_private_root = (
+            cleanup_path.parent == backup_dir
+            and cleanup_path.name.startswith(".novel-pipeline-secret-backup-")
+        )
+        selected = is_final_reservation if failed_cleanup == "final-reservation" else is_private_root
+        if selected and not cleanup_failure_injected:
+            cleanup_failure_injected = True
+            raise OSError(f"{failed_cleanup} cleanup failed")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", fake_encryption)
+    monkeypatch.setattr(ops.shutil, "rmtree", fail_selected_cleanup)
+
+    encrypted_path = ops.create_encrypted_backup(
+        data_dir=data_dir,
+        out_dir=backup_dir,
+        passphrase="test passphrase",
+        record_event=False,
+    )
+
+    assert cleanup_failure_injected is True
+    item = ops.list_backups(backup_dir)[0]
+    assert item["filename"] == encrypted_path.name
+    assert item["metadata_status"] == "READY"
+    assert item["encrypted"] is True
+    service = BackupService(backup_dir=backup_dir, data_dir=data_dir)
+    assert service.resolve_download_path(encrypted_path.name) == encrypted_path
+    assert all(not entry["filename"].startswith(".") for entry in service.list_backups())
+    hidden_residue = [path for path in backup_dir.iterdir() if path.name.startswith(".")]
+    assert len(hidden_residue) == 1
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(hidden_residue[0].name)
+
+
+@pytest.mark.parametrize("primary_failure", ["encryption", "publication"])
+def test_create_encrypted_backup_preserves_primary_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: str,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / ".env").write_text("TOKEN=test-only-secret\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    real_link = os.link
+    real_rmtree = shutil.rmtree
+    cleanup_failures = 0
+
+    def encryption(command: list[str], **_: object) -> None:
+        source_path = Path(command[command.index("-in") + 1])
+        output_path = Path(command[command.index("-out") + 1])
+        if primary_failure == "encryption":
+            raise subprocess.CalledProcessError(9, command)
+        output_path.write_bytes(b"encrypted:" + source_path.read_bytes())
+
+    def publication_link(source: str | Path, destination: str | Path, *args: object, **kwargs: object) -> None:
+        destination_path = Path(destination)
+        if (
+            primary_failure == "publication"
+            and destination_path.parent == backup_dir
+            and destination_path.name.endswith(".tar.gz.enc")
+        ):
+            raise PermissionError("publication link failed")
+        real_link(source, destination, *args, **kwargs)
+
+    def fail_owned_cleanup(path: str | Path, *args: object, **kwargs: object) -> None:
+        nonlocal cleanup_failures
+        cleanup_path = Path(path)
+        is_owned_live_staging = cleanup_path.parent == backup_dir and (
+            cleanup_path.name.endswith(".tar.gz.enc.partial")
+            or cleanup_path.name.startswith(".novel-pipeline-secret-backup-")
+        )
+        if is_owned_live_staging:
+            cleanup_failures += 1
+            raise OSError("owned staging cleanup failed")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "ROOT", project_root)
+    monkeypatch.setattr(ops.shutil, "which", lambda _: "/usr/bin/openssl")
+    monkeypatch.setattr(ops.subprocess, "run", encryption)
+    monkeypatch.setattr(ops.os, "link", publication_link)
+    monkeypatch.setattr(ops.shutil, "rmtree", fail_owned_cleanup)
+
+    expected_error = subprocess.CalledProcessError if primary_failure == "encryption" else PermissionError
+    with pytest.raises(expected_error):
+        ops.create_encrypted_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            passphrase="test passphrase",
+            record_event=False,
+        )
+
+    assert cleanup_failures >= 1
+    assert ops.list_backups(backup_dir) == []
+
+
+def test_interrupted_secret_backup_staging_is_not_listed_or_downloadable(tmp_path: Path) -> None:
+    from app.mobile_api.services.backup_service import BackupService
+
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    residue = backup_dir / ".novel-pipeline-secret-backup-interrupted.partial"
+    residue.mkdir(mode=0o700)
+    plain = residue / "novel-pipeline-backup-20260712-100000.tar.gz"
+    plain.write_bytes(b"plaintext secrets")
+    _write_backup_sidecar(plain, secrets_included=True)
+    partial = backup_dir / "novel-pipeline-backup-20260712-103000.tar.gz.partial"
+    partial.write_bytes(b"partial plaintext secrets")
+    pending_name = "novel-pipeline-backup-20260712-110000.tar.gz.enc"
+    pending_publication = backup_dir / f".{pending_name}.partial"
+    pending_publication.mkdir(mode=0o700)
+    _write_backup_sidecar(backup_dir / pending_name, encrypted=True, secrets_included=True)
+    service = BackupService(backup_dir=backup_dir, data_dir=tmp_path / "data")
+
+    assert service.list_backups() == []
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(plain.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(partial.name)
+    with pytest.raises(FileNotFoundError, match="Backup not found"):
+        service.resolve_download_path(pending_name)
+
+
+def test_backup_listing_ignores_staging_and_partial_publication_names(tmp_path: Path) -> None:
+    (tmp_path / ".novel-pipeline-backup-20260712-100000.tar.gz.staging").mkdir()
+    (tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz.partial").write_bytes(b"partial")
+    (tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz.manifest.json.tmp").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+
+    assert ops.list_backups(tmp_path) == []
+
+
+def test_backup_staging_permission_failure_cleans_owned_publication_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_chmod = Path.chmod
+
+    def fail_staging_chmod(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        if ".partial" in path.name:
+            raise OSError("chmod failed")
+        real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", fail_staging_chmod)
+
+    with pytest.raises(OSError, match="chmod failed"):
+        ops._backup_staging_path(tmp_path, "novel-pipeline-backup-20260712-100000.tar.gz")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_atomic_sidecar_failure_cleans_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    archive.write_bytes(b"artifact")
+    monkeypatch.setattr(
+        ops.os,
+        "replace",
+        lambda *args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        ops.write_backup_sidecar_atomic(archive, {"sidecar_schema_version": 1})
+
+    assert not ops.backup_sidecar_path(archive).exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_metadata_repair_dry_run_apply_and_idempotency(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "chapter.txt").write_text("source", encoding="utf-8")
+    source = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "source",
+        record_event=False,
+    )
+    rehearsal = tmp_path / "rehearsal"
+    rehearsal.mkdir()
+    archive = rehearsal / source.name
+    shutil.copy2(source, archive)
+    ops.backup_sidecar_path(archive).unlink(missing_ok=True)
+    before = ops.sha256_file(archive)
+
+    dry = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=False,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+    assert dry["would_write"] == 1
+    assert dry["written"] == 0
+    assert not ops.backup_sidecar_path(archive).exists()
+
+    first = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+    second = ops.repair_backup_metadata(
+        rehearsal,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert first["written"] == 1
+    assert second["written"] == 0
+    assert second["skipped_valid"] == 1
+    assert ops.sha256_file(archive) == before
+    assert ops.list_backups(rehearsal)[0]["metadata_status"] == "READY"
+
+
+def test_metadata_repair_derives_safe_metadata_for_manifestless_legacy_archive(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "data" / "raw").mkdir(parents=True)
+    (source / "data" / "pipeline.db").write_bytes(b"sqlite-fixture")
+    (source / "data" / "raw" / "chapter.txt").write_text("private", encoding="utf-8")
+    (source / ".env.example").write_text("SAFE=example\n", encoding="utf-8")
+    archive = tmp_path / "novel-pipeline-backup-20260630-101633.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(source / "data", arcname="data")
+        handle.add(source / ".env.example", arcname=".env.example")
+    before = ops.sha256_file(archive)
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    metadata = ops.read_backup_sidecar(archive)
+    assert result["written"] == 1
+    assert metadata["backup_format_version"] == 1
+    assert metadata["secrets_included"] is False
+    assert metadata["included_modules"] == ["database", "uploads"]
+    assert metadata["file_count"] == 2
+    assert metadata["total_size_bytes"] == len(b"sqlite-fixture") + len(b"private")
+    assert ops.sha256_file(archive) == before
+
+
+def test_metadata_repair_rejects_unsafe_manifestless_archive(tmp_path: Path) -> None:
+    archive = tmp_path / "novel-pipeline-backup-20260630-101633.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        member = tarfile.TarInfo("../escape.txt")
+        member.size = 1
+        handle.addfile(member, io.BytesIO(b"x"))
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=archive.name,
+        all_missing=False,
+        apply=True,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert result["failed"] == 1
+    assert not ops.backup_sidecar_path(archive).exists()
+
+
+def test_metadata_repair_reports_corrupt_and_encrypted_archives_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corrupt = tmp_path / "novel-pipeline-backup-20260712-100000.tar.gz"
+    corrupt.write_bytes(b"not-a-tar")
+    encrypted = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz.enc"
+    encrypted.write_bytes(b"encrypted")
+    monkeypatch.delenv("BACKUP_PASSPHRASE", raising=False)
+
+    result = ops.repair_backup_metadata(
+        tmp_path,
+        filename=None,
+        all_missing=True,
+        apply=False,
+        overwrite=False,
+        passphrase_env="BACKUP_PASSPHRASE",
+        report_dir=None,
+    )
+
+    assert result["failed"] == 2
+    serialized = json.dumps(result)
+    assert str(tmp_path) not in serialized
+    assert "passphrase" not in serialized.lower()
+    assert not ops.backup_sidecar_path(corrupt).exists()
+    assert not ops.backup_sidecar_path(encrypted).exists()
+
+
+def test_explicit_archive_inspection_rejects_unsafe_passphrase_env_name(tmp_path: Path) -> None:
+    encrypted = tmp_path / "novel-pipeline-backup-20260712-090000.tar.gz.enc"
+    encrypted.write_bytes(b"encrypted")
+
+    with pytest.raises(ValueError, match="environment variable name"):
+        ops.inspect_backup_archive_explicitly(
+            encrypted,
+            passphrase_env="BACKUP-PASSPHRASE",
+        )
+
+
+def test_backup_metadata_repair_cli_defaults_to_dry_run() -> None:
+    args = ops.build_parser().parse_args(
+        ["backup-metadata-repair", "--backup-dir", "backups", "--all-missing"]
+    )
+
+    assert args.command == "backup-metadata-repair"
+    assert args.apply is False
+    assert args.all_missing is True
 
 
 def test_backup_and_restore_round_trip(tmp_path: Path) -> None:
@@ -29,6 +975,122 @@ def test_backup_and_restore_round_trip(tmp_path: Path) -> None:
     assert restored_dir == tmp_path / "restored"
     assert (restored_dir / "raw" / "chapter.txt").read_text(encoding="utf-8") == "source"
     assert (restored_dir / "translated" / "chapter.txt").read_text(encoding="utf-8") == "ban dich"
+
+    manifest_sidecar = backup_path.with_suffix(backup_path.suffix + ops.BACKUP_MANIFEST_SUFFIX)
+    assert manifest_sidecar.exists()
+    manifest = ops.read_backup_manifest(backup_path)
+    assert manifest["backup_format_version"] == 2
+    assert "database" in manifest["included_modules"]
+    assert manifest["secrets_included"] is False
+
+
+def test_create_backup_can_exclude_exports_and_job_logs(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    (data_dir / "exports").mkdir(parents=True)
+    (data_dir / "logs").mkdir()
+    (data_dir / "audio").mkdir()
+    (data_dir / "exports" / "book.txt").write_text("export", encoding="utf-8")
+    (data_dir / "logs" / "runtime.log").write_text("log", encoding="utf-8")
+    (data_dir / "audio" / "chapter.mp3").write_bytes(b"audio")
+
+    backup_path = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "backups",
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+    )
+
+    manifest = ops.read_backup_manifest(backup_path)
+    assert "audio" in manifest["included_modules"]
+    assert "exports" in manifest["excluded_modules"]
+    assert "job_logs" in manifest["excluded_modules"]
+
+    with tarfile.open(backup_path, "r:gz") as archive:
+        names = set(archive.getnames())
+    assert "data/audio/chapter.mp3" in names
+    assert "data/exports/book.txt" not in names
+    assert "data/logs/runtime.log" not in names
+
+
+def test_create_backup_can_skip_operational_event_for_pre_rehearsal_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.database import db as database_db
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with sqlite3.connect(data_dir / "pipeline.db") as conn:
+        conn.execute("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    def record_event(db_path: Path, **kwargs: object) -> None:
+        calls.append((db_path, kwargs))
+
+    monkeypatch.setattr(database_db, "record_operational_event", record_event)
+
+    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-default")
+    assert len(calls) == 1
+    db_path, event = calls[0]
+    assert db_path == data_dir / "pipeline.db"
+    assert event["event_type"] == "backup_success"
+    assert event["severity"] == "info"
+    assert event["source"] == "ops"
+    assert event["message"] == "Backup completed"
+    assert event["details"]["include_env"] is False
+    assert str(event["details"]["backup_name"]).startswith("novel-pipeline-backup-")
+
+    calls.clear()
+    ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups-gated", record_event=False)
+    assert calls == []
+
+
+def test_backup_cli_and_shell_expose_no_event_gate() -> None:
+    parser = ops.build_parser()
+    args = parser.parse_args(["backup", "--no-record-event"])
+
+    assert args.no_record_event is True
+    shell = Path("scripts/backup-local.sh").read_text(encoding="utf-8")
+    assert 'record_event = os.getenv("BACKUP_RECORD_EVENT", "1") != "0"' in shell
+    assert "record_event=record_event" in shell
+
+
+def test_create_backup_can_skip_checkpoint_without_changing_source_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "pipeline.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES ('unchanged')")
+        conn.commit()
+    before = ops.sha256_file(db_path)
+    checkpoint_calls: list[Path] = []
+    monkeypatch.setattr(ops, "sqlite_checkpoint", lambda path: checkpoint_calls.append(path))
+
+    backup_path = ops.create_backup(
+        data_dir=data_dir,
+        out_dir=tmp_path / "backups",
+        record_event=False,
+        checkpoint_database=False,
+    )
+
+    assert backup_path.is_file()
+    assert checkpoint_calls == []
+    assert ops.sha256_file(db_path) == before
+
+
+def test_backup_cli_and_shell_expose_no_checkpoint_gate() -> None:
+    parser = ops.build_parser()
+    args = parser.parse_args(["backup", "--no-checkpoint"])
+
+    assert args.no_checkpoint is True
+    shell = Path("scripts/backup-local.sh").read_text(encoding="utf-8")
+    assert 'checkpoint_database = os.getenv("BACKUP_CHECKPOINT", "1") != "0"' in shell
+    assert "checkpoint_database=checkpoint_database" in shell
 
 
 def test_restore_rejects_unsafe_archive_member(tmp_path: Path) -> None:
@@ -74,6 +1136,68 @@ def test_ops_parser_exposes_expected_commands() -> None:
     assert "set-provider-key" in help_text
     assert "smoke" in help_text
     assert "smoke-public" in help_text
+
+
+def test_smoke_accepts_redacted_system_status_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith("/api/health"):
+            return {"status": "ok"}
+        if url.endswith("/api/ready"):
+            return {"status": "ok"}
+        if url.endswith("/api/auth/login"):
+            return {"access_token": "access-token"}
+        if url.endswith("/api/providers"):
+            return {"providers": []}
+        if url.endswith("/api/system/status"):
+            return {
+                "api_ready": True,
+                "database_available": True,
+                "data_directory_available": True,
+                "storage_health": "healthy",
+                "storage_label": "Configured data storage",
+            }
+        raise AssertionError(f"unexpected json request: {method} {url} {kwargs}")
+
+    monkeypatch.setattr(ops, "_request_json", fake_request_json)
+
+    result = ops.run_smoke(
+        base_url="http://127.0.0.1:7860",
+        username="operator",
+        password="strong-password",
+    )
+
+    assert result == 0
+    assert "OK smoke" in capsys.readouterr().out
+
+
+def test_smoke_rejects_absolute_path_fields_in_system_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith("/api/health") or url.endswith("/api/ready"):
+            return {"status": "ok"}
+        if url.endswith("/api/auth/login"):
+            return {"access_token": "access-token"}
+        if url.endswith("/api/providers"):
+            return {"providers": []}
+        if url.endswith("/api/system/status"):
+            return {
+                "api_ready": True,
+                "database_available": True,
+                "data_directory_available": True,
+                "database_path": "/private/operator/pipeline.db",
+            }
+        raise AssertionError(f"unexpected json request: {method} {url} {kwargs}")
+
+    monkeypatch.setattr(ops, "_request_json", fake_request_json)
+
+    with pytest.raises(RuntimeError, match="absolute path fields"):
+        ops.run_smoke(
+            base_url="http://127.0.0.1:7860",
+            username="operator",
+            password="strong-password",
+        )
 
 
 def test_batch_local_script_help_status_and_logs(tmp_path: Path) -> None:

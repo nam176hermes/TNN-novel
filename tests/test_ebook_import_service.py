@@ -1,12 +1,86 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import zipfile
 
-from app.database.db import get_book_by_title, init_db, list_chapters, list_ebook_import_runs
+import pytest
+
+from app.database.db import add_book, get_book_by_title, init_db, list_chapters, list_ebook_import_runs
 from app.mobile_api.services import ebook_import_service
-from app.mobile_api.services.ebook_import_service import EbookImportService
+from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
+
+
+def test_epub_archive_limits_member_count_and_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "limits.epub"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("a", b"123456")
+        archive.writestr("b", b"123456")
+        archive.writestr("c", b"1")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_MEMBERS", 2)
+        with pytest.raises(ValueError, match="too many files"):
+            ebook_import_service._validate_epub_archive(archive)
+
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_MEMBERS", 10)
+        monkeypatch.setattr(ebook_import_service, "MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES", 10)
+        with pytest.raises(ValueError, match="uncompressed size"):
+            ebook_import_service._validate_epub_archive(archive)
+
+
+def test_epub_archive_rejects_excessive_compression_ratio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "ratio.epub"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("chapter.xhtml", b"A" * 100_000)
+
+    monkeypatch.setattr(ebook_import_service, "MAX_EPUB_COMPRESSION_RATIO", 10.0)
+    with zipfile.ZipFile(archive_path) as archive:
+        with pytest.raises(ValueError, match="compression ratio"):
+            ebook_import_service._validate_epub_archive(archive)
+
+
+def test_epub_member_reader_enforces_document_and_stream_caps() -> None:
+    class FakeArchive:
+        def getinfo(self, _name: str):
+            return SimpleNamespace(filename="chapter.xhtml", file_size=10, compress_size=10, is_dir=lambda: False)
+
+        def open(self, _member, _mode: str):
+            return io.BytesIO(b"x" * 20)
+
+    with pytest.raises(ValueError, match="document exceeds"):
+        ebook_import_service._read_epub_member_bounded(
+            FakeArchive(),  # type: ignore[arg-type]
+            "chapter.xhtml",
+            max_bytes=10,
+            kind="document",
+        )
+
+
+def test_epub_preview_never_uses_unbounded_zipfile_read(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    epub_path = tmp_path / "translated.epub"
+    write_minimal_epub(epub_path)
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "read",
+        lambda *args, **kwargs: pytest.fail("EPUB parser used unbounded ZipFile.read"),
+    )
+
+    preview = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data").preview(epub_path)
+
+    assert preview["chapter_count"] == 2
 
 
 def write_minimal_epub(path: Path) -> None:
@@ -1415,6 +1489,85 @@ def test_image_only_epub_preview_warns_and_import_rejects_unreadable_chapters(
         raise AssertionError("Expected image-only ebook import to be rejected")
 
 
+def test_preview_reports_automatic_existing_book_match(tmp_path: Path, temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    ebook = tmp_path / "translated.epub"
+    write_minimal_epub(ebook)
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+    first = service.import_translated_ebook(ebook, duplicate_strategy="error")
+
+    dry_run = service.preview(ebook)["dry_run"]
+
+    assert dry_run["existing_book_id"] == first["book_id"]
+    assert dry_run["existing_book_title"] == "Phàm Nhân Tu Tiên"
+    assert dry_run["existing_chapter_count"] == 2
+    assert dry_run["book_match_reason"] == "title"
+    assert dry_run["requires_existing_book_confirmation"] is True
+
+
+def test_preview_reports_new_and_explicit_target_matches(tmp_path: Path, temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    ebook = tmp_path / "translated.epub"
+    write_minimal_epub(ebook)
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+
+    fresh = service.preview(ebook)["dry_run"]
+    assert fresh["book_match_reason"] == "new"
+    assert fresh["requires_existing_book_confirmation"] is False
+
+    existing_id = add_book(temp_db_path, "Truyện đích", "", "ebook", "")
+    selected = service.preview(ebook, target_book_id=existing_id)["dry_run"]
+    assert selected["existing_book_id"] == existing_id
+    assert selected["existing_chapter_count"] == 0
+    assert selected["book_match_reason"] == "selected"
+    assert selected["requires_existing_book_confirmation"] is True
+
+
+def test_existing_book_import_requires_exact_confirmation_before_mutation(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    ebook = tmp_path / "translated.epub"
+    write_minimal_epub(ebook)
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+    first = service.import_translated_ebook(ebook, duplicate_strategy="error")
+    before_raw = sorted((tmp_path / "data" / "raw").glob("*"))
+    before_runs = list_ebook_import_runs(temp_db_path)
+
+    with pytest.raises(ExistingBookConfirmationRequired):
+        service.import_translated_ebook(ebook, duplicate_strategy="skip")
+    with pytest.raises(ExistingBookConfirmationRequired):
+        service.import_translated_ebook(
+            ebook,
+            duplicate_strategy="skip",
+            confirmed_existing_book_id=first["book_id"] + 1,
+        )
+
+    assert sorted((tmp_path / "data" / "raw").glob("*")) == before_raw
+    assert list_ebook_import_runs(temp_db_path) == before_runs
+
+
+def test_exact_existing_book_confirmation_preserves_duplicate_strategy(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    ebook = tmp_path / "translated.epub"
+    write_minimal_epub(ebook)
+    service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
+    first = service.import_translated_ebook(ebook, duplicate_strategy="error")
+
+    second = service.import_translated_ebook(
+        ebook,
+        duplicate_strategy="skip",
+        confirmed_existing_book_id=first["book_id"],
+    )
+
+    assert second["imported_chapters"] == 0
+    assert second["skipped_chapters"] == 2
+
+
 def test_epub_preview_includes_dry_run_counts_for_duplicates(tmp_path: Path, temp_db_path: Path) -> None:
     init_db(temp_db_path)
     epub_path = tmp_path / "translated.epub"
@@ -1436,6 +1589,11 @@ def test_epub_preview_includes_dry_run_counts_for_duplicates(tmp_path: Path, tem
         "would_skip": 2,
         "would_overwrite": 0,
         "would_error": 0,
+        "existing_book_id": get_book_by_title(temp_db_path, "Phàm Nhân Tu Tiên")["id"],
+        "existing_book_title": "Phàm Nhân Tu Tiên",
+        "existing_chapter_count": 2,
+        "book_match_reason": "title",
+        "requires_existing_book_confirmation": True,
     }
     assert overwrite_preview["dry_run"]["would_import"] == 2
     assert overwrite_preview["dry_run"]["would_overwrite"] == 2
@@ -1471,7 +1629,10 @@ def test_import_translated_epub_defaults_to_skipping_duplicate_chapters(
     service = EbookImportService(db_path=temp_db_path, data_dir=tmp_path / "data")
 
     first = service.import_translated_ebook(epub_path, duplicate_strategy="error")
-    second = service.import_translated_ebook(epub_path)
+    second = service.import_translated_ebook(
+        epub_path,
+        confirmed_existing_book_id=first["book_id"],
+    )
 
     assert first["imported_chapters"] == 2
     assert second["imported_chapters"] == 0

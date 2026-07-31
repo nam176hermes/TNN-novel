@@ -33,12 +33,17 @@ from app.mobile_api.services import audio_service as audio_service_module
 from app.mobile_api.services.qa_service import QAService
 from app.mobile_api.services.audio_service import AudioService
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.services.tts.availability import TTSUnavailableError
+
+
+LEGACY_ROOT = Path("/legacy/novel-pipeline")
 
 
 def make_pipeline(db_path: Path, data_dir: Path) -> PipelineService:
     pipeline = object.__new__(PipelineService)
     pipeline.db_path = db_path
     pipeline.data_dir = data_dir
+    pipeline.legacy_artifact_root = None
     return pipeline
 
 
@@ -189,8 +194,12 @@ async def test_patch_book_title_merges_duplicate_book_into_existing_library_entr
     assert [book["title"] for book in library_response.json()["books"]] == ["Thanh Sơn"]
     chapters = chapters_response.json()
     assert len(chapters) == 1
-    assert chapters[0]["raw_text_path"] == str(raw_path)
-    assert chapters[0]["translated_text_path"] == str(translated_path)
+    assert chapters[0]["raw_text_path"] == "available"
+    assert chapters[0]["translated_text_path"] == "available"
+    merged_chapter = get_chapter_by_id(override_books_pipeline.db_path, target_chapter_id)
+    assert merged_chapter is not None
+    assert merged_chapter["raw_text_path"] == str(raw_path)
+    assert merged_chapter["translated_text_path"] == str(translated_path)
     assert get_book_by_id(override_books_pipeline.db_path, source_book_id) is None
 
 
@@ -464,6 +473,109 @@ async def test_audio_playlist_returns_client_urls_without_local_paths(
         }
     ]
     assert "audio_path" not in payload["chapters"][0]
+
+
+@pytest.mark.asyncio
+async def test_reader_cover_and_audio_resolve_exact_legacy_artifact_paths(
+    override_books_pipeline: PipelineService,
+    tmp_path: Path,
+) -> None:
+    pipeline = override_books_pipeline
+    pipeline.legacy_artifact_root = LEGACY_ROOT
+    for directory in ("raw", "translated", "audio", "covers"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    raw_target = tmp_path / "raw" / "chapter.txt"
+    translated_target = tmp_path / "translated" / "chapter.txt"
+    html_target = tmp_path / "translated" / "chapter.html"
+    audio_target = tmp_path / "audio" / "chapter.mp3"
+    cover_target = tmp_path / "covers" / "cover.jpg"
+    raw_target.write_text("原文章节", encoding="utf-8")
+    translated_target.write_text("Bản dịch chương", encoding="utf-8")
+    html_target.write_text("<p>Bản dịch chương</p>", encoding="utf-8")
+    audio_target.write_bytes(b"fake mp3")
+    cover_target.write_bytes(b"cover")
+
+    book_id = add_book(
+        pipeline.db_path,
+        "Legacy Artifacts",
+        cover_path=str(LEGACY_ROOT / "data/covers/cover.jpg"),
+    )
+    chapter_id = add_chapter(
+        pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=LEGACY_ROOT / "data/raw/chapter.txt",
+    )
+    update_chapter_paths(
+        pipeline.db_path,
+        chapter_id,
+        translated_text_path=LEGACY_ROOT / "data/translated/chapter.txt",
+        content_html_path=LEGACY_ROOT / "data/translated/chapter.html",
+        audio_path=LEGACY_ROOT / "data/audio/chapter.mp3",
+        status="audio_done",
+    )
+    app.dependency_overrides[audio_router.get_audio_service] = lambda: AudioService(pipeline)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            source = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+            translation = await client.get(
+                f"/api/books/{book_id}/chapters/{chapter_id}/translation", headers=headers
+            )
+            content = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/content", headers=headers)
+            audio = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/audio", headers=headers)
+            download = await client.get(
+                f"/api/books/{book_id}/chapters/{chapter_id}/audio/download", headers=headers
+            )
+    finally:
+        app.dependency_overrides.pop(audio_router.get_audio_service, None)
+
+    assert source.json() == {"text": "原文章节", "chapter_id": chapter_id, "missing": False}
+    assert translation.json() == {"text": "Bản dịch chương", "chapter_id": chapter_id, "missing": False}
+    assert content.json() == {
+        "chapter_id": chapter_id,
+        "text": "Bản dịch chương",
+        "html": "<p>Bản dịch chương</p>",
+    }
+    assert audio.status_code == 200 and audio.content == b"fake mp3"
+    assert download.status_code == 200 and download.content == b"fake mp3"
+    assert pipeline.get_book(book_id)["cover_url"] == "/covers/cover.jpg"
+    combined = source.text + translation.text + content.text
+    assert str(LEGACY_ROOT) not in combined
+    assert str(tmp_path) not in combined
+
+
+@pytest.mark.asyncio
+async def test_reader_distinguishes_missing_file_and_outside_root(
+    override_books_pipeline: PipelineService,
+) -> None:
+    pipeline = override_books_pipeline
+    pipeline.legacy_artifact_root = LEGACY_ROOT
+    book_id = add_book(pipeline.db_path, "Invalid Artifacts")
+    chapter_id = add_chapter(
+        pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=LEGACY_ROOT / "data/raw/missing.txt",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        missing = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+        with get_connection(pipeline.db_path) as conn:
+            conn.execute("UPDATE chapters SET raw_text_path = '/etc/passwd' WHERE id = ?", (chapter_id,))
+            conn.commit()
+        outside = await client.get(f"/api/books/{book_id}/chapters/{chapter_id}/source", headers=headers)
+
+    assert missing.status_code == 200
+    assert missing.json()["missing_reason"] == "file_missing"
+    assert outside.status_code == 403
+    assert outside.json()["detail"] == "Artifact path outside allowed root"
+    assert "/etc/passwd" not in outside.text
 
 
 def test_audio_playlist_openapi_documents_client_url_payload() -> None:
@@ -986,9 +1098,12 @@ def test_generate_audio_writes_under_pipeline_data_dir(
     translation_path.write_text("translation", encoding="utf-8")
     update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
 
+    captured: dict[str, object] = {}
+
     class FakeTTSPipeline:
         def __init__(self, db_path: Path, data_dir: Path, **_: object) -> None:
             self.data_dir = data_dir
+            captured.update(_)
 
         def generate_chapter(self, *, book_id: int, chapter_id: int, job_id: str, voice_config: dict[str, str]):
             output_path = self.data_dir / "audio" / f"book{book_id}_ch{chapter_id}_{job_id or 'tts'}.mp3"
@@ -1000,6 +1115,7 @@ def test_generate_audio_writes_under_pipeline_data_dir(
                 {"status": "completed", "output_mp3_path": str(output_path), "error_message": ""},
             )()
 
+    monkeypatch.setattr(pipeline_mod, "require_tts_runtime_available", lambda **kwargs: None, raising=False)
     monkeypatch.setattr(pipeline_mod, "TTSPipeline", FakeTTSPipeline)
 
     audio_path = temp_pipeline.generate_audio(book_id, chapter_id)
@@ -1007,6 +1123,69 @@ def test_generate_audio_writes_under_pipeline_data_dir(
     assert audio_path is not None
     assert temp_pipeline.data_dir in audio_path.parents
     assert audio_path.read_bytes() == b"fake mp3"
+    assert captured["legacy_fallback"] is None
+
+
+def test_generate_audio_rejects_unavailable_f5_before_constructing_pipeline(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter")
+    translation_path = tmp_path / "translation.txt"
+    translation_path.write_text("translation", encoding="utf-8")
+    update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
+
+    def reject_unavailable_runtime(*, provider: str) -> None:
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "require_tts_runtime_available",
+        reject_unavailable_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "TTSPipeline",
+        lambda *args, **kwargs: pytest.fail("TTSPipeline must not be constructed"),
+    )
+
+    with pytest.raises(TTSUnavailableError):
+        temp_pipeline.generate_audio(book_id, chapter_id)
+
+
+def test_generate_audio_keeps_legacy_fallback_for_explicit_non_f5_provider(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter")
+    translation_path = tmp_path / "translation.txt"
+    translation_path.write_text("translation", encoding="utf-8")
+    update_chapter_paths(temp_pipeline.db_path, chapter_id, translated_text_path=translation_path)
+    captured: dict[str, object] = {}
+
+    class CapturingPipeline:
+        def __init__(self, db_path: Path, data_dir: Path, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def generate_chapter(self, **kwargs: object):
+            return type(
+                "FakeTTSReport",
+                (),
+                {"status": "completed", "output_mp3_path": str(tmp_path / "audio.mp3"), "error_message": ""},
+            )()
+
+    monkeypatch.setattr(pipeline_mod.settings, "tts_provider", "edge_tts")
+    monkeypatch.setattr(pipeline_mod, "TTSPipeline", CapturingPipeline)
+
+    audio_path = temp_pipeline.generate_audio(book_id, chapter_id)
+
+    assert audio_path == tmp_path / "audio.mp3"
+    assert captured["legacy_fallback"] is pipeline_mod.text_to_speech_file
 
 
 def test_import_from_text_writes_under_pipeline_data_dir(

@@ -25,6 +25,7 @@ export type ReaderOfflineCacheClient = {
   downloadReaderDictionary?(filename: string): Promise<ExportDownload>;
   getBookAudioPlaylist?(bookId: number): Promise<{ chapters: BookAudioPlaylistItem[] }>;
   getChapterContent(bookId: number, chapterId: number): Promise<{ html: string; text: string } | null>;
+  getChapterSource?(bookId: number, chapterId: number): Promise<string>;
   getChapterTranslation(bookId: number, chapterId: number): Promise<string | null>;
   getReaderDictionaryPack(bookId: number, options?: { chapterId?: number | null }): Promise<ReaderDictionaryPack>;
   listReaderDictionaries?(): Promise<ReaderDictionaryFile[]>;
@@ -177,6 +178,20 @@ function cacheOfflineReaderAssets(
   baseUrl?: string,
 ): Promise<ReaderAssetCacheSummary> {
   return cacheReaderAssetsFromHtml(bookId, chapterId, html, undefined, baseUrl);
+}
+
+async function loadOfflineChapterSource(
+  client: ReaderOfflineCacheClient,
+  bookId: number,
+  chapterId: number,
+): Promise<string> {
+  if (!client.getChapterSource) return '';
+  try {
+    return await client.getChapterSource(bookId, chapterId);
+  } catch {
+    // Raw content is optional and must not prevent caching the translation.
+    return '';
+  }
 }
 
 function fallbackReaderDictionaryDownloadUrl(filename: string): string {
@@ -495,6 +510,7 @@ export async function cacheChapterForOffline({
   }
 
   try {
+    const sourceText = await loadOfflineChapterSource(client, bookId, chapter.id);
     const richContent = chapter.content_html_path
       ? await client.getChapterContent(bookId, chapter.id)
       : null;
@@ -503,8 +519,9 @@ export async function cacheChapterForOffline({
     await putCachedChapterAsync({
       bookId,
       chapterId: chapter.id,
+      contentRevision: chapter.content_html_path?.trim() ?? '',
       html,
-      sourceText: '',
+      sourceText,
       text: translation,
     });
     summary.chaptersCached = 1;
@@ -693,6 +710,7 @@ export async function cacheBookForOffline({
 
   for (const chapter of targets) {
     try {
+      const sourceText = await loadOfflineChapterSource(client, bookId, chapter.id);
       const richContent = chapter.content_html_path
         ? await client.getChapterContent(bookId, chapter.id)
         : null;
@@ -701,8 +719,9 @@ export async function cacheBookForOffline({
       await putCachedChapterAsync({
         bookId,
         chapterId: chapter.id,
+        contentRevision: chapter.content_html_path?.trim() ?? '',
         html,
-        sourceText: '',
+        sourceText,
         text: translation,
       });
       summary.chaptersCached += 1;

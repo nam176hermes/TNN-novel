@@ -124,6 +124,55 @@ describe('AssistPanel', () => {
     });
   });
 
+  it('shows deterministic chapter QA summary and escaped glossary violations', () => {
+    render(
+      <AssistPanel
+        activeJob={null}
+        glossaryError=""
+        pendingGlossaryCount={0}
+        qaIssues={[]}
+        qaReport={{
+          book_id: 42,
+          chapter_id: 4201,
+          quality_score: 4,
+          overall_status: 'WARNING',
+          chinese_leakage_count: 2,
+          length_ratio: 0.31,
+          missing_paragraph_warning: true,
+          repetition_warning: true,
+          name_consistency_status: 'PASS',
+          term_consistency_status: 'FAIL',
+          glossary_violations: [
+            {
+              source_term: '灵石',
+              expected: 'linh thạch',
+              message: '<img src=x onerror=alert(1)> phải dùng linh thạch',
+            },
+          ],
+        }}
+        qaState="ready"
+        relevantTerms={[]}
+        tmError=""
+        tmResults={[]}
+        tmState="idle"
+        onRunQa={vi.fn()}
+        onApplyQaFix={vi.fn()}
+        onSearchTm={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Trạng thái')).toBeInTheDocument();
+    expect(screen.getByText('WARNING')).toBeInTheDocument();
+    expect(screen.getByText('Rò chữ Trung')).toBeInTheDocument();
+    expect(screen.getByText('2')).toBeInTheDocument();
+    expect(screen.getByText('Tỷ lệ dài/ngắn')).toBeInTheDocument();
+    expect(screen.getByText('0.31')).toBeInTheDocument();
+    expect(screen.getByText('Vi phạm thuật ngữ khóa')).toBeInTheDocument();
+    expect(screen.getByText('灵石 -> linh thạch')).toBeInTheDocument();
+    expect(screen.getByText('<img src=x onerror=alert(1)> phải dùng linh thạch')).toBeInTheDocument();
+    expect(document.querySelector('img[src="x"]')).toBeNull();
+  });
+
   it('submits TM search only from the form and renders real hook results', async () => {
     const onSearchTm = vi.fn();
 

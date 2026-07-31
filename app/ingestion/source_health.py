@@ -32,6 +32,20 @@ class SourceHealthResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ManagedSourceTestResult:
+    source_id: str
+    domain: str
+    status: str
+    reason: str
+    tested_at: str
+    final_url: str = ""
+    http_status: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _utcnow_text() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -51,14 +65,7 @@ def _unsafe_ip_reason(value: str) -> str:
         ip = ipaddress.ip_address(value.strip("[]"))
     except ValueError:
         return ""
-    if (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip.is_reserved
-    ):
+    if not ip.is_global:
         return "private_network_not_allowed"
     return ""
 
@@ -125,6 +132,13 @@ def _read_limited_body(response: requests.Response) -> str:
 def _safe_final_url(url: str) -> str:
     safe_url, reason = validate_source_health_url(url)
     return safe_url if not reason else ""
+
+
+def sanitize_source_test_error(message: str) -> str:
+    text = " ".join(str(message or "").replace("\n", " ").split())
+    text = text.replace("\\", "/")
+    text = text[:220]
+    return text or "unknown_error"
 
 
 def check_source_health(
@@ -194,5 +208,108 @@ def check_source_health(
         reason=reason,
         checked_at=_utcnow_text(),
         final_url=_safe_final_url(str(getattr(response, "url", safe_url) or safe_url)),
+        http_status=int(response.status_code),
+    )
+
+
+def check_managed_source(
+    source: dict[str, Any],
+    *,
+    request_get: RequestGet = requests.get,
+) -> ManagedSourceTestResult:
+    source_id = str(source.get("id") or "")
+    source_status = str(source.get("status") or "").strip().upper()
+    parser_type = str(source.get("parser_type") or "").strip() or "policy_supported"
+    base_url = str(source.get("base_url") or "")
+    safe_url, blocked_reason = validate_source_health_url(base_url)
+    now = _utcnow_text()
+    if source_status == "BLOCKED":
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or ""),
+            status="blocked_by_policy",
+            reason="source_blocked",
+            tested_at=now,
+        )
+    if blocked_reason:
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or ""),
+            status="invalid_url" if blocked_reason != "request_timeout" else "timeout",
+            reason=blocked_reason,
+            tested_at=now,
+        )
+    if parser_type not in {"policy_supported", "generic_html"}:
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or urlparse(safe_url).hostname or ""),
+            status="parser_config_missing",
+            reason="unsupported_parser_type",
+            tested_at=now,
+        )
+
+    supported_source_id = str(source.get("supported_source_id") or "")
+    policy = get_source_policy(safe_url)
+    if parser_type == "policy_supported" and (not supported_source_id or policy is None):
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or urlparse(safe_url).hostname or ""),
+            status="parser_config_missing",
+            reason="supported_policy_required",
+            tested_at=now,
+        )
+
+    timeout_seconds = min(12, max(5, (int(source.get("rate_limit_delay_ms") or 0) // 1000) + 2))
+    headers = {
+        "User-Agent": HEALTH_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+    }
+    try:
+        response = request_get(
+            safe_url,
+            headers=headers,
+            timeout=timeout_seconds,
+            allow_redirects=False,
+            stream=True,
+        )
+    except requests.Timeout:
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or urlparse(safe_url).hostname or ""),
+            status="timeout",
+            reason="request_timeout",
+            tested_at=now,
+        )
+    except requests.RequestException as exc:
+        return ManagedSourceTestResult(
+            source_id=source_id,
+            domain=str(source.get("domain") or urlparse(safe_url).hostname or ""),
+            status="fetch_failed",
+            reason=sanitize_source_test_error(str(exc)),
+            tested_at=now,
+        )
+
+    body = _read_limited_body(response)
+    final_url = _safe_final_url(str(getattr(response, "url", safe_url) or safe_url))
+    if policy and policy.detects_cooldown(body):
+        status = "blocked_by_policy"
+        reason = "captcha_or_cooldown_detected"
+    elif int(response.status_code) >= 500:
+        status = "fetch_failed"
+        reason = "server_error"
+    elif not body.strip():
+        status = "parse_failed"
+        reason = "empty_response_body"
+    else:
+        status = "success"
+        reason = "ok"
+
+    return ManagedSourceTestResult(
+        source_id=source_id,
+        domain=str(source.get("domain") or urlparse(safe_url).hostname or ""),
+        status=status,
+        reason=reason,
+        tested_at=now,
+        final_url=final_url,
         http_status=int(response.status_code),
     )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
+from shutil import which
 from pathlib import Path
 
 
@@ -30,12 +32,13 @@ def export_m4b(
 
     if not audio_paths:
         raise ValueError("No chapter audio files found. Run TTS first.")
+    if which("ffmpeg") is None:
+        raise RuntimeError("FFmpeg is not installed. Install ffmpeg to export M4B audiobooks.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create ffmpeg concat file
-    concat_file = output_path.parent / "m4b_concat.txt"
-    try:
+    with tempfile.TemporaryDirectory(prefix="m4b-export-", dir=output_path.parent) as tmp:
+        concat_file = Path(tmp) / "chapters.ffconcat"
         with concat_file.open("w", encoding="utf-8") as f:
             for p in audio_paths:
                 f.write(f"file '{p.as_posix()}'\n")
@@ -65,14 +68,16 @@ def export_m4b(
             str(output_path),
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("FFmpeg M4B export timed out") from exc
         if result.returncode != 0:
             raise RuntimeError(f"FFmpeg M4B export failed: {result.stderr}")
+        if not output_path.exists() or output_path.stat().st_size <= 0:
+            raise RuntimeError("FFmpeg M4B export produced an empty file")
 
         return output_path
-    finally:
-        if concat_file.exists():
-            concat_file.unlink()
 
 
 def export_mp3_playlist(

@@ -60,6 +60,21 @@ const catalog: SourceCatalogList = {
       last_check_error: '',
       last_check_http_status: null,
       last_check_final_url: '',
+      managed_source_id: '',
+      managed_status: '',
+      managed_trust_level: '',
+      managed_last_test_status: '',
+      managed_last_tested_at: '',
+      managed_last_successful_fetch_at: '',
+      managed_last_error: '',
+      managed_rate_limit_requests_per_minute: 0,
+      managed_rate_limit_delay_ms: 0,
+      managed_max_concurrent_requests: 0,
+      managed_cooldown_after_error_seconds: 0,
+      managed_notes: '',
+      managed_parser_type: '',
+      managed_language: '',
+      can_use_in_jobs: false,
     },
     {
       id: 'catalog-unsupported',
@@ -86,6 +101,21 @@ const catalog: SourceCatalogList = {
       last_check_error: '',
       last_check_http_status: null,
       last_check_final_url: '',
+      managed_source_id: 'src-unsupported',
+      managed_status: 'BLOCKED',
+      managed_trust_level: 'MANUAL_ONLY',
+      managed_last_test_status: '',
+      managed_last_tested_at: '',
+      managed_last_successful_fetch_at: '',
+      managed_last_error: 'blocked',
+      managed_rate_limit_requests_per_minute: 6,
+      managed_rate_limit_delay_ms: 10000,
+      managed_max_concurrent_requests: 1,
+      managed_cooldown_after_error_seconds: 300,
+      managed_notes: '',
+      managed_parser_type: 'generic_html',
+      managed_language: 'zh-CN',
+      can_use_in_jobs: false,
     },
   ],
   entries: [],
@@ -142,7 +172,7 @@ describe('SourcesView', () => {
     const onRefresh = vi.fn();
     render(<SourcesView error="" onRefresh={onRefresh} sources={[]} state="empty" />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Làm mới' }));
 
     expect(onRefresh).toHaveBeenCalledOnce();
   });
@@ -156,6 +186,49 @@ describe('SourcesView', () => {
     expect(openSpy).toHaveBeenCalledWith('https://69shuba.com', '_blank', 'noopener,noreferrer');
   });
 
+  it('renders mobile card layouts for supported sources and catalog entries', async () => {
+    const originalMatchMedia = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        addEventListener: vi.fn(),
+        addListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+        matches: query === '(max-width: 760px)',
+        media: query,
+        onchange: null,
+        removeEventListener: vi.fn(),
+        removeListener: vi.fn(),
+      })),
+    });
+    try {
+      const loadCatalog = vi.fn().mockResolvedValue(catalog);
+      const { container } = render(
+        <SourcesView
+          error=""
+          loadCatalog={loadCatalog}
+          onRefresh={() => undefined}
+          sources={sources}
+          state="ready"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('.source-support-card').length).toBe(sources.length);
+      });
+
+      await userEvent.click(screen.getByRole('button', { name: 'Kho nguồn' }));
+      await screen.findByRole('row', { name: /69 Catalog/i });
+
+      expect(container.querySelectorAll('.source-catalog-card').length).toBe(catalog.items.length);
+    } finally {
+      Object.defineProperty(window, 'matchMedia', {
+        configurable: true,
+        value: originalMatchMedia,
+      });
+    }
+  });
+
   it('shows loading and error states honestly', () => {
     render(<SourcesView error="Failed to load" onRefresh={() => undefined} sources={[]} state="error" />);
 
@@ -164,7 +237,7 @@ describe('SourcesView', () => {
 
   it('renders source catalog rows with supported and unsupported badges', async () => {
     const loadCatalog = vi.fn().mockResolvedValue(catalog);
-    render(<SourcesView error="" loadCatalog={loadCatalog} onRefresh={() => undefined} sources={sources} state="ready" />);
+    render(<SourcesView error="" importCatalogSources={vi.fn()} loadCatalog={loadCatalog} onRefresh={() => undefined} sources={sources} state="ready" />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Kho nguồn' }));
 
@@ -173,9 +246,12 @@ describe('SourcesView', () => {
     const unsupportedRow = screen.getByRole('row', { name: /Unsupported Catalog/i });
 
     expect(within(supportedRow).getByText('supported')).toBeInTheDocument();
+    expect(within(supportedRow).getByText('UNMANAGED')).toBeInTheDocument();
     expect(within(supportedRow).getByText('search')).toBeInTheDocument();
     expect(within(unsupportedRow).getByText('unsupported')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /import/i })).not.toBeInTheDocument();
+    expect(within(unsupportedRow).getByText('BLOCKED')).toBeInTheDocument();
+    expect(within(supportedRow).getByRole('button', { name: 'Import source metadata 69 Catalog' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /bulk import|nhập hàng loạt/i })).not.toBeInTheDocument();
   });
 
   it('calls the catalog API when search and filter controls change', async () => {
@@ -218,6 +294,94 @@ describe('SourcesView', () => {
     expect(writeText).toHaveBeenCalledWith('https://www.69shuba.com/book/1');
     expect(screen.getByText('Đã sao chép URL đã chọn.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /bulk import|nhập hàng loạt/i })).not.toBeInTheDocument();
+  });
+
+  it('imports selected catalog metadata and verifies a managed source', async () => {
+    const loadCatalog = vi.fn().mockResolvedValue(catalog);
+    const importCatalogSources = vi.fn().mockResolvedValue({
+      selected: 1,
+      inserted: 1,
+      duplicates: 0,
+      invalid: 0,
+      skipped: 0,
+      items: [
+        {
+          id: 'src-verified',
+          catalog_entry_id: 'catalog-supported',
+          name: '69 Catalog',
+          base_url: 'https://www.69shuba.com/book/1',
+          domain: 'www.69shuba.com',
+          language: 'zh-CN',
+          parser_type: 'policy_supported',
+          parser_config: {},
+          status: 'NEEDS_REVIEW',
+          trust_level: 'MANUAL_ONLY',
+          supported_source_id: '69shuba',
+          last_test_status: '',
+          last_tested_at: '',
+          last_successful_fetch_at: '',
+          last_error: '',
+          rate_limit_requests_per_minute: 7,
+          rate_limit_delay_ms: 8000,
+          max_concurrent_requests: 1,
+          cooldown_after_error_seconds: 300,
+          notes: '',
+          created_at: '',
+          updated_at: '',
+          can_use_in_jobs: false,
+        },
+      ],
+    });
+    const verifyManagedSource = vi.fn().mockResolvedValue({
+      id: 'src-verified',
+      catalog_entry_id: 'catalog-supported',
+      name: '69 Catalog',
+      base_url: 'https://www.69shuba.com/book/1',
+      domain: 'www.69shuba.com',
+      language: 'zh-CN',
+      parser_type: 'policy_supported',
+      parser_config: {},
+      status: 'VERIFIED',
+      trust_level: 'HIGH',
+      supported_source_id: '69shuba',
+      last_test_status: 'success',
+      last_tested_at: '2026-07-09T00:00:00+00:00',
+      last_successful_fetch_at: '2026-07-09T00:00:00+00:00',
+      last_error: '',
+      rate_limit_requests_per_minute: 7,
+      rate_limit_delay_ms: 8000,
+      max_concurrent_requests: 1,
+      cooldown_after_error_seconds: 300,
+      notes: '',
+      created_at: '',
+      updated_at: '',
+      can_use_in_jobs: true,
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(
+      <SourcesView
+        error=""
+        importCatalogSources={importCatalogSources}
+        loadCatalog={loadCatalog}
+        onRefresh={() => undefined}
+        sources={sources}
+        state="ready"
+        verifyManagedSource={verifyManagedSource}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Kho nguồn' }));
+    const row = await screen.findByRole('row', { name: /69 Catalog/i });
+    await userEvent.click(within(row).getByRole('button', { name: 'Import source metadata 69 Catalog' }));
+
+    await waitFor(() => expect(importCatalogSources).toHaveBeenCalledWith(['catalog-supported']));
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(await within(row).findByText('NEEDS_REVIEW')).toBeInTheDocument();
+
+    await userEvent.click(within(row).getByRole('button', { name: 'Verify managed source 69 Catalog' }));
+    await waitFor(() => expect(verifyManagedSource).toHaveBeenCalledWith('src-verified'));
+    expect(await within(row).findByText('VERIFIED')).toBeInTheDocument();
+    expect(within(row).getByText(/Jobs: enabled/i)).toBeInTheDocument();
   });
 
   it('checks one catalog source and renders friendly health status', async () => {
@@ -269,7 +433,7 @@ describe('SourcesView', () => {
     await waitFor(() => expect(loadParserCandidates).toHaveBeenCalledOnce());
     expect(await screen.findByText('69 Candidate Novel')).toBeInTheDocument();
     expect(screen.getByText('needs_review')).toBeInTheDocument();
-    expect(screen.getByText(/Candidate is not a supported source/i)).toBeInTheDocument();
+    expect(screen.getByText(/Ứng viên parser chưa phải nguồn được hỗ trợ/i)).toBeInTheDocument();
   });
 
   it('creates a parser candidate from a catalog row without showing import action', async () => {
@@ -292,6 +456,6 @@ describe('SourcesView', () => {
 
     expect(createParserCandidate).toHaveBeenCalledWith('catalog-supported');
     expect(await screen.findByText(/Đã tạo parser candidate/)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /import/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /import using existing supported flow/i })).not.toBeInTheDocument();
   });
 });

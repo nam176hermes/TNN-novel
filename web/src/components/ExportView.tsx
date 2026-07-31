@@ -67,10 +67,10 @@ export default function ExportView({
       <header className="panel workbench-title">
         <div>
           <p className="section-label">
-            Output <span>/ Xuất file</span>
+            Book Export <span>/ Xuất file</span>
           </p>
           <h2 id="export-view-title">Xuất file</h2>
-          <p className="view-subtitle">Xuất nội dung sách/truyện sang các định dạng khác nhau.</p>
+          <p className="view-subtitle">Xuất sách để đọc/nghe. Không phải backup hệ thống.</p>
         </div>
         <button
           aria-expanded={helpOpen}
@@ -87,7 +87,7 @@ export default function ExportView({
         <section aria-label="Hướng dẫn xuất file" className="panel inline-help-panel">
           <p>
             Chọn truyện đã có bản dịch, chọn TXT/DOCX/EPUB, rồi bấm bắt đầu xuất.
-            File sẽ được tải qua trình duyệt sau khi backend tạo xong.
+            File sẽ được tải qua trình duyệt sau khi backend tạo xong. Backup hệ thống nằm ở trang Trạng thái.
           </p>
         </section>
       ) : null}

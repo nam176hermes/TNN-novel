@@ -11,7 +11,7 @@ import type {
 import GlossaryTmPanel from './GlossaryTmPanel';
 import JobProgress from './JobProgress';
 import ProviderCostPanel, { type QualityMode } from './ProviderCostPanel';
-import QualityPanel, { type QualityDetails, type QualityIssue } from './QualityPanel';
+import QualityPanel, { type QualityDetails, type QualityGlossaryViolation, type QualityIssue } from './QualityPanel';
 import ReviewEditor from './ReviewEditor';
 
 export type TranslatorWorkbenchProps = {
@@ -32,6 +32,12 @@ export type TranslatorWorkbenchProps = {
   qaIssues: QualityIssue[];
   qaScore?: number;
   qaVerdict?: string;
+  qaOverallStatus?: string;
+  qaChineseLeakageCount?: number;
+  qaLengthRatio?: number;
+  qaMissingParagraphWarning?: boolean;
+  qaRepetitionWarning?: boolean;
+  qaGlossaryViolations?: QualityGlossaryViolation[];
   qaDetails?: QualityDetails;
   textLoading?: boolean;
   onTranslationChange(text: string): void;
@@ -67,6 +73,12 @@ export default function TranslatorWorkbench({
   qaIssues,
   qaScore,
   qaVerdict,
+  qaOverallStatus,
+  qaChineseLeakageCount,
+  qaLengthRatio,
+  qaMissingParagraphWarning,
+  qaRepetitionWarning,
+  qaGlossaryViolations,
   qaDetails,
   textLoading = false,
   onTranslationChange,
@@ -131,6 +143,12 @@ export default function TranslatorWorkbench({
       <QualityPanel
         issues={qaIssues}
         details={qaDetails}
+        overallStatus={qaOverallStatus}
+        chineseLeakageCount={qaChineseLeakageCount}
+        lengthRatio={qaLengthRatio}
+        missingParagraphWarning={qaMissingParagraphWarning}
+        repetitionWarning={qaRepetitionWarning}
+        glossaryViolations={qaGlossaryViolations}
         onRunQa={onRunQa}
         score={qaScore}
         verdict={qaVerdict}

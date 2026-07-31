@@ -22,6 +22,7 @@ from app.mobile_api.schemas import (
 from app.mobile_api.services.job_service import JobService, JobTracker, get_shared_job_tracker as shared_tracker_for_db
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.provider_service import ProviderService
+from app.services.tts.availability import TTSUnavailableError
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 _SHARED_JOB_TRACKER: JobTracker | None = None
@@ -44,10 +45,15 @@ def provider_params(params: dict | None) -> dict:
     resolved = dict(params or {})
     provider_id = resolved.get("provider_id")
     if not provider_id:
+        if resolved.get("host"):
+            raise HTTPException(
+                status_code=400,
+                detail="Custom provider host must be configured through a registered provider",
+            )
         return {
             "provider_id": None,
             "model": resolved.get("model"),
-            "host": resolved.get("host"),
+            "host": None,
             "api_key": None,
         }
 
@@ -177,12 +183,15 @@ async def start_tts_job(
     service: JobService = Depends(get_job_service),
 ):
     """Start TTS job."""
-    job_id = service.start_tts_job(
-        book_id=job.book_id,
-        chapter_ids=job.chapter_ids,
-        limit=job.limit,
-        voice=job.params.get("voice") if job.params else None,
-    )
+    try:
+        job_id = service.start_tts_job(
+            book_id=job.book_id,
+            chapter_ids=job.chapter_ids,
+            limit=job.limit,
+            voice=job.params.get("voice") if job.params else None,
+        )
+    except TTSUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=exc.detail()) from exc
     record_audit_event(
         event_type="job_start",
         severity="info",
@@ -379,14 +388,14 @@ async def stream_job_events(
     job = service.get_job_status(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     async def event_stream() -> AsyncGenerator:
         yield json.dumps({"job_id": job_id, "status": "connected"})
-        
+
         job_obj = service.tracker.get_job(job_id)
         if not job_obj:
             return
-        
+
         last_progress = -1
         while job_obj.status not in ("completed", "failed", "cancelled", "canceled", "interrupted"):
             current = service.get_job_status(job_id)
@@ -395,12 +404,12 @@ async def stream_job_events(
                 last_progress = current["progress"]
             import asyncio
             await asyncio.sleep(0.5)
-        
+
         # Final status
         final = service.get_job_status(job_id)
         if final:
             yield json.dumps(final)
-    
+
     return EventSourceResponse(event_stream())
 
 

@@ -1,0 +1,8 @@
+# Full Upgrade B production release pin.
+# Images were built from reviewed source commit 3a781fa3cd48398dd298466118d8c1acc4d291f6
+# with NOVEL_RELEASE_ID=upgrade-b-production-20260725-r1.
+services:
+  api:
+    image: novel-pipeline-api:upgrade-b-production-20260725-r1
+  import-worker:
+    image: novel-pipeline-import-worker:upgrade-b-production-20260725-r1

@@ -64,11 +64,18 @@ export function useQa(client: ApiClient, enabled: boolean, chapter: Chapter | nu
   const [state, setState] = useState<LoadState>('idle');
   const [error, setError] = useState('');
   const requestIdRef = useRef(0);
+  const activeRequestRef = useRef<{
+    controller: AbortController;
+    key: string;
+    promise: Promise<QaReport | null>;
+  } | null>(null);
   const bookId = chapter?.book_id ?? null;
   const chapterId = chapter?.id ?? null;
 
   const reset = useCallback((nextState: LoadState = 'idle') => {
     requestIdRef.current += 1;
+    activeRequestRef.current?.controller.abort();
+    activeRequestRef.current = null;
     setReport(null);
     setState(nextState);
     setError('');
@@ -80,26 +87,39 @@ export function useQa(client: ApiClient, enabled: boolean, chapter: Chapter | nu
       return null;
     }
 
+    const requestKey = `${bookId}:${chapterId}`;
+    if (activeRequestRef.current?.key === requestKey) return activeRequestRef.current.promise;
+    activeRequestRef.current?.controller.abort();
+    const controller = new AbortController();
     const requestId = requestIdRef.current + 1;
     requestIdRef.current = requestId;
     setError('');
     setState('loading');
 
-    try {
-      const nextReport = await client.getQaReport(bookId, chapterId);
-      if (requestId !== requestIdRef.current) return nextReport;
-      setReport(nextReport);
-      setState(nextReport ? 'ready' : 'empty');
-      return nextReport;
-    } catch (nextError) {
-      if (requestId !== requestIdRef.current) throw nextError;
-      if (nextError instanceof ApiError && nextError.status === 401) {
-        onAuthError?.();
+    const promise = (async () => {
+      try {
+        const nextReport = await client.getQaReport(bookId, chapterId, { signal: controller.signal });
+        if (requestId !== requestIdRef.current) return nextReport;
+        setReport(nextReport);
+        setState(nextReport ? 'ready' : 'empty');
+        return nextReport;
+      } catch (nextError) {
+        if (controller.signal.aborted || (nextError instanceof DOMException && nextError.name === 'AbortError')) return null;
+        if (requestId !== requestIdRef.current) throw nextError;
+        if (nextError instanceof ApiError && nextError.status === 401) {
+          onAuthError?.();
+        }
+        setReport(null);
+        setError(formatError(nextError));
+        setState('error');
+        throw nextError;
       }
-      setReport(null);
-      setError(formatError(nextError));
-      setState('error');
-      throw nextError;
+    })();
+    activeRequestRef.current = { controller, key: requestKey, promise };
+    try {
+      return await promise;
+    } finally {
+      if (activeRequestRef.current?.promise === promise) activeRequestRef.current = null;
     }
   }, [bookId, chapterId, client, enabled, onAuthError, reset]);
 
@@ -121,10 +141,15 @@ export function useQa(client: ApiClient, enabled: boolean, chapter: Chapter | nu
   useEffect(() => {
     if (!enabled || bookId === null || chapterId === null) {
       reset('idle');
-      return;
+      return undefined;
     }
 
     void refresh().catch(() => {});
+    return () => {
+      requestIdRef.current += 1;
+      activeRequestRef.current?.controller.abort();
+      activeRequestRef.current = null;
+    };
   }, [bookId, chapterId, enabled, refresh, reset]);
 
   const issues = useMemo(() => qaIssuesFromReport(report), [report]);

@@ -86,6 +86,30 @@ describe('useLibrary', () => {
     expect(result.current.chapters.data[0]?.book_id).toBe(43);
   });
 
+  it('dedupes concurrent chapter refreshes for the same book', async () => {
+    const chapters = deferred<Array<typeof fixtureChapter>>();
+    const client = {
+      getBooks: vi.fn().mockResolvedValue([fixtureBook]),
+      getChapters: vi.fn().mockReturnValue(chapters.promise),
+    } as unknown as ApiClient;
+
+    const { result } = renderHook(() => useLibrary(client, true));
+
+    await waitFor(() => expect(result.current.selectedBookId).toBe(42));
+    await waitFor(() => expect(client.getChapters).toHaveBeenCalledTimes(1));
+
+    void act(() => {
+      void result.current.refreshChapters(42);
+      void result.current.refreshChapters(42);
+    });
+
+    expect(client.getChapters).toHaveBeenCalledTimes(1);
+    chapters.resolve([fixtureChapter]);
+
+    await waitFor(() => expect(result.current.chapters.state).toBe('ready'));
+    expect(result.current.chapters.data).toHaveLength(1);
+  });
+
   it('calls onAuthError when books load returns 401', async () => {
     const onAuthError = vi.fn();
     const client = {
@@ -159,5 +183,30 @@ describe('useLibrary', () => {
     expect(client.getBooks).toHaveBeenCalledTimes(2);
     expect(result.current.books.data).toHaveLength(1);
     expect(result.current.books.data[0]).toMatchObject({ id: 42, title: 'Live Book' });
+  });
+
+  it('restores a bounded cached reader selection without requiring a network response', async () => {
+    const client = {
+      getBooks: vi.fn().mockRejectedValue(new TypeError('offline')),
+      getChapters: vi.fn().mockRejectedValue(new TypeError('offline')),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useLibrary(client, true));
+    const cachedChapter = {
+      ...fixtureChapter,
+      book_id: 42,
+      book_title: 'Offline Book',
+      id: 4201,
+      title: 'Offline Chapter',
+    };
+
+    act(() => result.current.restoreReaderSelection(cachedChapter));
+
+    expect(result.current.selectedBookId).toBe(42);
+    expect(result.current.selectedChapterId).toBe(4201);
+    expect(result.current.selectedChapter).toMatchObject(cachedChapter);
+    expect(result.current.chapters.data).toEqual([cachedChapter]);
+
+    await waitFor(() => expect(result.current.chapters.state).toBe('error'));
+    expect(result.current.selectedChapter).toMatchObject(cachedChapter);
   });
 });

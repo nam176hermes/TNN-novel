@@ -222,6 +222,16 @@ async def test_translate_job_missing_provider_returns_404(
     assert service.translate_kwargs is None
 
 
+def test_provider_params_rejects_request_controlled_host() -> None:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        jobs_router.provider_params({"host": "http://100.64.0.1:11434/v1"})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Custom provider host must be configured through a registered provider"
+
+
 @pytest.mark.asyncio
 async def test_translate_job_rejects_provider_without_required_api_key(
     temp_db_path: Path,

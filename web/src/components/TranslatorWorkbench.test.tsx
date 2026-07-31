@@ -234,6 +234,41 @@ describe('TranslatorWorkbench', () => {
     expect(screen.getByText('Audiobook')).toBeInTheDocument();
   });
 
+  it('renders deterministic chapter QA status and glossary violations', () => {
+    renderWorkbench({
+      qaScore: 3,
+      qaVerdict: 'FAIL',
+      qaDetails: {
+        fidelity: 3,
+        style: 6,
+        glossary: 4,
+      },
+      qaOverallStatus: 'FAIL',
+      qaChineseLeakageCount: 2,
+      qaLengthRatio: 0.31,
+      qaMissingParagraphWarning: true,
+      qaRepetitionWarning: true,
+      qaGlossaryViolations: [
+        {
+          source_term: '灵石',
+          expected: 'linh thạch',
+          message: '<img src=x onerror=alert(1)> phải dùng linh thạch',
+        },
+      ],
+    });
+
+    expect(screen.getAllByText('FAIL').length).toBeGreaterThan(0);
+    expect(screen.getByText('Chinese leakage')).toBeInTheDocument();
+    expect(screen.getByText('2')).toBeInTheDocument();
+    expect(screen.getByText('Length ratio')).toBeInTheDocument();
+    expect(screen.getByText('0.31')).toBeInTheDocument();
+    expect(screen.getByText('Missing paragraphs')).toBeInTheDocument();
+    expect(screen.getByText('Repeated text')).toBeInTheDocument();
+    expect(screen.getByText('灵石 -> linh thạch')).toBeInTheDocument();
+    expect(screen.getByText('<img src=x onerror=alert(1)> phải dùng linh thạch')).toBeInTheDocument();
+    expect(document.querySelector('img[src="x"]')).toBeNull();
+  });
+
   it('does not derive QA panel content from chapter summary fields', () => {
     renderWorkbench({
       qaDetails: undefined,

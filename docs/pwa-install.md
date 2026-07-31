@@ -1,5 +1,7 @@
 # Novel-TNN PWA install mode
 
+See also: [PWA and offline shell](pwa-offline.md) for the current cache policy, offline fallback behavior, and validation checklist.
+
 Novel-TNN can be installed as a browser PWA. This gives the current web app a standalone window on Android Chrome, desktop Chrome, and Edge. It is not a native Android app and it does not move import, translation, TTS, export, provider keys, or background jobs into the client.
 
 ## What gets cached
@@ -15,8 +17,11 @@ The service worker does not blindly cache private content routes:
 - `/api/...`
 - `/covers/...`
 - `/book-assets/...`
+- `/exports/...`
+- `/backup` or `/backups/...`
+- `/data/...`
 
-Reader chapter/audio/book assets are only cached through the existing explicit reader offline controls, such as `Cache toàn bộ truyện offline`. Do not configure Cloudflare or another proxy to cache `/api/*`, `/covers/*`, or `/book-assets/*`.
+Reader chapter/audio/book assets are only cached through the existing explicit reader offline controls, such as `Cache toàn bộ truyện offline`. Do not configure Cloudflare or another proxy to cache `/api/*`, `/covers/*`, `/book-assets/*`, `/exports/*`, `/backups/*`, or `/data/*`.
 
 ## Reader and audio offline cache policy
 
@@ -93,4 +98,4 @@ After deployment, open DevTools > Application and verify:
 - Manifest loads without errors.
 - Service worker is active.
 - `Display mode` is standalone after install.
-- `/api/*`, `/covers/*`, and `/book-assets/*` are not listed as service-worker runtime-cached entries unless they were cached through explicit reader offline controls.
+- `/api/*`, `/covers/*`, `/book-assets/*`, `/exports/*`, `/backups/*`, and `/data/*` are not listed as service-worker runtime-cached entries.

@@ -138,6 +138,7 @@ async def test_parser_candidate_api_creates_and_lists_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.ingestion import parser_candidates as candidate_service
+    from app.mobile_api.auth import get_current_user
     from app.mobile_api.routers import source_adapter_candidates as candidates_router
     from app.mobile_api.routers import source_catalog as source_catalog_router
 
@@ -169,6 +170,7 @@ async def test_parser_candidate_api_creates_and_lists_candidates(
     app = FastAPI()
     app.include_router(source_catalog_router.router)
     app.include_router(candidates_router.router)
+    app.dependency_overrides[get_current_user] = lambda: {"username": "admin", "user_id": "u1"}
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

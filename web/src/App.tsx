@@ -12,32 +12,41 @@ import type {
   EbookSplitMode,
   ImportFileRequest,
   ImportPasteRequest,
+  ImportUrlRequest,
   ImportResponse,
+  JobStartResponse,
   SourceAdapterCandidate,
   SourceAdapterCandidateList,
   SourceCapability,
   SourceCatalogHealthResult,
   SourceCatalogQuery,
+  SourcePreview,
+  SystemBackupItem,
   SystemStatus,
   TranslatedBookSummary,
   TtsJobStatus,
+  WizardTextImportRequest,
+  WizardTextImportResult,
 } from './api/types';
 import LoginPanel from './components/LoginPanel';
 import PwaInstallPrompt from './components/PwaInstallPrompt';
+import PwaNetworkStatus from './components/PwaNetworkStatus';
 import ReviewModeApp from './components/ReviewModeApp';
 import WorkflowShell, { type WorkflowView } from './components/WorkflowShell';
 import type { WorkbenchDashboardData } from './components/WorkbenchView';
 import { resolveApiBaseUrl } from './api/baseUrl';
 import { formatError, type AsyncState, type LoadState } from './state/types';
-import { useChapterText } from './state/useChapterText';
+import { useReaderChapterData } from './state/useReaderChapterData';
 import { useGlossary } from './state/useGlossary';
 import { useJobAttempts } from './state/useJobAttempts';
 import { useJobLogs } from './state/useJobLogs';
 import { useJobsHistory } from './state/useJobsHistory';
 import { useLibrary } from './state/useLibrary';
 import { useProviders } from './state/useProviders';
-import { useQa, type NormalizedQaIssue } from './state/useQa';
+import type { NormalizedQaIssue } from './state/useQa';
 import { removeCachedBookAsync, removeCachedChapterAsync } from './state/readerCache';
+import { clearReaderPrivateData } from './state/readerPrivateData';
+import { loadReaderResume, saveReaderResume } from './state/readerResume';
 import {
   chooseLatestReaderProgressSnapshot,
   loadReaderProgressSnapshot,
@@ -157,15 +166,26 @@ function reviewModeRequested(): boolean {
 
 function AuthenticatedApp() {
   const session = useSession(API_BASE_URL, AUTH_DISABLED);
+  const initialReaderResumeRef = useRef(loadReaderResume());
+  const restoreOfflineReader = initialReaderResumeRef.current !== null
+    && typeof navigator !== 'undefined'
+    && navigator.onLine === false;
+  const readerResumeRestoredRef = useRef(false);
   const [backendError, setBackendError] = useState('');
   const [backendSuccess, setBackendSuccess] = useState('');
-  const [activeView, setActiveView] = useState<WorkflowView>('workbench');
+  const [activeView, setActiveView] = useState<WorkflowView>(restoreOfflineReader ? 'reader' : 'workbench');
   const [workbenchChapterId, setWorkbenchChapterId] = useState<number | null>(null);
   const [backendLoading, setBackendLoading] = useState(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [exportError, setExportError] = useState('');
   const [lastExport, setLastExport] = useState<ExportResponse | null>(null);
+  const [backupJobId, setBackupJobId] = useState('');
+  const [backupError, setBackupError] = useState('');
+  const [backupListError, setBackupListError] = useState('');
+  const [backupListLoading, setBackupListLoading] = useState(false);
+  const [backups, setBackups] = useState<SystemBackupItem[]>([]);
+  const handledBackupJobIdRef = useRef('');
   const [selectedPresetId, setSelectedPresetId] = useState(defaultTranslationPresetId);
   const [workbenchMode, setWorkbenchMode] = useState<'edit' | 'reader'>('edit');
   const [translatedBooks, setTranslatedBooks] = useState<AsyncState<TranslatedBookSummary[]>>(emptyTranslatedBooks);
@@ -195,6 +215,34 @@ function AuthenticatedApp() {
   const chapters = library.chapters.data;
   const selectedChapter = library.selectedChapter;
   const selectedChapterId = library.selectedChapterId;
+  useEffect(() => {
+    const resume = initialReaderResumeRef.current;
+    if (!restoreOfflineReader || !session.isAuthenticated || !resume || readerResumeRestoredRef.current) return;
+    readerResumeRestoredRef.current = true;
+    library.restoreReaderSelection({
+      audio_path: null,
+      book_id: resume.bookId,
+      book_title: resume.bookTitle,
+      chapter_number: resume.chapterNumber,
+      content_html_path: resume.contentRevision || null,
+      has_translation: true,
+      id: resume.chapterId,
+      status: 'translated',
+      title: resume.chapterTitle,
+    });
+  }, [library.restoreReaderSelection, restoreOfflineReader, session.isAuthenticated]);
+
+  useEffect(() => {
+    if (activeView !== 'reader' || !selectedChapter) return;
+    saveReaderResume({
+      bookId: selectedChapter.book_id,
+      bookTitle: selectedChapter.book_title ?? '',
+      chapterId: selectedChapter.id,
+      chapterNumber: selectedChapter.chapter_number,
+      chapterTitle: selectedChapter.title,
+      contentRevision: selectedChapter.content_html_path ?? '',
+    });
+  }, [activeView, selectedChapter]);
   const chapterTextPrefetchTargets = useMemo(() => {
     if (!selectedChapterId) return [];
     const translatedChapters = chapters
@@ -211,20 +259,72 @@ function AuthenticatedApp() {
       translatedChapters[selectedIndex - 1],
     ].filter((target): target is Chapter => Boolean(target));
   }, [chapters, selectedChapter?.book_id, selectedChapterId]);
-  const chapterText = useChapterText(
+  const workbenchChapterSelected = selectedChapter?.id === workbenchChapterId;
+  const chapterTextEnabled = session.isAuthenticated && Boolean(
+    selectedChapter && (activeView === 'reader' || (activeView === 'workbench' && workbenchChapterSelected)),
+  );
+  const glossaryEnabled = session.isAuthenticated && Boolean(
+    activeView === 'glossary' || (activeView === 'workbench' && workbenchChapterSelected),
+  );
+  const readerPrefetchTargets = activeView === 'reader' ? chapterTextPrefetchTargets : [];
+  const readerChapterData = useReaderChapterData(
     session.client,
-    session.isAuthenticated,
+    chapterTextEnabled,
     selectedChapter,
     expireSession,
-    chapterTextPrefetchTargets,
+    readerPrefetchTargets,
+    { cacheOwnership: activeView === 'reader' ? 'external' : 'internal' },
   );
+  const chapterText = readerChapterData.text;
+  const authorizeUnsavedTranslationDeparture = useCallback(({
+    nextView,
+    replacesDraft = false,
+  }: {
+    nextView?: WorkflowView;
+    replacesDraft?: boolean;
+  } = {}): boolean => {
+    if (!chapterText.isDirty) return true;
+
+    const changesView = nextView !== undefined && nextView !== activeView;
+    const leavesWorkbench = activeView === 'workbench' && changesView;
+    const leavesDirtyReader = activeView === 'reader'
+      && changesView
+      && nextView !== 'workbench';
+    if (!replacesDraft && !leavesWorkbench && !leavesDirtyReader) return true;
+
+    return window.confirm('You have unsaved translation edits. Leave without saving?');
+  }, [activeView, chapterText.isDirty]);
+  const requestActiveView = useCallback((
+    nextView: WorkflowView,
+    unsavedDepartureAuthorized = false,
+  ): boolean => {
+    if (nextView === activeView) return true;
+    if (
+      !unsavedDepartureAuthorized
+      && !authorizeUnsavedTranslationDeparture({ nextView })
+    ) return false;
+    setActiveView(nextView);
+    return true;
+  }, [activeView, authorizeUnsavedTranslationDeparture]);
+
+  useEffect(() => {
+    if (!chapterText.isDirty) return undefined;
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [chapterText.isDirty]);
+
   const providersState = useProviders(session.client, session.isAuthenticated, expireSession);
   const styleState = useStyleProfiles(session.client, session.isAuthenticated, expireSession);
   const assistBookId = selectedChapter?.book_id ?? library.selectedBookId;
-  const qaState = useQa(session.client, session.isAuthenticated, selectedChapter, expireSession);
+  const qaState = readerChapterData.qa;
   const glossaryState = useGlossary(
     session.client,
-    session.isAuthenticated,
+    glossaryEnabled,
     assistBookId,
     chapterText.sourceText,
     expireSession,
@@ -266,8 +366,9 @@ function AuthenticatedApp() {
   }, [expireSession, session.client, session.isAuthenticated]);
 
   useEffect(() => {
+    if (activeView !== 'import') return;
     void loadEbookImportHistory();
-  }, [loadEbookImportHistory]);
+  }, [activeView, loadEbookImportHistory]);
 
   const loadEbookInbox = useCallback(async (): Promise<void> => {
     if (!session.isAuthenticated) {
@@ -296,7 +397,7 @@ function AuthenticatedApp() {
 
   const activeBookId = library.selectedBookId;
   const textLoading = chapterText.state === 'loading';
-  const workbenchChapter = selectedChapter?.id === workbenchChapterId ? selectedChapter : null;
+  const workbenchChapter = workbenchChapterSelected ? selectedChapter : null;
 
   const loadRawBacklog = useCallback(async (): Promise<Chapter[]> => {
     if (!session.isAuthenticated) {
@@ -365,8 +466,30 @@ function AuthenticatedApp() {
     }
   }, [expireSession, session.client, session.isAuthenticated]);
 
+  const loadBackups = useCallback(async (): Promise<void> => {
+    if (!session.isAuthenticated) {
+      setBackups([]);
+      return;
+    }
+    setBackupListError('');
+    setBackupListLoading(true);
+    try {
+      const response = await session.client.listSystemBackups();
+      setBackups(response.items);
+    } catch (error) {
+      if (isAuthError(error)) {
+        expireSession();
+        return;
+      }
+      setBackupListError(formatError(error));
+    } finally {
+      setBackupListLoading(false);
+    }
+  }, [expireSession, session.client, session.isAuthenticated]);
+
   const refreshAfterCompletedJob = useCallback(
-    async (job: { job_id: string }) => {
+    async (job: { job_id: string; job_type?: string }) => {
+      if (job.job_type === 'backup') return;
       const refreshBookId = library.selectedChapter?.book_id ?? library.selectedBookId;
 
       const attemptRefresh = async () => {
@@ -437,6 +560,12 @@ function AuthenticatedApp() {
     session.isAuthenticated,
     refreshAfterCompletedJob,
     expireSession,
+  );
+  const backupJob = backupJobId && jobState.activeJob?.job_id === backupJobId
+    ? jobState.activeJob
+    : null;
+  const backupBusy = Boolean(
+    backupJob && ['queued', 'running'].includes(backupJob.status.toLowerCase()),
   );
   const jobAttemptsState = useJobAttempts(
     session.client,
@@ -534,7 +663,7 @@ function AuthenticatedApp() {
   }, [activeView, loadTranslatedBooks, session.isAuthenticated, translatedBooks.state]);
 
   useEffect(() => {
-    if (activeView !== 'workbench' && activeView !== 'raw') return;
+    if (activeView !== 'raw') return;
     void loadRawBacklog().catch(() => {});
   }, [activeView, loadRawBacklog]);
 
@@ -542,6 +671,32 @@ function AuthenticatedApp() {
     if (activeView !== 'workbench' && activeView !== 'status') return;
     void loadSystemStatus();
   }, [activeView, loadSystemStatus]);
+
+  useEffect(() => {
+    if (activeView !== 'status') return;
+    void loadBackups();
+  }, [activeView, loadBackups]);
+
+  useEffect(() => {
+    if (!backupJob) return;
+    const terminal = ['completed', 'failed', 'cancelled', 'canceled', 'interrupted', 'stale_interrupted']
+      .includes(backupJob.status.toLowerCase());
+    if (!terminal || handledBackupJobIdRef.current === backupJob.job_id) return;
+
+    handledBackupJobIdRef.current = backupJob.job_id;
+    if (backupJob.status.toLowerCase() === 'completed') {
+      setBackupError('');
+      setBackendSuccess(backupJob.message || 'System backup completed.');
+      void loadBackups();
+      return;
+    }
+    setBackupError(
+      backupJob.last_safe_error
+      || backupJob.error
+      || backupJob.message
+      || 'Backup job did not complete. Check server logs.',
+    );
+  }, [backupJob, loadBackups]);
 
   useEffect(() => {
     if (!session.isAuthenticated || activeView !== 'status') return undefined;
@@ -552,7 +707,13 @@ function AuthenticatedApp() {
   }, [activeView, loadSystemStatus, session.isAuthenticated, statusRefreshSeconds]);
 
   useEffect(() => {
-    if (!session.isAuthenticated || !selectedChapter || !chapterText.sourceText || !providersState.selectedProviderId) {
+    if (
+      activeView !== 'workbench'
+      || !session.isAuthenticated
+      || !workbenchChapter
+      || !chapterText.sourceText
+      || !providersState.selectedProviderId
+    ) {
       void providersState.estimateForSource(0, 0).catch(() => {});
       return;
     }
@@ -561,11 +722,12 @@ function AuthenticatedApp() {
       .estimateForSource(chapterText.sourceText.length, 1)
       .catch(() => {});
   }, [
+    activeView,
     chapterText.sourceText,
     providersState.estimateForSource,
     providersState.selectedProviderId,
-    selectedChapter,
     session.isAuthenticated,
+    workbenchChapter,
   ]);
 
   function handleJobError(error: unknown, label: string): void {
@@ -577,19 +739,21 @@ function AuthenticatedApp() {
     setBackendError(`${label}: ${formatError(error)}`);
   }
 
-  function canLeaveCurrentChapter(): boolean {
-    if (!chapterText.isDirty) return true;
-    return window.confirm('You have unsaved translation edits. Switch chapter anyway?');
-  }
-
   function handleSelectBook(bookId: number): void {
-    if (bookId !== activeBookId && !canLeaveCurrentChapter()) return;
+    const replacesDraft = bookId !== activeBookId || selectedChapterId !== null;
+    if (
+      replacesDraft
+      && !authorizeUnsavedTranslationDeparture({ replacesDraft: true })
+    ) return;
     library.setSelectedBookId(bookId);
     library.setSelectedChapterId(null);
   }
 
   function handleSelectChapter(chapterId: number): void {
-    if (chapterId !== selectedChapterId && !canLeaveCurrentChapter()) return;
+    if (
+      chapterId !== selectedChapterId
+      && !authorizeUnsavedTranslationDeparture({ replacesDraft: true })
+    ) return;
     library.setSelectedChapterId(chapterId);
     if (activeBookId !== null) {
       saveReaderProgress(activeBookId, chapterId);
@@ -597,8 +761,6 @@ function AuthenticatedApp() {
   }
 
   async function selectBookChapter(bookId: number, chapterId?: number | null): Promise<Chapter[] | null> {
-    if (bookId !== activeBookId && !canLeaveCurrentChapter()) return null;
-
     library.setSelectedBookId(bookId);
     const loadedChapters = await library.refreshChapters(bookId);
     let preferredChapterId = chapterId;
@@ -659,11 +821,15 @@ function AuthenticatedApp() {
   }
 
   async function handleOpenReader(bookId: number, chapterId?: number | null): Promise<void> {
+    const replacesDraft = bookId !== activeBookId
+      || (chapterId !== null && chapterId !== undefined && chapterId !== selectedChapterId);
+    if (!authorizeUnsavedTranslationDeparture({ nextView: 'reader', replacesDraft })) return;
+
     setBackendError('');
     setBackendLoading(true);
     try {
       const loadedChapters = await selectBookChapter(bookId, chapterId);
-      if (loadedChapters) setActiveView('reader');
+      if (loadedChapters) requestActiveView('reader', true);
     } catch (error) {
       handleJobError(error, 'Open reader failed');
     } finally {
@@ -672,21 +838,26 @@ function AuthenticatedApp() {
   }
 
   async function handleOpenWorkbenchBook(bookId: number, chapterId?: number | null): Promise<void> {
+    const willSwitchBook = bookId !== activeBookId;
+    const maySwitchChapter = chapterId === null
+      || chapterId === undefined
+      || chapterId !== selectedChapterId;
+    if (
+      (willSwitchBook || maySwitchChapter)
+      && !authorizeUnsavedTranslationDeparture({ nextView: 'workbench', replacesDraft: true })
+    ) return;
+
     setBackendError('');
     setBackendLoading(true);
     try {
-      const willSwitchBook = bookId !== activeBookId;
-      if (willSwitchBook && !canLeaveCurrentChapter()) return;
-
       library.setSelectedBookId(bookId);
       const loadedChapters = await library.refreshChapters(bookId);
       const nextChapterId = resolveWorkbenchChapterId(loadedChapters, chapterId);
-      if (!willSwitchBook && nextChapterId !== selectedChapterId && !canLeaveCurrentChapter()) return;
 
       library.setSelectedChapterId(nextChapterId);
       setWorkbenchChapterId(nextChapterId);
       setWorkbenchMode('edit');
-      setActiveView('workbench');
+      requestActiveView('workbench', true);
     } catch (error) {
       handleJobError(error, 'Open workbench failed');
     } finally {
@@ -697,7 +868,7 @@ function AuthenticatedApp() {
   function handleOpenSelectedWorkbench(): void {
     setWorkbenchChapterId(selectedChapterId);
     setWorkbenchMode('edit');
-    setActiveView('workbench');
+    requestActiveView('workbench');
   }
 
   async function handleRenameBook(bookId: number, title: string): Promise<void> {
@@ -764,7 +935,7 @@ function AuthenticatedApp() {
       );
       if (response) {
         setBackendSuccess(`Đã bắt đầu dịch hàng loạt: ${response.job_id}`);
-        setActiveView('jobs');
+        requestActiveView('jobs');
       }
     } catch (error) {
       handleJobError(error, 'Batch translate job failed');
@@ -783,7 +954,7 @@ function AuthenticatedApp() {
       );
       if (response) {
         setBackendSuccess(`Đã bắt đầu tạo audio hàng loạt: ${response.job_id}`);
-        setActiveView('jobs');
+        requestActiveView('jobs');
       }
     } catch (error) {
       handleJobError(error, 'Batch audio job failed');
@@ -1138,10 +1309,12 @@ function AuthenticatedApp() {
     if (rawBacklogChapters.state !== 'idle') {
       await loadRawBacklog();
     }
-    setActiveView('workbench');
+    requestActiveView('workbench');
   }
 
   async function handleImportPaste(request: ImportPasteRequest): Promise<void> {
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
     setBackendError('');
     setBackendSuccess('');
     setBackendLoading(true);
@@ -1157,6 +1330,8 @@ function AuthenticatedApp() {
   }
 
   async function handleImportFile(request: ImportFileRequest): Promise<void> {
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
     setBackendError('');
     setBackendSuccess('');
     setBackendLoading(true);
@@ -1168,6 +1343,105 @@ function AuthenticatedApp() {
       handleJobError(error, 'Import failed');
     } finally {
       setBackendLoading(false);
+    }
+  }
+
+  async function handleImportWizardText(
+    request: WizardTextImportRequest,
+    options?: { finalAction?: 'save' | 'open' | 'translate' | 'tts' },
+  ): Promise<WizardTextImportResult> {
+    setBackendError('');
+    setBackendSuccess('');
+    setBackendLoading(true);
+
+    try {
+      const result = await session.client.importWizardText(request);
+      await library.refreshBooks();
+      await library.refreshChapters(result.book_id);
+      library.setSelectedBookId(result.book_id);
+      if (result.chapter_ids.length > 0) {
+        library.setSelectedChapterId(result.chapter_ids[0]);
+        setWorkbenchChapterId(result.chapter_ids[0]);
+        if (options?.finalAction === 'open') {
+          requestActiveView('workbench');
+        }
+      }
+      if (rawBacklogChapters.state !== 'idle') {
+        await loadRawBacklog();
+      }
+      if (translatedBooks.state !== 'idle') {
+        await loadTranslatedBooks();
+      }
+      setBackendSuccess(
+        `Đã import ${result.imported_chapters} chương, bỏ qua ${result.skipped_chapters}, ghi đè ${result.overwritten_chapters}.`,
+      );
+      return result;
+    } catch (error) {
+      handleJobError(error, 'Import wizard failed');
+      throw error;
+    } finally {
+      setBackendLoading(false);
+    }
+  }
+
+  async function handleWizardTranslationJob(bookId: number, chapterIds: number[]): Promise<JobStartResponse | void> {
+    if (!selectedPresetId) {
+      throw new Error('Chưa chọn preset dịch.');
+    }
+    const selectedPreset = translationPresets.find((preset) => preset.id === selectedPresetId);
+    const response = await jobState.startJob(
+      () => session.client.startTranslateJob(
+        bookId,
+        chapterIds,
+        selectedPresetId,
+        styleState.selectedStyleProfileId || undefined,
+        selectedPreset?.chunk_size,
+      ),
+      chapterIds.length,
+    );
+    if (response) {
+      setBackendSuccess(`Đã tạo job dịch từ import: ${response.job_id}`);
+    }
+    return response ?? undefined;
+  }
+
+  async function handleWizardTtsJob(bookId: number, chapterIds: number[]): Promise<JobStartResponse | void> {
+    const response = await jobState.startJob(
+      () => session.client.startTtsJob(bookId, chapterIds),
+      chapterIds.length,
+    );
+    if (response) {
+      setBackendSuccess(`Đã tạo job audio từ import: ${response.job_id}`);
+    }
+    return response ?? undefined;
+  }
+
+  async function handleImportUrlPreview(url: string): Promise<SourcePreview> {
+    try {
+      return await session.client.previewImportUrl(url);
+    } catch (error) {
+      if (isAuthError(error)) {
+        expireSession();
+      }
+      throw error;
+    }
+  }
+
+  async function handleStartImportUrl(request: ImportUrlRequest): Promise<JobStartResponse | void> {
+    setBackendError('');
+    setBackendSuccess('');
+    try {
+      const response = await jobState.startJob(
+        () => session.client.startImportUrlJob(request),
+        request.chapters.length || 1,
+      );
+      if (response) {
+        setBackendSuccess(`Đã tạo job import URL: ${response.job_id}`);
+      }
+      return response ?? undefined;
+    } catch (error) {
+      handleJobError(error, 'URL import failed');
+      throw error;
     }
   }
 
@@ -1211,9 +1485,10 @@ function AuthenticatedApp() {
       jobState.setStartedJob(response, 1);
       await loadEbookImportHistory();
       setBackendSuccess(`Đã bắt đầu import ebook. Theo dõi tác vụ ${response.job_id.slice(0, 8)}.`);
-      setActiveView('jobs');
+      requestActiveView('jobs');
     } catch (error) {
       handleJobError(error, 'Import ebook failed');
+      throw error;
     } finally {
       setBackendLoading(false);
     }
@@ -1258,6 +1533,26 @@ function AuthenticatedApp() {
     [session.client],
   );
 
+  const importManagedSources = useCallback(
+    (entryIds: string[]) => session.client.importManagedSources(entryIds),
+    [session.client],
+  );
+
+  const testManagedSource = useCallback(
+    (sourceId: string) => session.client.testManagedSource(sourceId),
+    [session.client],
+  );
+
+  const verifyManagedSource = useCallback(
+    (sourceId: string) => session.client.verifyManagedSource(sourceId),
+    [session.client],
+  );
+
+  const setManagedSourceStatus = useCallback(
+    (sourceId: string, status: 'BROKEN' | 'BLOCKED' | 'NEEDS_REVIEW') => session.client.setManagedSourceStatus(sourceId, status),
+    [session.client],
+  );
+
   useEffect(() => {
     if (activeView !== 'sources' || sourceCapabilitiesState !== 'idle') return;
     void loadSourceCapabilities();
@@ -1298,8 +1593,67 @@ function AuthenticatedApp() {
     }
   }
 
+  async function handleCreateBackup(options: {
+    includeSecrets?: boolean;
+    passphrase?: string;
+  } = {}): Promise<void> {
+    setBackupError('');
+    setBackendSuccess('');
+    try {
+      const response = await jobState.startJob(
+        () => session.client.createSystemBackup({
+          include_audio: true,
+          include_exports: false,
+          include_job_logs: false,
+          include_secrets: options.includeSecrets ?? false,
+          passphrase: options.passphrase ?? '',
+        }),
+        6,
+      );
+      if (response) {
+        handledBackupJobIdRef.current = '';
+        setBackupJobId(response.job_id);
+        setBackendSuccess(response.message || 'Backup queued.');
+      }
+    } catch (error) {
+      if (isAuthError(error)) {
+        expireSession();
+      } else {
+        setBackupError(formatError(error));
+      }
+    }
+  }
+
+  async function handleCreateEncryptedBackup(): Promise<void> {
+    const passphrase = window.prompt('Nhập passphrase để tạo backup mã hóa (kèm secrets nếu cần):', '') ?? '';
+    if (!passphrase.trim()) {
+      setBackupError('Backup mã hóa cần passphrase.');
+      return;
+    }
+    await handleCreateBackup({ includeSecrets: true, passphrase });
+  }
+
+  async function handleDownloadBackup(filename: string): Promise<void> {
+    setBackupError('');
+    try {
+      const download = await session.client.downloadSystemBackup(filename);
+      triggerBrowserDownload(download.blob, download.filename || filename);
+    } catch (error) {
+      if (isAuthError(error)) {
+        expireSession();
+      } else {
+        setBackupError(formatError(error));
+      }
+    }
+  }
+
   async function handleLogout(): Promise<void> {
-    await session.logout();
+    if (!authorizeUnsavedTranslationDeparture({ replacesDraft: true })) return;
+
+    await Promise.all([
+      clearReaderPrivateData().catch(() => undefined),
+      session.logout(),
+    ]);
     setBackendError('');
     setBackendSuccess('');
   }
@@ -1428,6 +1782,7 @@ function AuthenticatedApp() {
     return (
       <>
         <PwaInstallPrompt />
+        <PwaNetworkStatus />
         <main className="login-screen">
           <section aria-label="Khôi phục phiên đăng nhập" className="login-panel">
             <div className="login-heading">
@@ -1445,6 +1800,7 @@ function AuthenticatedApp() {
     return (
       <>
         <PwaInstallPrompt />
+        <PwaNetworkStatus />
         <LoginPanel error={session.loginError} onLogin={session.login} />
       </>
     );
@@ -1491,6 +1847,7 @@ function AuthenticatedApp() {
                 glossaryError={glossaryState.terms.error}
                 pendingGlossaryCount={glossaryState.pendingCount}
                 qaIssues={qaState.issues}
+                qaReport={qaState.report}
                 qaState={qaState.state}
                 relevantTerms={glossaryState.relevantTerms}
                 tmError={glossaryState.tmError}
@@ -1511,11 +1868,11 @@ function AuthenticatedApp() {
           onDeleteChapter={requestDeleteChapter}
           onDeleteTranslation={requestDeleteTranslation}
           onEstimate={handleEstimateSelectedChapter}
-          onOpenGlossary={() => setActiveView('glossary')}
-          onOpenImport={() => setActiveView('import')}
-          onOpenJobs={() => setActiveView('jobs')}
-          onOpenLibrary={() => setActiveView('library')}
-          onOpenStatus={() => setActiveView('status')}
+          onOpenGlossary={() => requestActiveView('glossary')}
+          onOpenImport={() => requestActiveView('import')}
+          onOpenJobs={() => requestActiveView('jobs')}
+          onOpenLibrary={() => requestActiveView('library')}
+          onOpenStatus={() => requestActiveView('status')}
           onPresetChange={setSelectedPresetId}
           onSave={() => handleSaveTranslation(chapterText.translationText)}
           onStyleProfileChange={handleStyleProfileChange}
@@ -1549,7 +1906,7 @@ function AuthenticatedApp() {
               onBatchTranslate={(bookId, rawChapterIds) => {
                 void handleBatchTranslateBook(bookId, rawChapterIds);
               }}
-              onOpenImport={() => setActiveView('import')}
+              onOpenImport={() => requestActiveView('import')}
               onOpenWorkbench={(bookId, chapterId) => {
                 void handleOpenWorkbenchBook(bookId, chapterId);
               }}
@@ -1566,7 +1923,7 @@ function AuthenticatedApp() {
             <LibraryBooksView
               books={translatedBooks}
               onDeleteBook={requestDeleteBook}
-              onOpenImport={() => setActiveView('import')}
+              onOpenImport={() => requestActiveView('import')}
               onUpdateCover={(book, cover) => {
                 void handleUpdateBookCover(book, cover);
               }}
@@ -1591,12 +1948,16 @@ function AuthenticatedApp() {
               books={translatedBooks.data}
               chapters={chapters}
               contentHtml={chapterText.contentHtml}
+              qaError={qaState.error}
+              qaReport={qaState.report}
+              qaState={qaState.state}
               selectedChapter={selectedChapter}
               selectedChapterId={selectedChapterId}
+              sourceText={chapterText.sourceText}
               textError={chapterText.error}
               textState={chapterText.state}
               translationText={chapterText.translationText}
-              onBackToLibrary={() => setActiveView('library')}
+              onBackToLibrary={() => requestActiveView('library')}
               onOpenWorkbench={handleOpenSelectedWorkbench}
               onSelectBook={(bookId) => {
                 void handleOpenReader(bookId);
@@ -1611,18 +1972,31 @@ function AuthenticatedApp() {
             {statusMessages}
             <ImportPanel
               books={books}
+              chapters={chapters}
+              importJobClient={session.client}
               ebookInboxDirectory={ebookInboxDirectory}
               ebookInboxError={ebookInboxError}
               ebookInboxFiles={ebookInboxFiles}
               ebookImportHistory={ebookImportHistory}
               loading={backendLoading}
-              onCancel={() => setActiveView('workbench')}
+              onCancel={() => requestActiveView('workbench')}
+              loadSourceCatalog={loadSourceCatalog}
+              onCreateTranslationJob={handleWizardTranslationJob}
+              onCreateTtsJob={handleWizardTtsJob}
               onImportFile={handleImportFile}
               onImportPaste={handleImportPaste}
               onImportTranslatedEbook={handleImportTranslatedEbook}
+              onImportWizardText={handleImportWizardText}
+              onOpenImportedBook={(result) => {
+                void handleOpenReader(result.book_id, result.chapter_ids[0] ?? null);
+              }}
+              onOpenJob={() => requestActiveView('jobs')}
+              onReturnToLibrary={() => requestActiveView('library')}
               onPreviewInboxEbook={handlePreviewInboxEbook}
+              onPreviewImportUrl={handleImportUrlPreview}
               onPreviewTranslatedEbook={handlePreviewTranslatedEbook}
               onRefreshEbookInbox={loadEbookInbox}
+              onStartImportUrlJob={handleStartImportUrl}
             />
           </>
         );
@@ -1634,11 +2008,15 @@ function AuthenticatedApp() {
               checkCatalogSource={checkSourceCatalogEntry}
               createParserCandidate={createSourceAdapterCandidate}
               error={sourceCapabilitiesError}
+              importCatalogSources={importManagedSources}
               loadCatalog={loadSourceCatalog}
               loadParserCandidates={loadSourceAdapterCandidates}
+              markManagedSourceStatus={setManagedSourceStatus}
               onRefresh={loadSourceCapabilities}
               sources={sourceCapabilities}
               state={sourceCapabilitiesState}
+              testManagedSource={testManagedSource}
+              verifyManagedSource={verifyManagedSource}
             />
           </>
         );
@@ -1687,7 +2065,7 @@ function AuthenticatedApp() {
               logs={jobLogsState.logs}
               jobs={jobsHistoryState.jobs}
               onCancelJob={handleCancelJob}
-              onOpenProviders={() => setActiveView('providers')}
+              onOpenProviders={() => requestActiveView('providers')}
               onRefresh={handleRefreshJobsView}
               onRetryTtsChunks={handleRetryTtsChunks}
               ttsJob={ttsJobStatus}
@@ -1700,8 +2078,25 @@ function AuthenticatedApp() {
           <>
             {statusMessages}
             <StatusSettingsView
+              backupBusy={backupBusy}
+              backupError={backupError || backupListError}
+              backupItems={backups}
+              backupJob={backupJob}
+              backupListLoading={backupListLoading}
               error={systemStatus.error}
               loading={systemStatus.state === 'loading'}
+              onCreateBackup={() => {
+                void handleCreateBackup();
+              }}
+              onCreateEncryptedBackup={() => {
+                void handleCreateEncryptedBackup();
+              }}
+              onCancelBackup={() => {
+                void handleCancelJob();
+              }}
+              onDownloadBackup={(filename) => {
+                void handleDownloadBackup(filename);
+              }}
               onRefresh={loadSystemStatus}
               onRefreshIntervalChange={setStatusRefreshSeconds}
               onRetryJob={handleRetryFailedJob}
@@ -1712,6 +2107,7 @@ function AuthenticatedApp() {
               )}
               status={systemStatus.data}
             />
+            <PwaInstallPrompt />
           </>
         );
       case 'export':
@@ -1749,7 +2145,7 @@ function AuthenticatedApp() {
 
   return (
     <>
-      <PwaInstallPrompt />
+      <PwaNetworkStatus />
       <WorkflowShell
         activeView={activeView}
         apiBaseUrl={API_BASE_URL}
@@ -1763,8 +2159,8 @@ function AuthenticatedApp() {
                 : 'checking'
         }
         onLogout={handleLogout}
-        onOpenImport={() => setActiveView('import')}
-        onViewChange={setActiveView}
+        onOpenImport={() => requestActiveView('import')}
+        onViewChange={requestActiveView}
         renderView={renderWorkflowView}
       />
       {deleteConfirmation ? (
@@ -1784,6 +2180,7 @@ export default function App() {
     return (
       <>
         <PwaInstallPrompt />
+        <PwaNetworkStatus />
         <ReviewModeApp apiBaseUrl={API_BASE_URL} />
       </>
     );

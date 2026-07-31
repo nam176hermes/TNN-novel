@@ -113,6 +113,8 @@ def merge_chapter_audio(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg failed to merge TTS chunks: {result.stderr.strip()}")
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise RuntimeError("ffmpeg merge produced an empty chapter MP3")
     return output_path
 
 
@@ -156,4 +158,6 @@ def merge_book_m4b(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg failed to create M4B audiobook: {result.stderr.strip()}")
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        raise RuntimeError("ffmpeg created an empty M4B audiobook")
     return output_path

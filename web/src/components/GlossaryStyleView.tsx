@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { GlossaryTerm, GlossaryTermUpdate, StyleProfile } from '../api/types';
+import { useWindowedList } from '../hooks/useWindowedList';
 
 export type GlossaryStyleViewProps = {
   profiles: StyleProfile[];
@@ -23,6 +24,7 @@ export type GlossaryStyleViewProps = {
 };
 
 type GlossaryRowProps = {
+  rowIndex: number;
   term: GlossaryTerm;
   onApproveTerm(termId: number): void;
   onRejectTerm(termId: number): void;
@@ -32,15 +34,35 @@ type GlossaryRowProps = {
 };
 
 function isLocked(term: GlossaryTerm): boolean {
-  return term.locked === 1;
+  return term.locked === 1 || normalizedReviewStatus(term) === 'LOCKED';
 }
 
 function isPending(term: GlossaryTerm): boolean {
-  return term.approved !== 1;
+  return ['NEEDS_REVIEW', 'CONFLICT'].includes(normalizedReviewStatus(term));
+}
+
+function normalizedReviewStatus(term: GlossaryTerm): string {
+  const explicit = String(term.review_status ?? '').trim().toUpperCase();
+  if (explicit) return explicit;
+  if (term.locked === 1) return 'LOCKED';
+  if (term.approved === -1) return 'REJECTED';
+  if (term.approved === 1) return 'APPROVED';
+  return 'NEEDS_REVIEW';
 }
 
 function statusLabel(term: GlossaryTerm): string {
-  return isPending(term) ? 'Chờ duyệt' : 'Đã duyệt';
+  switch (normalizedReviewStatus(term)) {
+    case 'LOCKED':
+      return 'Đã khóa';
+    case 'APPROVED':
+      return 'Đã duyệt';
+    case 'REJECTED':
+      return 'Từ chối';
+    case 'CONFLICT':
+      return 'Xung đột';
+    default:
+      return 'Chờ duyệt';
+  }
 }
 
 function lockLabel(term: GlossaryTerm): string {
@@ -51,6 +73,7 @@ const literaryRuleSummary =
   'Dịch theo nghĩa và khí văn; giữ nhịp thơ/đối liên; ưu tiên thành ngữ Việt cổ phong khi có.';
 
 function GlossaryRow({
+  rowIndex,
   term,
   onApproveTerm,
   onRejectTerm,
@@ -85,8 +108,16 @@ function GlossaryRow({
   }
 
   return (
-    <tr>
-      <th scope="row">{term.source_term}</th>
+    <tr aria-rowindex={rowIndex + 2} data-virtual-index={rowIndex}>
+      <th scope="row">
+        <span>{term.source_term}</span>
+        {term.first_seen_chapter_number ? (
+          <small className="glossary-row-context">Ch. {term.first_seen_chapter_number}</small>
+        ) : null}
+        {term.source_context ? (
+          <small className="glossary-row-context">{term.source_context}</small>
+        ) : null}
+      </th>
       <td>
         <input
           aria-label={`Bản dịch cho ${term.source_term}`}
@@ -128,7 +159,15 @@ function GlossaryRow({
         />
       </td>
       <td>
-        <span className={isPending(term) ? 'status-chip status-chip-warning' : 'status-chip status-chip-success'}>
+        <span
+          className={
+            normalizedReviewStatus(term) === 'REJECTED'
+              ? 'status-chip status-chip-danger'
+              : isPending(term)
+                ? 'status-chip status-chip-warning'
+                : 'status-chip status-chip-success'
+          }
+        >
           {statusLabel(term)}
         </span>
       </td>
@@ -208,17 +247,29 @@ export default function GlossaryStyleView({
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
   const selectedValue = profiles.length > 0 ? selectedProfileId : '';
   const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const normalizedSearch = searchQuery.trim().toLowerCase();
-  const visibleTerms = normalizedSearch
-    ? glossaryTerms.filter((term) => [
+  const visibleTerms = glossaryTerms.filter((term) => {
+    if (statusFilter !== 'all' && normalizedReviewStatus(term) !== statusFilter) return false;
+    if (!normalizedSearch) return true;
+    return [
       term.source_term,
       term.target_term,
       term.category,
       term.term_type,
       term.genre,
-    ].some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch)))
-    : glossaryTerms;
+      term.review_status,
+      term.source_context,
+    ].some((value) => String(value ?? '').toLowerCase().includes(normalizedSearch));
+  });
+  const glossaryWindow = useWindowedList({
+    count: visibleTerms.length,
+    estimateSize: 118,
+    measureItems: true,
+    resetKey: `${statusFilter}:${normalizedSearch}:${visibleTerms.length}`,
+  });
+  const windowedTerms = visibleTerms.slice(glossaryWindow.startIndex, glossaryWindow.endIndex);
 
   return (
     <section aria-labelledby="glossary-style-title" className="workflow-management-view glossary-style-view">
@@ -307,6 +358,21 @@ export default function GlossaryStyleView({
                 value={searchQuery}
               />
             </label>
+            <label className="glossary-search glossary-status-filter">
+              <span className="sr-only">Lọc trạng thái thuật ngữ</span>
+              <select
+                aria-label="Lọc trạng thái thuật ngữ"
+                onChange={(event) => setStatusFilter(event.target.value)}
+                value={statusFilter}
+              >
+                <option value="all">Tất cả</option>
+                <option value="NEEDS_REVIEW">Chờ duyệt</option>
+                <option value="APPROVED">Đã duyệt</option>
+                <option value="LOCKED">Đã khóa</option>
+                <option value="CONFLICT">Xung đột</option>
+                <option value="REJECTED">Từ chối</option>
+              </select>
+            </label>
             <button
               aria-label="Tập trung tìm thuật ngữ"
               className="icon-action"
@@ -334,8 +400,14 @@ export default function GlossaryStyleView({
               <span>Thao tác</span>
             </div>
             {visibleTerms.length > 0 ? (
-              <div className="glossary-table-wrap">
-              <table className="provider-table glossary-management-table">
+              <div
+                aria-label="Danh sách thuật ngữ"
+                className="glossary-table-wrap"
+                onScroll={glossaryWindow.onScroll}
+                ref={glossaryWindow.containerRef}
+                tabIndex={0}
+              >
+              <table aria-rowcount={visibleTerms.length + 1} className="provider-table glossary-management-table">
                 <thead>
                   <tr>
                     <th>Gốc</th>
@@ -349,7 +421,12 @@ export default function GlossaryStyleView({
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleTerms.map((term) => (
+                  {glossaryWindow.paddingTop > 0 ? (
+                    <tr aria-hidden="true" className="glossary-virtual-spacer">
+                      <td colSpan={8} style={{ height: glossaryWindow.paddingTop }} />
+                    </tr>
+                  ) : null}
+                  {windowedTerms.map((term, offset) => (
                     <GlossaryRow
                       key={term.id}
                       onApproveTerm={onApproveTerm}
@@ -357,9 +434,15 @@ export default function GlossaryStyleView({
                       onRejectTerm={onRejectTerm}
                       onSaveAndApproveTerm={onSaveAndApproveTerm}
                       onUpdateTerm={onUpdateTerm}
+                      rowIndex={glossaryWindow.startIndex + offset}
                       term={term}
                     />
                   ))}
+                  {glossaryWindow.paddingBottom > 0 ? (
+                    <tr aria-hidden="true" className="glossary-virtual-spacer">
+                      <td colSpan={8} style={{ height: glossaryWindow.paddingBottom }} />
+                    </tr>
+                  ) : null}
                 </tbody>
               </table>
               </div>

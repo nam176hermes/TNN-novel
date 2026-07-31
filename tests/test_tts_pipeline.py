@@ -9,8 +9,11 @@ from pathlib import Path
 import pytest
 
 from app.database.db import add_book, add_chapter, get_chapter_by_id, init_db, update_chapter_paths
-from app.services.tts.f5_vietnamese_engine import VoiceConfig
+import app.services.tts.tts_pipeline as tts_pipeline_module
+from app.services.tts.availability import TTSUnavailableError
+from app.services.tts.f5_vietnamese_engine import TTSEngineError, VoiceConfig
 from app.services.tts.tts_pipeline import EdgeTtsChunkEngine, TTSPipeline
+from app.services.tts.audio_qa import AudioQAResult
 
 
 def _write_wav(path: Path, *, duration_seconds: float = 0.25) -> None:
@@ -25,6 +28,11 @@ def _write_wav(path: Path, *, duration_seconds: float = 0.25) -> None:
         for index in range(frames):
             payload.extend(struct.pack("<h", int(math.sin(index / 10) * 8000)))
         wav.writeframes(bytes(payload))
+
+
+@pytest.fixture(autouse=True)
+def allow_injected_tts_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tts_pipeline_module, "require_tts_runtime_available", lambda **kwargs: None, raising=False)
 
 
 class FakeEngine:
@@ -42,6 +50,50 @@ class ExplodingEngine:
         raise AssertionError("resume should not synthesize completed chunks")
 
 
+class FailSecondChunkEngine:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def synthesize_chunk(self, normalized_text: str, output_path: Path, *, voice_config) -> Path:
+        self.calls.append(normalized_text)
+        if len(self.calls) >= 2:
+            raise RuntimeError("provider timeout")
+        _write_wav(output_path)
+        return output_path
+
+
+class RecordingEngine:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def synthesize_chunk(self, normalized_text: str, output_path: Path, *, voice_config) -> Path:
+        self.calls.append(normalized_text)
+        _write_wav(output_path)
+        return output_path
+
+
+class PartialOutputTimeoutEngine:
+    def synthesize_chunk(self, normalized_text: str, output_path: Path, *, voice_config) -> Path:
+        output_path.write_bytes(b"partial")
+        raise RuntimeError("provider timeout")
+
+
+class EmptyOutputEngine:
+    def synthesize_chunk(self, normalized_text: str, output_path: Path, *, voice_config) -> Path:
+        output_path.write_bytes(b"")
+        return output_path
+
+
+class CancellingErrorEngine:
+    def __init__(self, pipeline: TTSPipeline, job_id: str) -> None:
+        self.pipeline = pipeline
+        self.job_id = job_id
+
+    def synthesize_chunk(self, normalized_text: str, output_path: Path, *, voice_config) -> Path:
+        self.pipeline.cancel_job(self.job_id)
+        raise RuntimeError("provider timeout after cancellation")
+
+
 def _prepare_translated_chapter(db_path: Path, tmp_path: Path) -> tuple[int, int]:
     init_db(db_path)
     book_id = add_book(db_path, "Độc Tu", author="Thủy Đạo Bất Cô")
@@ -56,12 +108,51 @@ def _prepare_translated_chapter(db_path: Path, tmp_path: Path) -> tuple[int, int
     return book_id, chapter_id
 
 
+def _patch_final_mp3_qa(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.tts.tts_pipeline.analyze_audio",
+        lambda path, **kwargs: AudioQAResult(True, duration_seconds=1.0),
+    )
+
+
 def test_tts_tables_exist_after_initialization(temp_db_path: Path) -> None:
     init_db(temp_db_path)
     with sqlite3.connect(temp_db_path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
     assert {"tts_jobs", "tts_chunks"}.issubset(tables)
+
+
+def test_direct_f5_pipeline_rejects_unavailable_runtime_before_writing_job_state(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    monkeypatch.setattr(tts_pipeline_module.settings, "tts_provider", "f5_vietnamese")
+
+    def reject_unavailable_runtime(*, provider: str) -> None:
+        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+
+    pipeline = TTSPipeline(temp_db_path, tmp_path)
+    monkeypatch.setattr(
+        tts_pipeline_module,
+        "require_tts_runtime_available",
+        reject_unavailable_runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_build_engine",
+        lambda *args, **kwargs: pytest.fail("The F5 engine must not be built"),
+    )
+
+    with pytest.raises(TTSUnavailableError):
+        pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="tts-unavailable")
+
+    with sqlite3.connect(temp_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tts_jobs").fetchone()[0] == 0
+    assert not (tmp_path / "audio" / "tts_jobs" / "tts-unavailable").exists()
 
 
 def test_tts_pipeline_generates_report_and_updates_chapter_audio(
@@ -77,6 +168,7 @@ def test_tts_pipeline_generates_report_and_updates_chapter_audio(
         output_path.write_bytes(b"fake mp3")
         return output_path
 
+    _patch_final_mp3_qa(monkeypatch)
     monkeypatch.setattr("app.services.tts.tts_pipeline.merge_chapter_audio", fake_merge)
     monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 70)
     pipeline = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: engine)
@@ -108,6 +200,7 @@ def test_tts_pipeline_resume_reuses_completed_chunks(
         output_path.write_bytes(b"fake mp3")
         return output_path
 
+    _patch_final_mp3_qa(monkeypatch)
     monkeypatch.setattr("app.services.tts.tts_pipeline.merge_chapter_audio", fake_merge)
     monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 70)
     first_engine = FakeEngine()
@@ -126,6 +219,176 @@ def test_tts_pipeline_resume_reuses_completed_chunks(
 
     assert report.status == "completed"
     assert first_engine.calls > 0
+
+
+def test_tts_pipeline_retry_failed_chunks_only_regenerates_failed_chunks(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+
+    def fake_merge(chunk_paths, output_path, **kwargs):
+        output_path.write_bytes(b"fake mp3")
+        return output_path
+
+    _patch_final_mp3_qa(monkeypatch)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.merge_chapter_audio", fake_merge)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 35)
+
+    first_engine = FailSecondChunkEngine()
+    first_report = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: first_engine).generate_chapter(
+        book_id=book_id,
+        chapter_id=chapter_id,
+        job_id="tts-retry-failed-chunks",
+    )
+
+    assert first_report.status == "failed"
+    failed_status = TTSPipeline(temp_db_path, tmp_path).get_job_status("tts-retry-failed-chunks")
+    assert failed_status is not None
+    assert [chunk["status"] for chunk in failed_status["chunks"]].count("completed") >= 1
+    assert [chunk["status"] for chunk in failed_status["chunks"]].count("failed") == 1
+
+    retry_engine = RecordingEngine()
+    retry_report = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: retry_engine).retry_failed_chunks(
+        "tts-retry-failed-chunks",
+    )
+
+    assert retry_report.status == "completed"
+    assert len(retry_engine.calls) == 1
+
+
+def test_tts_pipeline_cleans_partial_chunk_file_after_timeout(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 10_000)
+
+    report = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: PartialOutputTimeoutEngine()).generate_chapter(
+        book_id=book_id,
+        chapter_id=chapter_id,
+        job_id="tts-partial-timeout",
+    )
+
+    assert report.status == "failed"
+    chunk_path = tmp_path / "audio" / "tts_jobs" / "tts-partial-timeout" / "chunks" / "chunk_0000.wav"
+    assert not chunk_path.exists()
+
+
+def test_tts_pipeline_marks_zero_byte_provider_output_as_failed(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 10_000)
+
+    report = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: EmptyOutputEngine()).generate_chapter(
+        book_id=book_id,
+        chapter_id=chapter_id,
+        job_id="tts-empty-chunk-output",
+    )
+
+    assert report.status == "failed"
+    status = TTSPipeline(temp_db_path, tmp_path).get_job_status("tts-empty-chunk-output")
+    assert status is not None
+    assert status["chunks"][0]["status"] == "qa_failed"
+    assert "empty" in str(status["chunks"][0]["error_message"]).lower()
+
+
+def test_tts_pipeline_preserves_cancelled_state_when_provider_errors_after_cancel(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.settings.tts_chunk_max_chars", 10_000)
+    job_id = "tts-cancelled-provider-error"
+    pipeline: TTSPipeline
+    pipeline = TTSPipeline(
+        temp_db_path,
+        tmp_path,
+        engine_factory=lambda: CancellingErrorEngine(pipeline, job_id),
+    )
+
+    report = pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id=job_id)
+
+    assert report.status == "cancelled"
+    status = pipeline.get_job_status(job_id)
+    assert status is not None
+    assert status["status"] == "cancelled"
+
+
+def test_tts_pipeline_audio_summary_flags_missing_completed_chunk_files(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+
+    def fake_merge(chunk_paths, output_path, **kwargs):
+        output_path.write_bytes(b"fake mp3")
+        return output_path
+
+    _patch_final_mp3_qa(monkeypatch)
+    monkeypatch.setattr("app.services.tts.tts_pipeline.merge_chapter_audio", fake_merge)
+    pipeline = TTSPipeline(temp_db_path, tmp_path, engine_factory=lambda: FakeEngine())
+    pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="tts-audio-summary")
+    status = pipeline.get_job_status("tts-audio-summary")
+    assert status is not None
+    first_chunk_path = Path(status["chunks"][0]["wav_path"])
+    first_chunk_path.unlink()
+
+    refreshed = pipeline.get_job_status("tts-audio-summary")
+
+    assert refreshed is not None
+    assert refreshed["audio_summary"]["missing_chunk_file_count"] == 1
+    assert "1 completed chunk file is missing" in refreshed["audio_summary"]["warnings"]
+
+
+def test_tts_pipeline_get_download_path_rejects_zero_byte_outputs(temp_db_path: Path, tmp_path: Path) -> None:
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    empty_output = tmp_path / "empty.mp3"
+    empty_output.write_bytes(b"")
+    now = "2026-07-01T00:00:00+00:00"
+
+    with sqlite3.connect(temp_db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO tts_jobs
+            (id, book_id, chapter_id, status, provider, model, progress, output_mp3_path, created_at, updated_at)
+            VALUES ('tts-empty-output', ?, ?, 'completed', 'f5_vietnamese', 'vivioice', 100, ?, ?, ?)
+            """,
+            (book_id, chapter_id, str(empty_output), now, now),
+        )
+        conn.commit()
+
+    assert TTSPipeline(temp_db_path, tmp_path).get_download_path("tts-empty-output") is None
+
+
+def test_generate_book_m4b_rejects_empty_artifact(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Audio book", author="Author")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter 1")
+    audio_path = tmp_path / "chapter.mp3"
+    audio_path.write_bytes(b"chapter audio")
+    update_chapter_paths(temp_db_path, chapter_id, audio_path=audio_path, status="audio_done")
+
+    def fake_merge_book_m4b(chapter_paths, output_path, **kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"")
+        return output_path
+
+    monkeypatch.setattr("app.services.tts.tts_pipeline.merge_book_m4b", fake_merge_book_m4b)
+
+    with pytest.raises(TTSEngineError, match="book M4B is empty"):
+        TTSPipeline(temp_db_path, tmp_path).generate_book_m4b(book_id, job_id="m4b-empty")
 
 
 def test_tts_pipeline_cancel_after_last_chunk_does_not_merge_audio(
