@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-import requests
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.mobile_api.schemas import (
@@ -17,6 +17,9 @@ from app.mobile_api.services.provider_secret_store import ProviderSecretStoreErr
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 logger = logging.getLogger(__name__)
 PROVIDER_TEST_FAILURE_DETAIL = "Provider test failed. Check provider settings and server logs."
+PROVIDER_TEST_TIMEOUT_DETAIL = (
+    "Provider test timed out. Check provider timeout settings and server logs."
+)
 
 
 def get_provider_service() -> ProviderService:
@@ -152,7 +155,18 @@ async def test_provider(
     svc: ProviderService = Depends(get_provider_service),
 ):
     try:
-        return svc.test_provider(request.provider_id, request.prompt)
+        return await svc.test_provider_async(request.provider_id, request.prompt)
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        logger.warning("Provider test timed out for %s", request.provider_id)
+        record_audit_event(
+            event_type="provider_test_failure",
+            severity="warning",
+            source="providers",
+            message="Provider test failed",
+            request=http_request,
+            details={"provider_id": request.provider_id, "result": "failure"},
+        )
+        raise HTTPException(status_code=504, detail=PROVIDER_TEST_TIMEOUT_DETAIL) from exc
     except ValueError as exc:
         record_audit_event(
             event_type="provider_test_failure",
@@ -166,10 +180,10 @@ async def test_provider(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         if str(exc).startswith(f"Provider {request.provider_id} requires "):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        logger.warning("Provider test failed for %s", request.provider_id, exc_info=True)
+        logger.warning("Provider test failed for %s", request.provider_id)
         raise HTTPException(status_code=502, detail=PROVIDER_TEST_FAILURE_DETAIL) from exc
-    except requests.RequestException as exc:
-        logger.warning("Provider test failed for %s", request.provider_id, exc_info=True)
+    except httpx.HTTPError as exc:
+        logger.warning("Provider test failed for %s", request.provider_id)
         record_audit_event(
             event_type="provider_test_failure",
             severity="warning",
@@ -180,7 +194,7 @@ async def test_provider(
         )
         raise HTTPException(status_code=502, detail=PROVIDER_TEST_FAILURE_DETAIL) from exc
     except Exception as exc:
-        logger.warning("Provider test failed for %s", request.provider_id, exc_info=True)
+        logger.warning("Provider test failed for %s", request.provider_id)
         record_audit_event(
             event_type="provider_test_failure",
             severity="warning",

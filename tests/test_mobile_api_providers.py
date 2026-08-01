@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
 import secrets
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
-import requests
 
 from app.database.db import init_db, list_operational_events, record_provider_usage
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.routers import providers as providers_router
+from app.mobile_api.services import provider_service as provider_service_module
 from app.mobile_api.services.provider_service import ProviderService
 from app.mobile_api.services.provider_secret_store import ProviderSecretStore
 
@@ -52,7 +54,11 @@ def override_provider_service(
     init_db(temp_db_path)
     service = make_provider_service(temp_db_path)
     service.secret_store_path = tmp_path / "data" / "secrets" / "provider-keys.json"
-    app.dependency_overrides[providers_router.get_provider_service] = lambda: service
+
+    async def provide_service() -> ProviderService:
+        return service
+
+    app.dependency_overrides[providers_router.get_provider_service] = provide_service
     try:
         yield service
     finally:
@@ -461,7 +467,10 @@ async def test_provider_test_endpoint_returns_service_result(
     override_provider_service: ProviderService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_test_provider(provider_id: str, prompt: str) -> dict:
+    def fail_sync_test_provider(provider_id: str, prompt: str) -> dict:
+        raise AssertionError("provider test route called the synchronous compatibility method")
+
+    async def fake_test_provider_async(provider_id: str, prompt: str) -> dict:
         assert provider_id == "gemini"
         assert prompt == "hello"
         return {
@@ -471,7 +480,13 @@ async def test_provider_test_endpoint_returns_service_result(
             "sample": "xin chao",
         }
 
-    monkeypatch.setattr(override_provider_service, "test_provider", fake_test_provider)
+    monkeypatch.setattr(override_provider_service, "test_provider", fail_sync_test_provider)
+    monkeypatch.setattr(
+        override_provider_service,
+        "test_provider_async",
+        fake_test_provider_async,
+        raising=False,
+    )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
@@ -491,15 +506,76 @@ async def test_provider_test_endpoint_returns_service_result(
 
 
 @pytest.mark.asyncio
+async def test_provider_test_does_not_block_an_independent_authenticated_request(
+    override_provider_service: ProviderService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import main as main_mod
+
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def slow_test_provider_async(provider_id: str, prompt: str) -> dict:
+        provider_started.set()
+        await release_provider.wait()
+        return {
+            "provider_id": provider_id,
+            "model": "gemini-2.5-flash-lite",
+            "ok": True,
+            "sample": "xin chao",
+        }
+
+    monkeypatch.setattr(
+        override_provider_service,
+        "test_provider_async",
+        slow_test_provider_async,
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "validate_access_token",
+        lambda token: {"username": "", "user_id": "", "session_id": "test"},
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"Authorization": "Bearer synthetic-test-token"}
+        provider_request = asyncio.create_task(
+            client.post(
+                "/api/providers/test",
+                json={"provider_id": "gemini", "prompt": "hello"},
+                headers=headers,
+            )
+        )
+        try:
+            await asyncio.wait_for(provider_started.wait(), timeout=5)
+            independent = await asyncio.wait_for(
+                client.get("/api/providers/defaults", headers=headers),
+                timeout=5,
+            )
+            assert independent.status_code == 200
+            assert provider_request.done() is False
+        finally:
+            release_provider.set()
+
+        response = await asyncio.wait_for(provider_request, timeout=5)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider_id": "gemini",
+        "model": "gemini-2.5-flash-lite",
+        "ok": True,
+        "sample": "xin chao",
+    }
+
+
+@pytest.mark.asyncio
 async def test_provider_test_missing_provider_returns_404(
     override_provider_service: ProviderService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        override_provider_service,
-        "test_provider",
-        lambda provider_id, prompt: (_ for _ in ()).throw(ValueError("Provider missing not found")),
-    )
+    async def missing_provider(provider_id: str, prompt: str) -> dict:
+        raise ValueError("Provider missing not found")
+
+    monkeypatch.setattr(override_provider_service, "test_provider_async", missing_provider)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
@@ -520,10 +596,25 @@ async def test_provider_test_rejects_required_provider_without_api_key(
 ) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
+    class FailAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("provider test should not create a client without a configured key")
+
     def fail_post(*args, **kwargs):
         raise AssertionError("provider test should not call the remote API without a configured key")
 
-    monkeypatch.setattr("app.mobile_api.services.provider_service.requests.post", fail_post)
+    monkeypatch.setattr(
+        provider_service_module,
+        "httpx",
+        SimpleNamespace(AsyncClient=FailAsyncClient),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "requests",
+        SimpleNamespace(post=fail_post),
+        raising=False,
+    )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
@@ -543,13 +634,11 @@ async def test_provider_test_request_error_returns_502(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    monkeypatch.setattr(
-        override_provider_service,
-        "test_provider",
-        lambda provider_id, prompt: (_ for _ in ()).throw(
-            requests.ConnectionError("offline with provider-secret")
-        ),
-    )
+    async def fail_provider_test(provider_id: str, prompt: str) -> dict:
+        request = httpx.Request("POST", "https://provider-secret.example/v1")
+        raise httpx.ConnectError("offline with provider-secret", request=request)
+
+    monkeypatch.setattr(override_provider_service, "test_provider_async", fail_provider_test)
     transport = httpx.ASGITransport(app=app)
     with caplog.at_level("WARNING"):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -563,7 +652,7 @@ async def test_provider_test_request_error_returns_502(
     assert response.status_code == 502
     assert response.json()["detail"] == "Provider test failed. Check provider settings and server logs."
     assert "provider-secret" not in response.text
-    assert "offline with provider-secret" in caplog.text
+    assert "provider-secret" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -575,13 +664,12 @@ async def test_provider_test_failure_records_sanitized_operational_event(
     from app.mobile_api import audit as audit_mod
 
     monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
-    monkeypatch.setattr(
-        override_provider_service,
-        "test_provider",
-        lambda provider_id, prompt: (_ for _ in ()).throw(
-            requests.ConnectionError("offline with sk-provider-secret")
-        ),
-    )
+
+    async def fail_provider_test(provider_id: str, prompt: str) -> dict:
+        request = httpx.Request("POST", "https://sk-provider-secret.example/v1")
+        raise httpx.ConnectError("offline with sk-provider-secret", request=request)
+
+    monkeypatch.setattr(override_provider_service, "test_provider_async", fail_provider_test)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
@@ -605,12 +693,13 @@ async def test_provider_test_malformed_response_error_returns_502(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    async def malformed_provider_response(provider_id: str, prompt: str) -> dict:
+        raise ValueError("malformed provider response from /tmp/provider-secret.json")
+
     monkeypatch.setattr(
         override_provider_service,
-        "test_provider",
-        lambda provider_id, prompt: (_ for _ in ()).throw(
-            ValueError("malformed provider response from /tmp/provider-secret.json")
-        ),
+        "test_provider_async",
+        malformed_provider_response,
     )
     transport = httpx.ASGITransport(app=app)
     with caplog.at_level("WARNING"):
@@ -625,7 +714,192 @@ async def test_provider_test_malformed_response_error_returns_502(
     assert response.status_code == 502
     assert response.json()["detail"] == "Provider test failed. Check provider settings and server logs."
     assert "/tmp/provider-secret.json" not in response.text
-    assert "malformed provider response from /tmp/provider-secret.json" in caplog.text
+    assert "/tmp/provider-secret.json" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provider_test_timeout_returns_sanitized_504_and_cancels_network_call(
+    override_provider_service: ProviderService,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.mobile_api import audit as audit_mod
+    from app.mobile_api import main as main_mod
+
+    provider_started = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+    client_closed = asyncio.Event()
+    synthetic_key = "synthetic-timeout-key"
+    private_prompt = "private timeout prompt"
+    private_base_url = "https://private-timeout-provider.example/v1"
+
+    class SlowAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            client_closed.set()
+
+        async def post(self, url: str, **kwargs):
+            provider_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+
+    monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(
+        main_mod,
+        "validate_access_token",
+        lambda token: {"username": "", "user_id": "", "session_id": "test"},
+    )
+    monkeypatch.setenv("CUSTOM_TIMEOUT_KEY", synthetic_key)
+    monkeypatch.setattr(
+        override_provider_service,
+        "get_provider",
+        lambda provider_id: {
+            "id": "custom-timeout",
+            "base_url": private_base_url,
+            "model": "private-timeout-model",
+            "api_key_env": "CUSTOM_TIMEOUT_KEY",
+            "temperature": 0.3,
+            "timeout_seconds": 0.01,
+        },
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "httpx",
+        SimpleNamespace(AsyncClient=SlowAsyncClient),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "requests",
+        SimpleNamespace(post=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())),
+        raising=False,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    with caplog.at_level("WARNING"):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"Authorization": "Bearer synthetic-test-token"}
+            response = await asyncio.wait_for(
+                client.post(
+                    "/api/providers/test",
+                    json={"provider_id": "custom-timeout", "prompt": private_prompt},
+                    headers=headers,
+                ),
+                timeout=5,
+            )
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "detail": "Provider test timed out. Check provider timeout settings and server logs."
+    }
+    assert provider_started.is_set()
+    assert provider_cancelled.is_set()
+    assert client_closed.is_set()
+    events = list_operational_events(temp_db_path, limit=10, severities=())
+    event = next(item for item in events if item["event_type"] == "provider_test_failure")
+    assert event["details"] == {
+        "provider_id": "custom-timeout",
+        "result": "failure",
+        "client_host": "127.0.0.1",
+    }
+    assert_secret_absent(
+        synthetic_key,
+        response.text,
+        dict(response.headers),
+        caplog.text,
+        event,
+    )
+    assert private_prompt not in str((response.text, caplog.text, event))
+    assert private_base_url not in str((response.text, caplog.text, event))
+
+
+@pytest.mark.asyncio
+async def test_provider_test_cancellation_propagates_to_async_network_call(
+    override_provider_service: ProviderService,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import main as main_mod
+
+    provider_started = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+    client_closed = asyncio.Event()
+
+    class SlowAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            client_closed.set()
+
+        async def post(self, url: str, **kwargs):
+            provider_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+
+    monkeypatch.setattr(
+        override_provider_service,
+        "get_provider",
+        lambda provider_id: {
+            "id": "custom-cancel",
+            "base_url": "https://provider.example/v1",
+            "model": "custom-model",
+            "api_key_env": "",
+            "temperature": 0.3,
+            "timeout_seconds": 60,
+        },
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "httpx",
+        SimpleNamespace(AsyncClient=SlowAsyncClient),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "requests",
+        SimpleNamespace(post=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "validate_access_token",
+        lambda token: {"username": "", "user_id": "", "session_id": "test"},
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = {"Authorization": "Bearer synthetic-test-token"}
+        provider_request = asyncio.create_task(
+            client.post(
+                "/api/providers/test",
+                json={"provider_id": "custom-cancel", "prompt": "hello"},
+                headers=headers,
+            )
+        )
+        try:
+            await asyncio.wait_for(provider_started.wait(), timeout=5)
+            provider_request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await provider_request
+        finally:
+            if not provider_request.done():
+                provider_request.cancel()
+                await asyncio.gather(provider_request, return_exceptions=True)
+
+    assert provider_cancelled.is_set()
+    assert client_closed.is_set()
+    events = list_operational_events(temp_db_path, limit=10, severities=())
+    assert all(event["event_type"] != "provider_test_failure" for event in events)
 
 
 @pytest.mark.asyncio
