@@ -30,6 +30,7 @@ from app.mobile_api.routers import import_routes as import_router
 from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api.routers import qa as qa_router
 from app.mobile_api.services import audio_service as audio_service_module
+from app.mobile_api.services import qa_service as qa_service_module
 from app.mobile_api.services.qa_service import QAService
 from app.mobile_api.services.audio_service import AudioService
 from app.mobile_api.services.pipeline_service import PipelineService
@@ -663,6 +664,70 @@ async def test_missing_qa_report_returns_no_content(override_qa_service: Pipelin
 
     assert response.status_code == 204
     assert response.content == b""
+
+
+@pytest.mark.asyncio
+async def test_run_qa_check_returns_safe_503_when_generated_report_cannot_be_persisted(
+    override_qa_service: PipelineService,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_marker = "GENERATED_QA_ROUTE_SENTINEL"
+    database_error_marker = "QA_DATABASE_ROUTE_SENTINEL"
+    raw_path = tmp_path / "qa-source.txt"
+    translation_path = tmp_path / "qa-translation.txt"
+    raw_path.write_text("第一段。", encoding="utf-8")
+    translation_path.write_text("Đoạn thứ nhất.", encoding="utf-8")
+    book_id = add_book(override_qa_service.db_path, "Book")
+    chapter_id = add_chapter(
+        override_qa_service.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=raw_path,
+    )
+    update_chapter_paths(
+        override_qa_service.db_path,
+        chapter_id,
+        translated_text_path=translation_path,
+    )
+
+    def generated_report(**kwargs):
+        return {
+            "quality_score": 8.5,
+            "fidelity_score": 9,
+            "style_score": 8,
+            "glossary_score": 8,
+            "audiobook_score": 7,
+            "verdict": "PASS",
+            "issues": [{"type": "provider_debug", "message": generated_marker}],
+        }
+
+    def fail_after_generation(db_path, **kwargs):
+        assert generated_marker in kwargs["report_json"]
+        raise RuntimeError(database_error_marker)
+
+    monkeypatch.setattr(pipeline_mod, "run_qa_check", generated_report)
+    monkeypatch.setattr(qa_service_module, "save_qa_report", fail_after_generation)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        response = await client.post(
+            f"/api/books/{book_id}/chapters/{chapter_id}/qa/run",
+            headers=headers,
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "qa_persistence_failed",
+            "status": "generated_not_persisted",
+            "message": "QA report was generated but could not be persisted.",
+        }
+    }
+    assert generated_marker not in response.text
+    assert database_error_marker not in response.text
 
 
 def test_translate_chapter_requires_matching_book(
