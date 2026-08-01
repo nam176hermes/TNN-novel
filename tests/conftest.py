@@ -33,12 +33,19 @@ os.environ["TEMP"] = str(_TEST_TMPDIR)
 # application module can resolve the repository's operator database.
 _PYTEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="novel-tnn-pytest-", dir=_TEST_TMPDIR))
 os.environ["DATA_DIR"] = str(_PYTEST_DATA_DIR)
+_PYTEST_PROVIDER_SECRET_DIR = Path(
+    tempfile.mkdtemp(prefix="novel-tnn-provider-secrets-pytest-", dir=_TEST_TMPDIR)
+)
+os.environ["PROVIDER_SECRET_STORE_PATH"] = str(
+    _PYTEST_PROVIDER_SECRET_DIR / "provider-keys.json"
+)
 
 from app.database.schema import SCHEMA
 
 
 def pytest_sessionfinish() -> None:
     shutil.rmtree(_PYTEST_DATA_DIR, ignore_errors=True)
+    shutil.rmtree(_PYTEST_PROVIDER_SECRET_DIR, ignore_errors=True)
 
 
 @pytest.fixture

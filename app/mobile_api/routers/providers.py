@@ -8,11 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.mobile_api.schemas import (
     CostEstimateRequest,
     CostEstimateResponse,
-    ProviderKeyUpdateRequest,
     ProviderTestRequest,
 )
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.services.provider_service import ProviderService
+from app.mobile_api.services.provider_secret_store import ProviderSecretStoreError
 
 router = APIRouter(prefix="/api/providers", tags=["providers"])
 logger = logging.getLogger(__name__)
@@ -36,12 +36,26 @@ async def get_defaults(svc: ProviderService = Depends(get_provider_service)):
 @router.post("/{provider_id}/key")
 async def update_provider_key(
     provider_id: str,
-    request: ProviderKeyUpdateRequest,
     http_request: Request,
     svc: ProviderService = Depends(get_provider_service),
 ):
     try:
-        provider = svc.update_provider_key(provider_id, request.api_key)
+        payload = await http_request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    api_key = payload.get("api_key") if isinstance(payload, dict) else None
+    if not isinstance(api_key, str):
+        record_audit_event(
+            event_type="provider_key_update",
+            severity="warning",
+            source="providers",
+            message="Provider key update failed",
+            request=http_request,
+            details={"provider_id": provider_id, "result": "failure"},
+        )
+        raise HTTPException(status_code=422, detail="Provider key request is invalid")
+    try:
+        provider = svc.update_provider_key(provider_id, api_key)
         record_audit_event(
             event_type="provider_key_update",
             severity="info",
@@ -64,6 +78,60 @@ async def update_provider_key(
         if message == f"Provider {provider_id} not found":
             raise HTTPException(status_code=404, detail=message) from exc
         raise HTTPException(status_code=400, detail=message) from exc
+    except ProviderSecretStoreError as exc:
+        logger.warning("Provider key storage operation failed for %s", provider_id)
+        record_audit_event(
+            event_type="provider_key_update",
+            severity="error",
+            source="providers",
+            message="Provider key update failed",
+            request=http_request,
+            details={"provider_id": provider_id, "result": "failure"},
+        )
+        raise HTTPException(status_code=503, detail="Provider key storage unavailable") from exc
+
+
+@router.delete("/{provider_id}/key")
+async def delete_provider_key(
+    provider_id: str,
+    http_request: Request,
+    svc: ProviderService = Depends(get_provider_service),
+):
+    try:
+        provider = svc.delete_provider_key(provider_id)
+        record_audit_event(
+            event_type="provider_key_delete",
+            severity="info",
+            source="providers",
+            message="Provider key deleted",
+            request=http_request,
+            details={"provider_id": provider_id, "result": "success"},
+        )
+        return {"provider": provider}
+    except ValueError as exc:
+        message = str(exc)
+        record_audit_event(
+            event_type="provider_key_delete",
+            severity="warning",
+            source="providers",
+            message="Provider key deletion failed",
+            request=http_request,
+            details={"provider_id": provider_id, "result": "failure"},
+        )
+        if message == f"Provider {provider_id} not found":
+            raise HTTPException(status_code=404, detail=message) from exc
+        raise HTTPException(status_code=400, detail=message) from exc
+    except ProviderSecretStoreError as exc:
+        logger.warning("Provider key storage deletion failed for %s", provider_id)
+        record_audit_event(
+            event_type="provider_key_delete",
+            severity="error",
+            source="providers",
+            message="Provider key deletion failed",
+            request=http_request,
+            details={"provider_id": provider_id, "result": "failure"},
+        )
+        raise HTTPException(status_code=503, detail="Provider key storage unavailable") from exc
 
 
 @router.post("/estimate", response_model=CostEstimateResponse)

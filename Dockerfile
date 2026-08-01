@@ -48,8 +48,9 @@ COPY --chown=novel:novel app ./app
 COPY --chown=novel:novel scripts ./scripts
 COPY --from=web-build --chown=novel:novel /app/web/dist ./web/dist
 
-RUN mkdir -p /data /tmp/novel \
-    && chown -R novel:novel /data /tmp/novel
+RUN mkdir -p /data /data/secrets /tmp/novel \
+    && chown -R novel:novel /data /tmp/novel \
+    && chmod 0700 /data/secrets
 
 VOLUME ["/data"]
 

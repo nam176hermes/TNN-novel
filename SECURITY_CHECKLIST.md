@@ -55,8 +55,8 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=["novel-tnn.tradingcompa
 ### 5. Secrets Management
 - Never commit `.env` or `credentials-file` JSON
 - Use `openssl rand -hex 32` for JWT secrets
-- Keep provider keys (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`) only in `.env`
-- Store provider keys with `python scripts/ops.py set-provider-key <KEY_NAME> --stdin` so values are not printed or saved in shell history
+- Keep provider keys (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`) only in the private provider secret store, never in the project `.env`
+- Store provider keys with `python scripts/ops.py set-provider-key <KEY_NAME> --stdin` so values are not printed or saved in shell history; Docker Compose persists them in the API-only `provider-secrets` volume
 - Rotate JWT secret quarterly
 
 ### 6. Audit Log

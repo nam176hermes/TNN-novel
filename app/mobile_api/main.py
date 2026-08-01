@@ -28,6 +28,7 @@ from app.mobile_api.private_assets import (
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.session_auth import AccessTokenError, validate_access_token
 from app.mobile_api.services.retention_service import RetentionService, run_retention_loop
+from app.mobile_api.services.provider_secret_store import ProviderSecretStore, provider_secret_store_path
 from app.utils.stealth_browser import close_stealth_browser
 from app.mobile_api.routers import (
     auth_router,
@@ -95,7 +96,7 @@ def _is_sensitive_public_path(path: str) -> bool:
 
 
 def _prepare_runtime() -> None:
-    get_data_dir()
+    ProviderSecretStore(provider_secret_store_path()).load_into_environment()
     init_db(get_db_path())
 
     # Initialize captcha solver if API key is configured

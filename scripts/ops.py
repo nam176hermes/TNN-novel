@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -160,35 +161,19 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def update_env_file_value(env_path: Path, key: str, value: str) -> None:
+def update_provider_secret(store_path: Path | None, key: str, value: str) -> None:
     if key not in PROVIDER_KEY_NAMES:
         raise ValueError(f"Unsupported provider key: {key}")
     value = value.strip()
     if not value:
         raise ValueError(f"{key} value is empty")
+    from app.mobile_api.services.provider_secret_store import (
+        ProviderSecretStore,
+        provider_secret_store_path,
+    )
 
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    updated_lines: list[str] = []
-    replaced = False
-    prefix = f"{key}="
-    for line in lines:
-        if line.startswith(prefix):
-            if not replaced:
-                updated_lines.append(f"{key}={value}")
-                replaced = True
-            continue
-        updated_lines.append(line)
-    if not replaced:
-        if updated_lines and updated_lines[-1] != "":
-            updated_lines.append("")
-        updated_lines.append(f"{key}={value}")
-
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
-    try:
-        env_path.chmod(0o600)
-    except OSError:
-        pass
+    mutation = ProviderSecretStore(store_path or provider_secret_store_path()).save(key, value)
+    mutation.require_durable()
 
 
 def resolve_data_dir(value: str | None = None) -> Path:
@@ -259,6 +244,42 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _copy_regular_file_anchored(source_root: Path, relative: Path, destination: Path) -> os.stat_result:
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise OSError("Backup source path is invalid")
+
+    directory_descriptors: list[int] = []
+    source_descriptor = -1
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        directory_descriptors.append(os.open(source_root, directory_flags))
+        for part in relative.parts[:-1]:
+            directory_descriptors.append(
+                os.open(part, directory_flags, dir_fd=directory_descriptors[-1])
+            )
+        source_descriptor = os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=directory_descriptors[-1],
+        )
+        source_stat = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError("Backup source is not a regular file")
+        with os.fdopen(source_descriptor, "rb", closefd=True) as source_handle:
+            source_descriptor = -1
+            with destination.open("xb") as destination_handle:
+                shutil.copyfileobj(source_handle, destination_handle)
+        os.chmod(destination, stat.S_IMODE(source_stat.st_mode))
+        os.utime(destination, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        return source_stat
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        for descriptor in reversed(directory_descriptors):
+            os.close(descriptor)
 
 
 def delete_orphan_chapters(db_path: Path) -> int:
@@ -367,7 +388,7 @@ def create_backup(
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = f"-{label}" if label else ""
 
-    excluded_roots: set[str] = set()
+    excluded_roots: set[str] = {"secrets"}
     if not include_audio:
         excluded_roots.update(BACKUP_MODULE_SUBDIRS["audio"])
     if not include_exports:
@@ -396,21 +417,21 @@ def create_backup(
             if source_path.is_dir():
                 continue
             relative = source_path.relative_to(source_dir)
-            if relative.parts and relative.parts[0] in excluded_roots:
+            if (relative.parts and relative.parts[0] in excluded_roots) or "secrets" in relative.parts[:-1]:
                 continue
             if relative.name in {"pipeline.db", "pipeline.db-wal", "pipeline.db-shm"}:
                 continue
             _raise_if_backup_cancelled(cancel_check)
             destination = staging_data_dir / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, destination)
+            source_stat = _copy_regular_file_anchored(source_dir, relative, destination)
             copied_files += 1
-            total_size += source_path.stat().st_size
+            total_size += source_stat.st_size
             checksums.append(
                 {
                     "path": f"data/{relative.as_posix()}",
                     "sha256": sha256_file(destination),
-                    "size_bytes": source_path.stat().st_size,
+                    "size_bytes": source_stat.st_size,
                 }
             )
 
@@ -1855,12 +1876,20 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument("--keep", type=int, default=5)
     rotate.add_argument("--force", action="store_true")
 
-    provider_key = subparsers.add_parser("set-provider-key", help="Safely store a provider API key in .env")
+    provider_key = subparsers.add_parser(
+        "set-provider-key",
+        help="Safely store a provider API key in the private provider secret store",
+    )
     provider_key.add_argument("name", choices=PROVIDER_KEY_NAMES)
     source = provider_key.add_mutually_exclusive_group(required=True)
     source.add_argument("--stdin", action="store_true", help="Read the key value from stdin")
     source.add_argument("--from-env", action="store_true", help="Read the key value from the current environment")
-    provider_key.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    provider_key.add_argument(
+        "--secret-store",
+        type=Path,
+        default=None,
+        help="Override PROVIDER_SECRET_STORE_PATH for this operation",
+    )
 
     wait = subparsers.add_parser("wait-health", help="Wait until the API readiness endpoint is ok")
     wait.add_argument("--base-url", default="http://127.0.0.1:7860")
@@ -1955,8 +1984,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "set-provider-key":
         value = os.getenv(args.name, "") if args.from_env else sys.stdin.read()
-        update_env_file_value(args.env_file, args.name, value)
-        print(f"{args.name} configured in {args.env_file} (len={len(value.strip())})")
+        update_provider_secret(args.secret_store, args.name, value)
+        print(f"{args.name} configured in provider secret store")
         return 0
     if args.command == "wait-health":
         if wait_for_health(args.base_url, timeout_seconds=args.timeout):
