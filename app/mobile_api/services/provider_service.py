@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import requests
 
-from app.config import PROJECT_ROOT
 from app.database.db import get_provider_defaults, get_usage_summary, list_model_providers
 from app.mobile_api.dependencies import get_db_path
+from app.mobile_api.services.provider_secret_store import (
+    ProviderSecretStore,
+    provider_secret_store_path,
+)
 
 
 def _coerce_float(value: object, default: float) -> float:
@@ -39,7 +41,13 @@ def _coerce_int(value: object, default: int) -> int:
 class ProviderService:
     def __init__(self) -> None:
         self.db_path = get_db_path()
-        self.env_path = PROJECT_ROOT / ".env"
+        self.secret_store_path = provider_secret_store_path()
+
+    def _secret_store(self) -> ProviderSecretStore:
+        path = getattr(self, "secret_store_path", None)
+        if path is None:
+            path = provider_secret_store_path()
+        return ProviderSecretStore(path)
 
     def _normalize_provider(self, provider: dict) -> dict:
         normalized = dict(provider)
@@ -67,35 +75,6 @@ class ProviderService:
     def get_defaults(self) -> dict[str, str]:
         return get_provider_defaults(self.db_path)
 
-    def _write_env_value(self, key: str, value: str) -> None:
-        env_path = Path(getattr(self, "env_path", PROJECT_ROOT / ".env"))
-        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-        updated_lines: list[str] = []
-        replaced = False
-        prefix = f"{key}="
-
-        for line in lines:
-            if line.startswith(prefix):
-                if not replaced:
-                    updated_lines.append(f"{key}={value}")
-                    replaced = True
-                continue
-            updated_lines.append(line)
-
-        if not replaced:
-            if updated_lines and updated_lines[-1] != "":
-                updated_lines.append("")
-            updated_lines.append(f"{key}={value}")
-
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = env_path.with_name(f"{env_path.name}.tmp")
-        tmp_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
-        try:
-            tmp_path.chmod(0o600)
-        except OSError:
-            pass
-        tmp_path.replace(env_path)
-
     def update_provider_key(self, provider_id: str, api_key: str) -> dict:
         provider = self.get_provider(provider_id)
         if provider is None:
@@ -108,11 +87,26 @@ class ProviderService:
         value = api_key.strip()
         if not value:
             raise ValueError(f"{api_key_env} value is empty")
-        if "\n" in value or "\r" in value:
+        if "\n" in value or "\r" in value or "\0" in value:
             raise ValueError(f"{api_key_env} value must be a single line")
 
-        self._write_env_value(api_key_env, value)
+        mutation = self._secret_store().save(api_key_env, value)
         os.environ[api_key_env] = value
+        mutation.require_durable()
+        return self.get_provider(provider_id) or provider
+
+    def delete_provider_key(self, provider_id: str) -> dict:
+        provider = self.get_provider(provider_id)
+        if provider is None:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        api_key_env = str(provider.get("api_key_env") or "").strip()
+        if not api_key_env:
+            raise ValueError(f"Provider {provider_id} has no API key env var")
+
+        mutation = self._secret_store().delete(api_key_env)
+        os.environ.pop(api_key_env, None)
+        mutation.require_durable()
         return self.get_provider(provider_id) or provider
 
     def estimate_cost(

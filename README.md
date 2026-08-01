@@ -16,23 +16,18 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 pip install -e ".[dev]"   # installs the `novel` CLI command + test tools
-cp .env.example .env      # fill provider keys, local password, and secrets
+cp .env.example .env      # fill runtime authentication and service secrets
 npm --prefix web ci       # operator dashboard dependencies
 ```
 
-For the current operator workflow, configure one cheap/free cloud provider first:
+For the current operator workflow, keep runtime authentication in `.env`, but store provider keys separately:
 
 ```bash
-# Recommended starting point in .env
-GEMINI_API_KEY=...
-DEEPSEEK_API_KEY=...
-# Optional free/cheap fallback
-OPENROUTER_API_KEY=...
 MOBILE_API_SECRET=replace-with-a-long-random-value
 MOBILE_API_ADMIN_PASSWORD=replace-default-password
 ```
 
-To avoid placing provider keys in shell history, write them through stdin:
+Write provider keys to the private provider secret store through stdin:
 
 ```bash
 printf '%s' "$GEMINI_API_KEY" | python scripts/ops.py set-provider-key GEMINI_API_KEY --stdin
@@ -333,7 +328,7 @@ python scripts/ops.py repair-db --remove-empty-stale-db
 # Rotate runtime logs under data/logs/runtime
 python scripts/ops.py rotate-logs --force
 
-# Store a provider key in .env without printing it
+# Store a provider key in the private provider secret store without printing it
 printf '%s' "$GEMINI_API_KEY" | python scripts/ops.py set-provider-key GEMINI_API_KEY --stdin
 ```
 

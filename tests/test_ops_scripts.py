@@ -3,8 +3,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tarfile
 import threading
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from scripts import ops
+from app.mobile_api.services.provider_secret_store import ProviderSecretStore
 
 
 class _FrozenBackupDateTime(datetime):
@@ -139,6 +142,30 @@ def test_create_backup_writes_compact_sidecar(tmp_path: Path) -> None:
     with tarfile.open(archive, "r:gz") as handle:
         internal = json.loads(handle.extractfile("manifest.json").read().decode("utf-8"))
     assert internal["checksums"][0]["path"] == "data/chapter.txt"
+
+
+def test_create_backup_fails_closed_on_symlink_alias_to_provider_store(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    secret_dir = data_dir / "secrets"
+    secret_dir.mkdir(parents=True)
+    generated_key = secrets.token_urlsafe(32)
+    secret_path = secret_dir / "provider-keys.json"
+    secret_path.write_text(generated_key, encoding="utf-8")
+    (data_dir / "credential-alias.json").symlink_to(secret_path)
+    backup_dir = tmp_path / "backups"
+
+    with pytest.raises(OSError):
+        ops.create_backup(
+            data_dir=data_dir,
+            out_dir=backup_dir,
+            record_event=False,
+            checkpoint_database=False,
+        )
+
+    published = list(backup_dir.glob("novel-pipeline-backup-*.tar.gz"))
+    if published:
+        pytest.fail("backup published after encountering a symlink source")
+    assert generated_key not in "".join(path.name for path in backup_dir.rglob("*"))
 
 
 def test_create_backup_cancellation_does_not_publish_partial_artifacts(tmp_path: Path) -> None:
@@ -1013,6 +1040,30 @@ def test_create_backup_can_exclude_exports_and_job_logs(tmp_path: Path) -> None:
     assert "data/logs/runtime.log" not in names
 
 
+def test_create_backup_excludes_every_secrets_subtree(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    root_secrets = data_dir / "secrets"
+    nested_secrets = data_dir / "raw" / "secrets"
+    root_secrets.mkdir(parents=True)
+    nested_secrets.mkdir(parents=True)
+    generated_secret = secrets.token_urlsafe(32)
+    (root_secrets / "provider-keys.json").write_text(generated_secret, encoding="utf-8")
+    (nested_secrets / "copy.txt").write_text(generated_secret, encoding="utf-8")
+    (data_dir / "raw" / "chapter.txt").write_text("safe", encoding="utf-8")
+
+    backup_path = ops.create_backup(data_dir=data_dir, out_dir=tmp_path / "backups")
+
+    manifest = ops.read_backup_manifest(backup_path)
+    assert manifest["secrets_included"] is False
+    assert "secrets" in manifest["excluded_modules"]
+    with tarfile.open(backup_path, "r:gz") as archive:
+        names = set(archive.getnames())
+        archive_bytes = backup_path.read_bytes()
+    assert "data/raw/chapter.txt" in names
+    assert not any("secrets" in Path(name).parts for name in names)
+    assert generated_secret.encode("utf-8") not in archive_bytes
+
+
 def test_create_backup_can_skip_operational_event_for_pre_rehearsal_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1403,27 +1454,56 @@ def test_smoke_public_fails_when_cors_origin_is_not_exact(monkeypatch: pytest.Mo
         )
 
 
-def test_update_env_file_value_sets_supported_provider_key(tmp_path: Path) -> None:
+def test_update_provider_secret_sets_supported_key_without_mutating_env_file(tmp_path: Path) -> None:
+    store_path = tmp_path / "private" / "provider-keys.json"
     env_path = tmp_path / ".env"
-    env_path.write_text("MOBILE_API_ADMIN_USERNAME=admin\nGEMINI_API_KEY=old\n", encoding="utf-8")
+    original_env = b"MOBILE_API_ADMIN_USERNAME=admin\n"
+    env_path.write_bytes(original_env)
+    first = secrets.token_urlsafe(32)
+    second = secrets.token_urlsafe(32)
 
-    ops.update_env_file_value(env_path, "GEMINI_API_KEY", " new-secret \n")
-    ops.update_env_file_value(env_path, "OPENROUTER_API_KEY", "router-secret")
+    ops.update_provider_secret(store_path, "GEMINI_API_KEY", first)
+    ops.update_provider_secret(store_path, "OPENROUTER_API_KEY", second)
 
-    content = env_path.read_text(encoding="utf-8")
-    assert "GEMINI_API_KEY=new-secret" in content
-    assert "GEMINI_API_KEY=old" not in content
-    assert "OPENROUTER_API_KEY=router-secret" in content
-    assert "MOBILE_API_ADMIN_USERNAME=admin" in content
+    values = ProviderSecretStore(store_path).load()
+    assert secrets.compare_digest(values["GEMINI_API_KEY"], first)
+    assert secrets.compare_digest(values["OPENROUTER_API_KEY"], second)
+    assert env_path.read_bytes() == original_env
+    assert (store_path.stat().st_mode & 0o777) == 0o600
 
 
-def test_update_env_file_value_rejects_unsupported_or_empty_keys(tmp_path: Path) -> None:
-    env_path = tmp_path / ".env"
+def test_update_provider_secret_rejects_unsupported_or_empty_keys(tmp_path: Path) -> None:
+    store_path = tmp_path / "provider-keys.json"
 
     with pytest.raises(ValueError, match="Unsupported provider key"):
-        ops.update_env_file_value(env_path, "MOBILE_API_SECRET", "secret")
+        ops.update_provider_secret(store_path, "MOBILE_API_SECRET", secrets.token_urlsafe(32))
     with pytest.raises(ValueError, match="value is empty"):
-        ops.update_env_file_value(env_path, "GEMINI_API_KEY", "  ")
+        ops.update_provider_secret(store_path, "GEMINI_API_KEY", "  ")
+
+
+def test_update_provider_secret_reports_unconfirmed_directory_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.services.provider_secret_store import ProviderSecretStoreError
+
+    store_path = tmp_path / "private" / "provider-keys.json"
+    generated_key = secrets.token_urlsafe(32)
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("synthetic directory sync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(ProviderSecretStoreError, match="durability is unconfirmed"):
+        ops.update_provider_secret(store_path, "GEMINI_API_KEY", generated_key)
+
+    persisted = ProviderSecretStore(store_path).load()
+    if not secrets.compare_digest(persisted["GEMINI_API_KEY"], generated_key):
+        pytest.fail("committed provider secret was not retained after durability failure")
 
 
 def test_repair_database_removes_orphan_chapters_and_empty_stale_db(tmp_path: Path) -> None:
