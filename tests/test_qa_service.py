@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
-from app.database.db import add_book, add_chapter, init_db, save_qa_report, update_chapter_paths
+import pytest
+
+from app.database.db import (
+    add_book,
+    add_chapter,
+    init_db,
+    list_operational_events,
+    save_qa_report,
+    update_chapter_paths,
+)
+from app.mobile_api.services import qa_service as qa_service_module
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
 
@@ -58,6 +69,134 @@ def test_qa_service_accepts_chapter_content_reader_protocol(temp_db_path, tmp_pa
 
     assert report["overall_status"] == "PASS"
     assert reader.calls == [("source", chapter_id), ("translation", chapter_id)]
+
+
+def test_run_qa_check_raises_safe_typed_error_and_records_safe_event_when_save_fails(
+    temp_db_path,
+    monkeypatch,
+) -> None:
+    init_db(temp_db_path)
+    generated_marker = "GENERATED_QA_CONTENT_SENTINEL"
+    database_error_marker = "SQLITE_WRITE_FAILURE_SENTINEL"
+    steps: list[str] = []
+
+    class GeneratedReportPipeline:
+        db_path = temp_db_path
+
+        def run_qa_check(self, book_id, chapter_id, model, host):
+            steps.append("generated")
+            return {
+                "quality_score": 8.5,
+                "fidelity_score": 9,
+                "style_score": 8,
+                "glossary_score": 8,
+                "audiobook_score": 7,
+                "verdict": "PASS",
+                "issues": [],
+                "provider_debug": generated_marker,
+            }
+
+        def get_chapter_source(self, chapter_id):
+            return "第一段。"
+
+        def get_chapter_translation(self, chapter_id):
+            return "Đoạn thứ nhất."
+
+    def fail_after_generation(db_path, **kwargs):
+        assert db_path == temp_db_path
+        assert json.loads(kwargs["report_json"])["provider_debug"] == generated_marker
+        assert steps == ["generated"]
+        steps.append("persistence_failed")
+        raise RuntimeError(database_error_marker)
+
+    monkeypatch.setattr(qa_service_module, "save_qa_report", fail_after_generation)
+
+    with pytest.raises(Exception) as exc_info:
+        QAService(GeneratedReportPipeline()).run_qa_check(book_id=41, chapter_id=42)
+
+    error = exc_info.value
+    assert isinstance(error, qa_service_module.QAPersistenceError)
+    assert error.detail() == {
+        "code": "qa_persistence_failed",
+        "status": "generated_not_persisted",
+        "message": "QA report was generated but could not be persisted.",
+    }
+    assert database_error_marker not in str(error)
+    assert generated_marker not in str(error)
+    assert steps == ["generated", "persistence_failed"]
+
+    events = list_operational_events(temp_db_path, limit=10, severities=())
+    assert len(events) == 1
+    assert events[0]["event_type"] == "qa_persistence_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["source"] == "qa"
+    assert events[0]["message"] == "QA report persistence failed"
+    assert events[0]["actor_user_id"] == ""
+    assert events[0]["owner_user_id"] == ""
+    assert events[0]["job_id"] == ""
+    assert events[0]["details"] == {
+        "book_id": 41,
+        "chapter_id": 42,
+        "outcome": "generated_not_persisted",
+    }
+    serialized_event = json.dumps(events[0], ensure_ascii=False)
+    assert database_error_marker not in serialized_event
+    assert generated_marker not in serialized_event
+
+
+def test_run_qa_check_event_writer_failure_does_not_mask_persistence_error(
+    temp_db_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    init_db(temp_db_path)
+    database_error_marker = "QA_DATABASE_ERROR_SENTINEL"
+    event_error_marker = "QA_EVENT_ERROR_SENTINEL"
+
+    class GeneratedReportPipeline:
+        db_path = temp_db_path
+
+        def run_qa_check(self, book_id, chapter_id, model, host):
+            return {
+                "quality_score": 8,
+                "fidelity_score": 8,
+                "style_score": 8,
+                "glossary_score": 8,
+                "audiobook_score": 8,
+                "verdict": "PASS",
+                "issues": [],
+            }
+
+        def get_chapter_source(self, chapter_id):
+            return "第一段。"
+
+        def get_chapter_translation(self, chapter_id):
+            return "Đoạn thứ nhất."
+
+    def fail_report_write(*args, **kwargs):
+        raise RuntimeError(database_error_marker)
+
+    def fail_event_write(*args, **kwargs):
+        raise RuntimeError(event_error_marker)
+
+    monkeypatch.setattr(qa_service_module, "save_qa_report", fail_report_write)
+    monkeypatch.setattr(qa_service_module, "record_operational_event", fail_event_write)
+
+    with pytest.raises(Exception) as exc_info:
+        QAService(GeneratedReportPipeline()).run_qa_check(book_id=51, chapter_id=52)
+
+    error = exc_info.value
+    assert isinstance(error, qa_service_module.QAPersistenceError)
+    assert error.detail() == {
+        "code": "qa_persistence_failed",
+        "status": "generated_not_persisted",
+        "message": "QA report was generated but could not be persisted.",
+    }
+    assert database_error_marker not in str(error)
+    assert event_error_marker not in str(error)
+    assert database_error_marker not in caplog.text
+    assert event_error_marker not in caplog.text
+    assert "Failed to record QA persistence operational event" in caplog.text
 
 
 def test_qa_summary_treats_saved_0_to_10_score_as_pass(temp_db_path) -> None:

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.services.pipeline_service import PipelineService
-from app.mobile_api.services.qa_service import QAService
+from app.mobile_api.services.qa_service import QAPersistenceError, QAService
 
 router = APIRouter(prefix="/api", tags=["qa"])
 
@@ -54,6 +54,8 @@ async def run_qa_check(
     try:
         result = svc.run_qa_check(book_id, chapter_id)
         return result
+    except QAPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=exc.detail()) from exc
     except ValueError as exc:
         record_audit_event(
             event_type="qa_failure",

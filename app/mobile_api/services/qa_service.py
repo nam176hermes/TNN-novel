@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Protocol
@@ -9,6 +10,7 @@ from app.database.db import (
     get_qa_report as db_get_qa_report,
     list_glossary,
     list_qa_reports,
+    record_operational_event,
     save_qa_report,
 )
 
@@ -22,6 +24,43 @@ class ChapterContentReader(Protocol):
 
 
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+logger = logging.getLogger(__name__)
+
+
+class QAPersistenceError(RuntimeError):
+    """Raised when a generated QA report cannot be persisted."""
+
+    code = "qa_persistence_failed"
+    status = "generated_not_persisted"
+    safe_message = "QA report was generated but could not be persisted."
+
+    def __init__(self) -> None:
+        super().__init__(self.safe_message)
+
+    def detail(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "status": self.status,
+            "message": self.safe_message,
+        }
+
+
+def _record_qa_persistence_failure(db_path: Path, book_id: int, chapter_id: int) -> None:
+    try:
+        record_operational_event(
+            db_path,
+            event_type="qa_persistence_failed",
+            severity="error",
+            source="qa",
+            message="QA report persistence failed",
+            details={
+                "book_id": book_id,
+                "chapter_id": chapter_id,
+                "outcome": "generated_not_persisted",
+            },
+        )
+    except Exception:
+        logger.warning("Failed to record QA persistence operational event")
 
 
 def _paragraphs(text: str) -> list[str]:
@@ -302,7 +341,8 @@ class QAService:
             )
             result["created_at"] = ""  # DB will set this
         except Exception:
-            pass  # If saving fails, still return the result
+            _record_qa_persistence_failure(self.pipeline.db_path, book_id, chapter_id)
+            raise QAPersistenceError() from None
         return result
 
     def get_book_qa_summary(self, book_id: int) -> dict:
