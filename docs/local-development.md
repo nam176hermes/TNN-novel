@@ -33,6 +33,15 @@ scripts/status-local.sh
 scripts/stop-local.sh
 ```
 
+`start-local.sh` starts a dedicated import worker before the API. Source preview
+and import processing require that worker; use `scripts/status-local.sh` to
+confirm its process and health before investigating a stalled import.
+
+Runtime process files and append-only local logs are kept under
+`$DATA_DIR/logs/runtime/`, including `import-worker.pid` and
+`import-worker.log`. `scripts/stop-local.sh` stops the web server, API, and
+import worker in that order.
+
 Default local URLs:
 
 - Web: `http://127.0.0.1:5174`

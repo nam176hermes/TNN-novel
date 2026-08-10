@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+umask 007
 
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/python.sh"
@@ -34,10 +35,11 @@ fi
 
 RUNTIME_DIR="$RESOLVED_DATA_DIR/logs/runtime"
 mkdir -p "$RUNTIME_DIR"
+IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
 
 VITE_API_BASE_URL="$PUBLIC_URL" npm --prefix "$ROOT/web" run build
 
-scripts/stop-local.sh || true
+KEEP_IMPORT_WORKER=1 scripts/stop-local.sh || true
 
 listener_pids="$(
   ss -ltnp "sport = :${API_PORT}" 2>/dev/null \
@@ -63,18 +65,48 @@ export MOBILE_API_SERVE_WEB=1
 export WEB_DIST_DIR="${WEB_DIST_DIR:-web/dist}"
 export MOBILE_API_CORS_ORIGINS="${MOBILE_API_CORS_ORIGINS:-$PUBLIC_URL}"
 
+start_detached() {
+  local log_file="$1"
+  shift
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$@" >>"$log_file" 2>&1 &
+  else
+    nohup "$@" >>"$log_file" 2>&1 &
+  fi
+  echo $!
+}
+
+is_running() {
+  local pid_file="$1"
+  [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+}
+
+wait_for_import_worker() {
+  local timeout="${IMPORT_WORKER_START_TIMEOUT:-45}"
+  local deadline=$((SECONDS + timeout))
+  while ! "$PYTHON_BIN" -m app.import_worker --healthcheck >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Import worker did not become healthy within ${timeout} seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 "$PYTHON_BIN" scripts/ops.py rotate-logs \
   --data-dir "$RESOLVED_DATA_DIR" \
   --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
   --keep "${LOG_ROTATE_KEEP:-5}" \
   --force >/dev/null
 
-if command -v setsid >/dev/null 2>&1; then
-  nohup setsid "$PYTHON_BIN" -m app.mobile_api >>"$RUNTIME_DIR/mobile-api.log" 2>&1 &
+if is_running "$IMPORT_WORKER_PID_FILE"; then
+  echo "Import worker already running: pid $(cat "$IMPORT_WORKER_PID_FILE")"
 else
-  nohup "$PYTHON_BIN" -m app.mobile_api >>"$RUNTIME_DIR/mobile-api.log" 2>&1 &
+  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
 fi
-echo $! >"$RUNTIME_DIR/mobile-api.pid"
+wait_for_import_worker
+
+start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$RUNTIME_DIR/mobile-api.pid"
 
 "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${API_PORT}" --timeout "${API_START_TIMEOUT:-45}"
 curl -fsS --max-time 20 "$PUBLIC_URL/api/ready" >/dev/null

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import textwrap
 from pathlib import Path
 
 
@@ -24,6 +25,239 @@ ACTIVE_OPERATIONAL_FILES = (
     "docs/local-development.md",
     "docs/operations/P5_RUNBOOK.md",
 )
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    """Provide inert commands while preserving the scripts' real process flow."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    invocation_log = tmp_path / "invocations.log"
+    data_dir = tmp_path / "runtime-data"
+    heartbeat = data_dir / "logs" / "runtime" / "import-worker.heartbeat"
+    fresh_heartbeat = tmp_path / "worker-heartbeat-fresh"
+    healthcheck_success = tmp_path / "worker-healthcheck-success"
+    process_stopped = tmp_path / "process-stopped"
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text("enable -n kill\n", encoding="utf-8")
+    _write_executable(
+        bin_dir / "python",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        printf 'python %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        if [[ "${1:-}" == "-c" ]]; then
+          exit 0
+        fi
+        if [[ "${1:-}" == "-m" && "${2:-}" == "app.import_worker" ]]; then
+          if [[ "${3:-}" == "--healthcheck" ]]; then
+            if [[ -f "$STUB_HEARTBEAT" && -f "$STUB_WORKER_HEARTBEAT_FRESH" ]]; then
+              printf 'worker-healthcheck ok\\n' >>"$STUB_INVOCATION_LOG"
+              : >"$STUB_WORKER_HEALTHCHECK_SUCCESS"
+              exit 0
+            fi
+            exit 1
+          fi
+          mkdir -p "$(dirname "$STUB_HEARTBEAT")"
+          : >"$STUB_HEARTBEAT"
+          : >"$STUB_WORKER_HEARTBEAT_FRESH"
+          exit 0
+        fi
+        if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "wait-health" && ! -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]]; then
+          exit 42
+        fi
+        exit 0
+        """,
+    )
+    _write_executable(
+        bin_dir / "setsid",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        printf 'setsid %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        exec "$@"
+        """,
+    )
+    _write_executable(
+        bin_dir / "npm",
+        """#!/usr/bin/env bash
+        printf 'npm %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        """,
+    )
+    _write_executable(
+        bin_dir / "curl",
+        """#!/usr/bin/env bash
+        printf 'curl %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        printf '<div id="root"></div>\\n'
+        """,
+    )
+    _write_executable(
+        bin_dir / "ss",
+        """#!/usr/bin/env bash
+        printf 'ss %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        """,
+    )
+    _write_executable(
+        bin_dir / "kill",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        target="${!#}"
+        if [[ "$target" == -* ]]; then
+          exit 1
+        fi
+        if [[ "${1:-}" == "-0" ]]; then
+          [[ " $STUB_LIVE_PIDS " == *" $target "* && ! -f "$STUB_PROCESS_STOPPED/$target" ]]
+          exit
+        fi
+        printf 'kill %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        mkdir -p "$STUB_PROCESS_STOPPED"
+        : >"$STUB_PROCESS_STOPPED/$target"
+        """,
+    )
+    env = {
+        **os.environ,
+        "DATA_DIR": str(data_dir),
+        "PYTHON_BIN": str(bin_dir / "python"),
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STUB_HEARTBEAT": str(heartbeat),
+        "STUB_WORKER_HEARTBEAT_FRESH": str(fresh_heartbeat),
+        "STUB_WORKER_HEALTHCHECK_SUCCESS": str(healthcheck_success),
+        "STUB_INVOCATION_LOG": str(invocation_log),
+        "STUB_PROCESS_PID": "4103",
+        "STUB_LIVE_PIDS": "4101 4102 4103",
+        "STUB_PROCESS_STOPPED": str(process_stopped),
+        "BASH_ENV": str(bash_env),
+        "NOVEL_PIPELINE_IGNORE_DOTENV": "1",
+    }
+    return env, invocation_log, data_dir
+
+
+def _run_script(script_name: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(ROOT / "scripts" / script_name)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _seed_stale_heartbeat(data_dir: Path) -> None:
+    heartbeat = data_dir / "logs" / "runtime" / "import-worker.heartbeat"
+    heartbeat.parent.mkdir(parents=True)
+    heartbeat.touch()
+    os.utime(heartbeat, (1, 1))
+
+
+def test_local_start_launches_worker_before_waiting_for_api_readiness(tmp_path: Path) -> None:
+    """A missing worker release must prevent the API from becoming ready."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    _seed_stale_heartbeat(data_dir)
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    runtime_dir = data_dir / "logs" / "runtime"
+    assert (runtime_dir / "import-worker.pid").is_file()
+    assert (runtime_dir / "import-worker.log").is_file()
+    invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+    worker_start = next(
+        index
+        for index, line in enumerate(invocations)
+        if line.startswith("setsid") and "app.import_worker" in line
+    )
+    readiness_wait = next(
+        index
+        for index, line in enumerate(invocations)
+        if "scripts/ops.py wait-health" in line
+    )
+    healthcheck = next(index for index, line in enumerate(invocations) if line == "worker-healthcheck ok")
+    assert worker_start < healthcheck < readiness_wait
+
+
+def test_cloudflare_start_launches_the_same_worker_process(tmp_path: Path) -> None:
+    """The public-local workflow must release the same dedicated worker first."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env["CLOUDFLARE_HOSTNAME"] = "local.example.test"
+    _seed_stale_heartbeat(data_dir)
+
+    result = _run_script("start-cloudflare.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    runtime_dir = data_dir / "logs" / "runtime"
+    assert (runtime_dir / "import-worker.pid").is_file()
+    assert (runtime_dir / "import-worker.log").is_file()
+    invocations = invocation_log.read_text(encoding="utf-8").splitlines()
+    worker_start = next(
+        index
+        for index, line in enumerate(invocations)
+        if line.startswith("setsid") and "app.import_worker" in line
+    )
+    readiness_wait = next(
+        index
+        for index, line in enumerate(invocations)
+        if "scripts/ops.py wait-health" in line
+    )
+    healthcheck = next(index for index, line in enumerate(invocations) if line == "worker-healthcheck ok")
+    assert worker_start < healthcheck < readiness_wait
+
+
+def test_cloudflare_start_reuses_a_live_worker(tmp_path: Path) -> None:
+    """Restarting the public-local API leaves a healthy worker process in place."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env["CLOUDFLARE_HOSTNAME"] = "local.example.test"
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "import-worker.heartbeat").touch()
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+    worker_pid_file = runtime_dir / "import-worker.pid"
+    worker_pid_file.write_text(env["STUB_PROCESS_PID"], encoding="utf-8")
+
+    result = _run_script("start-cloudflare.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert not Path(env["STUB_PROCESS_STOPPED"]).exists()
+    assert worker_pid_file.read_text(encoding="utf-8") == env["STUB_PROCESS_PID"]
+    assert not any(
+        line.startswith("setsid") and "app.import_worker" in line
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_local_stop_and_status_manage_import_worker_pid(tmp_path: Path) -> None:
+    """A managed worker PID is visible, health-checked, and terminated on stop."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "import-worker.heartbeat").touch()
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+    (runtime_dir / "web-vite.pid").write_text("4101", encoding="utf-8")
+    (runtime_dir / "mobile-api.pid").write_text("4102", encoding="utf-8")
+    worker_pid_file = runtime_dir / "import-worker.pid"
+    worker_pid_file.write_text(env["STUB_PROCESS_PID"], encoding="utf-8")
+
+    status = _run_script("status-local.sh", env)
+    assert status.returncode == 0, status.stderr
+    assert f"Import worker running: pid {env['STUB_PROCESS_PID']}" in status.stdout
+    assert "Import worker health: ok" in status.stdout
+    assert any("-m app.import_worker --healthcheck" in line for line in invocation_log.read_text(encoding="utf-8").splitlines())
+
+    stop = _run_script("stop-local.sh", env)
+    assert stop.returncode == 0, stop.stderr
+    assert not worker_pid_file.exists()
+    stopped = Path(env["STUB_PROCESS_STOPPED"])
+    assert all((stopped / pid).is_file() for pid in ("4101", "4102", "4103"))
+    assert "Import worker stopped" in stop.stdout
+    signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
+    assert signals == ["kill 4101", "kill 4102", "kill 4103"]
 
 
 def test_python_resolver_rejects_missing_explicit_interpreter(tmp_path: Path) -> None:

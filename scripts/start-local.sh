@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+umask 007
 
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/python.sh"
@@ -37,6 +38,7 @@ RUNTIME_DIR="$RESOLVED_DATA_DIR/logs/runtime"
 mkdir -p "$RUNTIME_DIR"
 API_PID_FILE="$RUNTIME_DIR/mobile-api.pid"
 WEB_PID_FILE="$RUNTIME_DIR/web-vite.pid"
+IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
 
 is_running() {
   local pid_file="$1"
@@ -53,6 +55,25 @@ start_detached() {
   fi
   echo $!
 }
+
+wait_for_import_worker() {
+  local timeout="${IMPORT_WORKER_START_TIMEOUT:-45}"
+  local deadline=$((SECONDS + timeout))
+  while ! "$PYTHON_BIN" -m app.import_worker --healthcheck >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Import worker did not become healthy within ${timeout} seconds" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+if is_running "$IMPORT_WORKER_PID_FILE"; then
+  echo "Import worker already running: pid $(cat "$IMPORT_WORKER_PID_FILE")"
+else
+  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
+fi
+wait_for_import_worker
 
 if is_running "$API_PID_FILE"; then
   echo "API already running: pid $(cat "$API_PID_FILE")"

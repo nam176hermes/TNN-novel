@@ -25,6 +25,7 @@ fi
 RUNTIME_DIR="$RESOLVED_DATA_DIR/logs/runtime"
 API_PID_FILE="$RUNTIME_DIR/mobile-api.pid"
 WEB_PID_FILE="$RUNTIME_DIR/web-vite.pid"
+IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
 API_PORT="${MOBILE_API_PORT:-7860}"
 WEB_PORT="${WEB_PORT:-5174}"
 
@@ -40,6 +41,13 @@ show_pid() {
 
 show_pid "API" "$API_PID_FILE"
 show_pid "Web" "$WEB_PID_FILE"
+show_pid "Import worker" "$IMPORT_WORKER_PID_FILE"
+
+if "$PYTHON_BIN" -m app.import_worker --healthcheck >/dev/null 2>&1; then
+  echo "Import worker health: ok"
+else
+  echo "Import worker health: unavailable"
+fi
 
 if "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${API_PORT}" --timeout 3 >/dev/null; then
   echo "API readiness: ok"

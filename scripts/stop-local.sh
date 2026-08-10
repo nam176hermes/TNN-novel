@@ -60,3 +60,6 @@ stop_pid_file() {
 
 stop_pid_file "Web" "$RUNTIME_DIR/web-vite.pid"
 stop_pid_file "API" "$RUNTIME_DIR/mobile-api.pid"
+if [[ "${KEEP_IMPORT_WORKER:-0}" != "1" ]]; then
+  stop_pid_file "Import worker" "$RUNTIME_DIR/import-worker.pid"
+fi
