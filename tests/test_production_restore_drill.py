@@ -345,7 +345,7 @@ def test_recovery_runbook_bash_blocks_are_fail_fast_and_syntax_valid() -> None:
                 check=False,
             )
             assert result.returncode == 0, f"{document}: bash block {block_number}: {result.stderr}"
-    assert checked_blocks == 13
+    assert checked_blocks == 17
 
 
 def test_restore_static_validation_does_not_inspect_or_create_the_private_receipt_path(

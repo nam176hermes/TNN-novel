@@ -107,6 +107,7 @@ private installed file. The dispatcher reads only these variables:
 Prepare the private file without printing its contents:
 
 ```bash
+set -euo pipefail
 install -d -m 0700 "$HOME/.config/novel-tnn"
 install -m 0600 deploy/production/alert.env.example \
   "$HOME/.config/novel-tnn/alert.env"
@@ -150,6 +151,7 @@ oneshot service. Repository changes do not install, enable, or start them.
 Static review and inspection are safe:
 
 ```bash
+set -euo pipefail
 systemd-analyze verify \
   deploy/systemd/user/novel-tnn-alert-dispatch.service \
   deploy/systemd/user/novel-tnn-alert-dispatch.timer
