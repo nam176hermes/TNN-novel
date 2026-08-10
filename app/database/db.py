@@ -2688,39 +2688,49 @@ def request_cancel_mobile_job(
 ) -> bool:
     now = datetime.now(timezone.utc).isoformat()
     with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE mobile_jobs
+            SET cancel_requested = 1,
+                status = CASE
+                    WHEN ? = 1 AND LOWER(status) IN ('pending', 'queued', 'retrying')
+                    THEN 'cancelled'
+                    ELSE status
+                END,
+                state = CASE
+                    WHEN ? = 1 AND LOWER(status) IN ('pending', 'queued', 'retrying')
+                    THEN 'CANCELED'
+                    ELSE state
+                END,
+                message = CASE
+                    WHEN ? = 1 AND LOWER(status) IN ('pending', 'queued', 'retrying')
+                    THEN 'Job cancelled before claim'
+                    ELSE 'Cancel requested'
+                END,
+                updated_at = ?,
+                finished_at = CASE
+                    WHEN ? = 1 AND LOWER(status) IN ('pending', 'queued', 'retrying')
+                    THEN ?
+                    ELSE finished_at
+                END
+            WHERE job_id = ?
+              AND LOWER(status) NOT IN ('completed', 'failed', 'cancelled', 'canceled', 'interrupted')
+            """,
+            (
+                1 if terminal_if_pending else 0,
+                1 if terminal_if_pending else 0,
+                1 if terminal_if_pending else 0,
+                now,
+                1 if terminal_if_pending else 0,
+                now,
+                job_id,
+            ),
+        )
         row = conn.execute("SELECT status FROM mobile_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if not row:
-            return False
-        status = str(row["status"] or "").lower()
-        if status in {"completed", "failed", "cancelled", "canceled", "interrupted"}:
-            return True
-        if terminal_if_pending and status in {"pending", "queued", "retrying"}:
-            cur = conn.execute(
-                """
-                UPDATE mobile_jobs
-                SET cancel_requested = 1,
-                    status = 'cancelled',
-                    state = 'CANCELED',
-                    message = 'Job cancelled before claim',
-                    updated_at = ?,
-                    finished_at = ?
-                WHERE job_id = ?
-                """,
-                (now, now, job_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE mobile_jobs
-                SET cancel_requested = 1,
-                    message = 'Cancel requested',
-                    updated_at = ?
-                WHERE job_id = ?
-                """,
-                (now, job_id),
-            )
         conn.commit()
-        return cur.rowcount > 0
+        # Public callers use False only for a missing job. A terminal winner is
+        # left untouched but retains the historical successful lookup result.
+        return row is not None
 
 
 def record_job_log(

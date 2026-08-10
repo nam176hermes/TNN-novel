@@ -1409,7 +1409,7 @@ class JobService:
                     return
                 chapter_id = chapter["id"]
                 started_at = time.monotonic()
-                self.tracker.update_job(
+                chapter_started = self.tracker.update_job(
                     job_id,
                     status="running",
                     progress=10 + int((idx / len(pending)) * 80) if pending else 90,
@@ -1418,6 +1418,8 @@ class JobService:
                     current_chapter_id=chapter_id,
                     current_step="TRANSLATING",
                 )
+                if not chapter_started or self._cancel_if_requested(job_id):
+                    return
                 try:
                     await asyncio.to_thread(
                         self.pipeline.translate_chapter,

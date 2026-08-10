@@ -279,6 +279,55 @@ async def test_daily_job_observes_durable_cancel_and_does_not_start_next_chapter
 
 
 @pytest.mark.asyncio
+async def test_daily_job_does_not_start_chapter_when_start_update_reconciles_cancellation(
+    temp_db_path,
+    monkeypatch,
+) -> None:
+    translated: list[int] = []
+
+    class ChapterStartCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 501, "book_id": 1},
+                {"id": 502, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(ChapterStartCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+    update_job = tracker.update_job
+    cancellation_injected = False
+
+    def cancel_before_second_chapter_start(job_id: str, **changes) -> bool:
+        nonlocal cancellation_injected
+        if changes.get("current_chapter_id") == 502:
+            cancellation_injected = True
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **changes)
+
+    monkeypatch.setattr(tracker, "update_job", cancel_before_second_chapter_start)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert cancellation_injected is True
+    assert translated == [501]
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
+    assert persisted.cancel_requested is cached["cancel_requested"] is True
+
+
+@pytest.mark.asyncio
 async def test_daily_job_keeps_durable_cancel_when_translation_raises(
     temp_db_path,
 ) -> None:

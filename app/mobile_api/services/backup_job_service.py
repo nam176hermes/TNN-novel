@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.database.db import get_mobile_job, record_operational_event
 from app.mobile_api.services.backup_service import BackupService
-from app.mobile_api.services.job_service import JobTracker
+from app.mobile_api.services.job_service import JobStatus, JobTracker
 from scripts.ops import BackupCancelled
 
 logger = logging.getLogger(__name__)
@@ -225,6 +225,12 @@ class BackupJobCoordinator:
                 and cached.updated_at == str((persisted or {}).get("updated_at") or "")
             )
             if not persisted or (persisted_status != requested_status and not cancellation_reconciled):
+                if persisted is not None:
+                    reconciled = JobStatus.from_record(persisted)
+                    if cached is None:
+                        self.tracker.jobs[job_id] = reconciled
+                    else:
+                        cached.__dict__.update(reconciled.__dict__)
                 raise
             logger.warning("Job %s terminal state persisted but auxiliary recording failed", job_id)
         return self._terminal_result(job_id, fallback=status)
@@ -238,20 +244,20 @@ class BackupJobCoordinator:
                 job = self.tracker.get_job(job_id)
                 include_secrets = bool(job and job.params.get("include_secrets"))
                 if self._cancel_requested(job_id):
+                    result = self._update_terminal_job(
+                        job_id,
+                        status="cancelled",
+                        message="Backup cancelled",
+                        cancel_requested=True,
+                    )
                     self._record_terminal_event(
                         job_id=job_id,
-                        result="cancelled",
+                        result=result,
                         # Cancellation has no completed artifact metadata, so
                         # request intent is the authoritative safe fallback.
                         encrypted=include_secrets,
                         secrets_included=include_secrets,
                         started_at=started_at,
-                    )
-                    self._update_terminal_job(
-                        job_id,
-                        status="cancelled",
-                        message="Backup cancelled",
-                        cancel_requested=True,
                     )
                     return
 
@@ -306,18 +312,18 @@ class BackupJobCoordinator:
                                 pass
                         raise BackupCancelled("Backup cancelled") from None
                 except BackupCancelled:
-                    self._record_terminal_event(
-                        job_id=job_id,
-                        result="cancelled",
-                        encrypted=include_secrets,
-                        secrets_included=include_secrets,
-                        started_at=started_at,
-                    )
-                    self._update_terminal_job(
+                    result = self._update_terminal_job(
                         job_id,
                         status="cancelled",
                         message="Backup cancelled",
                         cancel_requested=True,
+                    )
+                    self._record_terminal_event(
+                        job_id=job_id,
+                        result=result,
+                        encrypted=include_secrets,
+                        secrets_included=include_secrets,
+                        started_at=started_at,
                     )
                     return
                 except Exception:
@@ -360,18 +366,18 @@ class BackupJobCoordinator:
         except asyncio.CancelledError:
             job = self.tracker.get_job(job_id)
             include_secrets = bool(job and job.params.get("include_secrets"))
-            self._record_terminal_event(
-                job_id=job_id,
-                result="cancelled",
-                encrypted=include_secrets,
-                secrets_included=include_secrets,
-                started_at=started_at,
-            )
-            self._update_terminal_job(
+            result = self._update_terminal_job(
                 job_id,
                 status="cancelled",
                 message="Backup cancelled",
                 cancel_requested=True,
+            )
+            self._record_terminal_event(
+                job_id=job_id,
+                result=result,
+                encrypted=include_secrets,
+                secrets_included=include_secrets,
+                started_at=started_at,
             )
         finally:
             self.secret_store.discard(job_id)
