@@ -15,8 +15,11 @@ from app.database.db import (
     get_connection,
     get_job_attempts,
     get_job_logs,
+    get_mobile_job,
+    list_operational_events,
     get_qa_report,
     init_db,
+    request_cancel_mobile_job,
     update_chapter_paths,
 )
 from app.ingestion.source_adapters import SourceBlockedError
@@ -98,6 +101,87 @@ def test_job_tracker_persists_step_progress_and_sanitized_logs(temp_db_path) -> 
     assert "secret-token" not in joined
     assert "Traceback" not in joined
     assert "/home/user" not in joined
+    events = list_operational_events(temp_db_path, limit=10, severities=())
+    failure_event = next(event for event in events if event["event_type"] == "job_failure")
+    assert failure_event["severity"] == "error"
+    assert failure_event["job_id"] == job.job_id
+
+
+def test_stale_completion_after_durable_cancel_keeps_cancellation_telemetry(temp_db_path) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("daily", None, 1)
+    assert tracker.update_job(job.job_id, status="running", message="Starting daily batch")
+    assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+
+    assert tracker.update_job(
+        job.job_id,
+        status="completed",
+        message="Daily batch completed",
+        last_safe_error="stale completion error",
+        internal_error_ref="stale-completion-ref",
+    )
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = tracker.get_job(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    for snapshot in (persisted.to_dict(), cached.to_dict()):
+        assert snapshot["status"] == "cancelled"
+        assert snapshot["state"] == "CANCELED"
+        assert snapshot["message"] == "Job cancelled by user"
+        assert snapshot["error"] == ""
+        assert snapshot["last_safe_error"] == ""
+        assert snapshot["internal_error_ref"] == ""
+
+    transition = get_job_logs(temp_db_path, job_id=job.job_id)[0]
+    assert transition["state"] == "CANCELED"
+    assert transition["message"] == "Job cancelled by user"
+    assert transition["details"]["to_status"] == "cancelled"
+    assert not [
+        event
+        for event in list_operational_events(temp_db_path, limit=10, severities=())
+        if event["event_type"] == "job_failure" and event["job_id"] == job.job_id
+    ]
+
+
+def test_stale_failure_after_durable_cancel_keeps_cancellation_telemetry(temp_db_path) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("daily", None, 1)
+    assert tracker.update_job(job.job_id, status="running", message="Starting daily batch")
+    assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+
+    assert tracker.update_job(
+        job.job_id,
+        status="failed",
+        message="Daily job failed",
+        error="provider failure",
+        last_safe_error="stale failure error",
+        internal_error_ref="stale-failure-ref",
+    )
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = tracker.get_job(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    for snapshot in (persisted.to_dict(), cached.to_dict()):
+        assert snapshot["status"] == "cancelled"
+        assert snapshot["state"] == "CANCELED"
+        assert snapshot["message"] == "Job cancelled by user"
+        assert snapshot["error"] == ""
+        assert snapshot["last_safe_error"] == ""
+        assert snapshot["internal_error_ref"] == ""
+
+    transition = get_job_logs(temp_db_path, job_id=job.job_id)[0]
+    assert transition["state"] == "CANCELED"
+    assert transition["message"] == "Job cancelled by user"
+    assert transition["details"]["to_status"] == "cancelled"
+    assert not [
+        event
+        for event in list_operational_events(temp_db_path, limit=10, severities=())
+        if event["event_type"] == "job_failure" and event["job_id"] == job.job_id
+    ]
 
 
 def test_job_tracker_rejects_terminal_to_running_transition(temp_db_path) -> None:
@@ -112,6 +196,95 @@ def test_job_tracker_rejects_terminal_to_running_transition(temp_db_path) -> Non
     assert loaded is not None
     assert loaded.status == "completed"
     assert loaded.to_dict()["state"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_database_backed_cancel_preserves_cached_terminal_job(
+    terminal_status: str,
+    temp_db_path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("translate", [42], 1)
+    assert tracker.update_job(job.job_id, status="running", message="Translating")
+    assert tracker.update_job(job.job_id, status=terminal_status, message=f"Job {terminal_status}")
+
+    assert tracker.cancel_job(job.job_id) is True
+
+    cached = tracker.jobs[job.job_id]
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    assert {
+        "cached": (cached.status, cached.state, cached.cancel_requested, cached.message),
+        "durable": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+            durable["message"],
+        ),
+    } == {
+        "cached": (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}"),
+        "durable": (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}"),
+    }
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_database_backed_cancel_reconciles_stale_running_tracker_to_terminal_winner(
+    terminal_status: str,
+    temp_db_path,
+) -> None:
+    init_db(temp_db_path)
+    owner = JobTracker(db_path=temp_db_path)
+    job = owner.create_job("translate", [42], 1)
+    assert owner.update_job(job.job_id, status="running", message="Translating")
+    stale = JobTracker(db_path=temp_db_path)
+    stale_running = stale.get_job(job.job_id)
+    assert stale_running is not None
+    assert stale_running.status == "running"
+    assert owner.update_job(job.job_id, status=terminal_status, message=f"Job {terminal_status}")
+
+    assert stale.cancel_job(job.job_id) is True
+
+    owner_cached = owner.jobs[job.job_id]
+    stale_cached = stale.jobs[job.job_id]
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    expected = (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}")
+    assert (
+        owner_cached.status,
+        owner_cached.state,
+        owner_cached.cancel_requested,
+        owner_cached.message,
+    ) == expected
+    assert (
+        stale_cached.status,
+        stale_cached.state,
+        stale_cached.cancel_requested,
+        stale_cached.message,
+    ) == expected
+    assert (
+        durable["status"],
+        durable["state"],
+        durable["cancel_requested"],
+        durable["message"],
+    ) == expected
+
+
+def test_job_cancel_requested_for_missing_in_memory_job() -> None:
+    service = JobService(object(), tracker=JobTracker())  # type: ignore[arg-type]
+
+    assert service._job_cancel_requested("missing-job")
+
+
+@pytest.mark.parametrize("status", ["cancelled", "canceled"])
+def test_job_cancel_requested_for_cached_terminal_status_without_flag(status: str) -> None:
+    tracker = JobTracker()
+    job = tracker.create_job("translate", [42], 1)
+    assert tracker.update_job(job.job_id, status=status)
+    assert job.cancel_requested is False
+    service = JobService(object(), tracker=tracker)  # type: ignore[arg-type]
+
+    assert service._job_cancel_requested(job.job_id)
 
 
 @pytest.mark.asyncio
@@ -141,6 +314,198 @@ async def test_job_cancel_request_is_persisted_until_worker_exits(temp_db_path) 
     assert snapshot["status"] == "cancelled"
     assert snapshot["state"] == "CANCELED"
     assert snapshot["cancel_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_job_observes_durable_cancel_and_does_not_start_next_chapter(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class DurableCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 101, "book_id": 1},
+                {"id": 102, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            if len(translated) == 1:
+                assert request_cancel_mobile_job(temp_db_path, job_id=str(kwargs["job_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(DurableCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    assert persisted is not None
+    assert translated == [101]
+    assert persisted.status == "cancelled"
+    assert persisted.state == "CANCELED"
+
+
+@pytest.mark.asyncio
+async def test_daily_job_does_not_start_chapter_when_start_update_reconciles_cancellation(
+    temp_db_path,
+    monkeypatch,
+) -> None:
+    translated: list[int] = []
+
+    class ChapterStartCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 501, "book_id": 1},
+                {"id": 502, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(ChapterStartCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+    update_job = tracker.update_job
+    cancellation_injected = False
+
+    def cancel_before_second_chapter_start(job_id: str, **changes) -> bool:
+        nonlocal cancellation_injected
+        if changes.get("current_chapter_id") == 502:
+            cancellation_injected = True
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **changes)
+
+    monkeypatch.setattr(tracker, "update_job", cancel_before_second_chapter_start)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert cancellation_injected is True
+    assert translated == [501]
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
+    assert persisted.cancel_requested is cached["cancel_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_job_keeps_durable_cancel_when_translation_raises(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class DurableCancelFailurePipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 201, "book_id": 1},
+                {"id": 202, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            assert request_cancel_mobile_job(temp_db_path, job_id=str(kwargs["job_id"]))
+            raise RuntimeError("provider failure after cancellation")
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(DurableCancelFailurePipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    assert persisted is not None
+    assert translated == [201]
+    assert persisted.status == "cancelled"
+    assert persisted.state == "CANCELED"
+
+
+@pytest.mark.asyncio
+async def test_daily_job_durable_cancel_during_pending_lookup_is_not_overwritten(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class PendingLookupCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 1
+            assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+            return [{"id": 301, "book_id": 1}]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(PendingLookupCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 1)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert translated == []
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
+
+
+@pytest.mark.asyncio
+async def test_daily_job_cancel_before_final_completion_write_stays_cancelled(
+    temp_db_path,
+    monkeypatch,
+) -> None:
+    translated: list[int] = []
+
+    class FinalCompletionCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 1
+            return [{"id": 401, "book_id": 1}]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(FinalCompletionCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+    update_job = tracker.update_job
+
+    def request_cancel_before_completion(job_id: str, **kwargs) -> bool:
+        if kwargs.get("status") == "completed":
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **kwargs)
+
+    monkeypatch.setattr(tracker, "update_job", request_cancel_before_completion)
+
+    await service._run_daily_job(job.job_id, 1)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert translated == [401]
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
 
 
 @pytest.mark.asyncio

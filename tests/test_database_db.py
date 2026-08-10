@@ -15,6 +15,7 @@ from app.database.db import (
     get_chapter_by_id,
     get_connection,
     get_job_attempts,
+    get_mobile_job,
     get_qa_report,
     get_last_summary,
     init_db,
@@ -24,6 +25,8 @@ from app.database.db import (
     load_glossary,
     put_glossary_term,
     record_job_attempt,
+    request_cancel_mobile_job,
+    save_mobile_job,
     save_summary,
     update_chapter_paths,
     glossary_stats,
@@ -46,6 +49,142 @@ def test_db_reexports_connection_function_object(temp_db_path: Path) -> None:
     with db_mod.get_connection(temp_db_path) as conn:
         assert conn.row_factory is sqlite3.Row
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_save_mobile_job_preserves_durable_cancellation_against_stale_update(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    job = {
+        "job_id": "durable-cancel",
+        "job_type": "daily",
+        "status": "running",
+        "created_at": "2026-08-10T00:00:00+00:00",
+        "updated_at": "2026-08-10T00:00:00+00:00",
+    }
+    save_mobile_job(temp_db_path, job)
+    assert request_cancel_mobile_job(temp_db_path, job_id=job["job_id"])
+
+    stale_completion = {**job, "status": "completed", "state": "COMPLETED", "updated_at": "2026-08-10T00:01:00+00:00"}
+    save_mobile_job(temp_db_path, stale_completion)
+
+    persisted = get_mobile_job(temp_db_path, job["job_id"])
+    assert persisted is not None
+    assert persisted["cancel_requested"] is True
+    assert persisted["status"] == "cancelled"
+    assert persisted["state"] == "CANCELED"
+
+
+def test_request_cancel_mobile_job_terminal_win_is_atomic_and_preserves_terminal_row(
+    temp_db_path: Path,
+    monkeypatch,
+) -> None:
+    init_db(temp_db_path)
+    job = {
+        "job_id": "terminal-wins-cancel-race",
+        "job_type": "daily",
+        "status": "running",
+        "state": "TRANSLATING",
+        "message": "Translating",
+        "created_at": "2026-08-10T00:00:00+00:00",
+        "updated_at": "2026-08-10T00:00:00+00:00",
+    }
+    terminal_job = {
+        **job,
+        "status": "completed",
+        "state": "COMPLETED",
+        "message": "Daily batch completed",
+        "updated_at": "2026-08-10T00:01:00+00:00",
+        "completed_at": "2026-08-10T00:01:00+00:00",
+        "finished_at": "2026-08-10T00:01:00+00:00",
+    }
+    save_mobile_job(temp_db_path, job)
+    get_connection_before_interleaving = db_mod.get_connection
+    terminal_committed = False
+
+    class InterleavingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.connection.__exit__(*args)
+
+        def execute(self, sql: str, parameters=()):  # type: ignore[no-untyped-def]
+            nonlocal terminal_committed
+            normalized = " ".join(sql.lower().split())
+            if (
+                not terminal_committed
+                and normalized.startswith("update mobile_jobs")
+                and "cancel_requested = 1" in normalized
+            ):
+                terminal_committed = True
+                save_mobile_job(temp_db_path, terminal_job)
+            return self.connection.execute(sql, parameters)
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+    def interleaving_get_connection(db_path: Path):  # type: ignore[no-untyped-def]
+        connection = get_connection_before_interleaving(db_path)
+        return connection if terminal_committed else InterleavingConnection(connection)
+
+    monkeypatch.setattr(db_mod, "get_connection", interleaving_get_connection)
+
+    accepted = request_cancel_mobile_job(temp_db_path, job_id=job["job_id"])
+    persisted = get_mobile_job(temp_db_path, job["job_id"])
+
+    assert terminal_committed is True
+    assert accepted is True
+    assert persisted is not None
+    assert {
+        "status": persisted["status"],
+        "state": persisted["state"],
+        "cancel_requested": persisted["cancel_requested"],
+        "message": persisted["message"],
+    } == {
+        "status": "completed",
+        "state": "COMPLETED",
+        "cancel_requested": False,
+        "message": "Daily batch completed",
+    }
+
+
+def test_request_cancel_mobile_job_preserves_pending_terminalization_modes(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    terminal_pending = {
+        "job_id": "terminal-pending-cancel",
+        "job_type": "daily",
+        "status": "queued",
+        "created_at": "2026-08-10T00:00:00+00:00",
+        "updated_at": "2026-08-10T00:00:00+00:00",
+    }
+    cooperative_pending = {**terminal_pending, "job_id": "cooperative-pending-cancel"}
+    save_mobile_job(temp_db_path, terminal_pending)
+    save_mobile_job(temp_db_path, cooperative_pending)
+
+    assert request_cancel_mobile_job(temp_db_path, job_id=terminal_pending["job_id"])
+    assert request_cancel_mobile_job(
+        temp_db_path,
+        job_id=cooperative_pending["job_id"],
+        terminal_if_pending=False,
+    )
+
+    terminal = get_mobile_job(temp_db_path, terminal_pending["job_id"])
+    cooperative = get_mobile_job(temp_db_path, cooperative_pending["job_id"])
+    assert terminal is not None
+    assert cooperative is not None
+    assert (terminal["status"], terminal["state"], terminal["cancel_requested"]) == (
+        "cancelled",
+        "CANCELED",
+        True,
+    )
+    assert (cooperative["status"], cooperative["state"], cooperative["cancel_requested"]) == (
+        "queued",
+        "QUEUED",
+        True,
+    )
 
 
 def test_add_and_get_book(temp_db_path: Path):
