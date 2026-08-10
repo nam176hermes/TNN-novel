@@ -180,6 +180,40 @@ async def test_daily_job_observes_durable_cancel_and_does_not_start_next_chapter
 
 
 @pytest.mark.asyncio
+async def test_daily_job_keeps_durable_cancel_when_translation_raises(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class DurableCancelFailurePipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 201, "book_id": 1},
+                {"id": 202, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            assert request_cancel_mobile_job(temp_db_path, job_id=str(kwargs["job_id"]))
+            raise RuntimeError("provider failure after cancellation")
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(DurableCancelFailurePipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    assert persisted is not None
+    assert translated == [201]
+    assert persisted.status == "cancelled"
+    assert persisted.state == "CANCELED"
+
+
+@pytest.mark.asyncio
 async def test_start_translate_job_book_zero_does_not_target_all_books(
     temp_db_path,
     tmp_path,

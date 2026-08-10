@@ -1431,6 +1431,8 @@ class JobService:
                         error=str(exc),
                         elapsed_ms=int((time.monotonic() - started_at) * 1000),
                     )
+                    if self._cancel_if_requested(job_id):
+                        return
                     raise
             if self._cancel_if_requested(job_id):
                 return
