@@ -33,12 +33,33 @@ EXPECTED_RECEIPT_NAMES = {
 
 class FakeResponse:
     def __init__(self, status_code: int, response_body: str = "") -> None:
-        self.status_code = status_code
+        self._status_code = status_code
         self._response_body = response_body
+        self.close_calls = 0
+
+    @property
+    def status_code(self) -> int:
+        return self._status_code
 
     @property
     def text(self) -> str:
         raise AssertionError(f"response body must not be inspected: {self._response_body}")
+
+    @property
+    def content(self) -> bytes:
+        raise AssertionError(f"response body must not be buffered: {self._response_body}")
+
+    def iter_content(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError(f"response body must not be iterated: {self._response_body}")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class FaultyStatusResponse(FakeResponse):
+    @property
+    def status_code(self) -> int:
+        raise RuntimeError("synthetic status inspection failure")
 
 
 class FakeSession:
@@ -54,6 +75,7 @@ class FakeSession:
         headers: dict[str, str],
         timeout: float,
         allow_redirects: bool | None = None,
+        stream: bool | None = None,
     ) -> FakeResponse:
         self.posts.append(
             {
@@ -62,6 +84,7 @@ class FakeSession:
                 "headers": headers,
                 "timeout": timeout,
                 "allow_redirects": allow_redirects,
+                "stream": stream,
             }
         )
         if not self.outcomes:
@@ -291,11 +314,13 @@ def test_synthetic_mode_rejects_non_literal_loopback_http(url: str) -> None:
 
 def test_retryable_failures_then_success_use_bounded_attempts_and_backoff(tmp_path: Path) -> None:
     sleeps: list[float] = []
+    retryable_response = FakeResponse(503, "LEAK-SENTINEL-RESPONSE")
+    delivered_response = FakeResponse(202)
     session = FakeSession(
         [
             requests.ConnectionError("LEAK-SENTINEL-NETWORK"),
-            FakeResponse(503, "LEAK-SENTINEL-RESPONSE"),
-            FakeResponse(202),
+            retryable_response,
+            delivered_response,
         ]
     )
     dispatcher = _dispatcher(tmp_path, session, sleep=sleeps.append)
@@ -307,12 +332,16 @@ def test_retryable_failures_then_success_use_bounded_attempts_and_backoff(tmp_pa
     assert receipt.attempt_count == 3
     assert receipt.http_status == 202
     assert len(session.posts) == 3
+    assert all(post["stream"] is True for post in session.posts)
+    assert retryable_response.close_calls == 1
+    assert delivered_response.close_calls == 1
     assert sleeps == [1.0, 2.0]
     assert all(math.isfinite(delay) and 0 < delay <= 5.0 for delay in sleeps)
 
 
 def test_redirect_responses_are_not_followed_or_delivered(tmp_path: Path) -> None:
-    session = FakeSession([FakeResponse(307), FakeResponse(307), FakeResponse(307)])
+    responses = [FakeResponse(307), FakeResponse(307), FakeResponse(307)]
+    session = FakeSession(list(responses))
     dispatcher = _dispatcher(tmp_path, session)
 
     receipts = dispatcher.dispatch(_snapshot(_alert("backup_failed")))
@@ -323,6 +352,96 @@ def test_redirect_responses_are_not_followed_or_delivered(tmp_path: Path) -> Non
     assert receipt.http_status == 307
     assert len(session.posts) == 3
     assert all(post["allow_redirects"] is False for post in session.posts)
+    assert all(post["stream"] is True for post in session.posts)
+    assert all(response.close_calls == 1 for response in responses)
+
+
+def test_delivered_response_is_streamed_and_closed_without_reading_body(tmp_path: Path) -> None:
+    response = FakeResponse(202, "LEAK-SENTINEL-UNBOUNDED-BODY")
+    session = FakeSession([response])
+    dispatcher = _dispatcher(tmp_path, session, max_attempts=1)
+
+    receipts = dispatcher.dispatch(_snapshot(_alert("backup_failed")))
+
+    receipt = next(item for item in receipts if item.alert_class == "backup_failure")
+    assert receipt.status == "delivered"
+    assert session.posts[0]["stream"] is True
+    assert response.close_calls == 1
+
+
+def test_response_is_closed_when_status_inspection_raises(tmp_path: Path) -> None:
+    response = FaultyStatusResponse(200, "LEAK-SENTINEL-UNBOUNDED-BODY")
+    session = FakeSession([response])
+    dispatcher = _dispatcher(tmp_path, session, max_attempts=1)
+
+    with pytest.raises(RuntimeError, match="synthetic status inspection failure"):
+        dispatcher.dispatch(_snapshot(_alert("backup_failed")))
+
+    assert session.posts[0]["stream"] is True
+    assert response.close_calls == 1
+
+
+def test_response_attached_to_request_exception_is_closed(tmp_path: Path) -> None:
+    response = FakeResponse(503, "LEAK-SENTINEL-UNBOUNDED-BODY")
+    error = requests.ConnectionError("synthetic connection failure", response=response)
+    session = FakeSession([error])
+    dispatcher = _dispatcher(tmp_path, session, max_attempts=1)
+
+    receipts = dispatcher.dispatch(_snapshot(_alert("backup_failed")))
+
+    receipt = next(item for item in receipts if item.alert_class == "backup_failure")
+    assert receipt.status == "failed"
+    assert session.posts[0]["stream"] is True
+    assert response.close_calls == 1
+
+
+def test_owned_session_ignores_proxy_and_netrc_ambient_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    netrc_path = tmp_path / "ambient.netrc"
+    netrc_path.write_text(
+        "machine 127.0.0.1 login ambient-user password ambient-secret\n",
+        encoding="utf-8",
+    )
+    netrc_path.chmod(0o600)
+    monkeypatch.setenv("NETRC", str(netrc_path))
+    config = delivery.AlertDeliveryConfig(
+        webhook_url="http://127.0.0.1:18765/hook",
+        bearer_token="explicit-bearer",
+        max_attempts=1,
+        allow_loopback_http=True,
+    )
+    dispatcher = delivery.OperationalAlertDispatcher(config, receipt_dir=tmp_path / "receipts")
+    captured: dict[str, object] = {}
+    response = FakeResponse(202)
+
+    def inspect_send(request: object, **kwargs: object) -> FakeResponse:
+        captured["authorization"] = getattr(request, "headers")["Authorization"]
+        captured["proxies"] = kwargs.get("proxies")
+        captured["stream"] = kwargs.get("stream")
+        return response
+
+    monkeypatch.setattr(dispatcher.session, "send", inspect_send)
+
+    dispatcher.dispatch(_snapshot(_alert("backup_failed")))
+
+    assert dispatcher.session.trust_env is False
+    assert captured["authorization"] == "Bearer explicit-bearer"
+    assert captured["proxies"] == {}
+    assert captured["stream"] is True
+    assert response.close_calls == 1
 
 
 def test_exhausted_delivery_writes_redacted_failed_receipt(tmp_path: Path) -> None:

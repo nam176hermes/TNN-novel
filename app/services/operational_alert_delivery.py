@@ -77,6 +77,8 @@ DeliveryStatus = Literal["delivered", "failed", "resolved"]
 class _ResponseLike(Protocol):
     status_code: int
 
+    def close(self) -> None: ...
+
 
 class _SessionLike(Protocol):
     def post(
@@ -87,6 +89,7 @@ class _SessionLike(Protocol):
         headers: dict[str, str],
         timeout: float,
         allow_redirects: bool,
+        stream: bool,
     ) -> _ResponseLike: ...
 
 
@@ -510,7 +513,11 @@ def _payload_for_incident(incident: AlertIncident) -> dict[str, object]:
 
 
 class OperationalAlertDispatcher:
-    """Deliver selected incidents without coupling webhook health to runtime health."""
+    """Deliver incidents with an ambient-config-free owned HTTP session.
+
+    Explicitly injected sessions remain caller-owned; callers are responsible
+    for configuring their proxy, netrc, and other ambient-environment policy.
+    """
 
     def __init__(
         self,
@@ -529,7 +536,12 @@ class OperationalAlertDispatcher:
             or self.receipt_dir == Path(self.receipt_dir.anchor)
         ):
             raise ValueError("Operational alert receipt directory is unsafe")
-        self.session = requests.Session() if session is None else session
+        if session is None:
+            owned_session = requests.Session()
+            owned_session.trust_env = False
+            self.session = owned_session
+        else:
+            self.session = session
         self.sleep = sleep
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -545,6 +557,7 @@ class OperationalAlertDispatcher:
         payload = _payload_for_incident(incident)
         last_status: int | None = None
         for attempt in range(1, self.config.max_attempts + 1):
+            response: _ResponseLike | None = None
             try:
                 response = self.session.post(
                     self.config.webhook_url,
@@ -552,6 +565,7 @@ class OperationalAlertDispatcher:
                     headers=headers,
                     timeout=self.config.timeout_seconds,
                     allow_redirects=False,
+                    stream=True,
                 )
                 raw_status = getattr(response, "status_code", None)
                 last_status = (
@@ -561,8 +575,14 @@ class OperationalAlertDispatcher:
                     and 100 <= raw_status <= 599
                     else None
                 )
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 last_status = None
+                attached_response = getattr(exc, "response", None)
+                if response is None and attached_response is not None:
+                    response = attached_response
+            finally:
+                if response is not None:
+                    response.close()
             if last_status is not None and 200 <= last_status < 300:
                 return DeliveryReceipt(
                     status="delivered",
