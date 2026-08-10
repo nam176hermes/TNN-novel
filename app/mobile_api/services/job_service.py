@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 from app.database.db import (
     claim_mobile_job,
+    commit_backup_job_terminal,
     get_chapter_by_id,
     get_mobile_job,
     heartbeat_mobile_job_lease,
@@ -334,10 +335,38 @@ class JobTracker:
         cancel_requested: bool | None = None,
         last_safe_error: str | None = None,
         internal_error_ref: str | None = None,
+        backup_terminal_event: dict[str, object] | None = None,
     ) -> bool:
         job = self.get_job(job_id)
         if not job:
             return False
+        if (
+            backup_terminal_event is not None
+            and self.db_path is not None
+            and job.job_type == "backup"
+            and status is not None
+            and status.lower() in {"completed", "failed", "cancelled", "canceled"}
+        ):
+            return self._update_database_backup_terminal(
+                job,
+                status=status,
+                progress=progress,
+                message=message,
+                error=error,
+                params=params,
+                state=state,
+                current_book_id=current_book_id,
+                current_chapter_id=current_chapter_id,
+                current_chunk_index=current_chunk_index,
+                total_chunks=total_chunks,
+                current_step=current_step,
+                provider=provider,
+                model=model,
+                cancel_requested=cancel_requested,
+                last_safe_error=last_safe_error,
+                internal_error_ref=internal_error_ref,
+                terminal_event=backup_terminal_event,
+            )
         previous_status = job.status
         previous_state = job.state
         previous_step = job.current_step
@@ -439,6 +468,154 @@ class JobTracker:
             )
         return True
 
+    def _update_database_backup_terminal(
+        self,
+        job: JobStatus,
+        *,
+        status: str,
+        progress: int | None,
+        message: str | None,
+        error: str | None,
+        params: dict | None,
+        state: str | None,
+        current_book_id: int | None,
+        current_chapter_id: int | None,
+        current_chunk_index: int | None,
+        total_chunks: int | None,
+        current_step: str | None,
+        provider: str | None,
+        model: str | None,
+        cancel_requested: bool | None,
+        last_safe_error: str | None,
+        internal_error_ref: str | None,
+        terminal_event: dict[str, object],
+    ) -> bool:
+        if self.db_path is None:
+            raise RuntimeError("Database-backed backup terminal persistence requires a database")
+
+        previous_status = job.status
+        previous_state = job.state
+        candidate = JobStatus.from_record(job.to_record())
+        next_step = current_step if current_step is not None else candidate.current_step
+        next_state = state or normalize_job_state(status, current_step=next_step)
+        if not is_valid_job_state_transition(candidate.state, next_state):
+            logger.warning(
+                "Rejected invalid job state transition %s -> %s for %s",
+                candidate.state,
+                next_state,
+                candidate.job_id,
+            )
+            record_job_log(
+                self.db_path,
+                job_id=candidate.job_id,
+                event_type="invalid_transition",
+                state=candidate.state,
+                step=candidate.current_step,
+                message="Invalid job state transition rejected",
+                details={"from": candidate.state, "to": next_state},
+            )
+            return False
+
+        candidate.status = status
+        candidate.state = next_state
+        if progress is not None:
+            candidate.progress = progress
+        if message is not None:
+            candidate.message = message
+        if error is not None:
+            candidate.error = error
+            candidate.last_safe_error = sanitize_job_error(error)
+        if params is not None:
+            candidate.params = params
+            candidate.retry_count = _safe_int(params.get("retry_count"), candidate.retry_count)
+        if current_book_id is not None:
+            candidate.current_book_id = max(0, int(current_book_id))
+        if current_chapter_id is not None:
+            candidate.current_chapter_id = max(0, int(current_chapter_id))
+        if current_chunk_index is not None:
+            candidate.current_chunk_index = max(0, int(current_chunk_index))
+        if total_chunks is not None:
+            candidate.total_chunks = max(0, int(total_chunks))
+        if current_step is not None:
+            candidate.current_step = current_step
+        if provider is not None:
+            candidate.provider = provider
+        if model is not None:
+            candidate.model = model
+        if cancel_requested is not None:
+            candidate.cancel_requested = cancel_requested
+        if last_safe_error is not None:
+            candidate.last_safe_error = sanitize_job_error(last_safe_error)
+        if internal_error_ref is not None:
+            candidate.internal_error_ref = internal_error_ref
+
+        candidate.updated_at = datetime.now(timezone.utc).isoformat()
+        if status == "completed":
+            candidate.completed_at = candidate.updated_at
+            candidate.finished_at = candidate.updated_at
+        elif status == "failed":
+            candidate.failed_at = candidate.updated_at
+            candidate.finished_at = candidate.updated_at
+        else:
+            candidate.finished_at = candidate.updated_at
+
+        try:
+            expected_lease_owner = self.worker_id if candidate.job_id in self._tasks else ""
+            persisted = commit_backup_job_terminal(
+                self.db_path,
+                candidate.to_record(),
+                expected_lease_owner=expected_lease_owner,
+                event_type="backup_job_terminal",
+                event_source="backup_job_coordinator",
+                event_message="Backup job reached a terminal state",
+                event_details=terminal_event,
+            )
+        except Exception:
+            authoritative = get_mobile_job(self.db_path, candidate.job_id)
+            if (
+                authoritative is not None
+                and str(authoritative.get("job_type") or "") == "backup"
+                and str(authoritative.get("owner_user_id") or "") == candidate.owner_user_id
+                and str(authoritative.get("lease_owner") or "") == expected_lease_owner
+            ):
+                job.__dict__.update(JobStatus.from_record(authoritative).__dict__)
+            else:
+                self.jobs.pop(candidate.job_id, None)
+            raise
+
+        reconciled = JobStatus.from_record(persisted)
+        job.__dict__.update(reconciled.__dict__)
+        record_job_log(
+            self.db_path,
+            job_id=job.job_id,
+            event_type="state_transition",
+            state=job.state,
+            step=job.current_step,
+            message=job.message or job.error or f"Job state {job.state}",
+            details={
+                "from_status": previous_status,
+                "to_status": job.status,
+                "from_state": previous_state,
+                "to_state": job.state,
+                "progress": job.progress,
+                "total": job.total,
+                "chapter_id": job.current_chapter_id,
+                "provider": job.provider,
+                "model": job.model,
+            },
+        )
+        if job.status in {"failed", "interrupted"} and previous_status != job.status:
+            record_operational_event(
+                self.db_path,
+                event_type="job_failure" if job.status == "failed" else "job_interrupted",
+                severity="error" if job.status == "failed" else "warning",
+                source="job_tracker",
+                message=job.error or job.message or f"Job {job.status}",
+                job_id=job.job_id,
+                details={"job_type": job.job_type, "status": job.status},
+            )
+        return True
+
     def cancel_job(self, job_id: str) -> bool:
         job = self.get_job(job_id)
         if not job:
@@ -505,6 +682,7 @@ class JobTracker:
 
     def start_background_task(self, job_id: str, coro) -> None:
         lease_token = uuid.uuid4().hex
+        tracked_job_type = self.jobs.get(job_id).job_type if job_id in self.jobs else ""
 
         async def heartbeat_loop() -> None:
             while True:
@@ -561,12 +739,13 @@ class JobTracker:
                 self.update_job(job_id, status="cancelled", message="Job cancelled", cancel_requested=True)
             except Exception:
                 logger.exception("Background job %s failed", job_id)
-                self.update_job(
-                    job_id,
-                    status="failed",
-                    error=GENERIC_JOB_FAILURE_DETAIL,
-                    message=GENERIC_JOB_FAILURE_DETAIL,
-                )
+                if self.db_path is None or tracked_job_type != "backup":
+                    self.update_job(
+                        job_id,
+                        status="failed",
+                        error=GENERIC_JOB_FAILURE_DETAIL,
+                        message=GENERIC_JOB_FAILURE_DETAIL,
+                    )
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()

@@ -86,11 +86,73 @@ def record_operational_event(
     actor_user_id: str = "",
     owner_user_id: str = "",
 ) -> int:
+    with get_connection(db_path) as conn:
+        event_id = insert_operational_event(
+            conn,
+            event_type=event_type,
+            severity=severity,
+            source=source,
+            message=message,
+            job_id=job_id,
+            details=details,
+            actor_user_id=actor_user_id,
+            owner_user_id=owner_user_id,
+        )
+        conn.commit()
+        return event_id
+
+
+def insert_operational_event(
+    conn: Any,
+    *,
+    event_type: str,
+    severity: str = "info",
+    source: str = "",
+    message: str = "",
+    job_id: str = "",
+    details: dict[str, Any] | None = None,
+    actor_user_id: str = "",
+    owner_user_id: str = "",
+    if_absent: bool = False,
+) -> int:
+    """Insert an event on a caller-owned transaction.
+
+    ``if_absent`` is serialized by the caller's write transaction and uses the
+    stable event-type/job-id identity used by backup terminal events.
+    """
     safe_message = _sanitize_operational_message(message)
     safe_details = _sanitize_operational_details(details)
     safe_actor_user_id = "" if _operational_value_has_sensitive_marker(actor_user_id) else actor_user_id
     safe_owner_user_id = "" if _operational_value_has_sensitive_marker(owner_user_id) else owner_user_id
-    with get_connection(db_path) as conn:
+    if if_absent:
+        cur = conn.execute(
+            """
+            INSERT INTO operational_events
+            (
+                event_type, severity, source, message,
+                actor_user_id, owner_user_id, details_json, job_id
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM operational_events
+                WHERE event_type = ? AND job_id = ?
+            )
+            """,
+            (
+                event_type,
+                severity,
+                source,
+                safe_message,
+                safe_actor_user_id,
+                safe_owner_user_id,
+                json.dumps(safe_details, ensure_ascii=False),
+                job_id,
+                event_type,
+                job_id,
+            ),
+        )
+    else:
         cur = conn.execute(
             """
             INSERT INTO operational_events
@@ -111,8 +173,7 @@ def record_operational_event(
                 job_id,
             ),
         )
-        conn.commit()
-        return cur.lastrowid
+    return int(cur.lastrowid or 0) if cur.rowcount else 0
 
 
 def list_operational_events(

@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from app.database.db import get_mobile_job, init_db, list_operational_events, request_cancel_mobile_job
-from app.mobile_api.services import backup_job_service as backup_job_module
+from app.database.db import (
+    claim_mobile_job,
+    get_mobile_job,
+    init_db,
+    list_operational_events,
+    request_cancel_mobile_job,
+)
+from app.database import db as database_module
+from app.database import operations_repository
 from app.mobile_api.services import job_service as job_service_module
 from app.mobile_api.services.backup_job_service import BackupJobCoordinator, BackupSecretStore
 from app.mobile_api.services.backup_service import BackupService
-from app.mobile_api.services.job_service import JobStatus, JobTracker
+from app.mobile_api.services.job_service import JobTracker
 from scripts.ops import BackupCancelled
 
 
@@ -203,6 +211,61 @@ def terminal_backup_events(db_path: Path, job_id: str) -> list[dict]:
         for event in list_operational_events(db_path, limit=50, severities=())
         if event["event_type"] == "backup_job_terminal" and event["job_id"] == job_id
     ]
+
+
+class OperationalEventWriteFailureConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        failures_remaining: list[int],
+        attempts: list[str],
+    ) -> None:
+        self.connection = connection
+        self.failures_remaining = failures_remaining
+        self.attempts = attempts
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, *args):  # type: ignore[no-untyped-def]
+        return self.connection.__exit__(*args)
+
+    def execute(self, sql: str, parameters=()):  # type: ignore[no-untyped-def]
+        normalized = " ".join(sql.lower().split())
+        if normalized.startswith("insert into operational_events"):
+            event_type = str(parameters[0]) if parameters else ""
+            if event_type == "backup_job_terminal":
+                self.attempts.append(event_type)
+                if self.failures_remaining[0] > 0:
+                    self.failures_remaining[0] -= 1
+                    raise sqlite3.OperationalError("injected backup terminal event write failure")
+        return self.connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self.connection, name)
+
+
+def inject_operational_event_write_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure_count: int,
+) -> list[str]:
+    original_get_connection = database_module.get_connection
+    attempts: list[str] = []
+    failures_remaining = [failure_count]
+
+    def failing_get_connection(db_path: Path):  # type: ignore[no-untyped-def]
+        return OperationalEventWriteFailureConnection(
+            original_get_connection(db_path),
+            failures_remaining=failures_remaining,
+            attempts=attempts,
+        )
+
+    monkeypatch.setattr(database_module, "get_connection", failing_get_connection)
+    monkeypatch.setattr(operations_repository, "get_connection", failing_get_connection)
+    return attempts
 
 
 def test_backup_service_forwards_cancellation_and_progress_callbacks(
@@ -1003,18 +1066,11 @@ def test_missing_job_terminal_update_raises_without_recording_event(
     error: RuntimeError | None = None
 
     try:
-        result = coordinator._update_terminal_job(
+        coordinator._update_terminal_job(
             job_id,
             status="cancelled",
             message="Backup cancelled",
             cancel_requested=True,
-        )
-        coordinator._record_terminal_event(
-            job_id=job_id,
-            result=result,
-            encrypted=False,
-            secrets_included=False,
-            started_at=time.monotonic(),
         )
     except RuntimeError as exc:
         error = exc
@@ -1032,6 +1088,231 @@ def test_missing_job_terminal_update_raises_without_recording_event(
         "archive_call_count": 0,
         "terminal_events": [],
     }
+
+
+def test_stale_cached_deleted_backup_terminal_does_not_recreate_row_or_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="running")
+    with database_module.get_connection(temp_db_path) as conn:
+        conn.execute("DELETE FROM mobile_jobs WHERE job_id = ?", (job.job_id,))
+        conn.commit()
+
+    error: RuntimeError | None = None
+    try:
+        coordinator._update_terminal_job(
+            job.job_id,
+            status="cancelled",
+            message="Backup cancelled",
+            cancel_requested=True,
+        )
+    except RuntimeError as exc:
+        error = exc
+
+    assert {
+        "error_type": type(error).__name__ if error is not None else None,
+        "cached": job.job_id in tracker.jobs,
+        "durable": get_mobile_job(temp_db_path, job.job_id),
+        "terminal_events": terminal_backup_events(temp_db_path, job.job_id),
+    } == {
+        "error_type": "RuntimeError",
+        "cached": False,
+        "durable": None,
+        "terminal_events": [],
+    }
+
+
+def test_backup_terminal_update_does_not_adopt_changed_ownership(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="running")
+    with database_module.get_connection(temp_db_path) as conn:
+        conn.execute(
+            "UPDATE mobile_jobs SET owner_user_id = ? WHERE job_id = ?",
+            ("different-owner", job.job_id),
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="ownership changed"):
+        coordinator._update_terminal_job(
+            job.job_id,
+            status="completed",
+            progress=6,
+            message="Backup completed: finished.tar.gz",
+        )
+
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    assert job.job_id not in tracker.jobs
+    assert (durable["owner_user_id"], durable["status"], durable["state"]) == (
+        "different-owner",
+        "running",
+        "CLAIMED",
+    )
+    assert terminal_backup_events(temp_db_path, job.job_id) == []
+
+
+def test_cross_tracker_cannot_terminalize_claimed_backup_owned_by_another_tracker(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    owner = JobTracker(db_path=temp_db_path)
+    job = owner.create_job("backup")
+    assert claim_mobile_job(
+        temp_db_path,
+        job_id=job.job_id,
+        worker_id=owner.worker_id,
+        lease_token="owner-lease-token",
+    )
+    remote = JobTracker(db_path=temp_db_path)
+    loaded = remote.get_job(job.job_id)
+    assert loaded is not None
+    assert loaded.status == "running"
+    coordinator = BackupJobCoordinator(
+        tracker=remote,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+
+    with pytest.raises(RuntimeError, match="ownership changed"):
+        coordinator._update_terminal_job(
+            job.job_id,
+            status="completed",
+            progress=6,
+            message="Backup completed: foreign.tar.gz",
+        )
+
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    assert job.job_id not in remote.jobs
+    assert (durable["status"], durable["state"], durable["lease_owner"]) == (
+        "running",
+        "CLAIMED",
+        owner.worker_id,
+    )
+    assert terminal_backup_events(temp_db_path, job.job_id) == []
+
+
+def test_backup_terminal_event_failure_rolls_back_terminal_status(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="running")
+    attempts = inject_operational_event_write_failures(monkeypatch, failure_count=10)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected backup terminal event write failure"):
+        coordinator._update_terminal_job(
+            job.job_id,
+            status="completed",
+            progress=6,
+            message="Backup completed: finished.tar.gz",
+            event_backup_filename="finished.tar.gz",
+        )
+
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    assert attempts == ["backup_job_terminal", "backup_job_terminal"]
+    assert (job.status, job.state) == ("running", "CLAIMED")
+    assert (durable["status"], durable["state"]) == ("running", "CLAIMED")
+    assert terminal_backup_events(temp_db_path, job.job_id) == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_terminal_event_failure_cannot_generic_terminalize_backup(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    attempts = inject_operational_event_write_failures(monkeypatch, failure_count=10)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    await wait_for_job(tracker, job_id)
+
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    assert attempts == ["backup_job_terminal", "backup_job_terminal"]
+    assert durable["status"] not in {"completed", "failed", "cancelled", "canceled"}
+    assert tracker.jobs[job_id].status == durable["status"]
+    assert terminal_backup_events(temp_db_path, job_id) == []
+
+
+def test_repeated_backup_terminal_persistence_records_exactly_one_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="running")
+    attempts = inject_operational_event_write_failures(monkeypatch, failure_count=1)
+
+    for attempt_number in range(2):
+        coordinator._update_terminal_job(
+            job.job_id,
+            status="completed",
+            progress=6,
+            message="Backup completed: finished.tar.gz",
+            event_backup_filename="finished.tar.gz",
+        )
+        if attempt_number == 0:
+            first_attempt_events = terminal_backup_events(temp_db_path, job.job_id)
+            assert [event["details"]["result"] for event in first_attempt_events] == [
+                "completed"
+            ]
+
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    events = terminal_backup_events(temp_db_path, job.job_id)
+    assert durable is not None
+    assert (durable["status"], durable["state"]) == ("completed", "COMPLETED")
+    assert attempts == [
+        "backup_job_terminal",
+        "backup_job_terminal",
+        "backup_job_terminal",
+    ]
+    assert [(event["severity"], event["details"]["result"]) for event in events] == [
+        ("info", "completed")
+    ]
 
 
 @pytest.mark.asyncio
@@ -1125,16 +1406,16 @@ async def test_terminal_event_retries_one_shot_pre_persist_failure(
         failure=RuntimeError("provider failed") if requested_status == "failed" else None,
     )
     coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
-    persist_job = tracker._persist_job
+    persist_terminal = job_service_module.commit_backup_job_terminal
     persist_failures: list[str] = []
 
-    def fail_first_terminal_persist(job: JobStatus) -> None:
-        if job.status == requested_status and not persist_failures:
-            persist_failures.append(job.job_id)
+    def fail_first_terminal_persist(db_path: Path, job: dict, **kwargs: object) -> dict:
+        if str(job.get("status") or "") == requested_status and not persist_failures:
+            persist_failures.append(str(job["job_id"]))
             raise RuntimeError("terminal state failed before persistence")
-        persist_job(job)
+        return persist_terminal(db_path, job, **kwargs)
 
-    monkeypatch.setattr(tracker, "_persist_job", fail_first_terminal_persist)
+    monkeypatch.setattr(job_service_module, "commit_backup_job_terminal", fail_first_terminal_persist)
     job_id = coordinator.start_backup_job(
         include_audio=True,
         include_exports=False,
@@ -1235,22 +1516,11 @@ async def test_cancelled_terminal_event_survives_post_save_job_log_failure(
 async def test_cancellation_before_archive_work_records_one_terminal_event(
     tmp_path: Path,
     temp_db_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
     tracker = JobTracker(db_path=temp_db_path)
     service = FakeBackupService(tmp_path / "backups")
     coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
-    record_terminal_event = coordinator._record_terminal_event
-    statuses_when_terminal_event_is_recorded: list[str] = []
-
-    def record_terminal_event_before_terminal_status(**kwargs) -> None:
-        job = tracker.get_job(str(kwargs["job_id"]))
-        assert job is not None
-        statuses_when_terminal_event_is_recorded.append(job.status)
-        record_terminal_event(**kwargs)
-
-    monkeypatch.setattr(coordinator, "_record_terminal_event", record_terminal_event_before_terminal_status)
     job_id = coordinator.start_backup_job(
         include_audio=True,
         include_exports=False,
@@ -1272,7 +1542,6 @@ async def test_cancellation_before_archive_work_records_one_terminal_event(
     assert not service.started.is_set()
     events = terminal_backup_events(temp_db_path, job_id)
     assert len(events) == 1
-    assert statuses_when_terminal_event_is_recorded == ["cancelled"]
     assert events[0]["severity"] == "warning"
     assert events[0]["details"]["result"] == "cancelled"
 
@@ -1328,22 +1597,15 @@ async def test_external_cancellation_while_waiting_for_lock_records_terminal_eve
 
 
 @pytest.mark.asyncio
-async def test_terminal_audit_failure_preserves_the_persisted_job_outcome(
+async def test_terminal_audit_failure_is_retried_with_atomic_job_outcome(
     tmp_path: Path,
     temp_db_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     init_db(temp_db_path)
     tracker = JobTracker(db_path=temp_db_path)
     service = FakeBackupService(tmp_path / "backups")
-    attempts: list[str] = []
-
-    def fail_audit(*args, **kwargs) -> None:
-        attempts.append(str(kwargs.get("job_id") or ""))
-        raise RuntimeError("raw audit failure marker")
-
-    monkeypatch.setattr(backup_job_module, "record_operational_event", fail_audit, raising=False)
+    attempts = inject_operational_event_write_failures(monkeypatch, failure_count=1)
     coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
 
     job_id = coordinator.start_backup_job(
@@ -1358,8 +1620,11 @@ async def test_terminal_audit_failure_preserves_the_persisted_job_outcome(
     persisted = JobTracker(db_path=temp_db_path).get_job(job_id)
     assert persisted is not None
     assert persisted.status == "completed"
-    assert attempts == [job_id]
-    assert "raw audit failure marker" not in caplog.text
+    assert attempts == ["backup_job_terminal", "backup_job_terminal"]
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert [(event["severity"], event["details"]["result"]) for event in events] == [
+        ("info", "completed")
+    ]
 
 
 @pytest.mark.asyncio

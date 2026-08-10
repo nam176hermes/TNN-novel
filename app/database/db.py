@@ -2517,6 +2517,179 @@ def save_mobile_job(db_path: Path, job: dict) -> dict:
         return _mobile_job_from_row(row)
 
 
+def commit_backup_job_terminal(
+    db_path: Path,
+    job: dict,
+    *,
+    expected_lease_owner: str,
+    event_type: str,
+    event_source: str,
+    event_message: str,
+    event_details: dict[str, Any],
+) -> dict:
+    """Atomically update an owned backup row and insert its terminal event once."""
+    requested_status = str(job.get("status") or "").lower()
+    if requested_status not in {"completed", "failed", "cancelled", "canceled"}:
+        raise ValueError("Backup terminal persistence requires a terminal status")
+
+    job_id = str(job.get("job_id") or "")
+    expected_owner_user_id = str(job.get("owner_user_id") or "").strip()
+    if not job_id or not expected_owner_user_id or str(job.get("job_type") or "") != "backup":
+        raise RuntimeError("Backup terminal persistence ownership is unavailable")
+
+    with get_connection(db_path) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM mobile_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"Backup job {job_id} no longer exists")
+
+            current = _mobile_job_from_row(row)
+            if (
+                str(current.get("job_type") or "") != "backup"
+                or str(current.get("owner_user_id") or "") != expected_owner_user_id
+                or str(current.get("lease_owner") or "") != expected_lease_owner
+            ):
+                raise RuntimeError(f"Backup job {job_id} ownership changed")
+
+            current_status = str(current.get("status") or "").lower()
+            if current_status not in {"completed", "failed", "cancelled", "canceled"}:
+                terminal = dict(job)
+                cancellation_wins = bool(
+                    current.get("cancel_requested")
+                    or current_status in {"cancelled", "canceled"}
+                ) and requested_status not in {"cancelled", "canceled"}
+                if cancellation_wins:
+                    terminal.update(
+                        {
+                            "status": "cancelled",
+                            "state": "CANCELED",
+                            "message": "Job cancelled by user",
+                            "error": "",
+                            "completed_at": "",
+                            "failed_at": "",
+                            "finished_at": str(job.get("updated_at") or ""),
+                            "cancel_requested": True,
+                            "last_safe_error": "",
+                            "internal_error_ref": "",
+                        }
+                    )
+
+                terminal_status = str(terminal.get("status") or "").lower()
+                terminal_step = str(terminal.get("current_step") or "")
+                terminal_state = normalize_job_state(
+                    terminal_status,
+                    current_step=terminal_step,
+                    existing_state=str(terminal.get("state") or ""),
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE mobile_jobs
+                    SET status = ?,
+                        state = ?,
+                        progress = ?,
+                        total = ?,
+                        current_book_id = ?,
+                        current_chapter_id = ?,
+                        current_chunk_index = ?,
+                        total_chunks = ?,
+                        current_step = ?,
+                        provider = ?,
+                        model = ?,
+                        retry_count = ?,
+                        target_ids_json = ?,
+                        params_json = ?,
+                        message = ?,
+                        error = ?,
+                        updated_at = ?,
+                        started_at = ?,
+                        completed_at = ?,
+                        failed_at = ?,
+                        finished_at = ?,
+                        cancel_requested = ?,
+                        last_safe_error = ?,
+                        internal_error_ref = ?
+                    WHERE job_id = ?
+                      AND job_type = 'backup'
+                      AND owner_user_id = ?
+                      AND COALESCE(lease_owner, '') = ?
+                    """,
+                    (
+                        terminal_status,
+                        terminal_state,
+                        int(terminal.get("progress") or 0),
+                        int(terminal.get("total") or 0),
+                        int(terminal.get("current_book_id") or 0),
+                        int(terminal.get("current_chapter_id") or 0),
+                        int(terminal.get("current_chunk_index") or 0),
+                        int(terminal.get("total_chunks") or 0),
+                        terminal_step,
+                        str(terminal.get("provider") or ""),
+                        str(terminal.get("model") or ""),
+                        int(terminal.get("retry_count") or 0),
+                        json.dumps(terminal.get("target_ids") or [], ensure_ascii=False),
+                        json.dumps(terminal.get("params") or {}, ensure_ascii=False),
+                        str(terminal.get("message") or ""),
+                        str(terminal.get("error") or ""),
+                        str(terminal.get("updated_at") or ""),
+                        str(terminal.get("started_at") or ""),
+                        str(terminal.get("completed_at") or ""),
+                        str(terminal.get("failed_at") or ""),
+                        terminal.get("finished_at"),
+                        1 if terminal.get("cancel_requested") else 0,
+                        str(terminal.get("last_safe_error") or ""),
+                        str(terminal.get("internal_error_ref") or ""),
+                        job_id,
+                        expected_owner_user_id,
+                        expected_lease_owner,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(f"Backup job {job_id} terminal update lost ownership")
+
+            terminal_row = conn.execute(
+                "SELECT * FROM mobile_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if terminal_row is None:
+                raise RuntimeError(f"Backup job {job_id} no longer exists")
+            persisted = _mobile_job_from_row(terminal_row)
+            persisted_status = str(persisted.get("status") or "").lower()
+            if persisted_status not in {"completed", "failed", "cancelled", "canceled"}:
+                raise RuntimeError(f"Backup job {job_id} did not reach a terminal state")
+
+            result = "cancelled" if persisted_status in {"cancelled", "canceled"} else persisted_status
+            details = dict(event_details)
+            details["result"] = result
+            if result == "completed":
+                filename = str(details.get("backup_filename") or "")
+                if not filename:
+                    filename = str((persisted.get("params") or {}).get("backup_filename") or "")
+                if filename:
+                    details["backup_filename"] = Path(filename.replace("\\", "/")).name
+            else:
+                details.pop("backup_filename", None)
+            severity = "info" if result == "completed" else "warning" if result == "cancelled" else "error"
+            _operations_repository.insert_operational_event(
+                conn,
+                event_type=event_type,
+                severity=severity,
+                source=event_source,
+                message=event_message,
+                job_id=job_id,
+                details=details,
+                if_absent=True,
+            )
+            conn.commit()
+            return persisted
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_mobile_job(db_path: Path, job_id: str) -> dict | None:
     with get_connection(db_path) as conn:
         row = conn.execute("SELECT * FROM mobile_jobs WHERE job_id = ?", (job_id,)).fetchone()
