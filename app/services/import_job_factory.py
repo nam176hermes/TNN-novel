@@ -12,7 +12,7 @@ from app.observability import CircuitBreakerConfig, Observability, default_obser
 from app.services.import_job_quotas import ImportJobQuotaPolicy
 from app.services.import_job_runtime import RetryPolicy
 from app.services.import_job_service import ImportJobService
-from app.services.source_import_task_pipeline import SourceImportTaskPipeline
+from app.services.source_task_pipeline import SourceTaskPipeline
 
 
 def create_import_job_service(
@@ -43,7 +43,7 @@ def create_import_job_service(
     return ImportJobService(
         repository,
         worker_id=worker_id,
-        pipeline=SourceImportTaskPipeline(
+        pipeline=SourceTaskPipeline(
             repository,
             resolved_pipeline,
             observability=resolved_observability,

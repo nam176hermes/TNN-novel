@@ -1,6 +1,6 @@
 """Dedicated durable import/browser worker process.
 
-The worker consumes the P05/P06 SQLite job store.  It owns source and browser
+The worker consumes the shared SQLite job store.  It owns source and browser
 work in production; FastAPI may retain its legacy in-process execution mode for
 local development only.  The heartbeat contains no job, source, cookie, or
 credential data and is used solely by the container health check.

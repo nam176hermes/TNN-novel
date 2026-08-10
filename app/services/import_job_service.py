@@ -19,6 +19,7 @@ from threading import Condition
 from urllib.parse import urlparse
 
 from app.database.import_jobs import (
+    BrowserResultPublicationRejected,
     ChapterTask,
     ImportJob,
     ImportJobRepository,
@@ -26,6 +27,7 @@ from app.database.import_jobs import (
     TaskStage,
     TaskStatus,
 )
+from app.import_contracts import BrowserResultState, BrowserTaskResult, ImportOperationKind
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
 from app.observability import Observability, default_observability
 from app.services.import_job_runtime import BoundedTaskRunner, RetryPolicy
@@ -76,7 +78,9 @@ class ImportTaskPipeline(Protocol):
         task: ChapterTask,
         *,
         cancel_check: Callable[[], bool],
-    ) -> TaskImportOutcome | None: ...
+    ) -> TaskImportOutcome | BrowserTaskResult | None: ...
+
+    def release_task(self, task_id: int) -> None: ...
 
 
 class ImportJobService:
@@ -134,6 +138,9 @@ class ImportJobService:
         tasks: list[Mapping[str, Any]],
         book_id: int | None = None,
         config_snapshot: Mapping[str, Any] | None = None,
+        operation_kind: ImportOperationKind = ImportOperationKind.IMPORT_CHAPTERS,
+        deadline_at: str = "",
+        correlation_id: str = "",
     ) -> ImportJob:
         if len(tasks) > self.quota_policy.max_chapters_per_job:
             raise ImportJobQuotaError(
@@ -152,6 +159,9 @@ class ImportJobService:
             total=len(tasks),
             book_id=book_id,
             config_snapshot=config_snapshot,
+            operation_kind=operation_kind,
+            deadline_at=deadline_at,
+            correlation_id=correlation_id,
         )
         for task in tasks:
             self.repository.create_task(
@@ -236,6 +246,13 @@ class ImportJobService:
             job = self.repository.transition_job(job_id, owner_user_id, JobStatus.RUNNING)
         elif job.status is not JobStatus.RUNNING:
             return job
+        if job.operation_kind is ImportOperationKind.PREVIEW:
+            if self._preview_expired(job):
+                result = self.repository.expire_browser_job(job_id, owner_user_id)
+                self._record_terminal_job(result, operation="preview")
+                self._refresh_workload_metrics()
+                return result
+            return self._run_preview_job(job, owner_user_id)
         if self._duration_limit_exceeded(job):
             self.repository.fail_pending_tasks(
                 job_id,
@@ -286,6 +303,259 @@ class ImportJobService:
         self._record_terminal_job(result, operation="run")
         self._refresh_workload_metrics()
         return result
+
+    def _run_preview_job(self, job: ImportJob, owner_user_id: str) -> ImportJob:
+        if self._preview_should_stop(job.id, owner_user_id):
+            result = self.get_job(job.id, owner_user_id)
+            self._record_terminal_job(result, operation="preview")
+            self._refresh_workload_metrics()
+            return result
+        task = self.repository.claim_next_task(
+            job.id,
+            owner_user_id,
+            worker_id=self.worker_id,
+            lease_seconds=self.lease_seconds,
+        )
+        if task is not None:
+            self._run_claimed_preview_task(job, task, owner_user_id)
+        result = self.get_job(job.id, owner_user_id)
+        self._record_terminal_job(result, operation="preview")
+        self._refresh_workload_metrics()
+        return result
+
+    def _run_claimed_preview_task(
+        self,
+        job: ImportJob,
+        task: ChapterTask,
+        owner_user_id: str,
+    ) -> None:
+        current_task = task
+        result: BrowserTaskResult | None = None
+        try:
+            try:
+                result, current_task = self._execute_preview_stages(
+                    job,
+                    task,
+                    owner_user_id,
+                )
+            except SourceAdapterError as exc:
+                result = BrowserTaskResult(
+                    correlation_id=job.correlation_id,
+                    state=(
+                        BrowserResultState.BLOCKED
+                        if exc.code is FetchErrorCode.USER_VERIFICATION_REQUIRED
+                        else BrowserResultState.FAILED
+                    ),
+                    error_code=exc.code.value,
+                    error_message=exc.safe_message,
+                    retryable=bool(exc.retryable),
+                    http_status=exc.http_status,
+                )
+                current_task = self._current_task(task, owner_user_id)
+            except Exception:
+                result = BrowserTaskResult(
+                    correlation_id=job.correlation_id,
+                    state=BrowserResultState.FAILED,
+                    error_code=FetchErrorCode.INTERNAL_ERROR.value,
+                    error_message="Browser task failed",
+                    retryable=False,
+                    http_status=500,
+                )
+                current_task = self._current_task(task, owner_user_id)
+
+            if result is None or self._preview_should_stop(job.id, owner_user_id):
+                return
+            try:
+                self._publish_preview_result(
+                    job,
+                    current_task,
+                    owner_user_id,
+                    result,
+                )
+            except BrowserResultPublicationRejected as exc:
+                self._reconcile_preview_publication_rejection(job, owner_user_id, exc)
+        finally:
+            self.pipeline.release_task(task.id)
+
+    def _execute_preview_stages(
+        self,
+        job: ImportJob,
+        task: ChapterTask,
+        owner_user_id: str,
+    ) -> tuple[BrowserTaskResult | None, ChapterTask]:
+        current_task = task
+        outcome: BrowserTaskResult | None = None
+        for stage in (
+            TaskStage.FETCHING,
+            TaskStage.PARSING,
+            TaskStage.VALIDATING,
+            TaskStage.IMPORTING,
+        ):
+            if self._preview_should_stop(job.id, owner_user_id):
+                return None, current_task
+            current_task = self.repository.renew_task_lease(
+                task.id,
+                owner_user_id,
+                lease_token=task.lease_token,
+                lease_seconds=self.lease_seconds,
+            )
+            current_task = self.repository.transition_task(
+                task.id,
+                owner_user_id,
+                status=TaskStatus.RUNNING,
+                stage=stage,
+                lease_token=task.lease_token,
+            )
+            started = self.clock()
+            retry_attempt = 1
+            while True:
+                if self._preview_should_stop(job.id, owner_user_id):
+                    return None, current_task
+                try:
+                    stage_result = self.pipeline.run_stage(
+                        stage,
+                        task,
+                        cancel_check=lambda: self.repository.is_cancel_requested(
+                            task.job_id,
+                            owner_user_id,
+                        ),
+                    )
+                    break
+                except SourceAdapterError as exc:
+                    elapsed = self.clock() - started
+                    if not self.retry_policy.should_retry(
+                        exc,
+                        attempt=retry_attempt,
+                        elapsed_seconds=elapsed,
+                    ):
+                        raise
+                    delay = self.retry_policy.delay_seconds(
+                        attempt=retry_attempt,
+                        random_value=self.random_value,
+                        retry_after_seconds=getattr(exc, "retry_after_seconds", None),
+                    )
+                    next_attempt = (
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    ).isoformat()
+                    current_task = self.repository.schedule_task_retry(
+                        task.id,
+                        owner_user_id,
+                        lease_token=task.lease_token,
+                        next_attempt_at=next_attempt,
+                        error_code=exc.code.value,
+                        error_message=exc.safe_message,
+                    )
+                    self.observability.metrics.increment(
+                        "import_task_retries_total",
+                        labels={
+                            "adapter_id": "unknown",
+                            "fetch_method": task.fetch_method or "direct_http",
+                            "stage": stage.value,
+                            "operation": "retry",
+                        },
+                    )
+                    if self._preview_should_stop(job.id, owner_user_id):
+                        return None, current_task
+                    self.sleep(delay)
+                    if self._preview_should_stop(job.id, owner_user_id):
+                        return None, current_task
+                    current_task = self.repository.transition_task(
+                        task.id,
+                        owner_user_id,
+                        status=TaskStatus.RUNNING,
+                        stage=stage,
+                        lease_token=task.lease_token,
+                    )
+                    retry_attempt += 1
+            if stage is TaskStage.IMPORTING:
+                if not isinstance(stage_result, BrowserTaskResult):
+                    raise RuntimeError("preview importing stage returned no browser result")
+                outcome = stage_result
+        return outcome, current_task
+
+    def _publish_preview_result(
+        self,
+        job: ImportJob,
+        task: ChapterTask,
+        owner_user_id: str,
+        result: BrowserTaskResult,
+    ) -> None:
+        self.repository.publish_browser_result(
+            job.id,
+            owner_user_id,
+            task_id=task.id,
+            lease_token=task.lease_token,
+            lease_owner=task.lease_owner,
+            expected_job_version=job.version,
+            expected_task_version=task.version,
+            result=result,
+        )
+        task_status, task_stage = {
+            BrowserResultState.COMPLETED: (TaskStatus.SUCCEEDED, TaskStage.SUCCEEDED),
+            BrowserResultState.BLOCKED: (
+                TaskStatus.USER_VERIFICATION_REQUIRED,
+                TaskStage.USER_VERIFICATION_REQUIRED,
+            ),
+            BrowserResultState.FAILED: (TaskStatus.FAILED, TaskStage.FAILED),
+            BrowserResultState.CANCELLED: (TaskStatus.CANCELLED, TaskStage.CANCELLED),
+            BrowserResultState.TIMED_OUT: (TaskStatus.FAILED, TaskStage.FAILED),
+        }[result.state]
+        self.observability.record_task(
+            status=task_status.value,
+            stage=task_stage.value,
+            operation="preview",
+            job_id=job.id,
+            task_id=task.id,
+            error_code=result.error_code,
+            attempts=task.attempts,
+            worker_id=self.worker_id,
+        )
+        if result.state is BrowserResultState.COMPLETED:
+            self.observability.metrics.increment(
+                "import_operations_total",
+                labels={"operation": "preview"},
+            )
+
+    def _reconcile_preview_publication_rejection(
+        self,
+        job: ImportJob,
+        owner_user_id: str,
+        rejection: BrowserResultPublicationRejected,
+    ) -> None:
+        if rejection.code == "cancelled":
+            self.repository.request_cancel(job.id, owner_user_id)
+        elif rejection.code == "deadline_exceeded":
+            self.repository.expire_browser_job(job.id, owner_user_id)
+
+    def _preview_should_stop(self, job_id: str, owner_user_id: str) -> bool:
+        current = self.repository.get_job(job_id, owner_user_id)
+        if current is None:
+            return True
+        if current.result_snapshot is not None:
+            return True
+        if current.cancel_requested_at:
+            self.repository.request_cancel(job_id, owner_user_id)
+            return True
+        if self._preview_expired(current):
+            self.repository.expire_browser_job(job_id, owner_user_id)
+            return True
+        return current.status is not JobStatus.RUNNING
+
+    def _preview_expired(self, job: ImportJob) -> bool:
+        if self._duration_limit_exceeded(job):
+            return True
+        try:
+            deadline = datetime.fromisoformat(job.deadline_at)
+        except (TypeError, ValueError):
+            return True
+        return deadline.tzinfo is None or deadline <= datetime.now(timezone.utc)
+
+    def _current_task(self, task: ChapterTask, owner_user_id: str) -> ChapterTask:
+        return next(
+            item
+            for item in self.repository.list_tasks(task.job_id, owner_user_id)
+            if item.id == task.id
+        )
 
     def _run_claimed_task(
         self,

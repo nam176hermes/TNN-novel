@@ -4,10 +4,16 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 
-from app.database.db import init_db
+from app.database.db import add_book, add_chapter, init_db
 from app.database.import_jobs import ImportJobRepository, JobStatus, TaskStage, TaskStatus
-from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
+from app.ingestion.source_adapters import (
+    FetchErrorCode,
+    SourceAdapterError,
+    SourceChapterContent,
+)
+from app.mobile_api.services.pipeline_service import ChapterImportResult
 from app.services.import_job_service import ImportJobService, TaskImportOutcome
+from app.services.source_task_pipeline import SourceTaskPipeline
 
 
 @dataclass
@@ -259,3 +265,79 @@ def test_cancel_during_backoff_at_worker_level(temp_db_path) -> None:
     service.enqueue_job(job.id, "operator-a")
     service.run_job(job.id, "operator-a")
     assert repository.list_tasks(job.id, "operator-a")[0].status is TaskStatus.CANCELLED
+
+
+def test_chapter_import_pipeline_behavior_is_unchanged(temp_db_path) -> None:
+    class PipelineServiceFake:
+        preview_calls: list[str]
+        fetch_calls: list[str]
+        imported_text: list[str]
+
+        def __init__(self, book_id: int, chapter_id: int) -> None:
+            self.preview_calls = []
+            self.fetch_calls = []
+            self.imported_text = []
+            self.book_id = book_id
+            self.chapter_id = chapter_id
+
+        def preview_source_url(self, url: str) -> dict[str, object]:
+            self.preview_calls.append(url)
+            raise AssertionError("chapter import must not execute preview")
+
+        def fetch_source_chapter(self, url: str) -> SourceChapterContent:
+            self.fetch_calls.append(url)
+            return SourceChapterContent(
+                adapter_id="69shuba",
+                source="69shuba",
+                source_url=url,
+                chapter_number=1,
+                title="Chapter 1",
+                text="  Chapter text  ",
+                fetch_method="direct_http",
+                fetch_attempts=1,
+                fetch_elapsed_ms=7,
+                fetch_bytes_received=16,
+            )
+
+        def import_from_text(self, **kwargs) -> ChapterImportResult:
+            self.imported_text.append(str(kwargs["text"]))
+            return ChapterImportResult(
+                book_id=self.book_id,
+                chapter_id=self.chapter_id,
+                stored_text_length=len(str(kwargs["text"])),
+                content_hash="chapter-hash",
+                operation="created",
+            )
+
+    init_db(temp_db_path)
+    repository = ImportJobRepository(temp_db_path)
+    book_id = add_book(temp_db_path, "A novel")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter 1")
+    pipeline_service = PipelineServiceFake(book_id, chapter_id)
+    service = ImportJobService(
+        repository,
+        worker_id="worker-a",
+        pipeline=SourceTaskPipeline(repository, pipeline_service),  # type: ignore[arg-type]
+    )
+    job = _create_job(service, tasks=[_task("chapter-1", 1)])
+    service.enqueue_job(job.id, "operator-a")
+
+    completed = service.run_job(job.id, "operator-a")
+
+    task = repository.list_tasks(job.id, "operator-a")[0]
+    stage_events = [
+        event.payload.get("stage")
+        for event in repository.list_events(job.id, "operator-a")
+        if event.event_type == "task_transitioned"
+    ]
+    assert completed.status is JobStatus.SUCCEEDED
+    assert pipeline_service.preview_calls == []
+    assert pipeline_service.fetch_calls == ["https://www.69shuba.com/chapter/1"]
+    assert pipeline_service.imported_text == ["Chapter text"]
+    assert (task.book_id, task.chapter_id, task.text_length, task.content_hash) == (
+        book_id,
+        chapter_id,
+        12,
+        "chapter-hash",
+    )
+    assert stage_events == ["fetching", "parsing", "validating", "importing", "succeeded"]
