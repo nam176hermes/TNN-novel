@@ -7,11 +7,17 @@ from pathlib import Path
 import pytest
 
 from app.database.db import init_db
-from app.database.import_jobs import ImportJobRepository, JobStatus, TaskStatus
+from app.database.import_jobs import (
+    ImportJobRepository,
+    InvalidImportJobTransition,
+    JobStatus,
+    TaskStatus,
+)
 from app.import_contracts import BrowserResultState, ImportOperationKind
 from app.import_worker import DurableImportWorker
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
 from app.services.import_job_factory import create_import_job_service
+from app.services.import_job_runtime import RetryPolicy
 
 
 OWNER = "operator-a"
@@ -88,19 +94,21 @@ def _enqueue_preview(service, *, deadline_at: str = FUTURE_DEADLINE):
         owner_user_id=OWNER,
         source="69shuba",
         source_url=SOURCE_URL,
-        tasks=[
-            {
-                "canonical_identity": f"69shuba:{SOURCE_URL}",
-                "canonical_chapter_url": SOURCE_URL,
-                "chapter_number": 0,
-                "title": "Preview",
-            }
-        ],
+        tasks=[_preview_task()],
         operation_kind=ImportOperationKind.PREVIEW,
         deadline_at=deadline_at,
         correlation_id="preview-correlation",
     )
     return service.enqueue_job(job.id, OWNER)
+
+
+def _preview_task() -> dict[str, object]:
+    return {
+        "canonical_identity": f"69shuba:{SOURCE_URL}",
+        "canonical_chapter_url": SOURCE_URL,
+        "chapter_number": 0,
+        "title": "Preview",
+    }
 
 
 def _run_worker(service, heartbeat_path: Path) -> int:
@@ -334,3 +342,106 @@ def test_unexpected_preview_error_is_sanitized_before_publication(
     assert completed.result_snapshot.error_code == "internal_error"
     assert completed.result_snapshot.error_message == "Browser task failed"
     assert private_exception not in _database_dump(temp_db_path)
+
+
+def test_preview_retry_is_rejected_without_reopening_terminal_snapshot(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    failed_pipeline = PreviewPipeline(
+        error=SourceAdapterError(
+            "Temporary source failure",
+            code=FetchErrorCode.SOURCE_UNAVAILABLE,
+            retryable=True,
+            http_status=503,
+        )
+    )
+    service = _service(temp_db_path, failed_pipeline, worker_id="preview-worker")
+    service.retry_policy = RetryPolicy(max_attempts=1, base_delay_seconds=0)
+    failed_job = _enqueue_preview(service)
+    assert _run_worker(service, tmp_path / "failed-preview-worker.heartbeat") == 1
+    terminal_before_retry = service.get_job(failed_job.id, OWNER)
+    task_before_retry = service.list_tasks(failed_job.id, OWNER)[0]
+
+    with pytest.raises(InvalidImportJobTransition, match="preview jobs cannot be retried"):
+        service.retry_failed_tasks(failed_job.id, OWNER)
+
+    terminal_after_retry = service.get_job(failed_job.id, OWNER)
+    task_after_retry = service.list_tasks(failed_job.id, OWNER)[0]
+    later_job = _enqueue_preview(service)
+    runnable = service.repository.list_runnable_jobs(limit=1)
+    assert terminal_before_retry.result_snapshot is not None
+    assert terminal_after_retry == terminal_before_retry
+    assert task_after_retry == task_before_retry
+    assert [job.id for job in runnable] == [later_job.id]
+
+
+@pytest.mark.parametrize(
+    ("correlation_id", "deadline_at"),
+    [
+        ("", FUTURE_DEADLINE),
+        ("x" * 129, FUTURE_DEADLINE),
+        ("preview-correlation", ""),
+        ("preview-correlation", "2099-08-10T12:00:00"),
+    ],
+)
+def test_preview_creation_rejects_invalid_terminal_contract_metadata(
+    temp_db_path: Path,
+    correlation_id: str,
+    deadline_at: str,
+) -> None:
+    init_db(temp_db_path)
+    service = _service(temp_db_path, PreviewPipeline(), worker_id="api-process")
+
+    with pytest.raises(ValueError, match="invalid preview"):
+        service.create_job(
+            owner_user_id=OWNER,
+            source="69shuba",
+            source_url=SOURCE_URL,
+            tasks=[_preview_task()],
+            operation_kind=ImportOperationKind.PREVIEW,
+            deadline_at=deadline_at,
+            correlation_id=correlation_id,
+        )
+
+    assert service.repository.list_runnable_jobs(limit=1) == []
+
+
+@pytest.mark.parametrize(
+    ("safe_message", "http_status", "expected_message", "expected_http_status"),
+    [
+        ("x" * 2_001, 503, "x" * 2_000, 503),
+        ("Safe source failure", 200, "Safe source failure", None),
+    ],
+)
+def test_worker_bounds_invalid_source_error_metadata_into_failed_result(
+    temp_db_path: Path,
+    tmp_path: Path,
+    safe_message: str,
+    http_status: int,
+    expected_message: str,
+    expected_http_status: int | None,
+) -> None:
+    init_db(temp_db_path)
+    pipeline = PreviewPipeline(
+        error=SourceAdapterError(
+            safe_message,
+            code=FetchErrorCode.SOURCE_UNAVAILABLE,
+            retryable=False,
+            http_status=http_status,
+        )
+    )
+    service = _service(temp_db_path, pipeline, worker_id="preview-worker")
+    job = _enqueue_preview(service)
+
+    assert _run_worker(service, tmp_path / "bounded-error-worker.heartbeat") == 1
+
+    completed = service.get_job(job.id, OWNER)
+    task = service.list_tasks(job.id, OWNER)[0]
+    assert completed.result_state is BrowserResultState.FAILED
+    assert completed.result_snapshot is not None
+    assert completed.result_snapshot.error_message == expected_message
+    assert completed.result_snapshot.http_status == expected_http_status
+    assert task.status is TaskStatus.FAILED
+    assert (task.lease_token, task.lease_owner, task.lease_expires_at) == ("", "", "")

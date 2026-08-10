@@ -23,11 +23,18 @@ from app.database.import_jobs import (
     ChapterTask,
     ImportJob,
     ImportJobRepository,
+    InvalidImportJobTransition,
     JobStatus,
     TaskStage,
     TaskStatus,
 )
-from app.import_contracts import BrowserResultState, BrowserTaskResult, ImportOperationKind
+from app.import_contracts import (
+    MAX_CORRELATION_ID_LENGTH,
+    MAX_PUBLIC_STRING_LENGTH,
+    BrowserResultState,
+    BrowserTaskResult,
+    ImportOperationKind,
+)
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
 from app.observability import Observability, default_observability
 from app.services.import_job_runtime import BoundedTaskRunner, RetryPolicy
@@ -142,6 +149,11 @@ class ImportJobService:
         deadline_at: str = "",
         correlation_id: str = "",
     ) -> ImportJob:
+        if operation_kind == ImportOperationKind.PREVIEW:
+            self._validate_preview_metadata(
+                correlation_id=correlation_id,
+                deadline_at=deadline_at,
+            )
         if len(tasks) > self.quota_policy.max_chapters_per_job:
             raise ImportJobQuotaError(
                 "chapter_quota_exceeded",
@@ -199,7 +211,9 @@ class ImportJobService:
 
     def retry_failed_tasks(self, job_id: str, owner_user_id: str) -> list[ChapterTask]:
         """Explicit retry only for failed tasks marked retryable by the pipeline."""
-        self.get_job(job_id, owner_user_id)
+        job = self.get_job(job_id, owner_user_id)
+        if job.operation_kind is ImportOperationKind.PREVIEW:
+            raise InvalidImportJobTransition("preview jobs cannot be retried")
         retried: list[ChapterTask] = []
         for task in self.repository.list_tasks(job_id, owner_user_id):
             if task.status is TaskStatus.FAILED and task.retryable:
@@ -339,18 +353,7 @@ class ImportJobService:
                     owner_user_id,
                 )
             except SourceAdapterError as exc:
-                result = BrowserTaskResult(
-                    correlation_id=job.correlation_id,
-                    state=(
-                        BrowserResultState.BLOCKED
-                        if exc.code is FetchErrorCode.USER_VERIFICATION_REQUIRED
-                        else BrowserResultState.FAILED
-                    ),
-                    error_code=exc.code.value,
-                    error_message=exc.safe_message,
-                    retryable=bool(exc.retryable),
-                    http_status=exc.http_status,
-                )
+                result = self._browser_source_error_result(job, exc)
                 current_task = self._current_task(task, owner_user_id)
             except Exception:
                 result = BrowserTaskResult(
@@ -549,6 +552,44 @@ class ImportJobService:
         except (TypeError, ValueError):
             return True
         return deadline.tzinfo is None or deadline <= datetime.now(timezone.utc)
+
+    @staticmethod
+    def _validate_preview_metadata(*, correlation_id: str, deadline_at: str) -> None:
+        if not isinstance(correlation_id, str) or not (
+            1 <= len(correlation_id) <= MAX_CORRELATION_ID_LENGTH
+        ):
+            raise ValueError("invalid preview correlation_id")
+        try:
+            deadline = datetime.fromisoformat(deadline_at)
+        except (TypeError, ValueError):
+            raise ValueError("invalid preview deadline_at") from None
+        if deadline.tzinfo is None:
+            raise ValueError("invalid preview deadline_at")
+
+    @staticmethod
+    def _browser_source_error_result(
+        job: ImportJob,
+        error: SourceAdapterError,
+    ) -> BrowserTaskResult:
+        http_status = error.http_status
+        if (
+            isinstance(http_status, bool)
+            or not isinstance(http_status, int)
+            or not 400 <= http_status <= 599
+        ):
+            http_status = None
+        return BrowserTaskResult(
+            correlation_id=job.correlation_id,
+            state=(
+                BrowserResultState.BLOCKED
+                if error.code is FetchErrorCode.USER_VERIFICATION_REQUIRED
+                else BrowserResultState.FAILED
+            ),
+            error_code=error.code.value,
+            error_message=str(error.safe_message)[:MAX_PUBLIC_STRING_LENGTH],
+            retryable=bool(error.retryable),
+            http_status=http_status,
+        )
 
     def _current_task(self, task: ChapterTask, owner_user_id: str) -> ChapterTask:
         return next(
