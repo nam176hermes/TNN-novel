@@ -678,7 +678,9 @@ class JobService:
                 if job is not None:
                     job.cancel_requested = True
                 return True
-        return bool(job and job.cancel_requested)
+        if not job:
+            return True
+        return bool(job.cancel_requested or job.status in {"cancelled", "canceled"})
 
     def _cancel_if_requested(self, job_id: str, message: str = "Job cancelled by user") -> bool:
         if not self._job_cancel_requested(job_id):

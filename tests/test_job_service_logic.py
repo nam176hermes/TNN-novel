@@ -115,6 +115,23 @@ def test_job_tracker_rejects_terminal_to_running_transition(temp_db_path) -> Non
     assert loaded.to_dict()["state"] == "COMPLETED"
 
 
+def test_job_cancel_requested_for_missing_in_memory_job() -> None:
+    service = JobService(object(), tracker=JobTracker())  # type: ignore[arg-type]
+
+    assert service._job_cancel_requested("missing-job")
+
+
+@pytest.mark.parametrize("status", ["cancelled", "canceled"])
+def test_job_cancel_requested_for_cached_terminal_status_without_flag(status: str) -> None:
+    tracker = JobTracker()
+    job = tracker.create_job("translate", [42], 1)
+    assert tracker.update_job(job.job_id, status=status)
+    assert job.cancel_requested is False
+    service = JobService(object(), tracker=tracker)  # type: ignore[arg-type]
+
+    assert service._job_cancel_requested(job.job_id)
+
+
 @pytest.mark.asyncio
 async def test_job_cancel_request_is_persisted_until_worker_exits(temp_db_path) -> None:
     init_db(temp_db_path)
