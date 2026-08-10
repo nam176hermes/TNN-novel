@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -19,6 +20,7 @@ from app.mobile_api.routers import import_routes
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.runtime_status import WorkerRuntimeStatus
 from app.services.import_job_factory import create_import_job_service
+from app.services.import_job_quotas import ImportJobQuotaPolicy
 from app.services.import_job_service import ImportJobService
 
 
@@ -74,11 +76,16 @@ class NeverRunPipeline:
         return None
 
 
-def _durable_service(db_path: Path) -> ImportJobService:
+def _durable_service(
+    db_path: Path,
+    *,
+    quota_policy: ImportJobQuotaPolicy | None = None,
+) -> ImportJobService:
     return ImportJobService(
         ImportJobRepository(db_path),
         worker_id="api-test-worker",
         pipeline=NeverRunPipeline(),
+        quota_policy=quota_policy,
     )
 
 
@@ -375,6 +382,132 @@ async def test_import_source_url_endpoint_rejects_same_source_other_book(
     assert response.status_code == 400
     assert "same source book" in response.text
     assert service.repository.count_active_jobs("admin") == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_url_endpoint_rejects_duplicate_chapters_before_persisting_job(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import audit as audit_mod
+
+    init_db(temp_db_path)
+    managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
+    service = _durable_service(temp_db_path)
+    monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
+    _override_import_job_service(service)
+
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/import/url",
+                json={
+                    "url": "https://www.69shuba.com/book/1",
+                    "title": "Duplicate chapters",
+                    "managed_source_id": managed_source_id,
+                    "chapters": [
+                        {"chapter_number": 1, "title": "One", "url": "https://www.69shuba.com/book/1/chapter/1"},
+                        {"chapter_number": 2, "title": "Again", "url": "https://www.69shuba.com/book/1/chapter/1"},
+                    ],
+                },
+                headers=headers,
+            )
+    finally:
+        _clear_import_job_service_override()
+
+    assert response.status_code == 409
+    assert response.headers["x-novel-fetch-error-code"] == "duplicate"
+    assert response.json()["detail"] == "Duplicate chapter selection"
+    with sqlite3.connect(temp_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 0
+    assert any(event["event_type"] == "import_failure" for event in list_operational_events(temp_db_path, limit=10, severities=()))
+
+
+@pytest.mark.asyncio
+async def test_legacy_url_endpoint_maps_chapter_quota_without_persisting_job(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import audit as audit_mod
+
+    init_db(temp_db_path)
+    managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
+    service = _durable_service(temp_db_path, quota_policy=ImportJobQuotaPolicy(max_chapters_per_job=1))
+    monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
+    _override_import_job_service(service)
+
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/import/url",
+                json={
+                    "url": "https://www.69shuba.com/book/1",
+                    "title": "Over chapter quota",
+                    "managed_source_id": managed_source_id,
+                    "chapters": [
+                        {"chapter_number": 1, "title": "One", "url": "https://www.69shuba.com/book/1/chapter/1"},
+                        {"chapter_number": 2, "title": "Two", "url": "https://www.69shuba.com/book/1/chapter/2"},
+                    ],
+                },
+                headers=headers,
+            )
+    finally:
+        _clear_import_job_service_override()
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "chapter_quota_exceeded"
+    with sqlite3.connect(temp_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 0
+    assert any(event["event_type"] == "import_failure" for event in list_operational_events(temp_db_path, limit=10, severities=()))
+
+
+@pytest.mark.asyncio
+async def test_legacy_url_endpoint_maps_active_job_quota_without_extra_job(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api import audit as audit_mod
+
+    init_db(temp_db_path)
+    managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
+    service = _durable_service(temp_db_path, quota_policy=ImportJobQuotaPolicy(max_active_jobs_per_owner=1))
+    monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
+    _override_import_job_service(service)
+    payload = {
+        "url": "https://www.69shuba.com/book/1",
+        "title": "Active quota",
+        "managed_source_id": managed_source_id,
+        "chapters": [{"chapter_number": 1, "title": "One", "url": "https://www.69shuba.com/book/1/chapter/1"}],
+    }
+
+    try:
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            first = await client.post("/api/import/url", json=payload, headers=headers)
+            response = await client.post("/api/import/url", json=payload, headers=headers)
+    finally:
+        _clear_import_job_service_override()
+
+    assert first.status_code == 200
+    assert response.status_code == 429
+    assert response.json()["detail"]["code"] == "active_job_quota_exceeded"
+    with sqlite3.connect(temp_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 1
+    assert any(event["event_type"] == "import_failure" for event in list_operational_events(temp_db_path, limit=10, severities=()))
 
 
 @pytest.mark.asyncio

@@ -452,6 +452,7 @@ def _validated_url_import_payload(data: URLImportStart) -> tuple[str, list[dict]
         raise SourceAdapterError("Unsupported source domain")
 
     chapters: list[dict] = []
+    seen: set[str] = set()
     for chapter in data.chapters:
         chapter_data = chapter.model_dump()
         chapter_url = validate_public_http_url(chapter_data["url"])
@@ -460,6 +461,14 @@ def _validated_url_import_payload(data: URLImportStart) -> tuple[str, list[dict]
             raise SourceAdapterError("Selected chapters must belong to the same supported source")
         if not chapter_url_matches_source_book(source_url, chapter_url):
             raise SourceAdapterError("Selected chapters must belong to the same source book")
+        if chapter_url in seen:
+            raise SourceAdapterError(
+                "Duplicate chapter selection",
+                code=FetchErrorCode.DUPLICATE,
+                retryable=False,
+                http_status=409,
+            )
+        seen.add(chapter_url)
         chapter_data["url"] = chapter_url
         chapters.append(chapter_data)
 
@@ -1383,7 +1392,7 @@ async def import_source_url(
         if source_url != str(managed_source.get("base_url") or ""):
             raise SourceAdapterError("Managed source URL does not match the selected preview URL")
         job = _create_durable_legacy_url_import_job(service, data, owner_user_id)
-    except SourceAdapterError as exc:
+    except (SourceAdapterError, ImportJobQuotaError) as exc:
         record_audit_event(
             event_type="import_failure",
             severity="warning",
@@ -1392,7 +1401,10 @@ async def import_source_url(
             request=request,
             details={"import_type": "url", "result": "failure"},
         )
-        raise _source_adapter_http_exception(exc) from exc
+        if isinstance(exc, SourceAdapterError):
+            raise _source_adapter_http_exception(exc) from exc
+        _raise_import_job_error(exc)
+        raise AssertionError("unreachable")
     record_audit_event(
         event_type="import_start",
         severity="info",

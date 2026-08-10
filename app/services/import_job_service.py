@@ -8,7 +8,7 @@ provide a real source/import pipeline through the small injected protocol.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -598,6 +598,25 @@ class ImportJobService:
             if item.id == task.id
         )
 
+    def _retry_policy_for_task(self, task: ChapterTask) -> RetryPolicy:
+        """Use the validated legacy URL retry limit without changing generic jobs."""
+        job = self.repository.get_job_internal(task.job_id)
+        if job is None:
+            return self.retry_policy
+        snapshot = job.config_snapshot
+        if not str(snapshot.get("managed_source_id") or "").strip():
+            return self.retry_policy
+        retry_limit = snapshot.get("retry_limit")
+        if isinstance(retry_limit, bool):
+            return self.retry_policy
+        try:
+            validated_retry_limit = int(retry_limit)
+        except (TypeError, ValueError):
+            return self.retry_policy
+        if validated_retry_limit < 0:
+            return self.retry_policy
+        return replace(self.retry_policy, max_attempts=validated_retry_limit + 1)
+
     def _run_claimed_task(
         self,
         task: ChapterTask,
@@ -613,6 +632,7 @@ class ImportJobService:
         finalize: bool = True,
     ) -> None:
         outcome: TaskImportOutcome | None = None
+        retry_policy = self._retry_policy_for_task(task)
         try:
             for stage in stages:
                 if self._duration_limit_exceeded_for_task(task, owner_user_id):
@@ -649,9 +669,9 @@ class ImportJobService:
                         break
                     except SourceAdapterError as exc:
                         elapsed = self.clock() - started
-                        if not self.retry_policy.should_retry(exc, attempt=retry_attempt, elapsed_seconds=elapsed):
+                        if not retry_policy.should_retry(exc, attempt=retry_attempt, elapsed_seconds=elapsed):
                             raise
-                        delay = self.retry_policy.delay_seconds(
+                        delay = retry_policy.delay_seconds(
                             attempt=retry_attempt,
                             random_value=self.random_value,
                             retry_after_seconds=getattr(exc, "retry_after_seconds", None),

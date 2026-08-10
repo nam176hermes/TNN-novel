@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+import time
 
 from app.database.db import add_book, add_chapter, init_db
 from app.database.import_jobs import ImportJobRepository, JobStatus, TaskStage, TaskStatus
@@ -12,6 +13,7 @@ from app.ingestion.source_adapters import (
     SourceChapterContent,
 )
 from app.mobile_api.services.pipeline_service import ChapterImportResult
+from app.services.import_job_runtime import RetryPolicy
 from app.services.import_job_service import ImportJobService, TaskImportOutcome
 from app.services.source_task_pipeline import SourceTaskPipeline
 
@@ -42,7 +44,15 @@ def _task(identity: str, number: int) -> dict[str, object]:
     }
 
 
-def _service(temp_db_path, pipeline, *, worker_id: str = "worker-a", lease_seconds: int = 120):
+def _service(
+    temp_db_path,
+    pipeline,
+    *,
+    worker_id: str = "worker-a",
+    lease_seconds: int = 120,
+    retry_policy: RetryPolicy | None = None,
+    sleep=None,
+):
     init_db(temp_db_path)
     repository = ImportJobRepository(temp_db_path)
     return repository, ImportJobService(
@@ -50,15 +60,18 @@ def _service(temp_db_path, pipeline, *, worker_id: str = "worker-a", lease_secon
         worker_id=worker_id,
         pipeline=pipeline,
         lease_seconds=lease_seconds,
+        retry_policy=retry_policy,
+        sleep=sleep if sleep is not None else time.sleep,
     )
 
 
-def _create_job(service, *, tasks: list[dict[str, object]]):
+def _create_job(service, *, tasks: list[dict[str, object]], config_snapshot: dict[str, object] | None = None):
     return service.create_job(
         owner_user_id="operator-a",
         source="69shuba",
         source_url="https://www.69shuba.com/book/123",
         tasks=tasks,
+        config_snapshot=config_snapshot,
     )
 
 
@@ -226,6 +239,78 @@ def test_retry_failed_tasks_resets_only_retryable_failures(temp_db_path) -> None
     assert [task.chapter_number for task in retried] == [2]
     assert completed.status is JobStatus.SUCCEEDED
     assert [task.attempts for task in repository.list_tasks(job.id, "operator-a")] == [1, 2]
+
+
+def test_legacy_url_retry_limit_overrides_global_policy_without_changing_generic_jobs(temp_db_path) -> None:
+    class RetryableFailurePipeline(SuccessfulPipeline):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.fetch_attempts = 0
+
+        def run_stage(self, stage, task, *, cancel_check):
+            if stage is TaskStage.FETCHING:
+                self.fetch_attempts += 1
+                raise SourceAdapterError(
+                    "Source unavailable",
+                    code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                    retryable=True,
+                )
+            return super().run_stage(stage, task, cancel_check=cancel_check)
+
+    retry_policy = RetryPolicy(
+        max_attempts=1,
+        base_delay_seconds=0,
+        jitter_ratio=0,
+    )
+    generic_pipeline = RetryableFailurePipeline()
+    generic_repository, generic_service = _service(
+        temp_db_path,
+        generic_pipeline,
+        retry_policy=retry_policy,
+        sleep=lambda _delay: None,
+    )
+    generic_job = _create_job(generic_service, tasks=[_task("generic", 1)])
+    generic_service.enqueue_job(generic_job.id, "operator-a")
+    assert generic_service.run_job(generic_job.id, "operator-a").status is JobStatus.FAILED
+
+    zero_pipeline = RetryableFailurePipeline()
+    zero_repository, zero_service = _service(
+        temp_db_path,
+        zero_pipeline,
+        worker_id="worker-b",
+        retry_policy=retry_policy,
+        sleep=lambda _delay: None,
+    )
+    zero_job = _create_job(
+        zero_service,
+        tasks=[_task("legacy-zero", 2)],
+        config_snapshot={"managed_source_id": "managed-69shuba", "retry_limit": 0},
+    )
+    zero_service.enqueue_job(zero_job.id, "operator-a")
+    assert zero_service.run_job(zero_job.id, "operator-a").status is JobStatus.FAILED
+
+    extended_pipeline = RetryableFailurePipeline()
+    extended_repository, extended_service = _service(
+        temp_db_path,
+        extended_pipeline,
+        worker_id="worker-c",
+        retry_policy=retry_policy,
+        sleep=lambda _delay: None,
+    )
+    extended_job = _create_job(
+        extended_service,
+        tasks=[_task("legacy-two-retries", 3)],
+        config_snapshot={"managed_source_id": "managed-69shuba", "retry_limit": 2},
+    )
+    extended_service.enqueue_job(extended_job.id, "operator-a")
+    assert extended_service.run_job(extended_job.id, "operator-a").status is JobStatus.FAILED
+
+    assert generic_pipeline.fetch_attempts == 1
+    assert zero_pipeline.fetch_attempts == 1
+    assert extended_pipeline.fetch_attempts == 3
+    assert generic_repository.list_tasks(generic_job.id, "operator-a")[0].status is TaskStatus.FAILED
+    assert zero_repository.list_tasks(zero_job.id, "operator-a")[0].status is TaskStatus.FAILED
+    assert extended_repository.list_tasks(extended_job.id, "operator-a")[0].status is TaskStatus.FAILED
 
 
 def test_ordered_import_out_of_order(temp_db_path) -> None:
