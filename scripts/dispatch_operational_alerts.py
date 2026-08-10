@@ -143,6 +143,7 @@ def main() -> int:
                     data_dir,
                     read_only=True,
                     database_connection=database_connection,
+                    database_size_bytes=os.fstat(database_descriptor).st_size,
                 )
                 snapshot = service.snapshot(use_cache=False)
                 _verify_database_guard(

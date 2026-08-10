@@ -68,10 +68,12 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
             *,
             read_only: bool = False,
             database_connection: sqlite3.Connection | None = None,
+            database_size_bytes: int | None = None,
         ) -> None:
             observed["metrics_paths"] = (db_path, data_dir)
             observed["read_only"] = read_only
             observed["database_connection"] = database_connection
+            observed["database_size_bytes"] = database_size_bytes
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, str]:
             observed["use_cache"] = use_cache
@@ -116,6 +118,7 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
     assert observed["use_cache"] is False
     assert observed["read_only"] is True
     assert isinstance(observed["database_connection"], sqlite3.Connection)
+    assert observed["database_size_bytes"] == 0
     assert observed["snapshot"] is snapshot
     assert observed["receipt_dir"] == data_dir / "logs" / "runtime"
     assert captured.err == ""
@@ -142,6 +145,7 @@ def test_dispatch_cli_redacts_receipt_persistence_errors_and_returns_nonzero(
             *,
             read_only: bool = False,
             database_connection: sqlite3.Connection | None = None,
+            database_size_bytes: int | None = None,
         ) -> None:
             pass
 
@@ -201,6 +205,7 @@ def test_dispatch_cli_reads_only_allowlisted_alert_environment(
             *,
             read_only: bool = False,
             database_connection: sqlite3.Connection | None = None,
+            database_size_bytes: int | None = None,
         ) -> None:
             pass
 
@@ -311,6 +316,7 @@ def test_dispatch_cli_snapshot_uses_guarded_inode_across_path_aba(
             *,
             read_only: bool = False,
             database_connection: sqlite3.Connection | None = None,
+            database_size_bytes: int | None = None,
         ) -> None:
             self.db_path = db_path
             self.database_connection = database_connection

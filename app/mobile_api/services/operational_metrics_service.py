@@ -123,10 +123,17 @@ class OperationalMetricsService:
     cache_ttl_seconds: float = 30.0
     read_only: bool = False
     database_connection: sqlite3.Connection | None = None
+    database_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         self.db_path = Path(self.db_path)
         self.data_dir = Path(self.data_dir)
+        if self.database_size_bytes is not None and (
+            isinstance(self.database_size_bytes, bool)
+            or not isinstance(self.database_size_bytes, int)
+            or self.database_size_bytes < 0
+        ):
+            raise ValueError("Operational database size is invalid")
         self._cached: tuple[float, dict[str, Any]] | None = None
 
     def _database_target(self) -> tuple[str, bool]:
@@ -229,7 +236,11 @@ class OperationalMetricsService:
             ),
             "storage": {
                 "disk_free_bytes": int(disk_free),
-                "database_size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+                "database_size_bytes": (
+                    self.database_size_bytes
+                    if self.database_size_bytes is not None
+                    else self.db_path.stat().st_size if self.db_path.exists() else 0
+                ),
             },
             "artifacts": artifacts,
             "auth_sessions": {
