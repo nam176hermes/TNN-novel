@@ -557,16 +557,16 @@ Add these exact tests:
 - `test_legacy_url_endpoint_returns_durable_job_without_jobservice`;
 - `test_legacy_url_fetch_waits_for_external_worker_without_draining`;
 - `test_legacy_url_fetch_timeout_cancels_job_and_returns_safe_504`;
-- `test_import_routes_have_no_api_job_drain_helper`.
+- `test_all_url_routes_leave_durable_jobs_for_external_worker`.
 
-Use sentinels that raise if `JobService.start_import_url_job`, `ImportJobService.run_job`, or `BackgroundTasks.add_task` receives the durable runner. Preserve current request validation, verified-managed-source checks, audit metadata, and response fields.
+Use sentinels that raise if `JobService.start_import_url_job`, `ImportJobService.run_job`, or `BackgroundTasks.add_task` receives the durable runner. Assert the observable HTTP response and durable SQLite state after each request; do not inspect route source text. Preserve current request validation, verified-managed-source checks, audit metadata, and response fields.
 
 - [ ] **Step 2: Run the focused tests and confirm RED**
 
 Run:
 
 ```bash
-NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_mobile_api_import_jobs.py tests/test_mobile_api_import_url.py -k 'jobs_endpoint or retry_failed or legacy_url or no_api_job_drain'
+NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_mobile_api_import_jobs.py tests/test_mobile_api_import_url.py -k 'jobs_endpoint or retry_failed or legacy_url or external_worker'
 ```
 
 Expected: failures because the three local execution paths still exist.
@@ -627,16 +627,11 @@ git commit -m "refactor: delegate URL imports to durable worker"
 - Modify: `docs/local-development.md`
 - Modify: `tests/test_environment_scripts.py`
 
-- [ ] **Step 1: Write RED script-contract tests**
+- [ ] **Step 1: Write RED executable script-contract tests**
 
-Add tests that parse the scripts and assert:
+Run the scripts under a temporary `DATA_DIR` with stub executables for Python, npm, curl, setsid, and process signalling. Add `test_local_start_launches_worker_before_waiting_for_api_readiness`, `test_cloudflare_start_launches_the_same_worker_process`, and `test_local_stop_and_status_manage_import_worker_pid`.
 
-Add `test_local_start_launches_worker_before_waiting_for_api_readiness`,
-`test_cloudflare_start_launches_the_same_worker_process`,
-`test_local_stop_and_status_manage_import_worker_pid`, and
-`test_local_docs_describe_api_worker_and_web_as_separate_processes`.
-
-Required artifacts are `import-worker.pid` and `import-worker.log` under the existing runtime directory. Tests must also assert no script exports `IMPORT_JOB_RUN_IN_API=1`.
+Assert recorded process invocations and real temporary artifacts, not script text. Required artifacts are `import-worker.pid` and `import-worker.log` under the temporary runtime directory. The API readiness stub must fail unless the worker heartbeat/healthcheck invocation occurred first. Human-facing documentation is reviewed directly and does not receive a source-text test.
 
 - [ ] **Step 2: Run script tests and confirm RED**
 
@@ -701,17 +696,11 @@ git commit -m "ops: start import worker in local workflows"
 
 > This task changes CI. Selecting this implementation plan for execution is the explicit approval required by repository policy for the scoped Docker-job update below.
 
-- [ ] **Step 1: Write RED source and smoke-script contract tests**
+- [ ] **Step 1: Write RED executable image and Compose contract tests**
 
-Add tests:
+Create `test_api_image_has_no_executable_browser`, `test_worker_image_launches_chromium_on_synthetic_page`, and `test_rendered_compose_keeps_worker_off_provider_secrets_and_api_dns`. These tests invoke the isolation smoke in a fake-Docker harness for focused RED feedback and assert commands, exit behavior, cleanup, and sanitized rendered metadata. They must not parse Dockerfile, Compose, workflow, or script source text.
 
-Add `test_api_docker_target_has_no_browser_install_or_browser_path`,
-`test_worker_docker_target_is_the_only_chromium_owner`,
-`test_compose_keeps_worker_off_provider_secret_volume_and_api_dns`,
-`test_isolation_smoke_uses_disposable_names_and_cleanup_trap`, and
-`test_ci_builds_both_targets_and_runs_isolation_smoke`.
-
-Parse target-specific Dockerfile sections, not just whole-file substrings. The API section must have zero `playwright install`, `chromium`, or `PLAYWRIGHT_BROWSERS_PATH` references.
+The real Docker smoke in Step 6 is the authoritative executable boundary test. CI workflow syntax is validated with `actionlint` when available and reviewed as configuration; it does not receive a source-text change-detector test.
 
 - [ ] **Step 2: Run tests and confirm RED**
 
@@ -721,7 +710,7 @@ Run:
 NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q tests/test_browser_execution_isolation_images.py tests/test_deployment_hardening.py
 ```
 
-Expected: API-target assertion fails because it still installs Chromium; smoke script/CI assertions fail because they do not exist.
+Expected: collection fails because the smoke harness does not exist; after the harness is introduced, the current API image check fails because Chromium is executable.
 
 - [ ] **Step 3: Remove API browser capability**
 
