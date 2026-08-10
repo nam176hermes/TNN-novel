@@ -206,6 +206,7 @@ async def test_legacy_url_endpoint_returns_durable_job_without_jobservice(
     assert stored.owner_user_id
     assert stored.source_url == "https://www.69shuba.com/book/1"
     assert stored.config_snapshot["title"] == "凡人修仙传"
+    assert stored.config_snapshot["legacy_url_retry_limit"] == 2
     events = list_operational_events(temp_db_path, limit=10, severities=())
     event = next(item for item in events if item["event_type"] == "import_start")
     assert event["job_id"] == response.json()["job_id"]

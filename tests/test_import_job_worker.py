@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import time
 
+import pytest
+
 from app.database.db import add_book, add_chapter, init_db
 from app.database.import_jobs import ImportJobRepository, JobStatus, TaskStage, TaskStatus
 from app.ingestion.source_adapters import (
@@ -284,7 +286,7 @@ def test_legacy_url_retry_limit_overrides_global_policy_without_changing_generic
     zero_job = _create_job(
         zero_service,
         tasks=[_task("legacy-zero", 2)],
-        config_snapshot={"managed_source_id": "managed-69shuba", "retry_limit": 0},
+        config_snapshot={"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": 0},
     )
     zero_service.enqueue_job(zero_job.id, "operator-a")
     assert zero_service.run_job(zero_job.id, "operator-a").status is JobStatus.FAILED
@@ -300,7 +302,7 @@ def test_legacy_url_retry_limit_overrides_global_policy_without_changing_generic
     extended_job = _create_job(
         extended_service,
         tasks=[_task("legacy-two-retries", 3)],
-        config_snapshot={"managed_source_id": "managed-69shuba", "retry_limit": 2},
+        config_snapshot={"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": 2},
     )
     extended_service.enqueue_job(extended_job.id, "operator-a")
     assert extended_service.run_job(extended_job.id, "operator-a").status is JobStatus.FAILED
@@ -311,6 +313,47 @@ def test_legacy_url_retry_limit_overrides_global_policy_without_changing_generic
     assert generic_repository.list_tasks(generic_job.id, "operator-a")[0].status is TaskStatus.FAILED
     assert zero_repository.list_tasks(zero_job.id, "operator-a")[0].status is TaskStatus.FAILED
     assert extended_repository.list_tasks(extended_job.id, "operator-a")[0].status is TaskStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "case"),
+    [
+        ({"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": 2.9, "retry_limit": 2.9}, "float"),
+        ({"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": "2", "retry_limit": "2"}, "numeric-string"),
+        ({"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": 6, "retry_limit": 6}, "above-schema-maximum"),
+        ({"managed_source_id": "managed-69shuba", "legacy_url_retry_limit": True, "retry_limit": True}, "boolean"),
+        ({"managed_source_id": "managed-69shuba", "retry_limit": 2}, "old-unmarked-snapshot"),
+    ],
+)
+def test_untrusted_legacy_retry_snapshots_keep_global_attempt_limit(temp_db_path, snapshot, case: str) -> None:
+    class RetryableFailurePipeline(SuccessfulPipeline):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.fetch_attempts = 0
+
+        def run_stage(self, stage, task, *, cancel_check):
+            if stage is TaskStage.FETCHING:
+                self.fetch_attempts += 1
+                raise SourceAdapterError(
+                    "Source unavailable",
+                    code=FetchErrorCode.SOURCE_UNAVAILABLE,
+                    retryable=True,
+                )
+            return super().run_stage(stage, task, cancel_check=cancel_check)
+
+    pipeline = RetryableFailurePipeline()
+    repository, service = _service(
+        temp_db_path,
+        pipeline,
+        retry_policy=RetryPolicy(max_attempts=1, base_delay_seconds=0, jitter_ratio=0),
+        sleep=lambda _delay: None,
+    )
+    job = _create_job(service, tasks=[_task(f"untrusted-{case}", 1)], config_snapshot=snapshot)
+    service.enqueue_job(job.id, "operator-a")
+
+    assert service.run_job(job.id, "operator-a").status is JobStatus.FAILED
+    assert pipeline.fetch_attempts == 1
+    assert repository.list_tasks(job.id, "operator-a")[0].status is TaskStatus.FAILED
 
 
 def test_ordered_import_out_of_order(temp_db_path) -> None:

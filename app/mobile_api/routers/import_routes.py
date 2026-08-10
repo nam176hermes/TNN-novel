@@ -294,6 +294,7 @@ def _create_durable_legacy_url_import_job(
             "source_url": source_url,
             "managed_source_id": str(data.managed_source_id or "").strip(),
             "retry_limit": retry_limit,
+            "legacy_url_retry_limit": retry_limit,
         },
         operation_kind=ImportOperationKind.IMPORT_CHAPTERS,
     )

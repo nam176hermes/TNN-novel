@@ -604,18 +604,12 @@ class ImportJobService:
         if job is None:
             return self.retry_policy
         snapshot = job.config_snapshot
-        if not str(snapshot.get("managed_source_id") or "").strip():
+        retry_limit = snapshot.get("legacy_url_retry_limit")
+        if isinstance(retry_limit, bool) or not isinstance(retry_limit, int):
             return self.retry_policy
-        retry_limit = snapshot.get("retry_limit")
-        if isinstance(retry_limit, bool):
+        if not 0 <= retry_limit <= 5:
             return self.retry_policy
-        try:
-            validated_retry_limit = int(retry_limit)
-        except (TypeError, ValueError):
-            return self.retry_policy
-        if validated_retry_limit < 0:
-            return self.retry_policy
-        return replace(self.retry_policy, max_attempts=validated_retry_limit + 1)
+        return replace(self.retry_policy, max_attempts=retry_limit + 1)
 
     def _run_claimed_task(
         self,
