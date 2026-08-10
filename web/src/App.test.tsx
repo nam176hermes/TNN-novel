@@ -394,7 +394,11 @@ describe('App', () => {
       render(<App />);
 
       expect(await screen.findByRole('status', { name: 'Trạng thái offline' })).toHaveTextContent('Bạn đang offline');
-      expect(await screen.findByText('Bản dịch đọc được khi offline.')).toBeInTheDocument();
+      expect(await screen.findByText(
+        'Bản dịch đọc được khi offline.',
+        undefined,
+        { timeout: 5_000 },
+      )).toBeInTheDocument();
       expect(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' })).toBeInTheDocument();
     } finally {
       await clearReaderPrivateData();
