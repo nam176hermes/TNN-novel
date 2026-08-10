@@ -154,7 +154,7 @@ async def readiness_check(request: Request, response: Response):
         data_dir=data_dir,
         db_path=get_db_path(),
         api_identity=identity,
-        required=not mobile_settings.import_job_run_in_api,
+        required=True,
         max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
     )
     checks["worker"] = worker.queue_claim_capable

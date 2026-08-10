@@ -14,7 +14,6 @@ import uuid
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -62,7 +61,7 @@ from app.mobile_api.schemas import (
 )
 from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
 from app.mobile_api.services.import_job_wait_service import ImportJobWaitError, wait_for_terminal_import_job
-from app.mobile_api.services.job_service import JobService, get_shared_job_tracker
+from app.mobile_api.services.job_service import get_shared_job_tracker
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
 from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload_to_temp_limited
@@ -122,10 +121,6 @@ def _source_adapter_http_exception(exc: SourceAdapterError, *, default_status: i
 
 def get_pipeline():
     return PipelineService()
-
-
-def get_job_service():
-    return JobService(PipelineService(), tracker=get_shared_job_tracker(get_db_path()))
 
 
 def get_import_job_service(
@@ -268,21 +263,41 @@ def _create_durable_import_job(
     return service.enqueue_job(job.id, owner_user_id)
 
 
-def _run_import_job_until_idle(
+def _create_durable_legacy_url_import_job(
     service: ImportJobService,
-    job_id: str,
+    data: URLImportStart,
     owner_user_id: str,
 ) -> ImportJob:
-    """Drain bounded P07 batches without introducing an autonomous scheduler."""
-    while True:
-        before = service.get_job(job_id, owner_user_id)
-        job = service.run_job(job_id, owner_user_id)
-        if job.status in IMPORT_JOB_TERMINAL_STATUSES:
-            return job
-        if job.cancel_requested_at or job.queued_count == 0:
-            return job
-        if job.version == before.version:
-            return job
+    source_url, chapters, retry_limit = _validated_url_import_payload(data)
+    source_policy = get_source_policy(source_url)
+    if source_policy is None:
+        raise SourceAdapterError("Unsupported source domain")
+    tasks = [
+        {
+            "canonical_identity": f"{source_policy.source_id}:{chapter['url']}",
+            "canonical_chapter_url": chapter["url"],
+            "chapter_number": chapter["chapter_number"],
+            "title": chapter["title"],
+        }
+        for chapter in chapters
+    ]
+    source = data.source.strip() or source_policy.source_id
+    job = service.create_job(
+        owner_user_id=owner_user_id,
+        source=source,
+        source_url=source_url,
+        tasks=tasks,
+        config_snapshot={
+            "title": data.title.strip(),
+            "author": data.author.strip(),
+            "source": source,
+            "source_url": source_url,
+            "managed_source_id": str(data.managed_source_id or "").strip(),
+            "retry_limit": retry_limit,
+        },
+        operation_kind=ImportOperationKind.IMPORT_CHAPTERS,
+    )
+    return service.enqueue_job(job.id, owner_user_id)
 
 
 def _import_job_snapshot(
@@ -1345,9 +1360,11 @@ async def preview_source_url(
 async def import_source_url(
     data: URLImportStart,
     request: Request,
-    service: JobService = Depends(get_job_service),
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
 ):
     """Start a background import job for selected URL chapters."""
+    owner_user_id = _import_job_owner(current_user)
     if not data.title.strip():
         raise HTTPException(status_code=400, detail="Book title is required")
     if not data.chapters:
@@ -1365,15 +1382,7 @@ async def import_source_url(
         source_url, chapters, retry_limit = _validated_url_import_payload(data)
         if source_url != str(managed_source.get("base_url") or ""):
             raise SourceAdapterError("Managed source URL does not match the selected preview URL")
-        job_id = service.start_import_url_job(
-            url=source_url,
-            managed_source_id=managed_source_id,
-            title=data.title,
-            author=data.author,
-            source=data.source,
-            chapters=chapters,
-            retry_limit=retry_limit,
-        )
+        job = _create_durable_legacy_url_import_job(service, data, owner_user_id)
     except SourceAdapterError as exc:
         record_audit_event(
             event_type="import_failure",
@@ -1390,7 +1399,7 @@ async def import_source_url(
         source="import",
         message="URL import job started",
         request=request,
-        job_id=job_id,
+        job_id=job.id,
         details={
             "import_type": "url",
             "result": "started",
@@ -1399,7 +1408,7 @@ async def import_source_url(
             "source": data.source,
         },
     )
-    return JobResponse(job_id=job_id, status="pending", message="URL import job started")
+    return JobResponse(job_id=job.id, status="pending", message="URL import job started")
 
 
 @router.post(
@@ -1410,7 +1419,6 @@ async def import_source_url(
 )
 async def create_import_job(
     data: ImportJobCreateRequest,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     service: ImportJobService = Depends(get_import_job_service),
 ):
@@ -1421,8 +1429,6 @@ async def create_import_job(
     except Exception as exc:
         _raise_import_job_error(exc)
         raise
-    if mobile_settings.import_job_run_in_api:
-        background_tasks.add_task(_run_import_job_until_idle, service, job.id, owner_user_id)
     return ImportJobAcceptedResponse(job_id=job.id, status=job.status.value, total=job.total)
 
 
@@ -1513,19 +1519,16 @@ async def cancel_import_job(
 )
 async def retry_failed_import_job_tasks(
     job_id: str,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     service: ImportJobService = Depends(get_import_job_service),
 ):
     owner_user_id = _import_job_owner(current_user)
     try:
-        retried = service.retry_failed_tasks(job_id, owner_user_id)
+        service.retry_failed_tasks(job_id, owner_user_id)
         snapshot = _import_job_snapshot(service, job_id, owner_user_id)
     except Exception as exc:
         _raise_import_job_error(exc)
         raise
-    if retried and mobile_settings.import_job_run_in_api:
-        background_tasks.add_task(_run_import_job_until_idle, service, job_id, owner_user_id)
     return snapshot
 
 
@@ -1535,13 +1538,35 @@ async def fetch_source_chapters(
     request: Request,
     current_user: dict = Depends(get_current_user),
     service: ImportJobService = Depends(get_import_job_service),
+    worker_runtime: WorkerRuntimeStatus = Depends(get_import_worker_runtime),
 ):
     """Compatibility response backed by the same durable P09 job engine."""
     owner_user_id = _import_job_owner(current_user)
     try:
+        if not worker_runtime.queue_claim_capable:
+            raise _import_job_http_error(
+                "worker_unavailable",
+                "Import worker is unavailable",
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         job = _create_durable_import_job(service, data, owner_user_id)
-        await asyncio.to_thread(_run_import_job_until_idle, service, job.id, owner_user_id)
+        await wait_for_terminal_import_job(
+            request,
+            service,
+            job.id,
+            owner_user_id,
+            timeout_seconds=mobile_settings.import_job_sync_wait_timeout_seconds,
+            poll_seconds=mobile_settings.import_job_wait_poll_seconds,
+        )
         tasks = service.list_tasks(job.id, owner_user_id)
+    except ImportJobWaitError as exc:
+        if exc.code == "client_disconnected":
+            raise _import_job_http_error("client_disconnected", "Client disconnected", 499) from exc
+        raise _import_job_http_error(
+            "import_job_timed_out",
+            "Import job timed out",
+            status.HTTP_504_GATEWAY_TIMEOUT,
+        ) from exc
     except Exception as exc:
         _raise_import_job_error(exc)
         raise
@@ -1553,6 +1578,9 @@ async def fetch_source_chapters(
         original = original_by_number.get(task.chapter_number)
         succeeded_task = task.status is DurableImportTaskStatus.SUCCEEDED
         operation = "created" if succeeded_task else "failed"
+        error_code = task.error_code
+        if not succeeded_task and error_code == FetchErrorCode.INTERNAL_ERROR.value:
+            error_code = FetchErrorCode.IMPORT_FAILED.value
         warnings: list[str] = []
         if task.chapter_id:
             stored = get_chapter_by_id(service.repository.db_path, task.chapter_id)
@@ -1574,7 +1602,7 @@ async def fetch_source_chapters(
                 content_hash=task.content_hash,
                 operation=operation,
                 warnings=warnings,
-                error_code=task.error_code,
+                error_code=error_code,
                 retryable=task.retryable,
                 attempts=task.attempts,
                 fetch_method=task.fetch_method,

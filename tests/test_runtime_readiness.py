@@ -55,7 +55,6 @@ async def _ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, now: int, h
     init_db(db_path)
     if heartbeat:
         _heartbeat(data_dir, updated_at=now, release_id=worker_release)
-    monkeypatch.setattr(health_router.mobile_settings, "import_job_run_in_api", False)
     monkeypatch.setattr(health_router.mobile_settings, "public_deploy", False)
     monkeypatch.setattr(health_router, "get_data_dir", lambda: data_dir)
     monkeypatch.setattr(health_router, "get_db_path", lambda: db_path)

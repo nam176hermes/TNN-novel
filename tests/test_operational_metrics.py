@@ -14,6 +14,7 @@ from app.mobile_api.services.operational_metrics_service import (
     OperationalMetricsService,
     evaluate_operational_alerts,
 )
+from app.mobile_api.config import mobile_settings
 
 
 def _heartbeat(data_dir: Path) -> None:
@@ -39,7 +40,6 @@ def test_operational_snapshot_is_bounded_and_redacted(tmp_path: Path, monkeypatc
     db_path = data_dir / "pipeline.db"
     init_db(db_path)
     _heartbeat(data_dir)
-    monkeypatch.setattr("app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api", False)
     monkeypatch.setenv("NOVEL_RELEASE_ID", "release-a")
     monkeypatch.setattr("app.services.tts.availability._cuda_available", lambda: False)
     receipt_counts = {
@@ -112,10 +112,6 @@ def test_read_only_operational_snapshot_does_not_create_missing_database(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     database_path = data_dir / "missing.db"
-    monkeypatch.setattr(
-        "app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api",
-        True,
-    )
 
     service = OperationalMetricsService(database_path, data_dir, read_only=True)
 
@@ -149,10 +145,6 @@ def test_guarded_snapshot_database_size_comes_from_query_inode_during_path_swap(
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     guarded_size = database_path.stat().st_size
     assert replacement_path.stat().st_size > guarded_size
-    monkeypatch.setattr(
-        "app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api",
-        True,
-    )
     monkeypatch.setattr("app.services.tts.availability._cuda_available", lambda: False)
     reader = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
     service = OperationalMetricsService(
@@ -185,7 +177,6 @@ def test_corrupt_receipt_payload_cannot_leak_source_data_through_metrics(
     runtime_dir.mkdir(parents=True)
     db_path = data_dir / "pipeline.db"
     init_db(db_path)
-    monkeypatch.setattr("app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api", True)
     monkeypatch.setenv("NOVEL_RELEASE_ID", "release-a")
     monkeypatch.setattr("app.services.tts.availability._cuda_available", lambda: False)
     (runtime_dir / "restore-drill.receipt.json").write_text(
@@ -279,7 +270,7 @@ def test_alert_rules_emit_dispatchable_backup_failure_and_worker_stale_codes() -
 )
 def test_recovery_alert_mapping_covers_each_non_fresh_state(state: str, suffix: str) -> None:
     snapshot = {
-        "worker": {"required": False, "queue_claim_capable": True},
+        "worker": {"required": True, "queue_claim_capable": True},
         "release": {"worker_match": True},
         "storage": {"disk_free_bytes": 2 * 1024**3},
         "queue": {"oldest_age_seconds": None},
@@ -300,12 +291,10 @@ def test_recovery_alert_mapping_covers_each_non_fresh_state(state: str, suffix: 
 async def test_operational_metrics_endpoint_requires_authentication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app import config as app_config
     from app.mobile_api import dependencies as dependencies_mod
-    from app.mobile_api.config import mobile_settings
     from app.mobile_api.main import create_app
 
     monkeypatch.setattr(app_config.settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(dependencies_mod.settings, "data_dir", tmp_path / "data")
-    monkeypatch.setattr(mobile_settings, "import_job_run_in_api", True)
     app = create_app()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         denied = await client.get("/api/ops/metrics")

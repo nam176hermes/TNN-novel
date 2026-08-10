@@ -14,7 +14,6 @@ def test_compose_separates_api_and_import_browser_worker_without_api_secrets() -
     api = compose.split("  api:", 1)[1].split("  import-worker:", 1)[0]
     worker = compose.split("  import-worker:", 1)[1]
     assert "target: import-worker" in worker
-    assert "IMPORT_JOB_RUN_IN_API: \"0\"" in compose
     assert "MOBILE_API_SECRET" not in worker
     assert "MOBILE_API_ADMIN_PASSWORD" not in worker
     assert "ARTIFACT_LEGACY_ROOT" not in compose

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import BackgroundTasks
 
 from app.database.db import get_chapter, init_db, list_operational_events, update_managed_source
+from app.database.import_jobs import ImportJobRepository, JobStatus
 from app.ingestion.managed_sources import import_selected_catalog_sources
 from app.ingestion.source_adapters import SourceChapterContent
 from app.ingestion.source_catalog import import_source_catalog_json
@@ -14,6 +17,9 @@ from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.routers import import_routes
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.runtime_status import WorkerRuntimeStatus
+from app.services.import_job_factory import create_import_job_service
+from app.services.import_job_service import ImportJobService
 
 
 async def auth_headers(client: httpx.AsyncClient) -> dict[str, str]:
@@ -60,13 +66,66 @@ def _seed_verified_managed_source(temp_db_path: Path, tmp_path: Path) -> str:
     return source_id
 
 
-class RecordingImportJobService:
-    def __init__(self) -> None:
-        self.kwargs: dict | None = None
+class NeverRunPipeline:
+    def run_stage(self, *_args, **_kwargs):
+        raise AssertionError("URL start routes must not execute import work")
 
-    def start_import_url_job(self, **kwargs) -> str:
-        self.kwargs = kwargs
-        return "job-import-url"
+    def release_task(self, _task_id: int) -> None:
+        return None
+
+
+def _durable_service(db_path: Path) -> ImportJobService:
+    return ImportJobService(
+        ImportJobRepository(db_path),
+        worker_id="api-test-worker",
+        pipeline=NeverRunPipeline(),
+    )
+
+
+def _override_import_job_service(service: ImportJobService) -> None:
+    app.dependency_overrides[import_routes.get_import_job_service] = lambda: service
+
+
+def _clear_import_job_service_override() -> None:
+    app.dependency_overrides.pop(import_routes.get_import_job_service, None)
+
+
+def _override_ready_worker() -> None:
+    app.dependency_overrides[import_routes.get_import_worker_runtime] = lambda: WorkerRuntimeStatus(
+        status="ready",
+        required=True,
+        heartbeat_age_seconds=0.0,
+        release_id="test",
+        release_match=True,
+        queue_claim_capable=True,
+        reason="ready",
+    )
+
+
+def _clear_worker_runtime_override() -> None:
+    app.dependency_overrides.pop(import_routes.get_import_worker_runtime, None)
+
+
+def _external_worker_service(db_path: Path, pipeline: object) -> ImportJobService:
+    api_service = create_import_job_service(
+        worker_id="api-test-worker",
+        pipeline=pipeline,
+        db_path=db_path,
+    )
+    worker_service = create_import_job_service(
+        worker_id="worker-test-worker",
+        pipeline=pipeline,
+        db_path=db_path,
+    )
+    original_enqueue = api_service.enqueue_job
+
+    def enqueue_and_wake_worker(job_id: str, owner_user_id: str):
+        job = original_enqueue(job_id, owner_user_id)
+        asyncio.get_running_loop().create_task(asyncio.to_thread(worker_service.run_job, job_id, owner_user_id))
+        return job
+
+    api_service.enqueue_job = enqueue_and_wake_worker
+    return api_service
 
 
 @pytest.mark.asyncio
@@ -87,7 +146,7 @@ async def test_list_import_sources_endpoint_returns_backend_policy_table(temp_db
 
 
 @pytest.mark.asyncio
-async def test_import_source_url_endpoint_starts_background_job(
+async def test_legacy_url_endpoint_returns_durable_job_without_jobservice(
     temp_db_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -96,10 +155,16 @@ async def test_import_source_url_endpoint_starts_background_job(
 
     init_db(temp_db_path)
     managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
-    service = RecordingImportJobService()
+    service = _durable_service(temp_db_path)
     monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
-    app.dependency_overrides[import_routes.get_job_service] = lambda: service
+    _override_import_job_service(service)
+    from app.mobile_api.services.job_service import JobService
+
+    def reject_legacy_job_service(*_args, **_kwargs):
+        raise AssertionError("legacy JobService must not start URL imports")
+
+    monkeypatch.setattr(JobService, "start_import_url_job", reject_legacy_job_service)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -124,28 +189,19 @@ async def test_import_source_url_endpoint_starts_background_job(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_job_service, None)
+        _clear_import_job_service_override()
 
     assert response.status_code == 200
-    assert response.json()["job_id"] == "job-import-url"
-    assert service.kwargs == {
-        "url": "https://www.69shuba.com/book/1",
-        "managed_source_id": managed_source_id,
-        "title": "凡人修仙传",
-        "author": "忘语",
-        "source": "www.69shuba.com",
-        "chapters": [
-            {
-                "url": "https://www.69shuba.com/book/1/chapter/1",
-                "chapter_number": 1,
-                "title": "第一章 山边小村",
-            }
-        ],
-        "retry_limit": 2,
-    }
+    assert response.json()["status"] == "pending"
+    stored = service.repository.get_job_internal(response.json()["job_id"])
+    assert stored is not None
+    assert stored.status is JobStatus.QUEUED
+    assert stored.owner_user_id
+    assert stored.source_url == "https://www.69shuba.com/book/1"
+    assert stored.config_snapshot["title"] == "凡人修仙传"
     events = list_operational_events(temp_db_path, limit=10, severities=())
     event = next(item for item in events if item["event_type"] == "import_start")
-    assert event["job_id"] == "job-import-url"
+    assert event["job_id"] == response.json()["job_id"]
     assert event["details"]["import_type"] == "url"
     assert event["details"]["chapter_count"] == 1
 
@@ -167,10 +223,10 @@ async def test_import_source_url_endpoint_rejects_unverified_managed_source(
     import_source_catalog_json(temp_db_path, catalog_path)
     summary = import_selected_catalog_sources(temp_db_path, ["yckceo:1"])
     managed_source_id = summary.items[0]["id"]
-    service = RecordingImportJobService()
+    service = _durable_service(temp_db_path)
     monkeypatch.setattr(audit_mod, "get_db_path", lambda: temp_db_path)
     monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
-    app.dependency_overrides[import_routes.get_job_service] = lambda: service
+    _override_import_job_service(service)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -194,11 +250,11 @@ async def test_import_source_url_endpoint_rejects_unverified_managed_source(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_job_service, None)
+        _clear_import_job_service_override()
 
     assert response.status_code == 400
     assert "Only VERIFIED sources" in response.text
-    assert service.kwargs is None
+    assert service.repository.count_active_jobs("admin") == 0
 
 
 @pytest.mark.asyncio
@@ -209,9 +265,9 @@ async def test_import_source_url_endpoint_rejects_unknown_source_domain(
 ) -> None:
     init_db(temp_db_path)
     managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
-    service = RecordingImportJobService()
+    service = _durable_service(temp_db_path)
     monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
-    app.dependency_overrides[import_routes.get_job_service] = lambda: service
+    _override_import_job_service(service)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -234,11 +290,11 @@ async def test_import_source_url_endpoint_rejects_unknown_source_domain(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_job_service, None)
+        _clear_import_job_service_override()
 
     assert response.status_code == 400
     assert "Unsupported source domain" in response.text
-    assert service.kwargs is None
+    assert service.repository.count_active_jobs("admin") == 0
 
 
 @pytest.mark.asyncio
@@ -249,9 +305,9 @@ async def test_import_source_url_endpoint_rejects_mixed_source_domains(
 ) -> None:
     init_db(temp_db_path)
     managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
-    service = RecordingImportJobService()
+    service = _durable_service(temp_db_path)
     monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
-    app.dependency_overrides[import_routes.get_job_service] = lambda: service
+    _override_import_job_service(service)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -274,11 +330,11 @@ async def test_import_source_url_endpoint_rejects_mixed_source_domains(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_job_service, None)
+        _clear_import_job_service_override()
 
     assert response.status_code == 400
     assert "same supported source" in response.text
-    assert service.kwargs is None
+    assert service.repository.count_active_jobs("admin") == 0
 
 
 @pytest.mark.asyncio
@@ -289,9 +345,9 @@ async def test_import_source_url_endpoint_rejects_same_source_other_book(
 ) -> None:
     init_db(temp_db_path)
     managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
-    service = RecordingImportJobService()
+    service = _durable_service(temp_db_path)
     monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
-    app.dependency_overrides[import_routes.get_job_service] = lambda: service
+    _override_import_job_service(service)
 
     try:
         transport = httpx.ASGITransport(app=app)
@@ -314,11 +370,69 @@ async def test_import_source_url_endpoint_rejects_same_source_other_book(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_job_service, None)
+        _clear_import_job_service_override()
 
     assert response.status_code == 400
     assert "same source book" in response.text
-    assert service.kwargs is None
+    assert service.repository.count_active_jobs("admin") == 0
+
+
+@pytest.mark.asyncio
+async def test_all_url_routes_leave_durable_jobs_for_external_worker(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    managed_source_id = _seed_verified_managed_source(temp_db_path, tmp_path)
+    service = _durable_service(temp_db_path)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
+    _override_import_job_service(service)
+    original_add_task = BackgroundTasks.add_task
+
+    def reject_durable_runner(self, func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "_run_import_job_until_idle":
+            raise AssertionError("API must not schedule durable URL execution")
+        return original_add_task(self, func, *args, **kwargs)
+
+    def reject_api_runner(*_args, **_kwargs):
+        raise AssertionError("API must not execute durable URL work")
+
+    monkeypatch.setattr(BackgroundTasks, "add_task", reject_durable_runner)
+    monkeypatch.setattr(service, "run_job", reject_api_runner)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            jobs = await client.post(
+                "/api/import/jobs",
+                json={
+                    "source_url": "https://www.69shuba.com/book/1",
+                    "title": "Durable jobs",
+                    "chapters": [{"url": "https://www.69shuba.com/book/1/chapter/1", "chapter_number": 1}],
+                },
+                headers=headers,
+            )
+            legacy = await client.post(
+                "/api/import/url",
+                json={
+                    "url": "https://www.69shuba.com/book/1",
+                    "title": "Durable legacy",
+                    "managed_source_id": managed_source_id,
+                    "chapters": [{"url": "https://www.69shuba.com/book/1/chapter/2", "chapter_number": 2}],
+                },
+                headers=headers,
+            )
+    finally:
+        _clear_import_job_service_override()
+
+    assert jobs.status_code == 202, jobs.text
+    assert legacy.status_code == 200, legacy.text
+    stored = [
+        service.repository.get_job_internal(jobs.json()["job_id"]),
+        service.repository.get_job_internal(legacy.json()["job_id"]),
+    ]
+    assert all(job is not None and job.status is JobStatus.QUEUED for job in stored)
 
 
 def test_url_import_groups_chapters_with_same_normalized_book_title(
@@ -392,7 +506,9 @@ async def test_url_fetch_returns_stored_chapter_metadata_without_content(
             fetch_elapsed_ms=123,
         ),
     )
-    app.dependency_overrides[import_routes.get_pipeline] = lambda: pipeline
+    service = _external_worker_service(temp_db_path, pipeline)
+    _override_import_job_service(service)
+    _override_ready_worker()
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -413,7 +529,8 @@ async def test_url_fetch_returns_stored_chapter_metadata_without_content(
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_pipeline, None)
+        _clear_import_job_service_override()
+        _clear_worker_runtime_override()
 
     assert response.status_code == 200, response.text
     chapter = response.json()["chapters"][0]
@@ -437,10 +554,12 @@ async def test_url_fetch_import_failure_returns_typed_safe_metadata(temp_db_path
     init_db(temp_db_path)
 
     class FailingImportPipeline:
-        def import_from_source_url(self, **_: object) -> dict:
+        def fetch_source_chapter(self, _url: str):
             raise RuntimeError("chapter body must never be returned")
 
-    app.dependency_overrides[import_routes.get_pipeline] = FailingImportPipeline
+    service = _external_worker_service(temp_db_path, FailingImportPipeline())
+    _override_import_job_service(service)
+    _override_ready_worker()
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -460,7 +579,8 @@ async def test_url_fetch_import_failure_returns_typed_safe_metadata(temp_db_path
                 headers=headers,
             )
     finally:
-        app.dependency_overrides.pop(import_routes.get_pipeline, None)
+        _clear_import_job_service_override()
+        _clear_worker_runtime_override()
 
     assert response.status_code == 200, response.text
     chapter = response.json()["chapters"][0]

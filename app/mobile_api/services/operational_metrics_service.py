@@ -155,7 +155,7 @@ class OperationalMetricsService:
             db_uri=database_is_uri,
             database_connection=self.database_connection,
             api_identity=identity,
-            required=not mobile_settings.import_job_run_in_api,
+            required=True,
             max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
             now=resolved_now.timestamp(),
         )

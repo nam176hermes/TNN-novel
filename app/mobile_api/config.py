@@ -68,7 +68,6 @@ class MobileAPISettings(BaseModel):
         default=int(os.getenv("IMPORT_JOB_MAX_DURATION_SECONDS", "3600")),
         gt=0,
     )
-    import_job_run_in_api: bool = _parse_bool(os.getenv("IMPORT_JOB_RUN_IN_API", "1"))
     import_preview_wait_timeout_seconds: float = Field(
         default=float(os.getenv("IMPORT_PREVIEW_WAIT_TIMEOUT_SECONDS", "60")),
         gt=0,

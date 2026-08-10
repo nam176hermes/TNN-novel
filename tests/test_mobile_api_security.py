@@ -91,8 +91,9 @@ async def test_mobile_api_protects_books_by_default() -> None:
         unauthenticated_books = await client.get("/api/books")
 
     assert health.status_code == 200
-    assert ready.status_code == 200
+    assert ready.status_code == 503
     assert ready.json()["checks"]["database"] is True
+    assert ready.json()["checks"]["worker"] is False
     assert unauthenticated_books.status_code == 401
 
 
@@ -122,12 +123,13 @@ async def test_public_ready_sanitizes_internal_diagnostics(
     ready = await health_router.readiness_check(_request_for_url("https://novel.example.com/api/ready"), response)
     payload = ready.model_dump()
 
-    assert response.status_code == 200
-    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
+    assert response.status_code == 503
+    assert payload["status"] == "not_ready"
     assert payload["checks"]["database"] is True
     assert payload["checks"]["storage"] is True
     assert payload["checks"]["jobs"] is True
     assert payload["checks"]["public_deploy"] is True
+    assert payload["checks"]["worker"] is False
     serialized = str(payload)
     assert str(tmp_path) not in serialized
     assert "pipeline.db" not in serialized
@@ -155,7 +157,8 @@ async def test_local_ready_keeps_useful_internal_diagnostics(
     ready = await health_router.readiness_check(_request_for_url("http://test/api/ready"), Response())
     payload = ready.model_dump()
 
-    assert payload["status"] in {"ready", "ready_with_degraded_capabilities"}
+    assert payload["status"] == "not_ready"
+    assert payload["checks"]["worker"] is False
     assert payload["details"]["data_dir"] == str(data_dir)
     assert payload["details"]["database"] == str(db_path)
 
