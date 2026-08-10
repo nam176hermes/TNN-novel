@@ -195,6 +195,34 @@ Record both immutable local image IDs before staging. At cutover, provide the
 resolved image digests through `NOVEL_API_IMAGE_DIGEST` and
 `NOVEL_WORKER_IMAGE_DIGEST`. API and worker must report the same release ID.
 
+### Reviewed operational-observability image pins
+
+Release `operational-observability-20260809-r1` was built at
+`2026-08-10T08:31:15Z` from clean source commit
+`4476f2908467761c4b265579d7cb0313757a0701`. Its reviewed local tags and
+immutable image IDs are:
+
+- `novel-pipeline-api:operational-observability-20260809-r1`:
+  `sha256:ea8cbdaf4fe362e489389dda6dd2dd401049f324bb3fb00024dc32b6ebf6f429`;
+- `novel-pipeline-import-worker:operational-observability-20260809-r1`:
+  `sha256:f01336eda33c3e46ac6b5e3874a4a432e1743d1c87c4e957ed1f2466811fe3f9`.
+
+The exact pins are recorded in
+`deploy/production/compose.release.operational-observability-20260809-r1.yaml`.
+Render that overlay with the base configuration before any approved deployment:
+
+```bash
+docker compose \
+  -f compose.yaml \
+  -f deploy/production/compose.release.operational-observability-20260809-r1.yaml \
+  config
+```
+
+An isolated loopback API probe must report the complete API ID above at
+`/api/version.image_digest`, never `unknown`. The worker receives its distinct
+complete ID through `NOVEL_IMAGE_DIGEST`. The overlay records provenance only;
+it does not authorize a production deployment, restart, or worker start.
+
 ## Pre-deployment gate
 
 1. Confirm the worktree is clean and the release commit was reviewed.

@@ -1,0 +1,11 @@
+# Operational-observability release pin. Both images were built from source
+# commit 4476f2908467761c4b265579d7cb0313757a0701 with one shared release ID.
+services:
+  api:
+    image: novel-pipeline-api:operational-observability-20260809-r1
+    environment:
+      NOVEL_IMAGE_DIGEST: "sha256:ea8cbdaf4fe362e489389dda6dd2dd401049f324bb3fb00024dc32b6ebf6f429"
+  import-worker:
+    image: novel-pipeline-import-worker:operational-observability-20260809-r1
+    environment:
+      NOVEL_IMAGE_DIGEST: "sha256:f01336eda33c3e46ac6b5e3874a4a432e1743d1c87c4e957ed1f2466811fe3f9"
