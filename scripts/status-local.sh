@@ -7,7 +7,7 @@ cd "$ROOT"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/python.sh"
 
-if [[ -f "$ROOT/.env" ]]; then
+if [[ "${NOVEL_PIPELINE_IGNORE_DOTENV:-0}" != "1" && -f "$ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$ROOT/.env"

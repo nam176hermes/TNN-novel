@@ -8,7 +8,7 @@ umask 007
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/python.sh"
 
-if [[ -f "$ROOT/.env" ]]; then
+if [[ "${NOVEL_PIPELINE_IGNORE_DOTENV:-0}" != "1" && -f "$ROOT/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "$ROOT/.env"
@@ -39,6 +39,9 @@ mkdir -p "$RUNTIME_DIR"
 API_PID_FILE="$RUNTIME_DIR/mobile-api.pid"
 WEB_PID_FILE="$RUNTIME_DIR/web-vite.pid"
 IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
+STARTED_WORKER=0
+STARTED_API=0
+STARTED_WEB=0
 
 is_running() {
   local pid_file="$1"
@@ -56,6 +59,31 @@ start_detached() {
   echo $!
 }
 
+stop_owned_pid_file() {
+  local pid_file="$1"
+  [[ -f "$pid_file" ]] || return
+  local pid
+  pid="$(cat "$pid_file")"
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    kill -- "-$pid" 2>/dev/null || true
+  else
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+}
+
+cleanup_started() {
+  local status="$1"
+  trap - EXIT
+  if (( status != 0 )); then
+    if (( STARTED_WEB )); then stop_owned_pid_file "$WEB_PID_FILE"; fi
+    if (( STARTED_API )); then stop_owned_pid_file "$API_PID_FILE"; fi
+    if (( STARTED_WORKER )); then stop_owned_pid_file "$IMPORT_WORKER_PID_FILE"; fi
+  fi
+  exit "$status"
+}
+trap 'cleanup_started $?' EXIT
+
 wait_for_import_worker() {
   local timeout="${IMPORT_WORKER_START_TIMEOUT:-45}"
   local deadline=$((SECONDS + timeout))
@@ -71,7 +99,12 @@ wait_for_import_worker() {
 if is_running "$IMPORT_WORKER_PID_FILE"; then
   echo "Import worker already running: pid $(cat "$IMPORT_WORKER_PID_FILE")"
 else
+  "$PYTHON_BIN" scripts/ops.py rotate-logs \
+    --data-dir "$RESOLVED_DATA_DIR" \
+    --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
+    --keep "${LOG_ROTATE_KEEP:-5}" >/dev/null
   start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
+  STARTED_WORKER=1
 fi
 wait_for_import_worker
 
@@ -84,11 +117,8 @@ elif "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${MOB
   rm -f "$API_PID_FILE"
   echo "API already reachable: http://127.0.0.1:${MOBILE_API_PORT}"
 else
-  "$PYTHON_BIN" scripts/ops.py rotate-logs \
-    --data-dir "$RESOLVED_DATA_DIR" \
-    --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
-    --keep "${LOG_ROTATE_KEEP:-5}" >/dev/null
   start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$API_PID_FILE"
+  STARTED_API=1
   "$PYTHON_BIN" scripts/ops.py wait-health \
     --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
     --timeout "${API_START_TIMEOUT:-45}"
@@ -104,6 +134,7 @@ else
     npm --prefix "$ROOT/web" ci
   fi
   start_detached "$RUNTIME_DIR/web-vite.log" npm --prefix "$ROOT/web" run dev -- --host "$WEB_HOST" --port "$WEB_PORT" >"$WEB_PID_FILE"
+  STARTED_WEB=1
 fi
 
 echo "API: http://127.0.0.1:${MOBILE_API_PORT}"

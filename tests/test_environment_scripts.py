@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -55,6 +56,7 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         fi
         if [[ "${1:-}" == "-m" && "${2:-}" == "app.import_worker" ]]; then
           if [[ "${3:-}" == "--healthcheck" ]]; then
+            [[ "${STUB_FAIL:-}" != "worker-health" ]] || exit 1
             if [[ -f "$STUB_HEARTBEAT" && -f "$STUB_WORKER_HEARTBEAT_FRESH" ]]; then
               printf 'worker-healthcheck ok\\n' >>"$STUB_INVOCATION_LOG"
               : >"$STUB_WORKER_HEALTHCHECK_SUCCESS"
@@ -67,8 +69,20 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
           : >"$STUB_WORKER_HEARTBEAT_FRESH"
           exit 0
         fi
-        if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "wait-health" && ! -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]]; then
-          exit 42
+        if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "rotate-logs" ]]; then
+          printf 'rotate-logs\\n' >>"$STUB_INVOCATION_LOG"
+          if [[ -f "$STUB_RUNTIME_DIR/import-worker.log" ]]; then
+            mv "$STUB_RUNTIME_DIR/import-worker.log" "$STUB_RUNTIME_DIR/import-worker.log.1"
+          fi
+          exit 0
+        fi
+        if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "wait-health" ]]; then
+          [[ "${STUB_FAIL:-}" != "api-readiness" ]] || exit 42
+          if [[ " $* " == *" --timeout 2 "* && "${STUB_API_ALREADY_REACHABLE:-1}" == "0" ]]; then
+            exit 1
+          fi
+          [[ -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]] || exit 42
+          exit 0
         fi
         exit 0
         """,
@@ -91,6 +105,7 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         bin_dir / "curl",
         """#!/usr/bin/env bash
         printf 'curl %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        [[ "${STUB_FAIL:-}" != "curl" ]] || exit 43
         printf '<div id="root"></div>\\n'
         """,
     )
@@ -109,6 +124,9 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
           exit 1
         fi
         if [[ "${1:-}" == "-0" ]]; then
+          if [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$target" ]]; then
+            exit 0
+          fi
           [[ " $STUB_LIVE_PIDS " == *" $target "* && ! -f "$STUB_PROCESS_STOPPED/$target" ]]
           exit
         fi
@@ -129,21 +147,35 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         "STUB_PROCESS_PID": "4103",
         "STUB_LIVE_PIDS": "4101 4102 4103",
         "STUB_PROCESS_STOPPED": str(process_stopped),
+        "STUB_RUNTIME_DIR": str(data_dir / "logs" / "runtime"),
         "BASH_ENV": str(bash_env),
         "NOVEL_PIPELINE_IGNORE_DOTENV": "1",
     }
     return env, invocation_log, data_dir
 
 
-def _run_script(script_name: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_script(script_name: str, env: dict[str, str], root: Path = ROOT) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(ROOT / "scripts" / script_name)],
-        cwd=ROOT,
+        ["bash", str(root / "scripts" / script_name)],
+        cwd=root,
         env=env,
         text=True,
         capture_output=True,
         check=False,
     )
+
+
+def _copy_script_tree(tmp_path: Path) -> Path:
+    copied_root = tmp_path / "poisoned-repository"
+    copied_scripts = copied_root / "scripts"
+    copied_scripts.mkdir(parents=True)
+    for name in ("start-local.sh", "start-cloudflare.sh", "stop-local.sh", "status-local.sh"):
+        shutil.copy2(ROOT / "scripts" / name, copied_scripts / name)
+    shutil.copy2(ROOT / "scripts" / "lib" / "python.sh", copied_scripts / "python.sh")
+    (copied_scripts / "lib").mkdir()
+    shutil.copy2(ROOT / "scripts" / "lib" / "python.sh", copied_scripts / "lib" / "python.sh")
+    (copied_root / "web").mkdir()
+    return copied_root
 
 
 def _seed_stale_heartbeat(data_dir: Path) -> None:
@@ -229,6 +261,107 @@ def test_cloudflare_start_reuses_a_live_worker(tmp_path: Path) -> None:
         line.startswith("setsid") and "app.import_worker" in line
         for line in invocation_log.read_text(encoding="utf-8").splitlines()
     )
+
+
+def test_scripts_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> None:
+    """The test-only dotenv bypass keeps all script runtime state isolated."""
+
+    env, _, data_dir = _script_test_environment(tmp_path)
+    copied_root = _copy_script_tree(tmp_path)
+    poison_dir = tmp_path / "operator-runtime"
+    (copied_root / ".env").write_text(
+        f"DATA_DIR={poison_dir}\nPYTHON_BIN=/operator/python\nPATH=/operator/bin\n",
+        encoding="utf-8",
+    )
+    env["STUB_API_ALREADY_REACHABLE"] = "0"
+
+    for script_name in ("start-local.sh", "status-local.sh", "stop-local.sh", "start-cloudflare.sh"):
+        result = _run_script(script_name, env, copied_root)
+        assert result.returncode == 0, result.stderr
+
+    assert (data_dir / "logs" / "runtime" / "import-worker.log").is_file()
+    assert not poison_dir.exists()
+
+
+def test_fresh_start_rotates_before_opening_import_worker_log(tmp_path: Path) -> None:
+    """Rotation must complete before a new worker opens its append-only log."""
+
+    env, invocation_log, _ = _script_test_environment(tmp_path)
+    env["STUB_API_ALREADY_REACHABLE"] = "0"
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    lines = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert lines.index("rotate-logs") < next(i for i, line in enumerate(lines) if line.startswith("setsid") and "app.import_worker" in line)
+
+
+def test_reused_worker_log_is_not_rotated(tmp_path: Path) -> None:
+    """A live worker retains its open log instead of being rotated underneath it."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env["CLOUDFLARE_HOSTNAME"] = "local.example.test"
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "import-worker.heartbeat").touch()
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+    (runtime_dir / "import-worker.log").write_text("worker output\n", encoding="utf-8")
+    (runtime_dir / "import-worker.pid").write_text(env["STUB_PROCESS_PID"], encoding="utf-8")
+
+    result = _run_script("start-cloudflare.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (runtime_dir / "import-worker.log").read_text(encoding="utf-8") == "worker output\n"
+    assert not (runtime_dir / "import-worker.log.1").exists()
+    assert "rotate-logs" not in invocation_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_failed_worker_health_cleans_only_the_new_worker(tmp_path: Path) -> None:
+    """A worker-health failure removes the worker process and its PID file."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env.update({"STUB_FAIL": "worker-health", "IMPORT_WORKER_START_TIMEOUT": "0", "STUB_ALLOW_DYNAMIC_PIDS": "1"})
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode != 0
+    assert not (data_dir / "logs" / "runtime" / "import-worker.pid").exists()
+    assert any(line.startswith("kill ") for line in invocation_log.read_text(encoding="utf-8").splitlines())
+
+
+def test_failed_api_readiness_cleans_new_api_and_worker(tmp_path: Path) -> None:
+    """An API readiness failure cleans both processes created by this invocation."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env.update({"STUB_FAIL": "api-readiness", "STUB_ALLOW_DYNAMIC_PIDS": "1"})
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode != 0
+    runtime_dir = data_dir / "logs" / "runtime"
+    assert not (runtime_dir / "import-worker.pid").exists()
+    assert not (runtime_dir / "mobile-api.pid").exists()
+    assert len([line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]) == 2
+
+
+def test_cloudflare_failure_cleans_new_api_but_preserves_existing_worker(tmp_path: Path) -> None:
+    """A later public-readiness failure cannot tear down a worker it did not start."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env.update({"CLOUDFLARE_HOSTNAME": "local.example.test", "STUB_FAIL": "curl", "STUB_ALLOW_DYNAMIC_PIDS": "1"})
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "import-worker.heartbeat").touch()
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+    worker_pid = runtime_dir / "import-worker.pid"
+    worker_pid.write_text(env["STUB_PROCESS_PID"], encoding="utf-8")
+
+    result = _run_script("start-cloudflare.sh", env)
+
+    assert result.returncode != 0
+    assert worker_pid.read_text(encoding="utf-8") == env["STUB_PROCESS_PID"]
+    assert not (runtime_dir / "mobile-api.pid").exists()
+    assert f"kill {env['STUB_PROCESS_PID']}" not in invocation_log.read_text(encoding="utf-8")
 
 
 def test_local_stop_and_status_manage_import_worker_pid(tmp_path: Path) -> None:
