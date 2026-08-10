@@ -2428,7 +2428,14 @@ def save_mobile_job(db_path: Path, job: dict) -> dict:
                     THEN 'Job cancelled by user'
                     ELSE excluded.message
                 END,
-                error = excluded.error,
+                error = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN ''
+                    ELSE excluded.error
+                END,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
                 started_at = excluded.started_at,
@@ -2457,8 +2464,22 @@ def save_mobile_job(db_path: Path, job: dict) -> dict:
                     ELSE excluded.finished_at
                 END,
                 cancel_requested = MAX(mobile_jobs.cancel_requested, excluded.cancel_requested),
-                last_safe_error = excluded.last_safe_error,
-                internal_error_ref = excluded.internal_error_ref
+                last_safe_error = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN ''
+                    ELSE excluded.last_safe_error
+                END,
+                internal_error_ref = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN ''
+                    ELSE excluded.internal_error_ref
+                END
             """,
             (
                 job["job_id"],

@@ -15,6 +15,7 @@ from app.database.db import (
     get_connection,
     get_job_attempts,
     get_job_logs,
+    list_operational_events,
     get_qa_report,
     init_db,
     request_cancel_mobile_job,
@@ -99,6 +100,87 @@ def test_job_tracker_persists_step_progress_and_sanitized_logs(temp_db_path) -> 
     assert "secret-token" not in joined
     assert "Traceback" not in joined
     assert "/home/user" not in joined
+    events = list_operational_events(temp_db_path, limit=10, severities=())
+    failure_event = next(event for event in events if event["event_type"] == "job_failure")
+    assert failure_event["severity"] == "error"
+    assert failure_event["job_id"] == job.job_id
+
+
+def test_stale_completion_after_durable_cancel_keeps_cancellation_telemetry(temp_db_path) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("daily", None, 1)
+    assert tracker.update_job(job.job_id, status="running", message="Starting daily batch")
+    assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+
+    assert tracker.update_job(
+        job.job_id,
+        status="completed",
+        message="Daily batch completed",
+        last_safe_error="stale completion error",
+        internal_error_ref="stale-completion-ref",
+    )
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = tracker.get_job(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    for snapshot in (persisted.to_dict(), cached.to_dict()):
+        assert snapshot["status"] == "cancelled"
+        assert snapshot["state"] == "CANCELED"
+        assert snapshot["message"] == "Job cancelled by user"
+        assert snapshot["error"] == ""
+        assert snapshot["last_safe_error"] == ""
+        assert snapshot["internal_error_ref"] == ""
+
+    transition = get_job_logs(temp_db_path, job_id=job.job_id)[0]
+    assert transition["state"] == "CANCELED"
+    assert transition["message"] == "Job cancelled by user"
+    assert transition["details"]["to_status"] == "cancelled"
+    assert not [
+        event
+        for event in list_operational_events(temp_db_path, limit=10, severities=())
+        if event["event_type"] == "job_failure" and event["job_id"] == job.job_id
+    ]
+
+
+def test_stale_failure_after_durable_cancel_keeps_cancellation_telemetry(temp_db_path) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("daily", None, 1)
+    assert tracker.update_job(job.job_id, status="running", message="Starting daily batch")
+    assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+
+    assert tracker.update_job(
+        job.job_id,
+        status="failed",
+        message="Daily job failed",
+        error="provider failure",
+        last_safe_error="stale failure error",
+        internal_error_ref="stale-failure-ref",
+    )
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = tracker.get_job(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    for snapshot in (persisted.to_dict(), cached.to_dict()):
+        assert snapshot["status"] == "cancelled"
+        assert snapshot["state"] == "CANCELED"
+        assert snapshot["message"] == "Job cancelled by user"
+        assert snapshot["error"] == ""
+        assert snapshot["last_safe_error"] == ""
+        assert snapshot["internal_error_ref"] == ""
+
+    transition = get_job_logs(temp_db_path, job_id=job.job_id)[0]
+    assert transition["state"] == "CANCELED"
+    assert transition["message"] == "Job cancelled by user"
+    assert transition["details"]["to_status"] == "cancelled"
+    assert not [
+        event
+        for event in list_operational_events(temp_db_path, limit=10, severities=())
+        if event["event_type"] == "job_failure" and event["job_id"] == job.job_id
+    ]
 
 
 def test_job_tracker_rejects_terminal_to_running_transition(temp_db_path) -> None:

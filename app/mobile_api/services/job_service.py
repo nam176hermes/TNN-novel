@@ -410,7 +410,7 @@ class JobTracker:
                 event_type="state_transition",
                 state=job.state,
                 step=job.current_step,
-                message=message or error or f"Job state {job.state}",
+                message=job.message or job.error or f"Job state {job.state}",
                 details={
                     "from_status": previous_status,
                     "to_status": job.status,
@@ -425,17 +425,17 @@ class JobTracker:
             )
         if (
             self.db_path is not None
-            and status in {"failed", "interrupted"}
-            and previous_status != status
+            and job.status in {"failed", "interrupted"}
+            and previous_status != job.status
         ):
             record_operational_event(
                 self.db_path,
-                event_type="job_failure" if status == "failed" else "job_interrupted",
-                severity="error" if status == "failed" else "warning",
+                event_type="job_failure" if job.status == "failed" else "job_interrupted",
+                severity="error" if job.status == "failed" else "warning",
                 source="job_tracker",
-                message=error or message or f"Job {status}",
+                message=job.error or job.message or f"Job {job.status}",
                 job_id=job_id,
-                details={"job_type": job.job_type, "status": status},
+                details={"job_type": job.job_type, "status": job.status},
             )
         return True
 
