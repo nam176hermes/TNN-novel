@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.database.db import init_db, list_operational_events
+from app.database.db import get_mobile_job, init_db, list_operational_events
 from app.mobile_api.services import backup_job_service as backup_job_module
 from app.mobile_api.services import job_service as job_service_module
 from app.mobile_api.services.backup_job_service import BackupJobCoordinator, BackupSecretStore
@@ -148,6 +148,43 @@ class DelayedCancellationBackupService(FakeBackupService):
             with self._lock:
                 self.active_calls -= 1
             self.finished.set()
+
+
+class NoProgressCancellationBackupService:
+    """Waits for release, then cooperatively checks cancellation before publication."""
+
+    def __init__(self, backup_dir: Path) -> None:
+        self.backup_dir = backup_dir.resolve()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.cancel_observed = False
+        self.publication_attempted = False
+        self.call_count = 0
+
+    def create_backup(
+        self,
+        *,
+        include_audio: bool,
+        include_exports: bool,
+        include_job_logs: bool,
+        include_secrets: bool,
+        passphrase: str,
+        cancel_check,
+        progress_callback,
+    ) -> dict:
+        self.call_count += 1
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise AssertionError("test did not release the backup provider")
+        if cancel_check():
+            self.cancel_observed = True
+            raise BackupCancelled("Backup cancelled")
+        self.publication_attempted = True
+        return {
+            "filename": "novel-pipeline-backup-20260713-120000.tar.gz",
+            "encrypted": include_secrets,
+            "secrets_included": include_secrets,
+        }
 
 
 class RecordingSecretStore(BackupSecretStore):
@@ -607,6 +644,115 @@ async def test_cooperative_backup_cancellation_records_one_terminal_event(
     assert events[0]["details"]["result"] == "cancelled"
     assert events[0]["details"]["encrypted"] is False
     assert events[0]["details"]["secrets_included"] is False
+
+
+@pytest.mark.asyncio
+async def test_remote_cancellation_before_owner_claim_is_terminalized_by_owner_without_archive_work(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    owner = JobTracker(db_path=temp_db_path)
+    remote = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=owner, backup_service=service)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    owner_task = owner._tasks[job_id]
+
+    cancel_accepted = remote.cancel_job(job_id)
+    await owner_task
+
+    cached = owner.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "cancel_accepted": cancel_accepted,
+        "archive_call_count": service.call_count,
+        "cached_state": (cached.status, cached.state, cached.cancel_requested),
+        "durable_state": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+        ),
+        "terminal_events": [
+            (event["source"], event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "cancel_accepted": True,
+        "archive_call_count": 0,
+        "cached_state": ("cancelled", "CANCELED", True),
+        "durable_state": ("cancelled", "CANCELED", True),
+        "terminal_events": [("backup_job_coordinator", "warning", "cancelled")],
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_durable_cancellation_reaches_running_provider_without_progress_callbacks(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    owner = JobTracker(db_path=temp_db_path)
+    remote = JobTracker(db_path=temp_db_path)
+    service = NoProgressCancellationBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=owner, backup_service=service)
+
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    owner_task = owner._tasks[job_id]
+    provider_started = await asyncio.to_thread(service.started.wait, 2)
+    assert provider_started
+
+    cancel_accepted = remote.cancel_job(job_id)
+    cancellation_before_release = get_mobile_job(temp_db_path, job_id)
+    service.release.set()
+    await owner_task
+
+    cached = owner.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert cancellation_before_release is not None
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "cancel_accepted": cancel_accepted,
+        "durable_cancel_requested_before_release": cancellation_before_release[
+            "cancel_requested"
+        ],
+        "provider_cancel_observed": service.cancel_observed,
+        "publication_attempted": service.publication_attempted,
+        "cached_state": (cached.status, cached.state, cached.cancel_requested),
+        "durable_state": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+        ),
+        "terminal_events": [
+            (event["source"], event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "cancel_accepted": True,
+        "durable_cancel_requested_before_release": True,
+        "provider_cancel_observed": True,
+        "publication_attempted": False,
+        "cached_state": ("cancelled", "CANCELED", True),
+        "durable_state": ("cancelled", "CANCELED", True),
+        "terminal_events": [("backup_job_coordinator", "warning", "cancelled")],
+    }
 
 
 @pytest.mark.asyncio
