@@ -222,7 +222,7 @@ def test_f5_engine_rejects_cpu_without_loading_runtime(tmp_path: Path, monkeypat
     with pytest.raises(TTSUnavailableError) as exc_info:
         engine._load()
 
-    assert exc_info.value.detail()["code"] == "tts_unavailable"
+    assert exc_info.value.detail()["code"] == "gpu_unavailable"
     assert "CUDA GPU is required" in str(exc_info.value)
     assert model_resolution_called is False
 
