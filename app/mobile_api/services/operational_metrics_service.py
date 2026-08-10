@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -121,6 +122,7 @@ class OperationalMetricsService:
     data_dir: Path
     cache_ttl_seconds: float = 30.0
     read_only: bool = False
+    database_connection: sqlite3.Connection | None = None
 
     def __post_init__(self) -> None:
         self.db_path = Path(self.db_path)
@@ -144,12 +146,18 @@ class OperationalMetricsService:
             data_dir=self.data_dir,
             db_path=database_target,
             db_uri=database_is_uri,
+            database_connection=self.database_connection,
             api_identity=identity,
             required=not mobile_settings.import_job_run_in_api,
             max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
             now=resolved_now.timestamp(),
         )
-        with sqlite3.connect(database_target, uri=database_is_uri) as connection:
+        connection_context = (
+            nullcontext(self.database_connection)
+            if self.database_connection is not None
+            else sqlite3.connect(database_target, uri=database_is_uri)
+        )
+        with connection_context as connection:
             queued = connection.execute(
                 """
                 SELECT COUNT(*) FROM mobile_jobs

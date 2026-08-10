@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -58,9 +61,17 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
     observed: dict[str, object] = {}
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
+        def __init__(
+            self,
+            db_path: Path,
+            data_dir: Path,
+            *,
+            read_only: bool = False,
+            database_connection: sqlite3.Connection | None = None,
+        ) -> None:
             observed["metrics_paths"] = (db_path, data_dir)
             observed["read_only"] = read_only
+            observed["database_connection"] = database_connection
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, str]:
             observed["use_cache"] = use_cache
@@ -104,6 +115,7 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
     assert observed["metrics_paths"] == (data_dir / "pipeline.db", data_dir)
     assert observed["use_cache"] is False
     assert observed["read_only"] is True
+    assert isinstance(observed["database_connection"], sqlite3.Connection)
     assert observed["snapshot"] is snapshot
     assert observed["receipt_dir"] == data_dir / "logs" / "runtime"
     assert captured.err == ""
@@ -123,7 +135,14 @@ def test_dispatch_cli_redacts_receipt_persistence_errors_and_returns_nonzero(
     private_path = tmp_path / "private-runtime" / "receipt.json"
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
+        def __init__(
+            self,
+            db_path: Path,
+            data_dir: Path,
+            *,
+            read_only: bool = False,
+            database_connection: sqlite3.Connection | None = None,
+        ) -> None:
             pass
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, object]:
@@ -175,7 +194,14 @@ def test_dispatch_cli_reads_only_allowlisted_alert_environment(
     }
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
+        def __init__(
+            self,
+            db_path: Path,
+            data_dir: Path,
+            *,
+            read_only: bool = False,
+            database_connection: sqlite3.Connection | None = None,
+        ) -> None:
             pass
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, object]:
@@ -227,6 +253,107 @@ def test_dispatch_cli_missing_database_stays_absent_and_error_is_redacted(
     assert captured.err == "status=error\n"
     assert not database_path.exists()
     assert os.fspath(database_path) not in captured.err
+
+
+def test_dispatch_cli_rejects_fifo_database_without_blocking_or_disclosure(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "private-fifo-data"
+    data_dir.mkdir()
+    database_path = data_dir / "pipeline.db"
+    os.mkfifo(database_path, mode=0o600)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DATA_DIR": os.fspath(data_dir),
+            "NOVEL_ALERT_WEBHOOK_URL": "https://alerts.example.invalid/hook",
+            "NOVEL_PIPELINE_IGNORE_DOTENV": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "scripts.dispatch_operational_alerts"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=2.0,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "status=error\n"
+    assert os.fspath(database_path) not in result.stderr
+
+
+def test_dispatch_cli_snapshot_uses_guarded_inode_across_path_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "aba-data"
+    data_dir.mkdir()
+    database_path = data_dir / "pipeline.db"
+    replacement_path = data_dir / "replacement.db"
+    saved_path = data_dir / "saved.db"
+    for path, marker in ((database_path, "A"), (replacement_path, "B")):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO marker (value) VALUES (?)", (marker,))
+    observed: dict[str, object] = {}
+
+    class SwappingMetricsService:
+        def __init__(
+            self,
+            db_path: Path,
+            data_dir: Path,
+            *,
+            read_only: bool = False,
+            database_connection: sqlite3.Connection | None = None,
+        ) -> None:
+            self.db_path = db_path
+            self.database_connection = database_connection
+
+        def snapshot(self, *, use_cache: bool = True) -> dict[str, object]:
+            database_path.rename(saved_path)
+            replacement_path.rename(database_path)
+            try:
+                if self.database_connection is None:
+                    with sqlite3.connect(self.db_path) as connection:
+                        marker = connection.execute("SELECT value FROM marker").fetchone()[0]
+                else:
+                    marker = self.database_connection.execute(
+                        "SELECT value FROM marker"
+                    ).fetchone()[0]
+            finally:
+                database_path.rename(replacement_path)
+                saved_path.rename(database_path)
+            return {"guarded_marker": marker}
+
+    class FakeDispatcher:
+        def __init__(self, config: object, *, receipt_dir: Path) -> None:
+            pass
+
+        def dispatch(self, snapshot: dict[str, object]) -> tuple[SimpleNamespace, ...]:
+            observed["snapshot"] = snapshot
+            return tuple(
+                SimpleNamespace(alert_class=alert_class, status="resolved")
+                for alert_class in SUPPORTED_ALERT_CLASSES
+            )
+
+    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", data_dir)
+    monkeypatch.setattr(
+        dispatch_operational_alerts,
+        "OperationalMetricsService",
+        SwappingMetricsService,
+    )
+    monkeypatch.setattr(dispatch_operational_alerts, "OperationalAlertDispatcher", FakeDispatcher)
+    monkeypatch.setenv("NOVEL_ALERT_WEBHOOK_URL", "https://alerts.example.invalid/hook")
+
+    assert dispatch_operational_alerts.main() == 0
+    assert observed["snapshot"] == {"guarded_marker": "A"}
+    assert capsys.readouterr().err == ""
 
 
 def test_synthetic_smoke_delivers_exactly_four_allowlisted_loopback_requests(
