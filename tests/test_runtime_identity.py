@@ -9,6 +9,9 @@ import pytest
 from app.runtime_identity import get_runtime_identity
 
 
+API_IMAGE_DIGEST = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
 def test_runtime_identity_exposes_only_allowlisted_build_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NOVEL_GIT_SHA", "abc1234")
     monkeypatch.setenv("NOVEL_BUILD_TIMESTAMP", "2026-07-23T12:00:00Z")
@@ -41,6 +44,7 @@ async def test_version_endpoint_reports_traceable_release_metadata(tmp_path: Pat
     monkeypatch.setattr(dependencies_mod.settings, "data_dir", tmp_path / "data")
     monkeypatch.setenv("NOVEL_GIT_SHA", "abc1234")
     monkeypatch.setenv("NOVEL_RELEASE_ID", "ws4-abc1234")
+    monkeypatch.setenv("NOVEL_IMAGE_DIGEST", API_IMAGE_DIGEST)
     monkeypatch.setenv("NOVEL_COMPONENT", "api")
     app = create_app()
 
@@ -51,6 +55,7 @@ async def test_version_endpoint_reports_traceable_release_metadata(tmp_path: Pat
     payload = response.json()
     assert payload["git_sha"] == "abc1234"
     assert payload["release_id"] == "ws4-abc1234"
+    assert payload["image_digest"] == API_IMAGE_DIGEST
     assert payload["component"] == "api"
     assert payload["schema_revision"]
 
