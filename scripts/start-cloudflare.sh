@@ -36,8 +36,10 @@ fi
 RUNTIME_DIR="$RESOLVED_DATA_DIR/logs/runtime"
 mkdir -p "$RUNTIME_DIR"
 IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
-STARTED_WORKER=0
-STARTED_API=0
+OWNED_WORKER_PID=""
+OWNED_API_PID=""
+OWNED_WORKER_TARGET=""
+OWNED_API_TARGET=""
 
 VITE_API_BASE_URL="$PUBLIC_URL" npm --prefix "$ROOT/web" run build
 
@@ -78,25 +80,35 @@ start_detached() {
   echo $!
 }
 
+capture_owned_target() {
+  local pid="$1"
+  if kill -0 -- "-$pid" 2>/dev/null; then printf '%s\n' "-$pid"; else printf '%s\n' "$pid"; fi
+}
+
 stop_owned_pid_file() {
   local pid_file="$1"
-  [[ -f "$pid_file" ]] || return
-  local pid
-  pid="$(cat "$pid_file")"
-  if kill -0 -- "-$pid" 2>/dev/null; then
-    kill -- "-$pid" 2>/dev/null || true
-  else
-    kill "$pid" 2>/dev/null || true
+  local pid="$2"
+  local target="$3"
+  [[ -n "$pid" ]] || return 0
+  kill -- "$target" 2>/dev/null || true
+  for _ in {1..20}; do
+    kill -0 -- "$target" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 -- "$target" 2>/dev/null; then
+    kill -9 -- "$target" 2>/dev/null || true
+    for _ in {1..20}; do kill -0 -- "$target" 2>/dev/null || break; sleep 0.1; done
   fi
-  rm -f "$pid_file"
+  if kill -0 -- "$target" 2>/dev/null; then echo "Cleanup could not stop owned process" >&2; return 1; fi
+  if [[ -f "$pid_file" && "$(cat "$pid_file")" == "$pid" ]]; then rm -f "$pid_file"; fi
 }
 
 cleanup_started() {
   local status="$1"
   trap - EXIT
   if (( status != 0 )); then
-    if (( STARTED_API )); then stop_owned_pid_file "$RUNTIME_DIR/mobile-api.pid"; fi
-    if (( STARTED_WORKER )); then stop_owned_pid_file "$IMPORT_WORKER_PID_FILE"; fi
+    stop_owned_pid_file "$RUNTIME_DIR/mobile-api.pid" "$OWNED_API_PID" "$OWNED_API_TARGET" || true
+    stop_owned_pid_file "$IMPORT_WORKER_PID_FILE" "$OWNED_WORKER_PID" "$OWNED_WORKER_TARGET" || true
   fi
   exit "$status"
 }
@@ -128,12 +140,14 @@ else
     --keep "${LOG_ROTATE_KEEP:-5}" \
     --force >/dev/null
   start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
-  STARTED_WORKER=1
+  OWNED_WORKER_PID="$(cat "$IMPORT_WORKER_PID_FILE")"
+  OWNED_WORKER_TARGET="$(capture_owned_target "$OWNED_WORKER_PID")"
 fi
 wait_for_import_worker
 
 start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$RUNTIME_DIR/mobile-api.pid"
-STARTED_API=1
+OWNED_API_PID="$(cat "$RUNTIME_DIR/mobile-api.pid")"
+OWNED_API_TARGET="$(capture_owned_target "$OWNED_API_PID")"
 
 "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${API_PORT}" --timeout "${API_START_TIMEOUT:-45}"
 curl -fsS --max-time 20 "$PUBLIC_URL/api/ready" >/dev/null

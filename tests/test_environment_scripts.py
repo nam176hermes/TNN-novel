@@ -77,10 +77,14 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
           exit 0
         fi
         if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "wait-health" ]]; then
-          [[ "${STUB_FAIL:-}" != "api-readiness" ]] || exit 42
+          if [[ "${STUB_FAIL:-}" == "api-readiness" ]]; then
+            if [[ -n "${STUB_REPLACE_PID_FILE:-}" ]]; then printf '%s' "$STUB_REPLACEMENT_PID" >"$STUB_REPLACE_PID_FILE"; fi
+            exit 42
+          fi
           if [[ " $* " == *" --timeout 2 "* && "${STUB_API_ALREADY_REACHABLE:-1}" == "0" ]]; then
             exit 1
           fi
+          if [[ "${STUB_PREEXISTING_API:-0}" == "1" ]]; then exit 0; fi
           [[ -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]] || exit 42
           exit 0
         fi
@@ -105,6 +109,8 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         bin_dir / "curl",
         """#!/usr/bin/env bash
         printf 'curl %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        if [[ "$*" == *"/api/health"* ]]; then [[ "${STUB_PREEXISTING_API:-0}" == "1" ]]; exit; fi
+        [[ "${STUB_PREEXISTING_WEB:-1}" == "1" ]] || exit 1
         [[ "${STUB_FAIL:-}" != "curl" ]] || exit 43
         printf '<div id="root"></div>\\n'
         """,
@@ -120,19 +126,19 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         """#!/usr/bin/env bash
         set -euo pipefail
         target="${!#}"
-        if [[ "$target" == -* ]]; then
-          exit 1
-        fi
+        normalized_target="${target#-}"
         if [[ "${1:-}" == "-0" ]]; then
-          if [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$target" ]]; then
+          if [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
             exit 0
           fi
-          [[ " $STUB_LIVE_PIDS " == *" $target "* && ! -f "$STUB_PROCESS_STOPPED/$target" ]]
+          [[ " $STUB_LIVE_PIDS " == *" $normalized_target "* && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]
           exit
         fi
         printf 'kill %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
         mkdir -p "$STUB_PROCESS_STOPPED"
-        : >"$STUB_PROCESS_STOPPED/$target"
+        if [[ "${1:-}" != "-9" && "${STUB_RESIST_TERM:-0}" == "1" ]]; then exit 0; fi
+        if [[ "${1:-}" == "-9" && "${STUB_UNKILLABLE:-0}" == "1" ]]; then exit 0; fi
+        : >"$STUB_PROCESS_STOPPED/$normalized_target"
         """,
     )
     env = {
@@ -206,7 +212,7 @@ def test_local_start_launches_worker_before_waiting_for_api_readiness(tmp_path: 
     readiness_wait = next(
         index
         for index, line in enumerate(invocations)
-        if "scripts/ops.py wait-health" in line
+        if "scripts/ops.py wait-health" in line and "--timeout 2" not in line
     )
     healthcheck = next(index for index, line in enumerate(invocations) if line == "worker-healthcheck ok")
     assert worker_start < healthcheck < readiness_wait
@@ -266,7 +272,7 @@ def test_cloudflare_start_reuses_a_live_worker(tmp_path: Path) -> None:
 def test_scripts_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> None:
     """The test-only dotenv bypass keeps all script runtime state isolated."""
 
-    env, _, data_dir = _script_test_environment(tmp_path)
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
     copied_root = _copy_script_tree(tmp_path)
     poison_dir = tmp_path / "operator-runtime"
     (copied_root / ".env").write_text(
@@ -275,9 +281,24 @@ def test_scripts_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> N
     )
     env["STUB_API_ALREADY_REACHABLE"] = "0"
 
-    for script_name in ("start-local.sh", "status-local.sh", "stop-local.sh", "start-cloudflare.sh"):
-        result = _run_script(script_name, env, copied_root)
-        assert result.returncode == 0, result.stderr
+    result = _run_script("start-local.sh", env, copied_root)
+    assert result.returncode == 0, result.stderr
+    runtime_dir = data_dir / "logs" / "runtime"
+    (runtime_dir / "web-vite.pid").write_text("4101", encoding="utf-8")
+    (runtime_dir / "mobile-api.pid").write_text("4102", encoding="utf-8")
+    (runtime_dir / "import-worker.pid").write_text("4103", encoding="utf-8")
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+    (runtime_dir / "import-worker.heartbeat").touch()
+
+    status = _run_script("status-local.sh", env, copied_root)
+    assert status.returncode == 0, status.stderr
+    assert "Import worker running: pid 4103" in status.stdout
+    stop = _run_script("stop-local.sh", env, copied_root)
+    assert stop.returncode == 0, stop.stderr
+    signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
+    assert signals[-3:] == ["kill -- -4101", "kill -- -4102", "kill -- -4103"]
+    result = _run_script("start-cloudflare.sh", env, copied_root)
+    assert result.returncode == 0, result.stderr
 
     assert (data_dir / "logs" / "runtime" / "import-worker.log").is_file()
     assert not poison_dir.exists()
@@ -288,12 +309,74 @@ def test_fresh_start_rotates_before_opening_import_worker_log(tmp_path: Path) ->
 
     env, invocation_log, _ = _script_test_environment(tmp_path)
     env["STUB_API_ALREADY_REACHABLE"] = "0"
+    env["STUB_PREEXISTING_WEB"] = "0"
 
     result = _run_script("start-local.sh", env)
 
     assert result.returncode == 0, result.stderr
     lines = invocation_log.read_text(encoding="utf-8").splitlines()
     assert lines.index("rotate-logs") < next(i for i, line in enumerate(lines) if line.startswith("setsid") and "app.import_worker" in line)
+
+
+def test_missing_worker_does_not_rotate_live_api_or_web_logs(tmp_path: Path) -> None:
+    """Recovering only the worker leaves active API and Vite logs untouched."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "mobile-api.pid").write_text("4102", encoding="utf-8")
+    (runtime_dir / "web-vite.pid").write_text("4101", encoding="utf-8")
+    (runtime_dir / "mobile-api.log").write_text("api writer\n", encoding="utf-8")
+    (runtime_dir / "web-vite.log").write_text("web writer\n", encoding="utf-8")
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (runtime_dir / "mobile-api.log").read_text(encoding="utf-8") == "api writer\n"
+    assert (runtime_dir / "web-vite.log").read_text(encoding="utf-8") == "web writer\n"
+    assert not (runtime_dir / "mobile-api.log.1").exists()
+    assert not (runtime_dir / "web-vite.log.1").exists()
+    assert "rotate-logs" not in invocation_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_missing_worker_does_not_rotate_reachable_api_or_web_logs(tmp_path: Path) -> None:
+    """Reachable writers without PID files still protect their open logs."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env["STUB_PREEXISTING_API"] = "1"
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "mobile-api.log").write_text("api writer\n", encoding="utf-8")
+    (runtime_dir / "web-vite.log").write_text("web writer\n", encoding="utf-8")
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (runtime_dir / "mobile-api.log").read_text(encoding="utf-8") == "api writer\n"
+    assert (runtime_dir / "web-vite.log").read_text(encoding="utf-8") == "web writer\n"
+    assert "rotate-logs" not in invocation_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_missing_worker_preserves_health_reachable_api_log_without_pid(tmp_path: Path) -> None:
+    """A live health endpoint protects its API log while worker readiness recovers."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env["STUB_PREEXISTING_WEB"] = "0"
+    env["STUB_PREEXISTING_API"] = "1"
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "mobile-api.log").write_text("api writer\n", encoding="utf-8")
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (runtime_dir / "mobile-api.log").read_text(encoding="utf-8") == "api writer\n"
+    lines = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert "rotate-logs" not in lines
+    assert not any(line.startswith("setsid") and "app.mobile_api" in line for line in lines)
+    worker_start = next(i for i, line in enumerate(lines) if line.startswith("setsid") and "app.import_worker" in line)
+    readiness = next(i for i, line in enumerate(lines) if "scripts/ops.py wait-health" in line and "--timeout 2" not in line)
+    assert worker_start < readiness
 
 
 def test_reused_worker_log_is_not_rotated(tmp_path: Path) -> None:
@@ -344,6 +427,53 @@ def test_failed_api_readiness_cleans_new_api_and_worker(tmp_path: Path) -> None:
     assert len([line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]) == 2
 
 
+def test_failure_cleanup_preserves_replaced_pid_file(tmp_path: Path) -> None:
+    """Cleanup uses the captured launched PID and leaves a replacement PID intact."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    replacement = runtime_dir / "mobile-api.pid"
+    env.update({
+        "STUB_FAIL": "api-readiness",
+        "STUB_ALLOW_DYNAMIC_PIDS": "1",
+        "STUB_REPLACE_PID_FILE": str(replacement),
+        "STUB_REPLACEMENT_PID": "4999",
+    })
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode != 0
+    assert replacement.read_text(encoding="utf-8") == "4999"
+    assert "kill 4999" not in invocation_log.read_text(encoding="utf-8")
+
+
+def test_resistant_owned_targets_escalate_to_kill_before_pid_removal(tmp_path: Path) -> None:
+    """TERM-resistant owned API and worker targets are polled then KILLed."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env.update({"STUB_FAIL": "api-readiness", "STUB_ALLOW_DYNAMIC_PIDS": "1", "STUB_RESIST_TERM": "1"})
+    result = _run_script("start-local.sh", env)
+    assert result.returncode != 0
+    runtime_dir = data_dir / "logs" / "runtime"
+    assert not (runtime_dir / "mobile-api.pid").exists()
+    assert not (runtime_dir / "import-worker.pid").exists()
+    signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
+    assert len(signals) == 4
+    assert signals[1].startswith("kill -9 ") and signals[3].startswith("kill -9 ")
+
+
+def test_unkillable_owned_target_preserves_its_pid_file(tmp_path: Path) -> None:
+    """Failed KILL confirmation leaves the owned PID file for operator recovery."""
+
+    env, _, data_dir = _script_test_environment(tmp_path)
+    env.update({"STUB_FAIL": "worker-health", "IMPORT_WORKER_START_TIMEOUT": "0", "STUB_ALLOW_DYNAMIC_PIDS": "1", "STUB_RESIST_TERM": "1", "STUB_UNKILLABLE": "1"})
+    result = _run_script("start-local.sh", env)
+    assert result.returncode != 0
+    assert (data_dir / "logs" / "runtime" / "import-worker.pid").exists()
+    assert "Cleanup could not stop owned process" in result.stderr
+
+
 def test_cloudflare_failure_cleans_new_api_but_preserves_existing_worker(tmp_path: Path) -> None:
     """A later public-readiness failure cannot tear down a worker it did not start."""
 
@@ -390,7 +520,7 @@ def test_local_stop_and_status_manage_import_worker_pid(tmp_path: Path) -> None:
     assert all((stopped / pid).is_file() for pid in ("4101", "4102", "4103"))
     assert "Import worker stopped" in stop.stdout
     signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
-    assert signals == ["kill 4101", "kill 4102", "kill 4103"]
+    assert signals == ["kill -- -4101", "kill -- -4102", "kill -- -4103"]
 
 
 def test_python_resolver_rejects_missing_explicit_interpreter(tmp_path: Path) -> None:

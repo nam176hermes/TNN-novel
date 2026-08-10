@@ -39,9 +39,21 @@ mkdir -p "$RUNTIME_DIR"
 API_PID_FILE="$RUNTIME_DIR/mobile-api.pid"
 WEB_PID_FILE="$RUNTIME_DIR/web-vite.pid"
 IMPORT_WORKER_PID_FILE="$RUNTIME_DIR/import-worker.pid"
-STARTED_WORKER=0
-STARTED_API=0
-STARTED_WEB=0
+OWNED_WORKER_PID=""
+OWNED_API_PID=""
+OWNED_WEB_PID=""
+OWNED_WORKER_TARGET=""
+OWNED_API_TARGET=""
+OWNED_WEB_TARGET=""
+
+API_ALREADY_REACHABLE=0
+WEB_ALREADY_REACHABLE=0
+if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "http://127.0.0.1:${MOBILE_API_PORT}/api/health" >/dev/null; then
+  API_ALREADY_REACHABLE=1
+fi
+if command -v curl >/dev/null 2>&1 && curl -fsS "http://${WEB_HOST}:${WEB_PORT}/" >/dev/null; then
+  WEB_ALREADY_REACHABLE=1
+fi
 
 is_running() {
   local pid_file="$1"
@@ -59,26 +71,39 @@ start_detached() {
   echo $!
 }
 
+capture_owned_target() {
+  local pid="$1"
+  if kill -0 -- "-$pid" 2>/dev/null; then printf '%s\n' "-$pid"; else printf '%s\n' "$pid"; fi
+}
+
 stop_owned_pid_file() {
   local pid_file="$1"
-  [[ -f "$pid_file" ]] || return
-  local pid
-  pid="$(cat "$pid_file")"
-  if kill -0 -- "-$pid" 2>/dev/null; then
-    kill -- "-$pid" 2>/dev/null || true
-  else
-    kill "$pid" 2>/dev/null || true
+  local pid="$2"
+  local target="$3"
+  [[ -n "$pid" ]] || return 0
+  kill -- "$target" 2>/dev/null || true
+  for _ in {1..20}; do
+    kill -0 -- "$target" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 -- "$target" 2>/dev/null; then
+    kill -9 -- "$target" 2>/dev/null || true
+    for _ in {1..20}; do kill -0 -- "$target" 2>/dev/null || break; sleep 0.1; done
   fi
-  rm -f "$pid_file"
+  if kill -0 -- "$target" 2>/dev/null; then
+    echo "Cleanup could not stop owned process" >&2
+    return 1
+  fi
+  if [[ -f "$pid_file" && "$(cat "$pid_file")" == "$pid" ]]; then rm -f "$pid_file"; fi
 }
 
 cleanup_started() {
   local status="$1"
   trap - EXIT
   if (( status != 0 )); then
-    if (( STARTED_WEB )); then stop_owned_pid_file "$WEB_PID_FILE"; fi
-    if (( STARTED_API )); then stop_owned_pid_file "$API_PID_FILE"; fi
-    if (( STARTED_WORKER )); then stop_owned_pid_file "$IMPORT_WORKER_PID_FILE"; fi
+    stop_owned_pid_file "$WEB_PID_FILE" "$OWNED_WEB_PID" "$OWNED_WEB_TARGET" || true
+    stop_owned_pid_file "$API_PID_FILE" "$OWNED_API_PID" "$OWNED_API_TARGET" || true
+    stop_owned_pid_file "$IMPORT_WORKER_PID_FILE" "$OWNED_WORKER_PID" "$OWNED_WORKER_TARGET" || true
   fi
   exit "$status"
 }
@@ -99,12 +124,15 @@ wait_for_import_worker() {
 if is_running "$IMPORT_WORKER_PID_FILE"; then
   echo "Import worker already running: pid $(cat "$IMPORT_WORKER_PID_FILE")"
 else
-  "$PYTHON_BIN" scripts/ops.py rotate-logs \
-    --data-dir "$RESOLVED_DATA_DIR" \
-    --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
-    --keep "${LOG_ROTATE_KEEP:-5}" >/dev/null
+  if ! is_running "$API_PID_FILE" && ! is_running "$WEB_PID_FILE" && (( ! API_ALREADY_REACHABLE && ! WEB_ALREADY_REACHABLE )); then
+    "$PYTHON_BIN" scripts/ops.py rotate-logs \
+      --data-dir "$RESOLVED_DATA_DIR" \
+      --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
+      --keep "${LOG_ROTATE_KEEP:-5}" >/dev/null
+  fi
   start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
-  STARTED_WORKER=1
+  OWNED_WORKER_PID="$(cat "$IMPORT_WORKER_PID_FILE")"
+  OWNED_WORKER_TARGET="$(capture_owned_target "$OWNED_WORKER_PID")"
 fi
 wait_for_import_worker
 
@@ -113,12 +141,16 @@ if is_running "$API_PID_FILE"; then
   "$PYTHON_BIN" scripts/ops.py wait-health \
     --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
     --timeout "${API_START_TIMEOUT:-45}"
-elif "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${MOBILE_API_PORT}" --timeout 2 >/dev/null 2>&1; then
+elif (( API_ALREADY_REACHABLE )); then
   rm -f "$API_PID_FILE"
   echo "API already reachable: http://127.0.0.1:${MOBILE_API_PORT}"
+  "$PYTHON_BIN" scripts/ops.py wait-health \
+    --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
+    --timeout "${API_START_TIMEOUT:-45}"
 else
   start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$API_PID_FILE"
-  STARTED_API=1
+  OWNED_API_PID="$(cat "$API_PID_FILE")"
+  OWNED_API_TARGET="$(capture_owned_target "$OWNED_API_PID")"
   "$PYTHON_BIN" scripts/ops.py wait-health \
     --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
     --timeout "${API_START_TIMEOUT:-45}"
@@ -126,7 +158,7 @@ fi
 
 if is_running "$WEB_PID_FILE"; then
   echo "Web already running: pid $(cat "$WEB_PID_FILE")"
-elif command -v curl >/dev/null 2>&1 && curl -fsS "http://${WEB_HOST}:${WEB_PORT}/" >/dev/null; then
+elif (( WEB_ALREADY_REACHABLE )); then
   rm -f "$WEB_PID_FILE"
   echo "Web already reachable: http://${WEB_HOST}:${WEB_PORT}"
 else
@@ -134,7 +166,8 @@ else
     npm --prefix "$ROOT/web" ci
   fi
   start_detached "$RUNTIME_DIR/web-vite.log" npm --prefix "$ROOT/web" run dev -- --host "$WEB_HOST" --port "$WEB_PORT" >"$WEB_PID_FILE"
-  STARTED_WEB=1
+  OWNED_WEB_PID="$(cat "$WEB_PID_FILE")"
+  OWNED_WEB_TARGET="$(capture_owned_target "$OWNED_WEB_PID")"
 fi
 
 echo "API: http://127.0.0.1:${MOBILE_API_PORT}"
