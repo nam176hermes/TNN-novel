@@ -15,6 +15,7 @@ from app.database.db import (
     get_connection,
     get_job_attempts,
     get_job_logs,
+    get_mobile_job,
     list_operational_events,
     get_qa_report,
     init_db,
@@ -195,6 +196,78 @@ def test_job_tracker_rejects_terminal_to_running_transition(temp_db_path) -> Non
     assert loaded is not None
     assert loaded.status == "completed"
     assert loaded.to_dict()["state"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_database_backed_cancel_preserves_cached_terminal_job(
+    terminal_status: str,
+    temp_db_path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    job = tracker.create_job("translate", [42], 1)
+    assert tracker.update_job(job.job_id, status="running", message="Translating")
+    assert tracker.update_job(job.job_id, status=terminal_status, message=f"Job {terminal_status}")
+
+    assert tracker.cancel_job(job.job_id) is True
+
+    cached = tracker.jobs[job.job_id]
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    assert {
+        "cached": (cached.status, cached.state, cached.cancel_requested, cached.message),
+        "durable": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+            durable["message"],
+        ),
+    } == {
+        "cached": (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}"),
+        "durable": (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}"),
+    }
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_database_backed_cancel_reconciles_stale_running_tracker_to_terminal_winner(
+    terminal_status: str,
+    temp_db_path,
+) -> None:
+    init_db(temp_db_path)
+    owner = JobTracker(db_path=temp_db_path)
+    job = owner.create_job("translate", [42], 1)
+    assert owner.update_job(job.job_id, status="running", message="Translating")
+    stale = JobTracker(db_path=temp_db_path)
+    stale_running = stale.get_job(job.job_id)
+    assert stale_running is not None
+    assert stale_running.status == "running"
+    assert owner.update_job(job.job_id, status=terminal_status, message=f"Job {terminal_status}")
+
+    assert stale.cancel_job(job.job_id) is True
+
+    owner_cached = owner.jobs[job.job_id]
+    stale_cached = stale.jobs[job.job_id]
+    durable = get_mobile_job(temp_db_path, job.job_id)
+    assert durable is not None
+    expected = (terminal_status, terminal_status.upper(), False, f"Job {terminal_status}")
+    assert (
+        owner_cached.status,
+        owner_cached.state,
+        owner_cached.cancel_requested,
+        owner_cached.message,
+    ) == expected
+    assert (
+        stale_cached.status,
+        stale_cached.state,
+        stale_cached.cancel_requested,
+        stale_cached.message,
+    ) == expected
+    assert (
+        durable["status"],
+        durable["state"],
+        durable["cancel_requested"],
+        durable["message"],
+    ) == expected
 
 
 def test_job_cancel_requested_for_missing_in_memory_job() -> None:

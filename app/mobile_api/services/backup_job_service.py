@@ -204,36 +204,42 @@ class BackupJobCoordinator:
             logger.warning("Failed to record terminal backup event for job %s", job_id)
 
     def _update_terminal_job(self, job_id: str, *, status: str, **changes: object) -> str:
-        cached_before = self.tracker.jobs.get(job_id)
-        cached_status_before = cached_before.status.lower() if cached_before is not None else ""
         requested_status = status.lower()
-        try:
-            self.tracker.update_job(job_id, status=status, **changes)
-        except Exception:
-            persisted = get_mobile_job(self.tracker.db_path, job_id) if self.tracker.db_path else None
-            persisted_status = str((persisted or {}).get("status") or "").lower()
-            cached = self.tracker.jobs.get(job_id)
-            cached_status = cached.status.lower() if cached is not None else ""
-            cancellation_reconciled = bool(
-                requested_status in {"completed", "failed"}
-                and cached_status_before == "running"
-                and persisted_status in {"cancelled", "canceled"}
-                and (persisted or {}).get("cancel_requested")
-                and cached_status in {"cancelled", "canceled"}
-                and cached is not None
-                and cached.cancel_requested
-                and cached.updated_at == str((persisted or {}).get("updated_at") or "")
-            )
-            if not persisted or (persisted_status != requested_status and not cancellation_reconciled):
-                if persisted is not None:
-                    reconciled = JobStatus.from_record(persisted)
-                    if cached is None:
-                        self.tracker.jobs[job_id] = reconciled
-                    else:
-                        cached.__dict__.update(reconciled.__dict__)
-                raise
-            logger.warning("Job %s terminal state persisted but auxiliary recording failed", job_id)
-        return self._terminal_result(job_id, fallback=status)
+        for attempt in range(2):
+            cached_before = self.tracker.jobs.get(job_id)
+            cached_status_before = cached_before.status.lower() if cached_before is not None else ""
+            try:
+                self.tracker.update_job(job_id, status=status, **changes)
+            except Exception:
+                persisted = get_mobile_job(self.tracker.db_path, job_id) if self.tracker.db_path else None
+                persisted_status = str((persisted or {}).get("status") or "").lower()
+                cached = self.tracker.jobs.get(job_id)
+                cached_status = cached.status.lower() if cached is not None else ""
+                cancellation_reconciled = bool(
+                    requested_status in {"completed", "failed"}
+                    and cached_status_before == "running"
+                    and persisted_status in {"cancelled", "canceled"}
+                    and (persisted or {}).get("cancel_requested")
+                    and cached_status in {"cancelled", "canceled"}
+                    and cached is not None
+                    and cached.cancel_requested
+                    and cached.updated_at == str((persisted or {}).get("updated_at") or "")
+                )
+                if persisted_status == requested_status or cancellation_reconciled:
+                    logger.warning("Job %s terminal state persisted but auxiliary recording failed", job_id)
+                    return self._terminal_result(job_id, fallback=status)
+                if persisted is None:
+                    raise
+                reconciled = JobStatus.from_record(persisted)
+                if cached is None:
+                    self.tracker.jobs[job_id] = reconciled
+                else:
+                    cached.__dict__.update(reconciled.__dict__)
+                if attempt:
+                    raise
+                continue
+            return self._terminal_result(job_id, fallback=status)
+        raise AssertionError("unreachable terminal update retry state")
 
     async def _run_backup_job(self, job_id: str) -> None:
         started_at = time.monotonic()

@@ -978,14 +978,17 @@ def test_terminal_update_does_not_swallow_pre_persist_failure_for_cancelled_job(
     assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
     assert tracker.update_job(job.job_id, status="completed")
     assert job.status == "cancelled"
+    attempts: list[str] = []
 
     def fail_before_persist(*args: object, **kwargs: object) -> bool:
+        attempts.append(str(args[0]))
         raise RuntimeError("pre-persist update failed")
 
     monkeypatch.setattr(tracker, "update_job", fail_before_persist)
 
     with pytest.raises(RuntimeError, match="pre-persist update failed"):
         coordinator._update_terminal_job(job.job_id, status="completed")
+    assert attempts == [job.job_id, job.job_id]
 
 
 @pytest.mark.asyncio
@@ -1054,25 +1057,41 @@ async def test_normal_terminal_result_survives_post_save_job_log_failure(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_terminal_event_is_not_recorded_when_persistence_fails_before_save(
+@pytest.mark.parametrize(
+    ("requested_status", "expected_state", "expected_severity", "cancel_requested", "archive_calls"),
+    [
+        ("completed", "COMPLETED", "info", False, 1),
+        ("failed", "FAILED", "error", False, 1),
+        ("cancelled", "CANCELED", "warning", True, 0),
+    ],
+)
+async def test_terminal_event_retries_one_shot_pre_persist_failure(
+    requested_status: str,
+    expected_state: str,
+    expected_severity: str,
+    cancel_requested: bool,
+    archive_calls: int,
     tmp_path: Path,
     temp_db_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
     tracker = JobTracker(db_path=temp_db_path)
-    service = FakeBackupService(tmp_path / "backups")
+    service = FakeBackupService(
+        tmp_path / "backups",
+        failure=RuntimeError("provider failed") if requested_status == "failed" else None,
+    )
     coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
     persist_job = tracker._persist_job
     persist_failures: list[str] = []
 
-    def fail_first_cancelled_persist(job: JobStatus) -> None:
-        if job.status == "cancelled" and not persist_failures:
+    def fail_first_terminal_persist(job: JobStatus) -> None:
+        if job.status == requested_status and not persist_failures:
             persist_failures.append(job.job_id)
-            raise RuntimeError("cancelled state failed before persistence")
+            raise RuntimeError("terminal state failed before persistence")
         persist_job(job)
 
-    monkeypatch.setattr(tracker, "_persist_job", fail_first_cancelled_persist)
+    monkeypatch.setattr(tracker, "_persist_job", fail_first_terminal_persist)
     job_id = coordinator.start_backup_job(
         include_audio=True,
         include_exports=False,
@@ -1081,7 +1100,8 @@ async def test_cancelled_terminal_event_is_not_recorded_when_persistence_fails_b
         passphrase="",
     )
     owner_task = tracker._tasks[job_id]
-    assert tracker.cancel_job(job_id)
+    if requested_status == "cancelled":
+        assert tracker.cancel_job(job_id)
     await owner_task
 
     cached = tracker.jobs[job_id]
@@ -1097,13 +1117,16 @@ async def test_cancelled_terminal_event_is_not_recorded_when_persistence_fails_b
             durable["state"],
             durable["cancel_requested"],
         ),
-        "terminal_events": events,
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
     } == {
         "persist_failures": [job_id],
-        "archive_call_count": 0,
-        "cached_state": ("cancelled", "CANCELED", True),
-        "durable_state": ("cancelled", "CANCELED", True),
-        "terminal_events": [],
+        "archive_call_count": archive_calls,
+        "cached_state": (requested_status, expected_state, cancel_requested),
+        "durable_state": (requested_status, expected_state, cancel_requested),
+        "terminal_events": [(expected_severity, requested_status)],
     }
 
 
