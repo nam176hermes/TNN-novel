@@ -1,0 +1,10 @@
+[Unit]
+Description=Dispatch Novel-TNN operational alerts every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=novel-tnn-alert-dispatch.service
+
+[Install]
+WantedBy=timers.target
