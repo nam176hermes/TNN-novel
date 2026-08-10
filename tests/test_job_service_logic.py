@@ -17,6 +17,7 @@ from app.database.db import (
     get_job_logs,
     get_qa_report,
     init_db,
+    request_cancel_mobile_job,
     update_chapter_paths,
 )
 from app.ingestion.source_adapters import SourceBlockedError
@@ -141,6 +142,41 @@ async def test_job_cancel_request_is_persisted_until_worker_exits(temp_db_path) 
     assert snapshot["status"] == "cancelled"
     assert snapshot["state"] == "CANCELED"
     assert snapshot["cancel_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_daily_job_observes_durable_cancel_and_does_not_start_next_chapter(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class DurableCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 2
+            return [
+                {"id": 101, "book_id": 1},
+                {"id": 102, "book_id": 1},
+            ]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            if len(translated) == 1:
+                assert request_cancel_mobile_job(temp_db_path, job_id=str(kwargs["job_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(DurableCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 2)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    assert persisted is not None
+    assert translated == [101]
+    assert persisted.status == "cancelled"
+    assert persisted.state == "CANCELED"
 
 
 @pytest.mark.asyncio
