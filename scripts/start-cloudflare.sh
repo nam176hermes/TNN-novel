@@ -82,7 +82,12 @@ start_detached() {
 
 capture_owned_target() {
   local pid="$1"
-  if kill -0 -- "-$pid" 2>/dev/null; then printf '%s\n' "-$pid"; else printf '%s\n' "$pid"; fi
+  local target="-$pid"
+  for _ in {1..20}; do
+    kill -0 -- "$target" 2>/dev/null && break
+    sleep 0.01
+  done
+  printf '%s\n' "$target"
 }
 
 stop_owned_pid_file() {

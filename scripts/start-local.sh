@@ -46,12 +46,12 @@ OWNED_WORKER_TARGET=""
 OWNED_API_TARGET=""
 OWNED_WEB_TARGET=""
 
-API_ALREADY_REACHABLE=0
+API_HEALTH_REACHABLE=0
 WEB_ALREADY_REACHABLE=0
 if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "http://127.0.0.1:${MOBILE_API_PORT}/api/health" >/dev/null; then
-  API_ALREADY_REACHABLE=1
+  API_HEALTH_REACHABLE=1
 fi
-if command -v curl >/dev/null 2>&1 && curl -fsS "http://${WEB_HOST}:${WEB_PORT}/" >/dev/null; then
+if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 2 "http://${WEB_HOST}:${WEB_PORT}/" >/dev/null; then
   WEB_ALREADY_REACHABLE=1
 fi
 
@@ -73,7 +73,12 @@ start_detached() {
 
 capture_owned_target() {
   local pid="$1"
-  if kill -0 -- "-$pid" 2>/dev/null; then printf '%s\n' "-$pid"; else printf '%s\n' "$pid"; fi
+  local target="-$pid"
+  for _ in {1..20}; do
+    kill -0 -- "$target" 2>/dev/null && break
+    sleep 0.01
+  done
+  printf '%s\n' "$target"
 }
 
 stop_owned_pid_file() {
@@ -124,7 +129,7 @@ wait_for_import_worker() {
 if is_running "$IMPORT_WORKER_PID_FILE"; then
   echo "Import worker already running: pid $(cat "$IMPORT_WORKER_PID_FILE")"
 else
-  if ! is_running "$API_PID_FILE" && ! is_running "$WEB_PID_FILE" && (( ! API_ALREADY_REACHABLE && ! WEB_ALREADY_REACHABLE )); then
+  if ! is_running "$API_PID_FILE" && ! is_running "$WEB_PID_FILE" && (( ! API_HEALTH_REACHABLE && ! WEB_ALREADY_REACHABLE )); then
     "$PYTHON_BIN" scripts/ops.py rotate-logs \
       --data-dir "$RESOLVED_DATA_DIR" \
       --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
@@ -136,17 +141,23 @@ else
 fi
 wait_for_import_worker
 
+API_ALREADY_READY=0
+if "$PYTHON_BIN" scripts/ops.py wait-health \
+  --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
+  --timeout 2 >/dev/null 2>&1; then
+  API_ALREADY_READY=1
+fi
+
 if is_running "$API_PID_FILE"; then
   echo "API already running: pid $(cat "$API_PID_FILE")"
-  "$PYTHON_BIN" scripts/ops.py wait-health \
-    --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
-    --timeout "${API_START_TIMEOUT:-45}"
-elif (( API_ALREADY_REACHABLE )); then
+  if (( ! API_ALREADY_READY )); then
+    "$PYTHON_BIN" scripts/ops.py wait-health \
+      --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
+      --timeout "${API_START_TIMEOUT:-45}"
+  fi
+elif (( API_ALREADY_READY )); then
   rm -f "$API_PID_FILE"
   echo "API already reachable: http://127.0.0.1:${MOBILE_API_PORT}"
-  "$PYTHON_BIN" scripts/ops.py wait-health \
-    --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
-    --timeout "${API_START_TIMEOUT:-45}"
 else
   start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$API_PID_FILE"
   OWNED_API_PID="$(cat "$API_PID_FILE")"

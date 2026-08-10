@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -44,8 +45,18 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
     fresh_heartbeat = tmp_path / "worker-heartbeat-fresh"
     healthcheck_success = tmp_path / "worker-healthcheck-success"
     process_stopped = tmp_path / "process-stopped"
+    group_signalled = tmp_path / "group-signalled"
+    group_probed = tmp_path / "group-probed"
+    kill_log = tmp_path / "kill.log"
+    process_map = tmp_path / "process-map.log"
+    readiness_log = tmp_path / "readiness.log"
+    api_became_ready = tmp_path / "api-became-ready"
     bash_env = tmp_path / "bash-env"
-    bash_env.write_text("enable -n kill\n", encoding="utf-8")
+    bash_env.write_text(
+        "enable -n kill\n"
+        'if [[ "${STUB_FAIL_FINAL_OUTPUT:-0}" == "1" ]]; then enable -n echo; fi\n',
+        encoding="utf-8",
+    )
     _write_executable(
         bin_dir / "python",
         """#!/usr/bin/env bash
@@ -67,6 +78,9 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
           mkdir -p "$(dirname "$STUB_HEARTBEAT")"
           : >"$STUB_HEARTBEAT"
           : >"$STUB_WORKER_HEARTBEAT_FRESH"
+          if [[ "${STUB_API_BECOMES_READY_WITH_WORKER:-0}" == "1" ]]; then
+            : >"$STUB_API_BECAME_READY"
+          fi
           exit 0
         fi
         if [[ "${1:-}" == "scripts/ops.py" && "${2:-}" == "rotate-logs" ]]; then
@@ -81,11 +95,17 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
             if [[ -n "${STUB_REPLACE_PID_FILE:-}" ]]; then printf '%s' "$STUB_REPLACEMENT_PID" >"$STUB_REPLACE_PID_FILE"; fi
             exit 42
           fi
-          if [[ " $* " == *" --timeout 2 "* && "${STUB_API_ALREADY_REACHABLE:-1}" == "0" ]]; then
+          if [[ ! -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]]; then
+            printf 'api-ready blocked\n' >>"$STUB_READINESS_LOG"
+            exit 42
+          fi
+          if [[ "${STUB_PREEXISTING_API:-0}" != "1" \
+                && ! -f "$STUB_API_BECAME_READY" \
+                && ! -f "$STUB_RUNTIME_DIR/mobile-api.pid" ]]; then
+            printf 'api-ready unavailable\n' >>"$STUB_READINESS_LOG"
             exit 1
           fi
-          if [[ "${STUB_PREEXISTING_API:-0}" == "1" ]]; then exit 0; fi
-          [[ -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]] || exit 42
+          printf 'api-ready ok\n' >>"$STUB_READINESS_LOG"
           exit 0
         fi
         exit 0
@@ -96,6 +116,11 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         """#!/usr/bin/env bash
         set -euo pipefail
         printf 'setsid %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        label=unknown
+        if [[ " $* " == *" app.import_worker "* ]]; then label=worker; fi
+        if [[ " $* " == *" app.mobile_api "* ]]; then label=api; fi
+        if [[ " $* " == *" npm "* || "${1:-}" == "npm" ]]; then label=web; fi
+        printf '%s %s\\n' "$label" "$BASHPID" >>"$STUB_PROCESS_MAP"
         exec "$@"
         """,
     )
@@ -106,10 +131,37 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         """,
     )
     _write_executable(
+        bin_dir / "echo",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        if [[ "${STUB_FAIL_FINAL_OUTPUT:-0}" == "1" && "${1:-}" == API:* ]]; then
+          for _ in {1..100}; do
+            grep -q '^web ' "$STUB_PROCESS_MAP" 2>/dev/null && break
+            sleep 0.01
+          done
+          if [[ -n "${STUB_REPLACE_PID_FILE:-}" ]]; then
+            printf '%s' "$STUB_REPLACEMENT_PID" >"$STUB_REPLACE_PID_FILE"
+          fi
+          exit 70
+        fi
+        printf '%s\\n' "$*"
+        """,
+    )
+    _write_executable(
         bin_dir / "curl",
         """#!/usr/bin/env bash
         printf 'curl %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
-        if [[ "$*" == *"/api/health"* ]]; then [[ "${STUB_PREEXISTING_API:-0}" == "1" ]]; exit; fi
+        if [[ "$*" == *"/api/health"* ]]; then
+          if [[ "${STUB_PREEXISTING_API:-0}" == "1" ]]; then
+            printf 'api-health ok\\n' >>"$STUB_READINESS_LOG"
+            if [[ ! -f "$STUB_WORKER_HEALTHCHECK_SUCCESS" ]]; then
+              printf 'api-ready blocked\\n' >>"$STUB_READINESS_LOG"
+            fi
+            exit 0
+          fi
+          printf 'api-health unavailable\\n' >>"$STUB_READINESS_LOG"
+          exit 1
+        fi
         [[ "${STUB_PREEXISTING_WEB:-1}" == "1" ]] || exit 1
         [[ "${STUB_FAIL:-}" != "curl" ]] || exit 43
         printf '<div id="root"></div>\\n'
@@ -128,14 +180,36 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         target="${!#}"
         normalized_target="${target#-}"
         if [[ "${1:-}" == "-0" ]]; then
+          state=stopped
           if [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
-            exit 0
+            state=alive
+          elif [[ " $STUB_LIVE_PIDS " == *" $normalized_target "* && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
+            state=alive
           fi
-          [[ " $STUB_LIVE_PIDS " == *" $normalized_target "* && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]
+          if [[ "$target" == -* \
+                && "${STUB_DELAY_GROUP_FORMATION:-0}" == "1" \
+                && ! -f "$STUB_GROUP_SIGNALLED/$normalized_target" ]]; then
+            mkdir -p "$STUB_GROUP_PROBED" "$STUB_GROUP_SIGNALLED"
+            if [[ ! -f "$STUB_GROUP_PROBED/$normalized_target" ]]; then
+              : >"$STUB_GROUP_PROBED/$normalized_target"
+              state=stopped
+            else
+              : >"$STUB_GROUP_SIGNALLED/$normalized_target"
+            fi
+          fi
+          printf 'poll %s %s\\n' "$state" "$target" >>"$STUB_KILL_LOG"
+          [[ "$state" == alive ]]
           exit
         fi
         printf 'kill %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        signal=TERM
+        if [[ "${1:-}" == "-9" ]]; then signal=KILL; fi
+        printf 'signal %s %s\\n' "$signal" "$target" >>"$STUB_KILL_LOG"
         mkdir -p "$STUB_PROCESS_STOPPED"
+        if [[ "$target" == -* ]]; then
+          mkdir -p "$STUB_GROUP_SIGNALLED"
+          : >"$STUB_GROUP_SIGNALLED/$normalized_target"
+        fi
         if [[ "${1:-}" != "-9" && "${STUB_RESIST_TERM:-0}" == "1" ]]; then exit 0; fi
         if [[ "${1:-}" == "-9" && "${STUB_UNKILLABLE:-0}" == "1" ]]; then exit 0; fi
         : >"$STUB_PROCESS_STOPPED/$normalized_target"
@@ -153,6 +227,12 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         "STUB_PROCESS_PID": "4103",
         "STUB_LIVE_PIDS": "4101 4102 4103",
         "STUB_PROCESS_STOPPED": str(process_stopped),
+        "STUB_GROUP_SIGNALLED": str(group_signalled),
+        "STUB_GROUP_PROBED": str(group_probed),
+        "STUB_KILL_LOG": str(kill_log),
+        "STUB_PROCESS_MAP": str(process_map),
+        "STUB_READINESS_LOG": str(readiness_log),
+        "STUB_API_BECAME_READY": str(api_became_ready),
         "STUB_RUNTIME_DIR": str(data_dir / "logs" / "runtime"),
         "BASH_ENV": str(bash_env),
         "NOVEL_PIPELINE_IGNORE_DOTENV": "1",
@@ -189,6 +269,37 @@ def _seed_stale_heartbeat(data_dir: Path) -> None:
     heartbeat.parent.mkdir(parents=True)
     heartbeat.touch()
     os.utime(heartbeat, (1, 1))
+
+
+def _seed_runtime(data_dir: Path, pids: tuple[str, str, str], canary: str) -> Path:
+    runtime_dir = data_dir / "logs" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    for name, pid in zip(("web-vite", "mobile-api", "import-worker"), pids, strict=True):
+        (runtime_dir / f"{name}.pid").write_text(pid, encoding="utf-8")
+        (runtime_dir / f"{name}.log").write_text(f"{canary}:{name}\n", encoding="utf-8")
+    (runtime_dir / "import-worker.heartbeat").write_text(f"{canary}:heartbeat\n", encoding="utf-8")
+    return runtime_dir
+
+
+def _snapshot_tree(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _process_pids(env: dict[str, str]) -> dict[str, str]:
+    lines = Path(env["STUB_PROCESS_MAP"]).read_text(encoding="utf-8").splitlines()
+    return {label: pid for label, pid in (line.split() for line in lines)}
+
+
+def _signal_targets(invocation_log: Path) -> list[str]:
+    return [
+        line.rsplit(" ", maxsplit=1)[-1]
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("kill ")
+    ]
 
 
 def test_local_start_launches_worker_before_waiting_for_api_readiness(tmp_path: Path) -> None:
@@ -269,39 +380,151 @@ def test_cloudflare_start_reuses_a_live_worker(tmp_path: Path) -> None:
     )
 
 
-def test_scripts_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> None:
-    """The test-only dotenv bypass keeps all script runtime state isolated."""
+def test_status_and_stop_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> None:
+    """Dotenv bypass selects only the isolated runtime and executables."""
 
     env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    copied_root = _copy_script_tree(tmp_path)
+    safe_runtime = _seed_runtime(data_dir, ("4101", "4102", "4103"), "safe")
+    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
+
+    poison_data = tmp_path / "poison-data"
+    _seed_runtime(poison_data, ("9101", "9102", "9103"), "poison")
+    poison_bin = tmp_path / "poison-bin"
+    poison_bin.mkdir()
+    poison_invocations = tmp_path / "poison-invocations.log"
+    poison_signals = tmp_path / "poison-signals.log"
+    poison_stopped = tmp_path / "poison-stopped"
+    _write_executable(
+        poison_bin / "python",
+        """#!/usr/bin/env bash
+        printf 'poison-python %s\n' "$*" >>"$POISON_INVOCATION_LOG"
+        """,
+    )
+    _write_executable(
+        poison_bin / "curl",
+        """#!/usr/bin/env bash
+        printf 'poison-curl %s\n' "$*" >>"$POISON_INVOCATION_LOG"
+        """,
+    )
+    _write_executable(
+        poison_bin / "kill",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        target="${!#}"
+        normalized_target="${target#-}"
+        if [[ "${1:-}" == "-0" ]]; then
+          [[ ! -f "$POISON_STOPPED/$normalized_target" ]]
+          exit
+        fi
+        printf 'poison-kill %s\n' "$*" >>"$POISON_SIGNAL_LOG"
+        mkdir -p "$POISON_STOPPED"
+        : >"$POISON_STOPPED/$normalized_target"
+        """,
+    )
+    env.update(
+        {
+            "POISON_INVOCATION_LOG": str(poison_invocations),
+            "POISON_SIGNAL_LOG": str(poison_signals),
+            "POISON_STOPPED": str(poison_stopped),
+        }
+    )
+    (copied_root / ".env").write_text(
+        "\n".join(
+            (
+                f"DATA_DIR={shlex.quote(str(poison_data))}",
+                f"PYTHON_BIN={shlex.quote(str(poison_bin / 'python'))}",
+                f"PATH={shlex.quote(str(poison_bin))}:$PATH",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    poison_before = _snapshot_tree(poison_data)
+
+    assert not (ROOT / ".env").exists()
+    status = _run_script("status-local.sh", env, copied_root)
+
+    assert status.returncode == 0, status.stderr
+    assert status.stderr == ""
+    assert status.stdout.splitlines() == [
+        "API running: pid 4102",
+        "Web running: pid 4101",
+        "Import worker running: pid 4103",
+        "Import worker health: ok",
+        "API readiness: ok",
+        "Web health: ok",
+    ]
+    assert invocation_log.read_text(encoding="utf-8").splitlines() == [
+        "python -c import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)",
+        "python -m app.import_worker --healthcheck",
+        "worker-healthcheck ok",
+        "python scripts/ops.py wait-health --base-url http://127.0.0.1:7860 --timeout 3",
+        "curl -fsS http://127.0.0.1:5174/",
+    ]
+    assert Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines() == [
+        "poll alive 4102",
+        "poll alive 4101",
+        "poll alive 4103",
+    ]
+    assert _snapshot_tree(poison_data) == poison_before
+    assert not poison_invocations.exists()
+    assert not poison_signals.exists()
+    assert not poison_stopped.exists()
+
+    invocation_log.write_text("", encoding="utf-8")
+    Path(env["STUB_KILL_LOG"]).write_text("", encoding="utf-8")
+    stop = _run_script("stop-local.sh", env, copied_root)
+
+    assert stop.returncode == 0, stop.stderr
+    assert stop.stderr == ""
+    assert stop.stdout.splitlines() == ["Web stopped", "API stopped", "Import worker stopped"]
+    assert invocation_log.read_text(encoding="utf-8").splitlines() == [
+        "kill -- -4101",
+        "kill -- -4102",
+        "kill -- -4103",
+    ]
+    assert Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines() == [
+        "poll alive 4101",
+        "poll alive -4101",
+        "signal TERM -4101",
+        "poll stopped 4101",
+        "poll alive 4102",
+        "poll alive -4102",
+        "signal TERM -4102",
+        "poll stopped 4102",
+        "poll alive 4103",
+        "poll alive -4103",
+        "signal TERM -4103",
+        "poll stopped 4103",
+    ]
+    assert not any(path.exists() for path in safe_runtime.glob("*.pid"))
+    assert _snapshot_tree(poison_data) == poison_before
+    assert not poison_invocations.exists()
+    assert not poison_signals.exists()
+    assert not poison_stopped.exists()
+    assert not (ROOT / ".env").exists()
+    assert all(target not in {"9101", "-9101", "9102", "-9102", "9103", "-9103"} for target in _signal_targets(invocation_log))
+
+
+def test_start_scripts_ignore_poisoned_repo_dotenv_when_requested(tmp_path: Path) -> None:
+    """Both start workflows keep their runtime artifacts out of poison data."""
+
+    env, _, data_dir = _script_test_environment(tmp_path)
     copied_root = _copy_script_tree(tmp_path)
     poison_dir = tmp_path / "operator-runtime"
     (copied_root / ".env").write_text(
         f"DATA_DIR={poison_dir}\nPYTHON_BIN=/operator/python\nPATH=/operator/bin\n",
         encoding="utf-8",
     )
-    env["STUB_API_ALREADY_REACHABLE"] = "0"
 
-    result = _run_script("start-local.sh", env, copied_root)
-    assert result.returncode == 0, result.stderr
-    runtime_dir = data_dir / "logs" / "runtime"
-    (runtime_dir / "web-vite.pid").write_text("4101", encoding="utf-8")
-    (runtime_dir / "mobile-api.pid").write_text("4102", encoding="utf-8")
-    (runtime_dir / "import-worker.pid").write_text("4103", encoding="utf-8")
-    Path(env["STUB_WORKER_HEARTBEAT_FRESH"]).touch()
-    (runtime_dir / "import-worker.heartbeat").touch()
-
-    status = _run_script("status-local.sh", env, copied_root)
-    assert status.returncode == 0, status.stderr
-    assert "Import worker running: pid 4103" in status.stdout
-    stop = _run_script("stop-local.sh", env, copied_root)
-    assert stop.returncode == 0, stop.stderr
-    signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
-    assert signals[-3:] == ["kill -- -4101", "kill -- -4102", "kill -- -4103"]
-    result = _run_script("start-cloudflare.sh", env, copied_root)
-    assert result.returncode == 0, result.stderr
-
+    local = _run_script("start-local.sh", env, copied_root)
+    assert local.returncode == 0, local.stderr
+    cloudflare = _run_script("start-cloudflare.sh", {**env, "CLOUDFLARE_HOSTNAME": "local.example.test"}, copied_root)
+    assert cloudflare.returncode == 0, cloudflare.stderr
     assert (data_dir / "logs" / "runtime" / "import-worker.log").is_file()
     assert not poison_dir.exists()
+    assert not (ROOT / ".env").exists()
 
 
 def test_fresh_start_rotates_before_opening_import_worker_log(tmp_path: Path) -> None:
@@ -358,7 +581,7 @@ def test_missing_worker_does_not_rotate_reachable_api_or_web_logs(tmp_path: Path
 
 
 def test_missing_worker_preserves_health_reachable_api_log_without_pid(tmp_path: Path) -> None:
-    """A live health endpoint protects its API log while worker readiness recovers."""
+    """Health protects the active log while readiness waits for worker freshness."""
 
     env, invocation_log, data_dir = _script_test_environment(tmp_path)
     env["STUB_PREEXISTING_WEB"] = "0"
@@ -371,12 +594,56 @@ def test_missing_worker_preserves_health_reachable_api_log_without_pid(tmp_path:
 
     assert result.returncode == 0, result.stderr
     assert (runtime_dir / "mobile-api.log").read_text(encoding="utf-8") == "api writer\n"
+    assert not (runtime_dir / "mobile-api.log.1").exists()
     lines = invocation_log.read_text(encoding="utf-8").splitlines()
     assert "rotate-logs" not in lines
     assert not any(line.startswith("setsid") and "app.mobile_api" in line for line in lines)
+    curl_lines = [line for line in lines if line.startswith("curl ")]
+    assert curl_lines == [
+        "curl -fsS --max-time 2 http://127.0.0.1:7860/api/health",
+        "curl -fsS --max-time 2 http://127.0.0.1:5174/",
+    ]
     worker_start = next(i for i, line in enumerate(lines) if line.startswith("setsid") and "app.import_worker" in line)
-    readiness = next(i for i, line in enumerate(lines) if "scripts/ops.py wait-health" in line and "--timeout 2" not in line)
-    assert worker_start < readiness
+    worker_health = next(i for i, line in enumerate(lines) if line == "worker-healthcheck ok")
+    readiness_lines = [line for line in lines if "scripts/ops.py wait-health" in line]
+    assert readiness_lines == [
+        "python scripts/ops.py wait-health --base-url http://127.0.0.1:7860 --timeout 2",
+    ]
+    readiness_index = lines.index(readiness_lines[0])
+    assert worker_start < worker_health < readiness_index
+    assert Path(env["STUB_READINESS_LOG"]).read_text(encoding="utf-8").splitlines() == [
+        "api-health ok",
+        "api-ready blocked",
+        "api-ready ok",
+    ]
+
+
+def test_api_recovery_during_worker_start_prevents_duplicate_launch(tmp_path: Path) -> None:
+    """A post-worker ready probe reuses an API that recovered after preflight."""
+
+    env, invocation_log, _ = _script_test_environment(tmp_path)
+    env.update(
+        {
+            "STUB_API_BECOMES_READY_WITH_WORKER": "1",
+            "STUB_PREEXISTING_API": "0",
+        }
+    )
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    lines = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert lines.count("curl -fsS --max-time 2 http://127.0.0.1:7860/api/health") == 1
+    assert not any(line.startswith("setsid") and "app.mobile_api" in line for line in lines)
+    readiness = [line for line in lines if "scripts/ops.py wait-health" in line]
+    assert readiness == [
+        "python scripts/ops.py wait-health --base-url http://127.0.0.1:7860 --timeout 2"
+    ]
+    assert Path(env["STUB_API_BECAME_READY"]).is_file()
+    assert Path(env["STUB_READINESS_LOG"]).read_text(encoding="utf-8").splitlines() == [
+        "api-health unavailable",
+        "api-ready ok",
+    ]
 
 
 def test_reused_worker_log_is_not_rotated(tmp_path: Path) -> None:
@@ -445,33 +712,94 @@ def test_failure_cleanup_preserves_replaced_pid_file(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert replacement.read_text(encoding="utf-8") == "4999"
-    assert "kill 4999" not in invocation_log.read_text(encoding="utf-8")
+    assert all(target not in {"4999", "-4999"} for target in _signal_targets(invocation_log))
 
 
-def test_resistant_owned_targets_escalate_to_kill_before_pid_removal(tmp_path: Path) -> None:
-    """TERM-resistant owned API and worker targets are polled then KILLed."""
+def test_resistant_owned_groups_escalate_in_reverse_order_without_following_replacement(tmp_path: Path) -> None:
+    """Late failure cleans exact stable groups and preserves a replacement PID."""
 
     env, invocation_log, data_dir = _script_test_environment(tmp_path)
-    env.update({"STUB_FAIL": "api-readiness", "STUB_ALLOW_DYNAMIC_PIDS": "1", "STUB_RESIST_TERM": "1"})
-    result = _run_script("start-local.sh", env)
-    assert result.returncode != 0
     runtime_dir = data_dir / "logs" / "runtime"
-    assert not (runtime_dir / "mobile-api.pid").exists()
+    replacement = runtime_dir / "mobile-api.pid"
+    env.update(
+        {
+            "STUB_ALLOW_DYNAMIC_PIDS": "1",
+            "STUB_DELAY_GROUP_FORMATION": "1",
+            "STUB_FAIL_FINAL_OUTPUT": "1",
+            "STUB_PREEXISTING_WEB": "0",
+            "STUB_REPLACE_PID_FILE": str(replacement),
+            "STUB_REPLACEMENT_PID": "4999",
+            "STUB_RESIST_TERM": "1",
+        }
+    )
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode != 0
+    pids = _process_pids(env)
+    assert pids.keys() == {"worker", "api", "web"}
+    assert replacement.read_text(encoding="utf-8") == "4999"
+    assert not (runtime_dir / "web-vite.pid").exists()
     assert not (runtime_dir / "import-worker.pid").exists()
-    signals = [line for line in invocation_log.read_text(encoding="utf-8").splitlines() if line.startswith("kill ")]
-    assert len(signals) == 4
-    assert signals[1].startswith("kill -9 ") and signals[3].startswith("kill -9 ")
+    expected_signals: list[str] = []
+    expected_kill_flow = [
+        event
+        for label in ("worker", "api", "web")
+        for event in (f"poll stopped -{pids[label]}", f"poll alive -{pids[label]}")
+    ]
+    for label in ("web", "api", "worker"):
+        target = f"-{pids[label]}"
+        expected_signals.extend((f"kill -- {target}", f"kill -9 -- {target}"))
+        expected_kill_flow.extend(
+            [f"signal TERM {target}"]
+            + [f"poll alive {target}"] * 21
+            + [f"signal KILL {target}", f"poll stopped {target}", f"poll stopped {target}"]
+        )
+    signals = [
+        line
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("kill ")
+    ]
+    assert signals == expected_signals
+    actual_kill_flow = Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert actual_kill_flow == expected_kill_flow
+    assert all(target not in {"4999", "-4999"} for target in _signal_targets(invocation_log))
+    assert not any(line.endswith((" 4999", " -4999")) for line in actual_kill_flow)
 
 
 def test_unkillable_owned_target_preserves_its_pid_file(tmp_path: Path) -> None:
-    """Failed KILL confirmation leaves the owned PID file for operator recovery."""
+    """Persistent group liveness keeps the PID file and emits a safe error."""
 
-    env, _, data_dir = _script_test_environment(tmp_path)
-    env.update({"STUB_FAIL": "worker-health", "IMPORT_WORKER_START_TIMEOUT": "0", "STUB_ALLOW_DYNAMIC_PIDS": "1", "STUB_RESIST_TERM": "1", "STUB_UNKILLABLE": "1"})
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    env.update(
+        {
+            "STUB_FAIL": "worker-health",
+            "IMPORT_WORKER_START_TIMEOUT": "0",
+            "STUB_ALLOW_DYNAMIC_PIDS": "1",
+            "STUB_DELAY_GROUP_FORMATION": "1",
+            "STUB_RESIST_TERM": "1",
+            "STUB_UNKILLABLE": "1",
+        }
+    )
     result = _run_script("start-local.sh", env)
+
     assert result.returncode != 0
-    assert (data_dir / "logs" / "runtime" / "import-worker.pid").exists()
-    assert "Cleanup could not stop owned process" in result.stderr
+    worker_pid = _process_pids(env)["worker"]
+    worker_pid_file = data_dir / "logs" / "runtime" / "import-worker.pid"
+    assert worker_pid_file.read_text(encoding="utf-8").strip() == worker_pid
+    target = f"-{worker_pid}"
+    assert [
+        line
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("kill ")
+    ] == [f"kill -- {target}", f"kill -9 -- {target}"]
+    assert Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines() == (
+        [f"poll stopped {target}", f"poll alive {target}", f"signal TERM {target}"]
+        + [f"poll alive {target}"] * 21
+        + [f"signal KILL {target}"]
+        + [f"poll alive {target}"] * 21
+    )
+    assert result.stderr.splitlines().count("Cleanup could not stop owned process") == 1
 
 
 def test_cloudflare_failure_cleans_new_api_but_preserves_existing_worker(tmp_path: Path) -> None:
@@ -491,7 +819,8 @@ def test_cloudflare_failure_cleans_new_api_but_preserves_existing_worker(tmp_pat
     assert result.returncode != 0
     assert worker_pid.read_text(encoding="utf-8") == env["STUB_PROCESS_PID"]
     assert not (runtime_dir / "mobile-api.pid").exists()
-    assert f"kill {env['STUB_PROCESS_PID']}" not in invocation_log.read_text(encoding="utf-8")
+    worker_targets = {env["STUB_PROCESS_PID"], f"-{env['STUB_PROCESS_PID']}"}
+    assert all(target not in worker_targets for target in _signal_targets(invocation_log))
 
 
 def test_local_stop_and_status_manage_import_worker_pid(tmp_path: Path) -> None:
