@@ -796,7 +796,8 @@ async def test_durable_cancellation_winning_completion_write_records_cancelled_t
         include_secrets=False,
         passphrase="",
     )
-    await wait_for_job(tracker, job_id)
+    owner_task = tracker._tasks[job_id]
+    await owner_task
 
     cached = tracker.jobs[job_id]
     durable = get_mobile_job(temp_db_path, job_id)
@@ -858,7 +859,8 @@ async def test_durable_cancellation_winning_failure_write_records_cancelled_term
         include_secrets=failure_mode == "expired_secret",
         passphrase="test credential" if failure_mode == "expired_secret" else "",
     )
-    await wait_for_job(tracker, job_id)
+    owner_task = tracker._tasks[job_id]
+    await owner_task
 
     cached = tracker.jobs[job_id]
     durable = get_mobile_job(temp_db_path, job_id)
@@ -879,6 +881,175 @@ async def test_durable_cancellation_winning_failure_write_records_cancelled_term
         "cached_state": ("cancelled", "CANCELED", True),
         "durable_state": ("cancelled", "CANCELED", True),
         "terminal_events": [("warning", "cancelled")],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_status", ["completed", "failed"])
+async def test_reconciled_cancellation_survives_post_save_job_log_failure(
+    requested_status: str,
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(
+        tmp_path / "backups",
+        failure=RuntimeError("provider failed") if requested_status == "failed" else None,
+    )
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    update_job = tracker.update_job
+    cancellation_injected = False
+    log_failures: list[str] = []
+
+    def request_cancel_before_terminal_save(job_id: str, **changes: object) -> bool:
+        nonlocal cancellation_injected
+        if changes.get("status") == requested_status and not cancellation_injected:
+            cancellation_injected = True
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **changes)
+
+    record_job_log = job_service_module.record_job_log
+
+    def fail_first_reconciled_transition(db_path: Path, **kwargs: object) -> int:
+        details = kwargs.get("details")
+        if (
+            not log_failures
+            and kwargs.get("event_type") == "state_transition"
+            and isinstance(details, dict)
+            and details.get("to_status") == "cancelled"
+        ):
+            log_failures.append(str(kwargs.get("job_id") or ""))
+            raise RuntimeError("post-save job log failed")
+        return record_job_log(db_path, **kwargs)
+
+    monkeypatch.setattr(tracker, "update_job", request_cancel_before_terminal_save)
+    monkeypatch.setattr(job_service_module, "record_job_log", fail_first_reconciled_transition)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    owner_task = tracker._tasks[job_id]
+    await owner_task
+
+    cached = tracker.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "cancellation_injected": cancellation_injected,
+        "log_failures": log_failures,
+        "cached_state": (cached.status, cached.state, cached.cancel_requested),
+        "durable_state": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+        ),
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "cancellation_injected": True,
+        "log_failures": [job_id],
+        "cached_state": ("cancelled", "CANCELED", True),
+        "durable_state": ("cancelled", "CANCELED", True),
+        "terminal_events": [("warning", "cancelled")],
+    }
+
+
+def test_terminal_update_does_not_swallow_pre_persist_failure_for_cancelled_job(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=FakeBackupService(tmp_path / "backups"),
+    )
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="running")
+    assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+    assert tracker.update_job(job.job_id, status="completed")
+    assert job.status == "cancelled"
+
+    def fail_before_persist(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError("pre-persist update failed")
+
+    monkeypatch.setattr(tracker, "update_job", fail_before_persist)
+
+    with pytest.raises(RuntimeError, match="pre-persist update failed"):
+        coordinator._update_terminal_job(job.job_id, status="completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_status", "expected_severity"),
+    [("completed", "info"), ("failed", "error")],
+)
+async def test_normal_terminal_result_survives_post_save_job_log_failure(
+    requested_status: str,
+    expected_severity: str,
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(
+        tmp_path / "backups",
+        failure=RuntimeError("provider failed") if requested_status == "failed" else None,
+    )
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    record_job_log = job_service_module.record_job_log
+    log_failures: list[str] = []
+
+    def fail_first_terminal_transition(db_path: Path, **kwargs: object) -> int:
+        details = kwargs.get("details")
+        if (
+            not log_failures
+            and kwargs.get("event_type") == "state_transition"
+            and isinstance(details, dict)
+            and details.get("to_status") == requested_status
+        ):
+            log_failures.append(str(kwargs.get("job_id") or ""))
+            raise RuntimeError("post-save job log failed")
+        return record_job_log(db_path, **kwargs)
+
+    monkeypatch.setattr(job_service_module, "record_job_log", fail_first_terminal_transition)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    owner_task = tracker._tasks[job_id]
+    await owner_task
+
+    cached = tracker.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "log_failures": log_failures,
+        "cached_status": cached.status,
+        "durable_status": durable["status"],
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "log_failures": [job_id],
+        "cached_status": requested_status,
+        "durable_status": requested_status,
+        "terminal_events": [(expected_severity, requested_status)],
     }
 
 
