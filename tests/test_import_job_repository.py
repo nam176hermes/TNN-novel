@@ -95,14 +95,29 @@ def test_terminal_task_only_returns_to_queue_through_explicit_retry(temp_db_path
 def test_cancel_request_is_idempotent_and_event_payload_is_sanitized(temp_db_path) -> None:
     repository = _repository(temp_db_path)
     job = _job(repository)
+    task = _task(repository, job.id)
+    repository.transition_job(job.id, "operator-a", JobStatus.RUNNING)
+    claimed = repository.claim_next_task(job.id, "operator-a", worker_id="chapter-worker-a")
+    assert claimed is not None and claimed.id == task.id
 
     first = repository.request_cancel(job.id, "operator-a")
     second = repository.request_cancel(job.id, "operator-a")
     events = repository.list_events(job.id, "operator-a")
+    current_task = repository.list_tasks(job.id, "operator-a")[0]
 
     assert first.cancel_requested_at
     assert second.cancel_requested_at == first.cancel_requested_at
-    assert [event.event_type for event in events] == ["job_created", "cancel_requested"]
+    assert first.status is JobStatus.RUNNING
+    assert first.result_snapshot is None
+    assert current_task.status is TaskStatus.RUNNING
+    assert current_task.lease_token == claimed.lease_token
+    assert [event.event_type for event in events] == [
+        "job_created",
+        "task_created",
+        "job_transitioned",
+        "task_claimed",
+        "cancel_requested",
+    ]
     assert repository.get_job(job.id, "operator-a").config_snapshot == {"adapter_id": "69shuba"}
 
 

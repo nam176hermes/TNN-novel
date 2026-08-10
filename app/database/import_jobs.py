@@ -22,6 +22,7 @@ from app.import_contracts import (
     BrowserTaskResult,
     ImportOperationKind,
     decode_browser_result,
+    encode_browser_result,
 )
 
 
@@ -65,6 +66,24 @@ class ConcurrentImportJobUpdate(RuntimeError):
     """Raised when an optimistic compare-and-set update loses its race."""
 
 
+class BrowserResultPublicationRejected(RuntimeError):
+    """Reject a browser result without reflecting persisted or private data."""
+
+    _SAFE_CODES = {
+        "stale_lease",
+        "cancelled",
+        "deadline_exceeded",
+        "already_published",
+        "wrong_operation",
+    }
+
+    def __init__(self, code: str):
+        if code not in self._SAFE_CODES:
+            raise ValueError("invalid browser result publication rejection code")
+        self.code = code
+        super().__init__(code)
+
+
 _JOB_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     JobStatus.QUEUED: {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELLED},
     JobStatus.RUNNING: {
@@ -97,9 +116,57 @@ _TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
 
 _SENSITIVE_PAYLOAD_MARKERS = ("html", "content", "cookie", "token", "secret", "password", "authorization")
 
+_BROWSER_RESULT_TRANSITIONS: dict[
+    BrowserResultState, tuple[TaskStatus, TaskStage, JobStatus]
+] = {
+    BrowserResultState.COMPLETED: (
+        TaskStatus.SUCCEEDED,
+        TaskStage.SUCCEEDED,
+        JobStatus.SUCCEEDED,
+    ),
+    BrowserResultState.BLOCKED: (
+        TaskStatus.USER_VERIFICATION_REQUIRED,
+        TaskStage.USER_VERIFICATION_REQUIRED,
+        JobStatus.FAILED,
+    ),
+    BrowserResultState.FAILED: (
+        TaskStatus.FAILED,
+        TaskStage.FAILED,
+        JobStatus.FAILED,
+    ),
+    BrowserResultState.CANCELLED: (
+        TaskStatus.CANCELLED,
+        TaskStage.CANCELLED,
+        JobStatus.CANCELLED,
+    ),
+    BrowserResultState.TIMED_OUT: (
+        TaskStatus.FAILED,
+        TaskStage.FAILED,
+        JobStatus.FAILED,
+    ),
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _timestamp_is_in_future(value: str, now: datetime) -> bool:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    if timestamp.tzinfo is None:
+        return False
+    return timestamp > now
+
+
+def _browser_event_payload(result: BrowserTaskResult) -> dict[str, str]:
+    return {
+        "state": result.state.value,
+        "error_code": result.error_code,
+        "correlation_id": result.correlation_id,
+    }
 
 
 def _safe_json_loads(value: object) -> dict[str, Any]:
@@ -949,6 +1016,198 @@ class ImportJobRepository:
             row = self._job_row(conn, job_id, owner_user_id)
         return _job_from_row(row)
 
+    def publish_browser_result(
+        self,
+        job_id: str,
+        owner_user_id: str,
+        *,
+        task_id: int,
+        lease_token: str,
+        lease_owner: str,
+        expected_job_version: int,
+        expected_task_version: int,
+        result: BrowserTaskResult,
+    ) -> ImportJob:
+        """Atomically publish one preview result from an active task lease."""
+        canonical_result = encode_browser_result(result)
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job_row = self._job_row(conn, job_id, owner_user_id)
+            stored_snapshot = str(job_row["result_snapshot_json"] or "")
+            if stored_snapshot:
+                if stored_snapshot == canonical_result:
+                    return _job_from_row(job_row)
+                raise BrowserResultPublicationRejected("already_published")
+            if job_row["result_state"] or job_row["result_published_at"]:
+                raise BrowserResultPublicationRejected("already_published")
+
+            job = _job_from_row(job_row)
+            if job.operation_kind is not ImportOperationKind.PREVIEW:
+                raise BrowserResultPublicationRejected("wrong_operation")
+            try:
+                task = _task_from_row(self._task_row(conn, task_id, owner_user_id))
+            except (LookupError, PermissionError):
+                raise BrowserResultPublicationRejected("stale_lease") from None
+
+            transaction_now = datetime.now(timezone.utc)
+            if job.cancel_requested_at:
+                raise BrowserResultPublicationRejected("cancelled")
+            if not _timestamp_is_in_future(job.deadline_at, transaction_now):
+                raise BrowserResultPublicationRejected("deadline_exceeded")
+            if (
+                task.job_id != job.id
+                or task.status is not TaskStatus.RUNNING
+                or task.lease_token != lease_token
+                or task.lease_owner != lease_owner
+                or not _timestamp_is_in_future(task.lease_expires_at, transaction_now)
+                or task.version != expected_task_version
+                or job.version != expected_job_version
+                or job.status is not JobStatus.RUNNING
+                or result.correlation_id != job.correlation_id
+            ):
+                raise BrowserResultPublicationRejected("stale_lease")
+
+            task_status, task_stage, job_status = _BROWSER_RESULT_TRANSITIONS[result.state]
+            now = transaction_now.isoformat()
+            task_update = conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, stage = ?, error_code = ?, error_message = ?,
+                    retryable = ?, finished_at = ?, lease_token = '', lease_owner = '',
+                    lease_expires_at = '', updated_at = ?, version = version + 1
+                WHERE id = ? AND job_id = ? AND status = ? AND version = ?
+                  AND lease_token = ? AND lease_owner = ?
+                """,
+                (
+                    task_status.value,
+                    task_stage.value,
+                    result.error_code,
+                    result.error_message,
+                    int(result.retryable),
+                    now,
+                    now,
+                    task.id,
+                    job.id,
+                    TaskStatus.RUNNING.value,
+                    task.version,
+                    lease_token,
+                    lease_owner,
+                ),
+            )
+            if task_update.rowcount != 1:
+                raise BrowserResultPublicationRejected("stale_lease")
+
+            job_update = conn.execute(
+                """
+                UPDATE import_jobs
+                SET status = ?, finished_at = ?, error_summary = ?, result_state = ?,
+                    result_snapshot_json = ?, result_published_at = ?, version = version + 1
+                WHERE id = ? AND owner_user_id = ? AND status = ? AND version = ?
+                  AND cancel_requested_at = '' AND result_state = ''
+                  AND result_snapshot_json = '' AND result_published_at = ''
+                """,
+                (
+                    job_status.value,
+                    now,
+                    result.error_message,
+                    result.state.value,
+                    canonical_result,
+                    now,
+                    job.id,
+                    owner_user_id,
+                    JobStatus.RUNNING.value,
+                    job.version,
+                ),
+            )
+            if job_update.rowcount != 1:
+                raise BrowserResultPublicationRejected("stale_lease")
+
+            self._sync_job_counters(conn, job.id)
+            event_payload = _browser_event_payload(result)
+            self._append_event(conn, job.id, task.id, "browser_result_published", event_payload)
+            self._append_event(conn, job.id, task.id, "task_transitioned", event_payload)
+            self._append_event(conn, job.id, None, "job_transitioned", event_payload)
+            published_row = self._job_row(conn, job.id, owner_user_id)
+        return _job_from_row(published_row)
+
+    def expire_browser_job(self, job_id: str, owner_user_id: str) -> ImportJob:
+        """Atomically record timeout and invalidate pending preview work."""
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job_row = self._job_row(conn, job_id, owner_user_id)
+            if job_row["result_snapshot_json"]:
+                return _job_from_row(job_row)
+            job = _job_from_row(job_row)
+            if job.operation_kind is not ImportOperationKind.PREVIEW:
+                raise BrowserResultPublicationRejected("wrong_operation")
+
+            correlation_id = job.correlation_id or job.id[:128]
+            timeout_result = BrowserTaskResult(
+                correlation_id=correlation_id,
+                state=BrowserResultState.TIMED_OUT,
+                error_code="browser_task_timed_out",
+                error_message="Browser task deadline exceeded",
+                retryable=False,
+            )
+            canonical_result = encode_browser_result(timeout_result)
+            now = _now()
+            conn.execute(
+                """
+                UPDATE chapter_tasks
+                SET status = ?, stage = ?, error_code = ?, error_message = ?, retryable = 0,
+                    finished_at = ?, lease_token = '', lease_owner = '', lease_expires_at = '',
+                    updated_at = ?, version = version + 1
+                WHERE job_id = ? AND status IN (?, ?)
+                """,
+                (
+                    TaskStatus.FAILED.value,
+                    TaskStage.FAILED.value,
+                    timeout_result.error_code,
+                    timeout_result.error_message,
+                    now,
+                    now,
+                    job.id,
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.RUNNING.value,
+                ),
+            )
+            job_update = conn.execute(
+                """
+                UPDATE import_jobs
+                SET status = ?, cancel_requested_at = CASE
+                        WHEN cancel_requested_at = '' THEN ? ELSE cancel_requested_at END,
+                    finished_at = ?, error_summary = ?, correlation_id = ?, result_state = ?,
+                    result_snapshot_json = ?, result_published_at = ?, version = version + 1
+                WHERE id = ? AND owner_user_id = ? AND version = ?
+                  AND result_state = '' AND result_snapshot_json = '' AND result_published_at = ''
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    now,
+                    timeout_result.error_message,
+                    correlation_id,
+                    timeout_result.state.value,
+                    canonical_result,
+                    now,
+                    job.id,
+                    owner_user_id,
+                    job.version,
+                ),
+            )
+            if job_update.rowcount != 1:
+                raise ConcurrentImportJobUpdate(job.id)
+            self._sync_job_counters(conn, job.id)
+            self._append_event(
+                conn,
+                job.id,
+                None,
+                "browser_job_timed_out",
+                _browser_event_payload(timeout_result),
+            )
+            expired_row = self._job_row(conn, job.id, owner_user_id)
+        return _job_from_row(expired_row)
+
     def request_cancel(self, job_id: str, owner_user_id: str) -> ImportJob:
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -966,6 +1225,105 @@ class ImportJobRepository:
                 if result.rowcount != 1:
                     raise ConcurrentImportJobUpdate(job_id)
                 self._append_event(conn, job_id, None, "cancel_requested", {})
+                current = _job_from_row(self._job_row(conn, job_id, owner_user_id))
+
+            if (
+                current.operation_kind is ImportOperationKind.PREVIEW
+                and current.result_snapshot is None
+            ):
+                now = _now()
+                correlation_id = current.correlation_id or current.id[:128]
+                cancelled_result = BrowserTaskResult(
+                    correlation_id=correlation_id,
+                    state=BrowserResultState.CANCELLED,
+                    error_code="cancelled",
+                    error_message="Browser task cancelled",
+                    retryable=False,
+                )
+                canonical_result = encode_browser_result(cancelled_result)
+                task_rows = conn.execute(
+                    """
+                    SELECT id FROM chapter_tasks
+                    WHERE job_id = ? AND status IN (?, ?, ?)
+                    ORDER BY id ASC
+                    """,
+                    (
+                        current.id,
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.WAITING_RETRY.value,
+                    ),
+                ).fetchall()
+                conn.execute(
+                    """
+                    UPDATE chapter_tasks
+                    SET status = ?, stage = ?, error_code = ?, error_message = ?, retryable = 0,
+                        finished_at = ?, lease_token = '', lease_owner = '', lease_expires_at = '',
+                        updated_at = ?, version = version + 1
+                    WHERE job_id = ? AND status IN (?, ?, ?)
+                    """,
+                    (
+                        TaskStatus.CANCELLED.value,
+                        TaskStage.CANCELLED.value,
+                        cancelled_result.error_code,
+                        cancelled_result.error_message,
+                        now,
+                        now,
+                        current.id,
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.WAITING_RETRY.value,
+                    ),
+                )
+                job_update = conn.execute(
+                    """
+                    UPDATE import_jobs
+                    SET status = ?, finished_at = ?, error_summary = ?, correlation_id = ?,
+                        result_state = ?, result_snapshot_json = ?, result_published_at = ?,
+                        version = version + 1
+                    WHERE id = ? AND owner_user_id = ? AND version = ?
+                      AND result_state = '' AND result_snapshot_json = ''
+                      AND result_published_at = ''
+                    """,
+                    (
+                        JobStatus.CANCELLED.value,
+                        now,
+                        cancelled_result.error_message,
+                        correlation_id,
+                        cancelled_result.state.value,
+                        canonical_result,
+                        now,
+                        current.id,
+                        owner_user_id,
+                        current.version,
+                    ),
+                )
+                if job_update.rowcount != 1:
+                    raise ConcurrentImportJobUpdate(job_id)
+                self._sync_job_counters(conn, current.id)
+                event_payload = _browser_event_payload(cancelled_result)
+                self._append_event(
+                    conn,
+                    current.id,
+                    None,
+                    "browser_result_published",
+                    event_payload,
+                )
+                for task_row in task_rows:
+                    self._append_event(
+                        conn,
+                        current.id,
+                        int(task_row["id"]),
+                        "task_transitioned",
+                        event_payload,
+                    )
+                self._append_event(
+                    conn,
+                    current.id,
+                    None,
+                    "job_transitioned",
+                    event_payload,
+                )
             row = self._job_row(conn, job_id, owner_user_id)
         return _job_from_row(row)
 
