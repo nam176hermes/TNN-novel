@@ -209,13 +209,28 @@ immutable image IDs are:
 
 The exact pins are recorded in
 `deploy/production/compose.release.operational-observability-20260809-r1.yaml`.
-Render that overlay with the base configuration before any approved deployment:
+Use the canonical project and private environment file to validate that overlay
+before any approved deployment. Never run `docker compose config` without
+`--quiet` or `--images`: unrestricted output resolves and prints application,
+administrator, and provider secrets.
 
 ```bash
-docker compose \
+set -euo pipefail
+PROJECT_NAME=novel-tnn-wsl
+PRODUCTION_ENV="${HOME}/.config/novel-tnn/production.env"
+RELEASE_OVERLAY=deploy/production/compose.release.operational-observability-20260809-r1.yaml
+
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
   -f compose.yaml \
-  -f deploy/production/compose.release.operational-observability-20260809-r1.yaml \
-  config
+  -f "$RELEASE_OVERLAY" \
+  config --quiet
+
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$RELEASE_OVERLAY" \
+  config --images
 ```
 
 An isolated loopback API probe must report the complete API ID above at
