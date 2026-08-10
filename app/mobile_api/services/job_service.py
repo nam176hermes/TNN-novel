@@ -669,9 +669,16 @@ class JobService:
 
     def _job_cancel_requested(self, job_id: str) -> bool:
         job = self.tracker.get_job(job_id)
-        if not job:
-            return True
-        return bool(job.cancel_requested or job.status in {"cancelled", "canceled"})
+        if self.tracker.db_path is not None:
+            persisted = get_mobile_job(self.tracker.db_path, job_id)
+            if persisted is not None and (
+                bool(persisted.get("cancel_requested"))
+                or str(persisted.get("status") or "").lower() in {"cancelled", "canceled"}
+            ):
+                if job is not None:
+                    job.cancel_requested = True
+                return True
+        return bool(job and job.cancel_requested)
 
     def _cancel_if_requested(self, job_id: str, message: str = "Job cancelled by user") -> bool:
         if not self._job_cancel_requested(job_id):
@@ -1385,7 +1392,7 @@ class JobService:
             # Translate them
             for idx, chapter in enumerate(pending):
                 if self._cancel_if_requested(job_id):
-                    break
+                    return
                 chapter_id = chapter["id"]
                 started_at = time.monotonic()
                 self.tracker.update_job(
@@ -1412,6 +1419,8 @@ class JobService:
                         status="success",
                         elapsed_ms=int((time.monotonic() - started_at) * 1000),
                     )
+                    if self._cancel_if_requested(job_id):
+                        return
                 except Exception as exc:
                     self._record_provider_attempt(
                         job_id=job_id,
@@ -1423,6 +1432,8 @@ class JobService:
                         elapsed_ms=int((time.monotonic() - started_at) * 1000),
                     )
                     raise
+            if self._cancel_if_requested(job_id):
+                return
             self.tracker.update_job(job_id, status="completed", progress=100, message="Daily batch completed")
         except Exception:
             logger.exception("Daily job %s failed", job_id)
