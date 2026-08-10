@@ -1,14 +1,10 @@
 import {
   BookOpenText,
   Check,
-  ChevronRight,
   Download,
   FileText,
-  Image,
   Info,
-  List,
   NotebookText,
-  StickyNote,
 } from 'lucide-react';
 import { useState } from 'react';
 import exportDocxIcon from '../assets/reference-ui/export-docx.png';
@@ -179,42 +175,17 @@ export default function ExportView({
 
       <section aria-labelledby="export-options-title" className="panel export-options-panel">
         <div className="panel-header">
-          <h3 id="export-options-title">Tùy chọn xuất</h3>
+          <div>
+            <p className="section-label">Không thể thay đổi</p>
+            <h3 id="export-options-title">Thiết lập cố định</h3>
+          </div>
         </div>
-        <div className="export-option-grid">
-          <article className="export-option-card">
-            <FileText aria-hidden="true" size={22} />
-            <span>
-              <strong>Phạm vi chương</strong>
-              <small>{activeBook ? `Tất cả chương (1 - ${activeBook.total})` : 'Chưa chọn truyện'}</small>
-            </span>
-            <ChevronRight aria-hidden="true" size={18} />
-          </article>
-          <article className="export-option-card">
-            <StickyNote aria-hidden="true" size={22} />
-            <span>
-              <strong>Bao gồm chú thích</strong>
-              <small>Bao gồm chú thích, ghi chú</small>
-            </span>
-            <span aria-hidden="true" className="toggle-switch is-on" />
-          </article>
-          <article className="export-option-card">
-            <Image aria-hidden="true" size={22} />
-            <span>
-              <strong>Bìa sách</strong>
-              <small>Không bao gồm bìa</small>
-            </span>
-            <ChevronRight aria-hidden="true" size={18} />
-          </article>
-          <article className="export-option-card">
-            <List aria-hidden="true" size={22} />
-            <span>
-              <strong>Mục lục</strong>
-              <small>Tạo mục lục tự động</small>
-            </span>
-            <span aria-hidden="true" className="toggle-switch is-on" />
-          </article>
-        </div>
+        <dl className="export-fixed-options">
+          <div><dt>Phạm vi chương</dt><dd>Tất cả chương đã dịch</dd></div>
+          <div><dt>Chú thích</dt><dd>Không kèm chú thích trong file sách</dd></div>
+          <div><dt>Bìa sách</dt><dd>Không kèm bìa sách</dd></div>
+          <div><dt>Mục lục</dt><dd>Theo mặc định của định dạng đã chọn</dd></div>
+        </dl>
       </section>
 
       <section aria-label="Export notice" className="panel export-action-panel">

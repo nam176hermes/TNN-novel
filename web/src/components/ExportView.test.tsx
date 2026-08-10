@@ -68,6 +68,26 @@ describe('ExportView', () => {
     expect(screen.getByRole('region', { name: 'Hướng dẫn xuất file' })).toHaveTextContent('Backup hệ thống nằm ở trang Trạng thái');
   });
 
+  it('describes unsupported export options as fixed defaults instead of controls', () => {
+    render(
+      <ExportView
+        activeBookId={1}
+        books={books}
+        lastExport={null}
+        onBookChange={() => undefined}
+        onExport={() => undefined}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Thiết lập cố định' })).toBeInTheDocument();
+    expect(screen.getByText('Tất cả chương đã dịch')).toBeInTheDocument();
+    expect(screen.getByText('Không kèm chú thích trong file sách')).toBeInTheDocument();
+    expect(screen.getByText('Không kèm bìa sách')).toBeInTheDocument();
+    expect(screen.getByText('Theo mặc định của định dạng đã chọn')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Phạm vi chương|Bao gồm chú thích|Bìa sách|Mục lục/ })).not.toBeInTheDocument();
+    expect(document.querySelector('.toggle-switch')).not.toBeInTheDocument();
+  });
+
   it('disables format buttons when selected book has no translations', () => {
     render(
       <ExportView
