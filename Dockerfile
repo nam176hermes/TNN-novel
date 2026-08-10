@@ -54,6 +54,19 @@ RUN mkdir -p /data /data/secrets /tmp/novel \
 
 VOLUME ["/data"]
 
+FROM runtime-base AS api
+
+ENV MOBILE_API_SERVE_WEB=1 \
+    WEB_DIST_DIR=/app/web/dist
+
+USER novel
+EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${MOBILE_API_PORT}/api/ready" >/dev/null || exit 1
+
+CMD ["sh", "-c", "umask 007 && exec python -m app.mobile_api"]
+
 FROM runtime-base AS import-worker
 
 # Chromium belongs only to the worker image. The API target remains smaller and
@@ -65,21 +78,6 @@ RUN playwright install --with-deps chromium \
 USER novel
 CMD ["sh", "-c", "umask 007 && exec python -m app.import_worker"]
 
-FROM runtime-base AS api
-
-# Chromium installed here too so preview/fetch can do stealth browser fallback
-# without delegating to the import-worker.
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    MOBILE_API_SERVE_WEB=1 \
-    WEB_DIST_DIR=/app/web/dist
-
-RUN playwright install --with-deps chromium \
-    && chown -R novel:novel /ms-playwright
-
-USER novel
-EXPOSE 7860
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${MOBILE_API_PORT}/api/ready" >/dev/null || exit 1
-
-CMD ["sh", "-c", "umask 007 && exec python -m app.mobile_api"]
+# Preserve the historical no-target Docker build as the API image while keeping
+# the explicit `api` target before the browser-capable worker stage.
+FROM api AS production

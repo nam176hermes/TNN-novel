@@ -11,7 +11,7 @@ services:
         NOVEL_BUILD_TIMESTAMP: "${NOVEL_BUILD_TIMESTAMP:-unknown}"
         NOVEL_RELEASE_ID: "${NOVEL_RELEASE_ID:-development}"
         NOVEL_IMAGE_TAG: "${NOVEL_API_IMAGE_TAG:-novel-pipeline-api:local}"
-    image: novel-pipeline-api:local
+    image: "${NOVEL_API_IMAGE_TAG:-novel-pipeline-api:local}"
     restart: unless-stopped
     init: true
     ports:
@@ -72,7 +72,7 @@ services:
       args:
         <<: *release-build-args
         NOVEL_IMAGE_TAG: "${NOVEL_WORKER_IMAGE_TAG:-novel-pipeline-import-worker:local}"
-    image: novel-pipeline-import-worker:local
+    image: "${NOVEL_WORKER_IMAGE_TAG:-novel-pipeline-import-worker:local}"
     restart: unless-stopped
     init: true
     command: ["sh", "-c", "umask 007 && exec python -m app.import_worker"]
