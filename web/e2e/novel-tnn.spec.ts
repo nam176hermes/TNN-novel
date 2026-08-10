@@ -1156,6 +1156,15 @@ test('exports a translated book as TXT without calling a live API', async ({ pag
   await page.getByRole('navigation', { name: 'Quy trình' }).getByRole('button', { name: 'Xuất file' }).click();
   await expect(page.getByRole('heading', { name: 'Xuất file' })).toBeVisible();
 
+  const fixedDefaults = page.getByRole('region', { name: 'Thiết lập cố định' });
+  await expect(fixedDefaults).toContainText('Tất cả chương đã dịch');
+  await expect(fixedDefaults).toContainText('Không kèm chú thích trong file sách');
+  await expect(fixedDefaults).toContainText('Không kèm bìa sách');
+  await expect(fixedDefaults).toContainText('Theo mặc định của định dạng đã chọn');
+  await expect(fixedDefaults.getByRole('button')).toHaveCount(0);
+  await expect(fixedDefaults.getByRole('checkbox')).toHaveCount(0);
+  await expect(fixedDefaults.getByRole('switch')).toHaveCount(0);
+
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Bắt đầu xuất' }).click();
   const download = await downloadPromise;
