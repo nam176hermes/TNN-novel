@@ -21,6 +21,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from app.runtime_identity import is_safe_runtime_identity_value
+
 
 SCHEMA_VERSION = 1
 MAX_TIMEOUT_SECONDS = 60.0
@@ -65,7 +67,6 @@ _RECEIPT_KEYS = {
     "fingerprint",
     "http_status",
 }
-_SAFE_RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,127}")
 _FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 _PROCESS_LOCK = threading.RLock()
 
@@ -85,6 +86,7 @@ class _SessionLike(Protocol):
         json: dict[str, object],
         headers: dict[str, str],
         timeout: float,
+        allow_redirects: bool,
     ) -> _ResponseLike: ...
 
 
@@ -180,8 +182,9 @@ def _canonical_timestamp(value: object) -> str:
 
 
 def _safe_release_id(value: object) -> str:
-    if not isinstance(value, str) or not _SAFE_RELEASE_ID.fullmatch(value):
+    if not is_safe_runtime_identity_value(value):
         raise ValueError("Operational alert release ID is invalid")
+    assert isinstance(value, str)
     return value
 
 
@@ -361,6 +364,8 @@ def _receipt_from_payload(payload: object, alert_class: str) -> DeliveryReceipt:
             or not _FINGERPRINT.fullmatch(fingerprint)
         ):
             raise ValueError("Operational alert receipt is invalid")
+        if fingerprint != _incident_fingerprint(alert_class, code, release_id):
+            raise ValueError("Operational alert receipt is invalid")
         if status == "delivered":
             delivered_at = _canonical_timestamp(delivered_at_value)
             if http_status is None or not 200 <= http_status < 300:
@@ -405,7 +410,11 @@ def _read_receipt(directory_descriptor: int, alert_class: str) -> DeliveryReceip
         raw = os.read(descriptor, MAX_RECEIPT_BYTES + 1)
         if len(raw) > MAX_RECEIPT_BYTES:
             return None
-        return _receipt_from_payload(_strict_json_object(raw), alert_class)
+        receipt = _receipt_from_payload(_strict_json_object(raw), alert_class)
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        return receipt
     except (json.JSONDecodeError, OSError, TypeError, UnicodeError, ValueError):
         return None
     finally:
@@ -542,6 +551,7 @@ class OperationalAlertDispatcher:
                     json=payload,
                     headers=headers,
                     timeout=self.config.timeout_seconds,
+                    allow_redirects=False,
                 )
                 raw_status = getattr(response, "status_code", None)
                 last_status = (
