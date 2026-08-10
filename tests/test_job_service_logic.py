@@ -231,6 +231,80 @@ async def test_daily_job_keeps_durable_cancel_when_translation_raises(
 
 
 @pytest.mark.asyncio
+async def test_daily_job_durable_cancel_during_pending_lookup_is_not_overwritten(
+    temp_db_path,
+) -> None:
+    translated: list[int] = []
+
+    class PendingLookupCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 1
+            assert request_cancel_mobile_job(temp_db_path, job_id=job.job_id)
+            return [{"id": 301, "book_id": 1}]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(PendingLookupCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+
+    await service._run_daily_job(job.job_id, 1)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert translated == []
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
+
+
+@pytest.mark.asyncio
+async def test_daily_job_cancel_before_final_completion_write_stays_cancelled(
+    temp_db_path,
+    monkeypatch,
+) -> None:
+    translated: list[int] = []
+
+    class FinalCompletionCancelPipeline:
+        db_path = temp_db_path
+
+        def get_pending_chapters(self, *, limit: int) -> list[dict[str, int]]:
+            assert limit == 1
+            return [{"id": 401, "book_id": 1}]
+
+        def translate_chapter(self, **kwargs) -> str:
+            translated.append(int(kwargs["chapter_id"]))
+            return "translated"
+
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(FinalCompletionCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
+    job = service.tracker.create_job("daily", None, 100)
+    update_job = tracker.update_job
+
+    def request_cancel_before_completion(job_id: str, **kwargs) -> bool:
+        if kwargs.get("status") == "completed":
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **kwargs)
+
+    monkeypatch.setattr(tracker, "update_job", request_cancel_before_completion)
+
+    await service._run_daily_job(job.job_id, 1)
+
+    persisted = JobTracker(db_path=temp_db_path).get_job(job.job_id)
+    cached = service.get_job_status(job.job_id)
+    assert persisted is not None
+    assert cached is not None
+    assert translated == [401]
+    assert persisted.status == cached["status"] == "cancelled"
+    assert persisted.state == cached["state"] == "CANCELED"
+
+
+@pytest.mark.asyncio
 async def test_start_translate_job_book_zero_does_not_target_all_books(
     temp_db_path,
     tmp_path,

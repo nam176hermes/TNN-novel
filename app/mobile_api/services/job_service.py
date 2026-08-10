@@ -243,7 +243,9 @@ class JobTracker:
 
     def _persist_job(self, job: JobStatus) -> None:
         if self.db_path is not None:
-            save_mobile_job(self.db_path, job.to_record())
+            persisted = save_mobile_job(self.db_path, job.to_record())
+            reconciled = JobStatus.from_record(persisted)
+            job.__dict__.update(reconciled.__dict__)
 
     def _load_job(self, job_id: str) -> JobStatus | None:
         if self.db_path is None:

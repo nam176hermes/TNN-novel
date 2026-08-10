@@ -15,6 +15,7 @@ from app.database.db import (
     get_chapter_by_id,
     get_connection,
     get_job_attempts,
+    get_mobile_job,
     get_qa_report,
     get_last_summary,
     init_db,
@@ -24,6 +25,8 @@ from app.database.db import (
     load_glossary,
     put_glossary_term,
     record_job_attempt,
+    request_cancel_mobile_job,
+    save_mobile_job,
     save_summary,
     update_chapter_paths,
     glossary_stats,
@@ -46,6 +49,28 @@ def test_db_reexports_connection_function_object(temp_db_path: Path) -> None:
     with db_mod.get_connection(temp_db_path) as conn:
         assert conn.row_factory is sqlite3.Row
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_save_mobile_job_preserves_durable_cancellation_against_stale_update(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    job = {
+        "job_id": "durable-cancel",
+        "job_type": "daily",
+        "status": "running",
+        "created_at": "2026-08-10T00:00:00+00:00",
+        "updated_at": "2026-08-10T00:00:00+00:00",
+    }
+    save_mobile_job(temp_db_path, job)
+    assert request_cancel_mobile_job(temp_db_path, job_id=job["job_id"])
+
+    stale_completion = {**job, "status": "completed", "state": "COMPLETED", "updated_at": "2026-08-10T00:01:00+00:00"}
+    save_mobile_job(temp_db_path, stale_completion)
+
+    persisted = get_mobile_job(temp_db_path, job["job_id"])
+    assert persisted is not None
+    assert persisted["cancel_requested"] is True
+    assert persisted["status"] == "cancelled"
+    assert persisted["state"] == "CANCELED"
 
 
 def test_add_and_get_book(temp_db_path: Path):

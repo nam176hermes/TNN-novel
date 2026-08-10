@@ -2361,7 +2361,7 @@ def _mobile_job_from_row(row: sqlite3.Row) -> dict:
     return job
 
 
-def save_mobile_job(db_path: Path, job: dict) -> None:
+def save_mobile_job(db_path: Path, job: dict) -> dict:
     target_ids_json = json.dumps(job.get("target_ids", []), ensure_ascii=False)
     params_json = json.dumps(job.get("params", {}), ensure_ascii=False)
     status = str(job.get("status") or "queued")
@@ -2392,8 +2392,22 @@ def save_mobile_job(db_path: Path, job: dict) -> None:
             ON CONFLICT(job_id) DO UPDATE SET
                 job_type = excluded.job_type,
                 owner_user_id = excluded.owner_user_id,
-                status = excluded.status,
-                state = excluded.state,
+                status = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN 'cancelled'
+                    ELSE excluded.status
+                END,
+                state = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN 'CANCELED'
+                    ELSE excluded.state
+                END,
                 progress = excluded.progress,
                 total = excluded.total,
                 current_book_id = excluded.current_book_id,
@@ -2406,15 +2420,43 @@ def save_mobile_job(db_path: Path, job: dict) -> None:
                 retry_count = excluded.retry_count,
                 target_ids_json = excluded.target_ids_json,
                 params_json = excluded.params_json,
-                message = excluded.message,
+                message = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN 'Job cancelled by user'
+                    ELSE excluded.message
+                END,
                 error = excluded.error,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
                 started_at = excluded.started_at,
-                completed_at = excluded.completed_at,
-                failed_at = excluded.failed_at,
-                finished_at = excluded.finished_at,
-                cancel_requested = excluded.cancel_requested,
+                completed_at = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN ''
+                    ELSE excluded.completed_at
+                END,
+                failed_at = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN ''
+                    ELSE excluded.failed_at
+                END,
+                finished_at = CASE
+                    WHEN (
+                        mobile_jobs.cancel_requested = 1
+                        OR LOWER(mobile_jobs.status) IN ('cancelled', 'canceled')
+                    ) AND LOWER(excluded.status) NOT IN ('cancelled', 'canceled')
+                    THEN excluded.updated_at
+                    ELSE excluded.finished_at
+                END,
+                cancel_requested = MAX(mobile_jobs.cancel_requested, excluded.cancel_requested),
                 last_safe_error = excluded.last_safe_error,
                 internal_error_ref = excluded.internal_error_ref
             """,
@@ -2450,6 +2492,8 @@ def save_mobile_job(db_path: Path, job: dict) -> None:
             ),
         )
         conn.commit()
+        row = conn.execute("SELECT * FROM mobile_jobs WHERE job_id = ?", (job["job_id"],)).fetchone()
+        return _mobile_job_from_row(row)
 
 
 def get_mobile_job(db_path: Path, job_id: str) -> dict | None:

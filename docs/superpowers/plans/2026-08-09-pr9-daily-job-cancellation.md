@@ -56,7 +56,8 @@ async def test_daily_job_observes_durable_cancel_and_does_not_start_next_chapter
                 assert request_cancel_mobile_job(temp_db_path, job_id=str(kwargs["job_id"]))
             return "translated"
 
-    service = JobService(DurableCancelPipeline())  # type: ignore[arg-type]
+    tracker = JobTracker(db_path=temp_db_path)
+    service = JobService(DurableCancelPipeline(), tracker=tracker)  # type: ignore[arg-type]
     job = service.tracker.create_job("daily", None, 100)
 
     await service._run_daily_job(job.job_id, 2)
@@ -192,4 +193,3 @@ git log --oneline --decorate -5
 ```
 
 Expected: no unstaged or untracked implementation artifacts; all checks exit `0`.
-
