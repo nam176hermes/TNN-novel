@@ -613,11 +613,22 @@ async def test_cooperative_backup_cancellation_records_one_terminal_event(
 async def test_cancellation_before_archive_work_records_one_terminal_event(
     tmp_path: Path,
     temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
     tracker = JobTracker(db_path=temp_db_path)
     service = FakeBackupService(tmp_path / "backups")
     coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    record_terminal_event = coordinator._record_terminal_event
+    statuses_when_terminal_event_is_recorded: list[str] = []
+
+    def record_terminal_event_before_terminal_status(**kwargs) -> None:
+        job = tracker.get_job(str(kwargs["job_id"]))
+        assert job is not None
+        statuses_when_terminal_event_is_recorded.append(job.status)
+        record_terminal_event(**kwargs)
+
+    monkeypatch.setattr(coordinator, "_record_terminal_event", record_terminal_event_before_terminal_status)
     job_id = coordinator.start_backup_job(
         include_audio=True,
         include_exports=False,
@@ -627,6 +638,10 @@ async def test_cancellation_before_archive_work_records_one_terminal_event(
     )
 
     assert tracker.cancel_job(job_id)
+    pending = tracker.get_job(job_id)
+    assert pending is not None
+    assert pending.status == "queued"
+    assert pending.cancel_requested is True
     await wait_for_job(tracker, job_id)
 
     job = tracker.get_job(job_id)
@@ -635,6 +650,7 @@ async def test_cancellation_before_archive_work_records_one_terminal_event(
     assert not service.started.is_set()
     events = terminal_backup_events(temp_db_path, job_id)
     assert len(events) == 1
+    assert statuses_when_terminal_event_is_recorded == ["running"]
     assert events[0]["severity"] == "warning"
     assert events[0]["details"]["result"] == "cancelled"
 

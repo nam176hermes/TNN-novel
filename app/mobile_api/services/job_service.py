@@ -443,8 +443,13 @@ class JobTracker:
         job = self.get_job(job_id)
         if not job:
             return False
+        is_database_backed_backup = job.job_type == "backup" and self.db_path is not None
         if self.db_path is not None:
-            request_cancel_mobile_job(self.db_path, job_id=job_id)
+            request_cancel_mobile_job(
+                self.db_path,
+                job_id=job_id,
+                terminal_if_pending=not is_database_backed_backup,
+            )
             job.cancel_requested = True
             record_job_log(
                 self.db_path,
@@ -454,7 +459,8 @@ class JobTracker:
                 step=job.current_step,
                 message="Cancel requested",
             )
-        self.update_job(job_id, cancel_requested=True)
+        if not is_database_backed_backup:
+            self.update_job(job_id, cancel_requested=True)
         # Cancel the asyncio task if it exists
         task = self._tasks.get(job_id)
         if job.job_type == "backup":

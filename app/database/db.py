@@ -2680,7 +2680,12 @@ def count_mobile_jobs_by_status(db_path: Path) -> dict[str, int]:
         return {str(row["status"]): int(row["count"]) for row in rows}
 
 
-def request_cancel_mobile_job(db_path: Path, *, job_id: str) -> bool:
+def request_cancel_mobile_job(
+    db_path: Path,
+    *,
+    job_id: str,
+    terminal_if_pending: bool = True,
+) -> bool:
     now = datetime.now(timezone.utc).isoformat()
     with get_connection(db_path) as conn:
         row = conn.execute("SELECT status FROM mobile_jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -2689,7 +2694,7 @@ def request_cancel_mobile_job(db_path: Path, *, job_id: str) -> bool:
         status = str(row["status"] or "").lower()
         if status in {"completed", "failed", "cancelled", "canceled", "interrupted"}:
             return True
-        if status in {"pending", "queued", "retrying"}:
+        if terminal_if_pending and status in {"pending", "queued", "retrying"}:
             cur = conn.execute(
                 """
                 UPDATE mobile_jobs

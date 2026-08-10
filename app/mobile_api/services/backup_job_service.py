@@ -198,12 +198,6 @@ class BackupJobCoordinator:
                 job = self.tracker.get_job(job_id)
                 include_secrets = bool(job and job.params.get("include_secrets"))
                 if self._cancel_requested(job_id):
-                    self._update_terminal_job(
-                        job_id,
-                        status="cancelled",
-                        message="Backup cancelled",
-                        cancel_requested=True,
-                    )
                     self._record_terminal_event(
                         job_id=job_id,
                         result="cancelled",
@@ -212,6 +206,12 @@ class BackupJobCoordinator:
                         encrypted=include_secrets,
                         secrets_included=include_secrets,
                         started_at=started_at,
+                    )
+                    self._update_terminal_job(
+                        job_id,
+                        status="cancelled",
+                        message="Backup cancelled",
+                        cancel_requested=True,
                     )
                     return
 
@@ -266,18 +266,18 @@ class BackupJobCoordinator:
                                 pass
                         raise BackupCancelled("Backup cancelled") from None
                 except BackupCancelled:
-                    self._update_terminal_job(
-                        job_id,
-                        status="cancelled",
-                        message="Backup cancelled",
-                        cancel_requested=True,
-                    )
                     self._record_terminal_event(
                         job_id=job_id,
                         result="cancelled",
                         encrypted=include_secrets,
                         secrets_included=include_secrets,
                         started_at=started_at,
+                    )
+                    self._update_terminal_job(
+                        job_id,
+                        status="cancelled",
+                        message="Backup cancelled",
+                        cancel_requested=True,
                     )
                     return
                 except Exception:
@@ -320,18 +320,18 @@ class BackupJobCoordinator:
         except asyncio.CancelledError:
             job = self.tracker.get_job(job_id)
             include_secrets = bool(job and job.params.get("include_secrets"))
-            self._update_terminal_job(
-                job_id,
-                status="cancelled",
-                message="Backup cancelled",
-                cancel_requested=True,
-            )
             self._record_terminal_event(
                 job_id=job_id,
                 result="cancelled",
                 encrypted=include_secrets,
                 secrets_included=include_secrets,
                 started_at=started_at,
+            )
+            self._update_terminal_job(
+                job_id,
+                status="cancelled",
+                message="Backup cancelled",
+                cancel_requested=True,
             )
         finally:
             self.secret_store.discard(job_id)
