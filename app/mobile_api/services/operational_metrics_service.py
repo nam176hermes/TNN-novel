@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -10,6 +11,7 @@ import shutil
 import sqlite3
 import time
 from typing import Any
+from urllib.parse import quote
 
 from app.config import settings
 from app.mobile_api.config import mobile_settings
@@ -79,6 +81,8 @@ def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]
     worker = snapshot["worker"]
     if worker["required"] and not worker["queue_claim_capable"]:
         add("worker_not_ready", "critical", "Required import worker cannot claim queued work")
+    if worker.get("required") and worker.get("status") == "stale":
+        add("worker_stale", "critical", "Required import worker heartbeat is stale")
     if snapshot["release"]["worker_match"] is False:
         add("release_mismatch", "critical", "API and worker release identities differ")
     if snapshot["storage"]["disk_free_bytes"] < 100 * 1024 * 1024:
@@ -90,6 +94,8 @@ def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]
         add("queue_stale", "warning", "Oldest queued work exceeds one hour")
     if snapshot["jobs"]["failed_or_interrupted"] > 0:
         add("jobs_failed", "warning", "Failed or interrupted jobs require review")
+    if snapshot["jobs"].get("backup_failed", 0) > 0:
+        add("backup_failed", "warning", "A backup job failed")
     recovery_alerts = {
         "missing": ("missing", "No verified recovery receipt is recorded"),
         "corrupt": ("invalid", "Recovery receipt is invalid"),
@@ -115,11 +121,26 @@ class OperationalMetricsService:
     db_path: Path
     data_dir: Path
     cache_ttl_seconds: float = 30.0
+    read_only: bool = False
+    database_connection: sqlite3.Connection | None = None
+    database_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         self.db_path = Path(self.db_path)
         self.data_dir = Path(self.data_dir)
+        if self.database_size_bytes is not None and (
+            isinstance(self.database_size_bytes, bool)
+            or not isinstance(self.database_size_bytes, int)
+            or self.database_size_bytes < 0
+        ):
+            raise ValueError("Operational database size is invalid")
         self._cached: tuple[float, dict[str, Any]] | None = None
+
+    def _database_target(self) -> tuple[str, bool]:
+        if not self.read_only:
+            return str(self.db_path), False
+        absolute_path = self.db_path.absolute()
+        return f"file:{quote(str(absolute_path), safe='/')}?mode=ro", True
 
     def snapshot(self, *, now: datetime | None = None, use_cache: bool = True) -> dict[str, Any]:
         monotonic_now = time.monotonic()
@@ -127,15 +148,23 @@ class OperationalMetricsService:
             return self._cached[1]
         resolved_now = now or datetime.now(timezone.utc)
         identity = get_runtime_identity(component="api")
+        database_target, database_is_uri = self._database_target()
         worker = inspect_worker_runtime(
             data_dir=self.data_dir,
-            db_path=self.db_path,
+            db_path=database_target,
+            db_uri=database_is_uri,
+            database_connection=self.database_connection,
             api_identity=identity,
             required=not mobile_settings.import_job_run_in_api,
             max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
             now=resolved_now.timestamp(),
         )
-        with sqlite3.connect(str(self.db_path)) as connection:
+        connection_context = (
+            nullcontext(self.database_connection)
+            if self.database_connection is not None
+            else sqlite3.connect(database_target, uri=database_is_uri)
+        )
+        with connection_context as connection:
             queued = connection.execute(
                 """
                 SELECT COUNT(*) FROM mobile_jobs
@@ -159,6 +188,12 @@ class OperationalMetricsService:
             ).fetchone()[0]
             failed += connection.execute(
                 "SELECT COUNT(*) FROM import_jobs WHERE status = 'failed'"
+            ).fetchone()[0]
+            backup_failed = connection.execute(
+                """
+                SELECT COUNT(*) FROM mobile_jobs
+                WHERE lower(job_type) = 'backup' AND lower(status) = 'failed'
+                """
             ).fetchone()[0]
             auth = connection.execute(
                 """
@@ -186,7 +221,7 @@ class OperationalMetricsService:
             },
             "worker": worker_payload,
             "queue": {"depth": int(queued), "oldest_age_seconds": oldest_age},
-            "jobs": {"failed_or_interrupted": int(failed)},
+            "jobs": {"failed_or_interrupted": int(failed), "backup_failed": int(backup_failed)},
             "backup": read_recovery_receipt(
                 self.data_dir,
                 "external_backup",
@@ -201,7 +236,11 @@ class OperationalMetricsService:
             ),
             "storage": {
                 "disk_free_bytes": int(disk_free),
-                "database_size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
+                "database_size_bytes": (
+                    self.database_size_bytes
+                    if self.database_size_bytes is not None
+                    else self.db_path.stat().st_size if self.db_path.exists() else 0
+                ),
             },
             "artifacts": artifacts,
             "auth_sessions": {

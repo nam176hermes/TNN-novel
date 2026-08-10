@@ -12,9 +12,15 @@ from app.database.db import CURRENT_SCHEMA_VERSION
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,191}$")
 
 
+def is_safe_runtime_identity_value(value: object) -> bool:
+    """Return whether a value satisfies the shared bounded identity contract."""
+
+    return isinstance(value, str) and _SAFE_VALUE.fullmatch(value) is not None
+
+
 def _value(name: str, default: str) -> str:
     value = str(os.getenv(name, default) or default).strip()
-    return value if _SAFE_VALUE.fullmatch(value) else default
+    return value if is_safe_runtime_identity_value(value) else default
 
 
 @dataclass(frozen=True)

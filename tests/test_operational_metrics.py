@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
 
 import httpx
 import pytest
@@ -66,6 +67,21 @@ def test_operational_snapshot_is_bounded_and_redacted(tmp_path: Path, monkeypatc
             producer_version="release-a",
             completed_at=datetime.fromtimestamp(90, tz=timezone.utc),
         )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO mobile_jobs (job_id, job_type, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("backup-failure", "BACKUP", "FAILED", "2026-08-09T00:00:00+00:00", "2026-08-09T00:00:00+00:00"),
+        )
+        connection.execute(
+            """
+            INSERT INTO mobile_jobs (job_id, job_type, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("non-backup-failure", "translate", "failed", "2026-08-09T00:00:00+00:00", "2026-08-09T00:00:00+00:00"),
+        )
 
     snapshot = OperationalMetricsService(db_path, data_dir).snapshot(
         now=datetime.fromtimestamp(100, tz=timezone.utc),
@@ -83,9 +99,81 @@ def test_operational_snapshot_is_bounded_and_redacted(tmp_path: Path, monkeypatc
     assert snapshot["tts"]["reason"] == "gpu_unavailable"
     assert snapshot["backup"]["state"] == "fresh"
     assert snapshot["restore_drill"]["state"] == "fresh"
+    assert snapshot["jobs"]["backup_failed"] == 1
     serialized = json.dumps(snapshot)
     for forbidden in (str(tmp_path), "pipeline.db", "worker-a", "authorization", "cookie", "token"):
         assert forbidden not in serialized.lower()
+
+
+def test_read_only_operational_snapshot_does_not_create_missing_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database_path = data_dir / "missing.db"
+    monkeypatch.setattr(
+        "app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api",
+        True,
+    )
+
+    service = OperationalMetricsService(database_path, data_dir, read_only=True)
+
+    with pytest.raises(sqlite3.OperationalError):
+        service.snapshot(use_cache=False)
+    assert not database_path.exists()
+
+
+def test_guarded_snapshot_database_size_comes_from_query_inode_during_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database_path = data_dir / "pipeline.db"
+    replacement_path = data_dir / "replacement.db"
+    saved_path = data_dir / "saved.db"
+    init_db(database_path)
+    init_db(replacement_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO mobile_jobs (job_id, job_type, status, created_at, updated_at)
+            VALUES ('guarded-backup', 'backup', 'failed', '2026-08-10', '2026-08-10')
+            """
+        )
+    with sqlite3.connect(replacement_path) as connection:
+        connection.execute("CREATE TABLE size_padding (payload BLOB NOT NULL)")
+        connection.execute("INSERT INTO size_padding VALUES (zeroblob(1048576))")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    guarded_size = database_path.stat().st_size
+    assert replacement_path.stat().st_size > guarded_size
+    monkeypatch.setattr(
+        "app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api",
+        True,
+    )
+    monkeypatch.setattr("app.services.tts.availability._cuda_available", lambda: False)
+    reader = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    service = OperationalMetricsService(
+        database_path,
+        data_dir,
+        read_only=True,
+        database_connection=reader,
+        database_size_bytes=guarded_size,
+    )
+
+    database_path.rename(saved_path)
+    replacement_path.rename(database_path)
+    try:
+        snapshot = service.snapshot(use_cache=False)
+    finally:
+        database_path.rename(replacement_path)
+        saved_path.rename(database_path)
+        reader.close()
+
+    assert snapshot["jobs"]["backup_failed"] == 1
+    assert snapshot["storage"]["database_size_bytes"] == guarded_size
 
 
 def test_corrupt_receipt_payload_cannot_leak_source_data_through_metrics(
@@ -160,6 +248,23 @@ def test_alert_rules_cover_worker_release_disk_queue_backup_restore_and_artifact
         "restore_drill_stale",
         "artifact_integrity",
     }
+
+
+def test_alert_rules_emit_dispatchable_backup_failure_and_worker_stale_codes() -> None:
+    snapshot = {
+        "worker": {"required": True, "status": "stale", "queue_claim_capable": False},
+        "release": {"worker_match": True},
+        "storage": {"disk_free_bytes": 2 * 1024**3},
+        "queue": {"oldest_age_seconds": None},
+        "jobs": {"failed_or_interrupted": 0, "backup_failed": 1},
+        "backup": {"state": "fresh"},
+        "restore_drill": {"state": "fresh"},
+        "artifacts": {"error_count": 0},
+    }
+
+    codes = {item["code"] for item in evaluate_operational_alerts(snapshot)}
+
+    assert {"worker_not_ready", "worker_stale", "backup_failed"}.issubset(codes)
 
 
 @pytest.mark.parametrize(

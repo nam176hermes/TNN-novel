@@ -30,11 +30,13 @@ session identifiers.
 | Code | Severity | Trigger |
 | --- | --- | --- |
 | `worker_not_ready` | critical | Required import worker cannot claim queued work |
+| `worker_stale` | critical | Required import worker heartbeat is explicitly stale |
 | `release_mismatch` | critical | API and worker release IDs differ |
 | `disk_critical` | critical | Free space below 100 MiB |
 | `disk_low` | warning | Free space below 1 GiB |
 | `queue_stale` | warning | Oldest queued work exceeds one hour |
 | `jobs_failed` | warning | Failed or interrupted work exists |
+| `backup_failed` | warning | A backup mobile job failed |
 | `external_backup_missing`, `restore_drill_missing` | warning | Required receipt is absent |
 | `external_backup_stale`, `restore_drill_stale` | warning | Receipt exceeds its configured maximum age |
 | `external_backup_invalid`, `restore_drill_invalid` | warning | Receipt JSON, schema, size, or file type is invalid |
@@ -46,6 +48,122 @@ session identifiers.
 Container restart count is reported only when an external orchestrator provides
 it. Docker socket access is intentionally not mounted into the API container.
 Public reachability also remains an external probe.
+
+## Operational webhook delivery
+
+The standalone dispatcher selects exactly four low-cardinality alert classes
+from a fresh, non-cached operational snapshot:
+
+| Delivery class | Source alert codes |
+| --- | --- |
+| `backup_failure` | `backup_failed` |
+| `wrong_release_receipt` | `external_backup_wrong_release`, `restore_drill_wrong_release` |
+| `worker_stale` | `worker_stale` |
+| `stuck_jobs` | `queue_stale` |
+
+It is intentionally outside API and worker request paths. A webhook outage or
+receipt error makes the command return non-zero; it does not change API or
+worker health. Command output is limited to an alert class and bounded status.
+It never prints the endpoint, bearer token, response body, or receipt path.
+
+### Isolated synthetic validation
+
+The synthetic command is the safe preflight. It binds a temporary receiver to
+the literal loopback address `127.0.0.1`, generates one incident per supported
+class, and uses the production dispatcher to write four isolated receipts. It
+does not read the operator database, contact an external host, or write anywhere
+in the resolved `DATA_DIR` subtree.
+
+```bash
+set -euo pipefail
+ALERT_SMOKE_DIR="$(mktemp -d)"
+chmod 0700 "$ALERT_SMOKE_DIR"
+NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python \
+  -m scripts.smoke_operational_alerts --receipt-dir "$ALERT_SMOKE_DIR"
+find "$ALERT_SMOKE_DIR" -maxdepth 1 -type f \
+  -name 'alert-*.receipt.json' -print
+```
+
+Expect one `class=... status=delivered` line and one receipt for each of the
+four classes. The command rejects filesystem root, the repository tree, the
+resolved `DATA_DIR` tree (including `logs/runtime` and every other descendant),
+relative paths, parent traversal, missing/non-directory paths, and paths reached
+through symlinks. Validation finishes before the receiver or dispatcher starts,
+so a rejected path cannot overwrite production receipts. Retain the temporary
+evidence until reviewed; remove it only after confirming the exact `mktemp`
+path and its four bounded receipt files.
+
+### Private configuration and manual dispatch
+
+Start from `deploy/production/alert.env.example`. The committed URL uses the
+reserved `.invalid` domain and the token is empty; replace them only in the
+private installed file. The dispatcher reads only these variables:
+
+- `NOVEL_ALERT_WEBHOOK_URL` (required HTTPS endpoint);
+- `NOVEL_ALERT_WEBHOOK_BEARER_TOKEN` (optional);
+- `NOVEL_ALERT_TIMEOUT_SECONDS` (finite request timeout, normalized to safe bounds);
+- `NOVEL_ALERT_MAX_ATTEMPTS` (normalized to one through three attempts).
+
+Prepare the private file without printing its contents:
+
+```bash
+set -euo pipefail
+install -d -m 0700 "$HOME/.config/novel-tnn"
+install -m 0600 deploy/production/alert.env.example \
+  "$HOME/.config/novel-tnn/alert.env"
+chmod 0600 "$HOME/.config/novel-tnn/alert.env"
+stat --format='%a %n' "$HOME/.config/novel-tnn" \
+  "$HOME/.config/novel-tnn/alert.env"
+```
+
+Do not place a live URL or token in the repository, shell history, command
+arguments, logs, or receipts. Loading the private environment and running
+`python -m scripts.dispatch_operational_alerts` performs real external
+delivery. That manual command requires explicit operator approval.
+
+Each outbound JSON object contains exactly `schema_version`, `alert_class`,
+`code`, `severity`, `release_id`, `observed_at`, and `fingerprint`. It contains
+no alert message, URL, token, response body, job/user identifier, filename,
+content, or filesystem path.
+
+### Receipts, retries, and deduplication
+
+The dispatcher stores one atomic mode-`0600` regular file per class below
+`DATA_DIR/logs/runtime/`:
+
+- `alert-backup_failure.receipt.json`;
+- `alert-wrong_release_receipt.receipt.json`;
+- `alert-worker_stale.receipt.json`;
+- `alert-stuck_jobs.receipt.json`.
+
+Each receipt contains exactly `schema_version`, `status`, `alert_class`, `code`,
+`attempt_count`, `observed_at`, `delivered_at`, `release_id`, `fingerprint`, and
+`http_status`. Network errors and non-2xx statuses are retried at most three
+times with bounded timeout/backoff. Response bodies are never read into output
+or receipts. A delivered receipt with the same deterministic fingerprint
+suppresses another POST. An inactive class becomes `resolved`, so a later
+recurrence is deliverable. Failed receipts do not suppress a later invocation.
+
+### Inert systemd examples
+
+The reviewed examples use a five-minute persistent user timer and a mode-`0077`
+oneshot service. Repository changes do not install, enable, or start them.
+Static review and inspection are safe:
+
+```bash
+set -euo pipefail
+systemd-analyze verify \
+  deploy/systemd/user/novel-tnn-alert-dispatch.service \
+  deploy/systemd/user/novel-tnn-alert-dispatch.timer
+systemctl --user is-enabled novel-tnn-alert-dispatch.timer || true
+systemctl --user status novel-tnn-alert-dispatch.timer --no-pager || true
+systemctl --user list-timers novel-tnn-alert-dispatch.timer --no-pager
+```
+
+Installing the examples, running `daemon-reload`, enabling/starting the timer,
+or executing the service can change operator state or send an external request.
+Each action requires explicit operator approval. Never use the synthetic
+loopback HTTP exception for a production endpoint.
 
 ## Release build
 
@@ -78,6 +196,49 @@ docker build --target import-worker \
 Record both immutable local image IDs before staging. At cutover, provide the
 resolved image digests through `NOVEL_API_IMAGE_DIGEST` and
 `NOVEL_WORKER_IMAGE_DIGEST`. API and worker must report the same release ID.
+
+### Reviewed operational-observability image pins
+
+Release `operational-observability-20260809-r1` was built at
+`2026-08-10T09:52:18Z` from clean source commit
+`0fdce5a0ea16d7741874cc7e8b6df65a97041b06`. Its reviewed local tags and
+immutable image IDs are:
+
+- `novel-pipeline-api:operational-observability-20260809-r1`:
+  `sha256:cf257299512228b482eaaaa949f50c59d6cbebb2875abe16d86b08c080e21d3f`;
+- `novel-pipeline-import-worker:operational-observability-20260809-r1`:
+  `sha256:7e0e22a1fcb23cd44b381dffddb255072c036a6c15f70742673d65fb06895615`.
+
+The exact pins are recorded in
+`deploy/production/compose.release.operational-observability-20260809-r1.yaml`.
+Use the canonical project and private environment file to validate that overlay
+before any approved deployment. Never run `docker compose config` without
+`--quiet` or `--images`: unrestricted output resolves and prints application,
+administrator, and provider secrets.
+
+```bash
+set -euo pipefail
+PROJECT_NAME=novel-tnn-wsl
+PRODUCTION_ENV="${HOME}/.config/novel-tnn/production.env"
+RELEASE_OVERLAY=deploy/production/compose.release.operational-observability-20260809-r1.yaml
+
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$RELEASE_OVERLAY" \
+  config --quiet
+
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$RELEASE_OVERLAY" \
+  config --images
+```
+
+An isolated loopback API probe must report the complete API ID above at
+`/api/version.image_digest`, never `unknown`. The worker receives its distinct
+complete ID through `NOVEL_IMAGE_DIGEST`. The overlay records provenance only;
+it does not authorize a production deployment, restart, or worker start.
 
 ## Pre-deployment gate
 
