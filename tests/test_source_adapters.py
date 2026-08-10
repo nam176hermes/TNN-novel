@@ -74,6 +74,99 @@ def test_validate_public_http_url_rejects_private_targets() -> None:
         validate_public_http_url("file:///tmp/book.html")
 
 
+def test_private_ipv4_ipv6_cgnat_and_link_local_targets_never_reach_browser_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.ingestion import source_adapters
+
+    blocked_addresses = (
+        "127.0.0.1",
+        "10.0.0.8",
+        "100.64.0.9",
+        "169.254.169.254",
+        "::1",
+        "fd00::8",
+        "fe80::1",
+    )
+    browser_calls: list[str] = []
+
+    class BlockedResponse:
+        status_code = 403
+        headers = {"server": "cloudflare", "Content-Type": "text/html"}
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.cookies = type(
+                "Cookies",
+                (),
+                {"get_dict": lambda _self: {}, "set": lambda _self, *_args, **_kwargs: None},
+            )()
+
+        def get(self, *_args, **_kwargs):
+            return BlockedResponse()
+
+    def browser_fallback(url: str, *_args, **_kwargs) -> str:
+        browser_calls.append(url)
+        return "<html><h1>browser must not receive blocked targets</h1></html>"
+
+    monkeypatch.setattr(source_adapters.requests, "Session", FakeSession)
+    monkeypatch.setattr(source_adapters, "apply_cookies_to_session", lambda *_args: None)
+    monkeypatch.setattr(source_adapters, "_call_stealth_fallback", browser_fallback)
+
+    for address in blocked_addresses:
+        with pytest.raises(SourceAdapterError) as caught:
+            source_adapters.fetch_public_html_result(
+                "https://www.69shuba.com/book/1/",
+                resolver=lambda _hostname, _port, resolved=address: (resolved,),
+            )
+        assert caught.value.code is source_adapters.FetchErrorCode.PRIVATE_NETWORK_BLOCKED
+
+    assert browser_calls == []
+
+
+def test_public_to_private_redirect_is_rejected_before_browser_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.ingestion import source_adapters
+
+    browser_calls: list[str] = []
+
+    class RedirectResponse:
+        status_code = 302
+        headers = {"Location": "https://edge.69shuba.com/book/1/"}
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.cookies = type(
+                "Cookies",
+                (),
+                {"get_dict": lambda _self: {}, "set": lambda _self, *_args, **_kwargs: None},
+            )()
+
+        def get(self, *_args, **_kwargs):
+            return RedirectResponse()
+
+    def resolver(hostname: str, _port: int) -> tuple[str, ...]:
+        return ("10.10.0.7",) if hostname == "edge.69shuba.com" else ("93.184.216.34",)
+
+    def browser_fallback(url: str, *_args, **_kwargs) -> str:
+        browser_calls.append(url)
+        return "<html><h1>browser must not receive redirect targets</h1></html>"
+
+    monkeypatch.setattr(source_adapters.requests, "Session", FakeSession)
+    monkeypatch.setattr(source_adapters, "apply_cookies_to_session", lambda *_args: None)
+    monkeypatch.setattr(source_adapters, "_call_stealth_fallback", browser_fallback)
+
+    with pytest.raises(SourceAdapterError) as caught:
+        source_adapters.fetch_public_html_result(
+            "https://www.69shuba.com/book/1/",
+            resolver=resolver,
+        )
+
+    assert caught.value.code is source_adapters.FetchErrorCode.PRIVATE_NETWORK_BLOCKED
+    assert browser_calls == []
+
+
 def test_source_policy_allows_known_cn_novel_domains() -> None:
     assert is_allowed_source_url("https://www.69shuba.com/book/123/")
     assert is_allowed_source_url("https://www.biquge.tw/book/456/")

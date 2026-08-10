@@ -196,5 +196,6 @@ def _raise_if_blocked_ip(address: str) -> None:
         or ip.is_multicast
         or ip.is_unspecified
         or ip.is_reserved
+        or not ip.is_global
     ):
         raise UrlPolicyViolation("Private or reserved network targets are not allowed", code="private_network_blocked")

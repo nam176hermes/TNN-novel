@@ -114,7 +114,16 @@ _TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.USER_VERIFICATION_REQUIRED: set(),
 }
 
-_SENSITIVE_PAYLOAD_MARKERS = ("html", "content", "cookie", "token", "secret", "password", "authorization")
+_SENSITIVE_PAYLOAD_MARKERS = (
+    "html",
+    "content",
+    "cookie",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "api_key",
+)
 
 _BROWSER_RESULT_TRANSITIONS: dict[
     BrowserResultState, tuple[TaskStatus, TaskStage, JobStatus]

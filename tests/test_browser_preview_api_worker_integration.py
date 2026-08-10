@@ -12,7 +12,12 @@ import pytest
 from starlette.requests import Request as StarletteRequest
 
 from app.database.db import init_db, update_managed_source
-from app.database.import_jobs import ImportJob, ImportJobRepository, JobStatus
+from app.database.import_jobs import (
+    BrowserResultPublicationRejected,
+    ImportJob,
+    ImportJobRepository,
+    JobStatus,
+)
 from app.import_contracts import (
     BrowserResultState,
     BrowserTaskResult,
@@ -257,7 +262,7 @@ def _published_preview(
 
 
 @pytest.mark.asyncio
-async def test_preview_endpoint_enqueues_worker_job_and_preserves_response_contract(
+async def test_api_worker_preview_contract_matches_legacy_preview_fixture(
     temp_db_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -338,6 +343,82 @@ async def test_preview_endpoint_enqueues_worker_job_and_preserves_response_contr
     assert datetime.fromisoformat(row[4]) > datetime.now(timezone.utc)
     assert row[5] == "COMPLETED"
     assert pipeline.calls == [SOURCE_URL]
+
+
+def test_stale_worker_result_cannot_overwrite_newer_preview_request(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    service = _worker_service(temp_db_path, PreviewWorkerPipeline())
+    old_job = service.create_job(
+        owner_user_id=PUBLISHED_OWNER,
+        source="69shuba",
+        source_url=SOURCE_URL,
+        tasks=[
+            {
+                "canonical_identity": f"old:69shuba:{SOURCE_URL}",
+                "canonical_chapter_url": SOURCE_URL,
+                "chapter_number": 0,
+                "title": "Old preview",
+            }
+        ],
+        operation_kind=ImportOperationKind.PREVIEW,
+        deadline_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        correlation_id="old-preview-request",
+    )
+    newer_job = service.create_job(
+        owner_user_id=PUBLISHED_OWNER,
+        source="69shuba",
+        source_url=SOURCE_URL,
+        tasks=[
+            {
+                "canonical_identity": f"new:69shuba:{SOURCE_URL}",
+                "canonical_chapter_url": SOURCE_URL,
+                "chapter_number": 0,
+                "title": "New preview",
+            }
+        ],
+        operation_kind=ImportOperationKind.PREVIEW,
+        deadline_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        correlation_id="new-preview-request",
+    )
+    service.enqueue_job(old_job.id, PUBLISHED_OWNER)
+    service.enqueue_job(newer_job.id, PUBLISHED_OWNER)
+    running = service.repository.transition_job(newer_job.id, PUBLISHED_OWNER, JobStatus.RUNNING)
+    claimed = service.repository.claim_next_task(
+        newer_job.id,
+        PUBLISHED_OWNER,
+        worker_id="new-preview-worker",
+    )
+    assert claimed is not None
+
+    stale_result = BrowserTaskResult(
+        correlation_id="old-preview-request",
+        state=BrowserResultState.COMPLETED,
+        payload=PreviewBrowserPayload(
+            adapter_id="69shuba",
+            adapter_label="69shuba",
+            source="www.69shuba.com",
+            source_url=SOURCE_URL,
+            title="Stale title",
+        ),
+    )
+    with pytest.raises(BrowserResultPublicationRejected) as caught:
+        service.repository.publish_browser_result(
+            newer_job.id,
+            PUBLISHED_OWNER,
+            task_id=claimed.id,
+            lease_token=claimed.lease_token,
+            lease_owner=claimed.lease_owner,
+            expected_job_version=running.version,
+            expected_task_version=claimed.version,
+            result=stale_result,
+        )
+
+    current = service.get_job(newer_job.id, PUBLISHED_OWNER)
+    assert caught.value.code == "stale_lease"
+    assert current.result_snapshot is None
+    assert current.result_state is None
 
 
 @pytest.mark.asyncio
