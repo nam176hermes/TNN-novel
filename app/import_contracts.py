@@ -108,7 +108,7 @@ class BrowserTaskResult(BaseModel):
         if self.state is BrowserResultState.COMPLETED:
             if self.payload is None:
                 raise ValueError("completed browser result requires a payload")
-            if self.error_code or self.error_message:
+            if self.error_code or self.error_message or self.retryable or self.http_status is not None:
                 raise ValueError("completed browser result cannot include error fields")
             return self
 

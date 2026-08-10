@@ -152,3 +152,21 @@ def test_browser_terminal_state_requires_payload_only_for_completed_preview() ->
         retryable=True,
         http_status=502,
     ).state is BrowserResultState.FAILED
+
+
+@pytest.mark.parametrize(
+    "error_metadata",
+    [
+        {"retryable": True},
+        {"http_status": 500},
+    ],
+)
+def test_completed_preview_result_rejects_error_metadata(error_metadata: dict[str, object]) -> None:
+    """A completed preview cannot carry retry or HTTP-error fields."""
+    with pytest.raises(ValidationError):
+        BrowserTaskResult(
+            correlation_id="preview-123",
+            state=BrowserResultState.COMPLETED,
+            payload=PreviewBrowserPayload.model_validate(_preview_payload()),
+            **error_metadata,
+        )
