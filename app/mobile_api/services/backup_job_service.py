@@ -113,7 +113,31 @@ class BackupJobCoordinator:
 
     def _cancel_requested(self, job_id: str) -> bool:
         job = self.tracker.get_job(job_id)
+        if self.tracker.db_path is not None:
+            persisted = get_mobile_job(self.tracker.db_path, job_id)
+            durable_cancel_requested = bool(
+                persisted
+                and (
+                    persisted.get("cancel_requested")
+                    or str(persisted.get("status") or "").lower() in {"cancelled", "canceled"}
+                )
+            )
+            if durable_cancel_requested:
+                if job is not None:
+                    job.cancel_requested = True
+                return True
         return bool(job and job.cancel_requested)
+
+    def _terminal_result(self, job_id: str, *, fallback: str) -> str:
+        job = self.tracker.get_job(job_id)
+        if job is None:
+            return fallback
+        status = job.status.lower()
+        if status in {"cancelled", "canceled"}:
+            return "cancelled"
+        if status in {"completed", "failed"}:
+            return status
+        return fallback
 
     def _publish_step(self, job_id: str, step: str) -> None:
         update = BACKUP_PROGRESS.get(step.strip().lower())
@@ -225,7 +249,7 @@ class BackupJobCoordinator:
                     )
                     self._record_terminal_event(
                         job_id=job_id,
-                        result="failed",
+                        result=self._terminal_result(job_id, fallback="failed"),
                         encrypted=True,
                         secrets_included=True,
                         started_at=started_at,
@@ -290,7 +314,7 @@ class BackupJobCoordinator:
                     )
                     self._record_terminal_event(
                         job_id=job_id,
-                        result="failed",
+                        result=self._terminal_result(job_id, fallback="failed"),
                         # Failure has no completed artifact metadata, so request
                         # intent is the authoritative safe fallback.
                         encrypted=include_secrets,
@@ -309,13 +333,14 @@ class BackupJobCoordinator:
                     current_step="PUBLISHING_BACKUP",
                     message=f"Backup completed: {filename}",
                 )
+                result = self._terminal_result(job_id, fallback="completed")
                 self._record_terminal_event(
                     job_id=job_id,
-                    result="completed",
+                    result=result,
                     encrypted=bool(item.get("encrypted")),
                     secrets_included=bool(item.get("secrets_included")),
                     started_at=started_at,
-                    backup_filename=filename,
+                    backup_filename=filename if result == "completed" else "",
                 )
         except asyncio.CancelledError:
             job = self.tracker.get_job(job_id)

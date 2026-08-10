@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.database.db import get_mobile_job, init_db, list_operational_events
+from app.database.db import get_mobile_job, init_db, list_operational_events, request_cancel_mobile_job
 from app.mobile_api.services import backup_job_service as backup_job_module
 from app.mobile_api.services import job_service as job_service_module
 from app.mobile_api.services.backup_job_service import BackupJobCoordinator, BackupSecretStore
@@ -646,6 +646,22 @@ async def test_cooperative_backup_cancellation_records_one_terminal_event(
     assert events[0]["details"]["secrets_included"] is False
 
 
+def test_durable_cancelled_status_reconciles_owner_cache_without_flag(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    job = tracker.create_job("backup")
+    assert tracker.update_job(job.job_id, status="cancelled")
+    assert job.cancel_requested is False
+
+    assert coordinator._cancel_requested(job.job_id)
+    assert job.cancel_requested is True
+
+
 @pytest.mark.asyncio
 async def test_remote_cancellation_before_owner_claim_is_terminalized_by_owner_without_archive_work(
     tmp_path: Path,
@@ -752,6 +768,117 @@ async def test_remote_durable_cancellation_reaches_running_provider_without_prog
         "cached_state": ("cancelled", "CANCELED", True),
         "durable_state": ("cancelled", "CANCELED", True),
         "terminal_events": [("backup_job_coordinator", "warning", "cancelled")],
+    }
+
+
+@pytest.mark.asyncio
+async def test_durable_cancellation_winning_completion_write_records_cancelled_terminal_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    update_job = tracker.update_job
+
+    def request_cancel_before_completion(job_id: str, **changes: object) -> bool:
+        if changes.get("status") == "completed":
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **changes)
+
+    monkeypatch.setattr(tracker, "update_job", request_cancel_before_completion)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=False,
+        passphrase="",
+    )
+    await wait_for_job(tracker, job_id)
+
+    cached = tracker.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "cached_state": (cached.status, cached.state, cached.cancel_requested),
+        "durable_state": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+        ),
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "cached_state": ("cancelled", "CANCELED", True),
+        "durable_state": ("cancelled", "CANCELED", True),
+        "terminal_events": [("warning", "cancelled")],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["provider", "expired_secret"])
+async def test_durable_cancellation_winning_failure_write_records_cancelled_terminal_event(
+    failure_mode: str,
+    tmp_path: Path,
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(
+        tmp_path / "backups",
+        failure=RuntimeError("provider failed") if failure_mode == "provider" else None,
+    )
+    secret_store = None
+    if failure_mode == "expired_secret":
+        ticks = iter((10.0, 11.0, 12.0))
+        secret_store = BackupSecretStore(ttl_seconds=0, monotonic=lambda: next(ticks))
+    coordinator = BackupJobCoordinator(
+        tracker=tracker,
+        backup_service=service,
+        secret_store=secret_store,
+    )
+    update_job = tracker.update_job
+
+    def request_cancel_before_failure(job_id: str, **changes: object) -> bool:
+        if changes.get("status") == "failed":
+            assert request_cancel_mobile_job(temp_db_path, job_id=job_id)
+        return update_job(job_id, **changes)
+
+    monkeypatch.setattr(tracker, "update_job", request_cancel_before_failure)
+    job_id = coordinator.start_backup_job(
+        include_audio=True,
+        include_exports=False,
+        include_job_logs=False,
+        include_secrets=failure_mode == "expired_secret",
+        passphrase="test credential" if failure_mode == "expired_secret" else "",
+    )
+    await wait_for_job(tracker, job_id)
+
+    cached = tracker.jobs[job_id]
+    durable = get_mobile_job(temp_db_path, job_id)
+    assert durable is not None
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "cached_state": (cached.status, cached.state, cached.cancel_requested),
+        "durable_state": (
+            durable["status"],
+            durable["state"],
+            durable["cancel_requested"],
+        ),
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "cached_state": ("cancelled", "CANCELED", True),
+        "durable_state": ("cancelled", "CANCELED", True),
+        "terminal_events": [("warning", "cancelled")],
     }
 
 

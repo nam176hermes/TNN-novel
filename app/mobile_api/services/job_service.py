@@ -467,6 +467,10 @@ class JobTracker:
             # Backup creation runs in a worker thread, which asyncio task
             # cancellation cannot stop. Let its cooperative callback observe
             # this durable flag before the directory lock is released.
+            if is_database_backed_backup:
+                # The owning coordinator must publish the dedicated terminal
+                # event, even when this tracker has no process-local task.
+                return True
             if task and not task.done():
                 return True
             refreshed = self.get_job(job_id)
