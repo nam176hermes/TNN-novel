@@ -13,7 +13,12 @@ from starlette.requests import Request as StarletteRequest
 
 from app.database.db import init_db, update_managed_source
 from app.database.import_jobs import ImportJob, ImportJobRepository, JobStatus
-from app.import_contracts import BrowserResultState, ImportOperationKind
+from app.import_contracts import (
+    BrowserResultState,
+    BrowserTaskResult,
+    ImportOperationKind,
+    PreviewBrowserPayload,
+)
 from app.import_worker import DurableImportWorker
 from app.ingestion.managed_sources import import_selected_catalog_sources
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
@@ -632,3 +637,88 @@ async def test_wait_timeout_terminalizes_preview_and_cancels_chapter_import(
     assert terminal.status is (JobStatus.FAILED if expected_result_state else JobStatus.CANCELLED)
     assert terminal.cancel_requested_at
     assert terminal.result_state is expected_result_state
+
+
+@pytest.mark.asyncio
+async def test_preview_wait_returns_completed_result_when_publication_wins_timeout_race(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    service = _worker_service(temp_db_path, PreviewWorkerPipeline())
+    repository = service.repository
+    job = service.create_job(
+        owner_user_id=PUBLISHED_OWNER,
+        source="69shuba",
+        source_url=SOURCE_URL,
+        tasks=[
+            {
+                "canonical_identity": f"69shuba:{SOURCE_URL}",
+                "canonical_chapter_url": SOURCE_URL,
+                "chapter_number": 0,
+                "title": "Preview",
+            }
+        ],
+        operation_kind=ImportOperationKind.PREVIEW,
+        deadline_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        correlation_id="publication-wins-timeout",
+    )
+    service.enqueue_job(job.id, PUBLISHED_OWNER)
+    running = repository.transition_job(job.id, PUBLISHED_OWNER, JobStatus.RUNNING)
+    claimed = repository.claim_next_task(
+        job.id,
+        PUBLISHED_OWNER,
+        worker_id="publishing-worker",
+    )
+    assert claimed is not None
+
+    completed_result = BrowserTaskResult(
+        correlation_id="publication-wins-timeout",
+        state=BrowserResultState.COMPLETED,
+        payload=PreviewBrowserPayload(
+            adapter_id="69shuba",
+            adapter_label="69shuba",
+            source="www.69shuba.com",
+            source_url=SOURCE_URL,
+            title="Publication won",
+        ),
+    )
+
+    class PublicationWinsRepository:
+        def __init__(self, delegate: ImportJobRepository) -> None:
+            self.delegate = delegate
+
+        def __getattr__(self, name: str):
+            return getattr(self.delegate, name)
+
+        def expire_browser_job(self, job_id: str, owner_user_id: str) -> ImportJob:
+            self.delegate.publish_browser_result(
+                job_id,
+                owner_user_id,
+                task_id=claimed.id,
+                lease_token=claimed.lease_token,
+                lease_owner=claimed.lease_owner,
+                expected_job_version=running.version,
+                expected_task_version=claimed.version,
+                result=completed_result,
+            )
+            return self.delegate.expire_browser_job(job_id, owner_user_id)
+
+    service.repository = PublicationWinsRepository(repository)  # type: ignore[assignment]
+
+    class ConnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    completed = await wait_for_terminal_import_job(
+        ConnectedRequest(),  # type: ignore[arg-type]
+        service,
+        job.id,
+        PUBLISHED_OWNER,
+        timeout_seconds=0.000001,
+        poll_seconds=0.001,
+    )
+
+    assert completed.status is JobStatus.SUCCEEDED
+    assert completed.result_state is BrowserResultState.COMPLETED
+    assert completed.result_snapshot == completed_result
+    assert repository.list_tasks(job.id, PUBLISHED_OWNER)[0].lease_token == ""

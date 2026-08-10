@@ -148,6 +148,55 @@ def test_worker_claims_preview_and_publishes_typed_completed_result(
     ) == 1
 
 
+def test_worker_cannot_claim_preview_before_task_creation_and_enqueue_marker(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    pipeline = PreviewPipeline()
+    service = _service(temp_db_path, pipeline, worker_id="preview-worker")
+    repository = service.repository
+    job = repository.create_job(
+        owner_user_id=OWNER,
+        source="69shuba",
+        source_url=SOURCE_URL,
+        total=1,
+        operation_kind=ImportOperationKind.PREVIEW,
+        deadline_at=FUTURE_DEADLINE,
+        correlation_id="partially-assembled-preview",
+    )
+    worker = DurableImportWorker(
+        service,
+        heartbeat_path=tmp_path / "assembly-race-worker.heartbeat",
+        close_browser=lambda: None,
+    )
+
+    assert worker.run_once() == 0
+    assert repository.get_job(job.id, OWNER).status is JobStatus.QUEUED
+
+    task = repository.create_task(
+        job_id=job.id,
+        owner_user_id=OWNER,
+        canonical_identity=f"69shuba:{SOURCE_URL}",
+        canonical_chapter_url=SOURCE_URL,
+        chapter_number=0,
+        title="Preview",
+    )
+    assert worker.run_once() == 0
+    assert repository.get_job(job.id, OWNER).status is JobStatus.QUEUED
+    assert repository.list_tasks(job.id, OWNER)[0].status is TaskStatus.QUEUED
+    assert pipeline.calls == []
+
+    repository.enqueue_job(job.id, OWNER)
+    assert worker.run_once() == 1
+
+    completed = repository.get_job(job.id, OWNER)
+    assert completed.status is JobStatus.SUCCEEDED
+    assert completed.result_state is BrowserResultState.COMPLETED
+    assert repository.list_tasks(job.id, OWNER)[0].id == task.id
+    assert pipeline.calls == [SOURCE_URL]
+
+
 def test_worker_maps_verification_required_to_blocked_result(
     temp_db_path: Path,
     tmp_path: Path,

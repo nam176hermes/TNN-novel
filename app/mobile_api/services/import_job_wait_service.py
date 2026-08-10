@@ -7,7 +7,7 @@ import asyncio
 from fastapi import Request
 
 from app.database.import_jobs import ImportJob, JobStatus
-from app.import_contracts import ImportOperationKind
+from app.import_contracts import BrowserResultState, ImportOperationKind
 from app.services.import_job_service import ImportJobService
 
 
@@ -49,11 +49,13 @@ async def wait_for_terminal_import_job(
             raise ImportJobWaitError("client_disconnected")
         if loop.time() >= wait_deadline:
             if job.operation_kind is ImportOperationKind.PREVIEW:
-                await asyncio.to_thread(
+                winner = await asyncio.to_thread(
                     service.repository.expire_browser_job,
                     job_id,
                     owner_user_id,
                 )
+                if winner.result_state is not BrowserResultState.TIMED_OUT:
+                    return winner
             else:
                 await asyncio.to_thread(service.request_cancel, job_id, owner_user_id)
             raise ImportJobWaitError("browser_task_timed_out")

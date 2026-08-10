@@ -474,6 +474,12 @@ class ImportJobRepository:
                 SELECT *
                 FROM import_jobs
                 WHERE status IN (?, ?)
+                  AND EXISTS (
+                    SELECT 1
+                    FROM import_job_events
+                    WHERE import_job_events.job_id = import_jobs.id
+                      AND import_job_events.event_type = ?
+                  )
                   AND (
                     status = ?
                     OR EXISTS (
@@ -489,6 +495,7 @@ class ImportJobRepository:
                 (
                     JobStatus.QUEUED.value,
                     JobStatus.RUNNING.value,
+                    "job_enqueued",
                     JobStatus.QUEUED.value,
                     TaskStatus.QUEUED.value,
                     max(1, limit),
