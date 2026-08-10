@@ -14,6 +14,7 @@ dependencies = [
     "pydantic-settings>=2.6.0",
     "rich>=13.9.2",
     "requests>=2.32.3",
+    "httpx>=0.28.0,<0.29.0",
     "pyperclip>=1.9.0",
     "python-dotenv>=1.0.0",
     "edge-tts>=7.2.8",

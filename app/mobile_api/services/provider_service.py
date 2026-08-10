@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 
+import httpx
 import requests
 
 from app.database.db import get_provider_defaults, get_usage_summary, list_model_providers
@@ -10,6 +13,11 @@ from app.mobile_api.services.provider_secret_store import (
     ProviderSecretStore,
     provider_secret_store_path,
 )
+
+
+# HTTPX logs complete request URLs at INFO. Provider base URLs are private
+# configuration, so retain only library warnings and errors application-wide.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _coerce_float(value: object, default: float) -> float:
@@ -163,6 +171,42 @@ class ProviderService:
             },
             timeout=int(provider.get("timeout_seconds") or 180),
         )
+        response.raise_for_status()
+        data = response.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        return {
+            "provider_id": provider_id,
+            "model": provider["model"],
+            "ok": bool(text.strip()),
+            "sample": text.strip()[:500],
+        }
+
+    async def test_provider_async(self, provider_id: str, prompt: str) -> dict:
+        provider = self.get_provider(provider_id)
+        if provider is None:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        api_key_env = provider.get("api_key_env") or ""
+        api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+        if api_key_env and not api_key:
+            raise ValueError(f"Provider {provider_id} requires {api_key_env}")
+
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        timeout_seconds = float(provider.get("timeout_seconds") or 180)
+        async with asyncio.timeout(timeout_seconds):
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{provider['base_url'].rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": provider["model"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": provider.get("temperature", 0.3),
+                        "stream": False,
+                    },
+                    timeout=timeout_seconds,
+                )
         response.raise_for_status()
         data = response.json()
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")

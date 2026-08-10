@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import inspect
+import logging
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from app.database.db import (
@@ -440,6 +444,7 @@ def test_provider_defaults_and_usage_summary(temp_db_path: Path) -> None:
     assert summary["total_estimated_cost_usd"] == 0.000742
 
 
+from app.mobile_api.services import provider_service as provider_service_module
 from app.mobile_api.services.provider_service import ProviderService
 
 
@@ -531,9 +536,9 @@ def test_list_get_defaults_usage_summary_surface_db_helpers(temp_db_path: Path) 
     }
 
 
-def test_test_provider_uses_openai_compatible_request_and_parses_content(
+def test_test_provider_preserves_synchronous_caller_contract(
     temp_db_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
     put_model_provider(
@@ -569,10 +574,94 @@ def test_test_provider_uses_openai_compatible_request_and_parses_content(
         captured.update(kwargs)
         return FakeResponse()
 
-    monkeypatch.setattr("app.mobile_api.services.provider_service.requests.post", fake_post)
+    monkeypatch.setattr(
+        provider_service_module,
+        "requests",
+        SimpleNamespace(post=fake_post),
+        raising=False,
+    )
     service = make_provider_service(temp_db_path)
 
     result = service.test_provider("custom", "Say hello")
+    try:
+        assert inspect.isawaitable(result) is False
+        assert captured["url"] == "https://provider.example/v1/chat/completions"
+        assert captured["timeout"] == 42
+        assert result == {
+            "provider_id": "custom",
+            "model": "custom-model",
+            "ok": True,
+            "sample": "Xin chao tu provider.",
+        }
+    finally:
+        if inspect.iscoroutine(result):
+            result.close()
+
+
+@pytest.mark.asyncio
+async def test_test_provider_uses_async_openai_compatible_request_and_parses_content(
+    temp_db_path: Path,
+    monkeypatch,
+) -> None:
+    init_db(temp_db_path)
+    put_model_provider(
+        temp_db_path,
+        provider_id="custom",
+        label="Custom",
+        base_url="https://provider.example/v1/",
+        model="custom-model",
+        api_key_env="CUSTOM_API_KEY",
+        temperature=0.7,
+        timeout_seconds=42,
+    )
+    monkeypatch.setenv("CUSTOM_API_KEY", "provider-secret")
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "  Xin chao tu provider.  ",
+                        },
+                    },
+                ],
+            }
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse()
+
+    def fail_sync_post(*args, **kwargs):
+        raise AssertionError("provider network call used the synchronous client")
+
+    monkeypatch.setattr(
+        provider_service_module,
+        "httpx",
+        SimpleNamespace(AsyncClient=FakeAsyncClient),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        provider_service_module,
+        "requests",
+        SimpleNamespace(post=fail_sync_post),
+        raising=False,
+    )
+    service = make_provider_service(temp_db_path)
+
+    result = await service.test_provider_async("custom", "Say hello")
 
     assert captured["url"] == "https://provider.example/v1/chat/completions"
     assert captured["headers"] == {"Authorization": "Bearer provider-secret"}
@@ -591,7 +680,29 @@ def test_test_provider_uses_openai_compatible_request_and_parses_content(
     }
 
 
-def test_test_provider_rejects_required_provider_with_whitespace_api_key(
+@pytest.mark.asyncio
+async def test_provider_httpx_logging_suppresses_private_url_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_base_url = "https://private-provider.example/v1"
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    transport = httpx.MockTransport(respond)
+    with caplog.at_level(logging.INFO):
+        async with httpx.AsyncClient(transport=transport) as client:
+            response = await client.post(f"{private_base_url}/chat/completions")
+
+    assert response.status_code == 200
+    assert private_base_url not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_test_provider_rejects_required_provider_with_whitespace_api_key(
     temp_db_path: Path,
     monkeypatch,
 ) -> None:
@@ -608,10 +719,11 @@ def test_test_provider_rejects_required_provider_with_whitespace_api_key(
     service = make_provider_service(temp_db_path)
 
     with pytest.raises(ValueError, match="Provider custom requires CUSTOM_API_KEY"):
-        service.test_provider("custom", "hello")
+        await service.test_provider_async("custom", "hello")
 
 
-def test_service_normalizes_dirty_provider_values(temp_db_path: Path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_service_normalizes_dirty_provider_values(temp_db_path: Path, monkeypatch) -> None:
     init_db(temp_db_path)
     put_model_provider(
         temp_db_path,
@@ -648,17 +760,29 @@ def test_service_normalizes_dirty_provider_values(temp_db_path: Path, monkeypatc
         def json(self) -> dict:
             return {"choices": [{"message": {"content": "ok"}}]}
 
-    def fake_post(url: str, **kwargs):
-        captured.update(kwargs)
-        return FakeResponse()
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, url: str, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
 
     monkeypatch.setenv("DIRTY_API_KEY", "dirty-secret")
-    monkeypatch.setattr("app.mobile_api.services.provider_service.requests.post", fake_post)
+    monkeypatch.setattr(
+        provider_service_module,
+        "httpx",
+        SimpleNamespace(AsyncClient=FakeAsyncClient),
+        raising=False,
+    )
     service = make_provider_service(temp_db_path)
 
     estimate = service.estimate_cost(provider_id="dirty", source_chars=100)
     provider = service.get_provider("dirty")
-    service.test_provider("dirty", "hello")
+    await service.test_provider_async("dirty", "hello")
 
     assert estimate["estimated_cost_usd"] == 0
     assert provider is not None
@@ -698,12 +822,13 @@ def test_estimate_budget_uses_rounded_cost(temp_db_path: Path) -> None:
     assert estimate["within_budget"] is True
 
 
-def test_test_provider_raises_value_error_for_missing_provider(temp_db_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_test_provider_raises_value_error_for_missing_provider(temp_db_path: Path) -> None:
     init_db(temp_db_path)
     service = make_provider_service(temp_db_path)
 
     with pytest.raises(ValueError, match="Provider missing not found"):
-        service.test_provider("missing", "hello")
+        await service.test_provider_async("missing", "hello")
 
 
 def test_estimate_cost_raises_value_error_for_missing_provider(temp_db_path: Path) -> None:
