@@ -4,6 +4,7 @@ import {
   ChevronDown,
   Circle,
   FilePlus2,
+  FileText,
   Download,
   Globe2,
   KeyRound,
@@ -191,6 +192,7 @@ export default function WorkflowShell({
             </header>
             <section aria-labelledby="mobile-more-manage">
               <h3 id="mobile-more-manage">Quản lý</h3>
+              <button onClick={() => openMobileView('raw')} type="button"><FileText aria-hidden="true" />Raw chưa dịch</button>
               <button
                 onClick={() => {
                   setMobileMoreOpen(false);
