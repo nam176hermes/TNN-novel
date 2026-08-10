@@ -45,6 +45,8 @@ OWNED_WEB_PID=""
 OWNED_WORKER_TARGET=""
 OWNED_API_TARGET=""
 OWNED_WEB_TARGET=""
+DETACHED_PID=""
+DETACHED_TARGET=""
 
 API_HEALTH_REACHABLE=0
 WEB_ALREADY_REACHABLE=0
@@ -65,20 +67,17 @@ start_detached() {
   shift
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "$@" >>"$log_file" 2>&1 &
+    DETACHED_PID=$!
+    DETACHED_TARGET="-$DETACHED_PID"
+    for _ in {1..20}; do
+      kill -0 -- "$DETACHED_TARGET" 2>/dev/null && break
+      sleep 0.01
+    done
   else
     nohup "$@" >>"$log_file" 2>&1 &
+    DETACHED_PID=$!
+    DETACHED_TARGET="$DETACHED_PID"
   fi
-  echo $!
-}
-
-capture_owned_target() {
-  local pid="$1"
-  local target="-$pid"
-  for _ in {1..20}; do
-    kill -0 -- "$target" 2>/dev/null && break
-    sleep 0.01
-  done
-  printf '%s\n' "$target"
 }
 
 stop_owned_pid_file() {
@@ -135,9 +134,10 @@ else
       --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
       --keep "${LOG_ROTATE_KEEP:-5}" >/dev/null
   fi
-  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
-  OWNED_WORKER_PID="$(cat "$IMPORT_WORKER_PID_FILE")"
-  OWNED_WORKER_TARGET="$(capture_owned_target "$OWNED_WORKER_PID")"
+  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker
+  OWNED_WORKER_PID="$DETACHED_PID"
+  OWNED_WORKER_TARGET="$DETACHED_TARGET"
+  printf '%s\n' "$OWNED_WORKER_PID" >"$IMPORT_WORKER_PID_FILE"
 fi
 wait_for_import_worker
 
@@ -159,9 +159,10 @@ elif (( API_ALREADY_READY )); then
   rm -f "$API_PID_FILE"
   echo "API already reachable: http://127.0.0.1:${MOBILE_API_PORT}"
 else
-  start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$API_PID_FILE"
-  OWNED_API_PID="$(cat "$API_PID_FILE")"
-  OWNED_API_TARGET="$(capture_owned_target "$OWNED_API_PID")"
+  start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api
+  OWNED_API_PID="$DETACHED_PID"
+  OWNED_API_TARGET="$DETACHED_TARGET"
+  printf '%s\n' "$OWNED_API_PID" >"$API_PID_FILE"
   "$PYTHON_BIN" scripts/ops.py wait-health \
     --base-url "http://127.0.0.1:${MOBILE_API_PORT}" \
     --timeout "${API_START_TIMEOUT:-45}"
@@ -176,9 +177,10 @@ else
   if [[ ! -d "$ROOT/web/node_modules" ]]; then
     npm --prefix "$ROOT/web" ci
   fi
-  start_detached "$RUNTIME_DIR/web-vite.log" npm --prefix "$ROOT/web" run dev -- --host "$WEB_HOST" --port "$WEB_PORT" >"$WEB_PID_FILE"
-  OWNED_WEB_PID="$(cat "$WEB_PID_FILE")"
-  OWNED_WEB_TARGET="$(capture_owned_target "$OWNED_WEB_PID")"
+  start_detached "$RUNTIME_DIR/web-vite.log" npm --prefix "$ROOT/web" run dev -- --host "$WEB_HOST" --port "$WEB_PORT"
+  OWNED_WEB_PID="$DETACHED_PID"
+  OWNED_WEB_TARGET="$DETACHED_TARGET"
+  printf '%s\n' "$OWNED_WEB_PID" >"$WEB_PID_FILE"
 fi
 
 echo "API: http://127.0.0.1:${MOBILE_API_PORT}"

@@ -75,11 +75,20 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
             fi
             exit 1
           fi
+          if [[ "${STUB_RECORD_DIRECT_LAUNCHES:-0}" == "1" ]]; then
+            printf 'worker %s\\n' "$BASHPID" >>"$STUB_PROCESS_MAP"
+          fi
           mkdir -p "$(dirname "$STUB_HEARTBEAT")"
           : >"$STUB_HEARTBEAT"
           : >"$STUB_WORKER_HEARTBEAT_FRESH"
           if [[ "${STUB_API_BECOMES_READY_WITH_WORKER:-0}" == "1" ]]; then
             : >"$STUB_API_BECAME_READY"
+          fi
+          exit 0
+        fi
+        if [[ "${1:-}" == "-m" && "${2:-}" == "app.mobile_api" ]]; then
+          if [[ "${STUB_RECORD_DIRECT_LAUNCHES:-0}" == "1" ]]; then
+            printf 'api %s\\n' "$BASHPID" >>"$STUB_PROCESS_MAP"
           fi
           exit 0
         fi
@@ -128,6 +137,9 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         bin_dir / "npm",
         """#!/usr/bin/env bash
         printf 'npm %s\\n' "$*" >>"$STUB_INVOCATION_LOG"
+        if [[ "${STUB_RECORD_DIRECT_LAUNCHES:-0}" == "1" && " $* " == *" run dev "* ]]; then
+          printf 'web %s\\n' "$BASHPID" >>"$STUB_PROCESS_MAP"
+        fi
         """,
     )
     _write_executable(
@@ -181,7 +193,9 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         normalized_target="${target#-}"
         if [[ "${1:-}" == "-0" ]]; then
           state=stopped
-          if [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
+          if [[ "$target" == -* && "${STUB_NO_PROCESS_GROUPS:-0}" == "1" ]]; then
+            state=stopped
+          elif [[ "${STUB_ALLOW_DYNAMIC_PIDS:-0}" == "1" && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
             state=alive
           elif [[ " $STUB_LIVE_PIDS " == *" $normalized_target "* && ! -f "$STUB_PROCESS_STOPPED/$normalized_target" ]]; then
             state=alive
@@ -205,6 +219,9 @@ def _script_test_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path
         signal=TERM
         if [[ "${1:-}" == "-9" ]]; then signal=KILL; fi
         printf 'signal %s %s\\n' "$signal" "$target" >>"$STUB_KILL_LOG"
+        if [[ "$target" == -* && "${STUB_NO_PROCESS_GROUPS:-0}" == "1" ]]; then
+          exit 1
+        fi
         mkdir -p "$STUB_PROCESS_STOPPED"
         if [[ "$target" == -* ]]; then
           mkdir -p "$STUB_GROUP_SIGNALLED"
@@ -249,6 +266,54 @@ def _run_script(script_name: str, env: dict[str, str], root: Path = ROOT) -> sub
         capture_output=True,
         check=False,
     )
+
+
+def _use_controlled_path_without_setsid(env: dict[str, str]) -> None:
+    """Keep required inert commands available while making setsid unresolvable."""
+
+    bin_dir = Path(env["PYTHON_BIN"]).parent
+    (bin_dir / "setsid").unlink()
+    for name in ("bash", "cat", "dirname", "grep", "mkdir", "mv", "nohup", "sed", "sleep", "sort"):
+        executable = shutil.which(name)
+        assert executable is not None
+        (bin_dir / name).symlink_to(executable)
+
+    real_rm = shutil.which("rm")
+    assert real_rm is not None
+    _write_executable(
+        bin_dir / "rm",
+        """#!/usr/bin/env bash
+        set -euo pipefail
+        target="${!#}"
+        if [[ "${STUB_REQUIRE_DEAD_BEFORE_PID_REMOVE:-0}" == "1" && "$target" == *.pid && -f "$target" ]]; then
+          pid="$(cat "$target")"
+          state=alive
+          if [[ -f "$STUB_PROCESS_STOPPED/$pid" ]]; then state=dead; fi
+          printf 'remove %s %s\\n' "$state" "$pid" >>"$STUB_PID_REMOVAL_LOG"
+          [[ "$state" == dead ]] || exit 97
+        fi
+        exec "$STUB_REAL_RM" "$@"
+        """,
+    )
+    env.update(
+        {
+            "PATH": str(bin_dir),
+            "STUB_NO_PROCESS_GROUPS": "1",
+            "STUB_PID_REMOVAL_LOG": str(bin_dir.parent / "pid-removal.log"),
+            "STUB_REAL_RM": real_rm,
+            "STUB_RECORD_DIRECT_LAUNCHES": "1",
+            "STUB_REQUIRE_DEAD_BEFORE_PID_REMOVE": "1",
+        }
+    )
+    probe = subprocess.run(
+        ["bash", "-c", "command -v setsid"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert probe.returncode != 0
+    assert probe.stdout == ""
 
 
 def _copy_script_tree(tmp_path: Path) -> Path:
@@ -765,6 +830,110 @@ def test_resistant_owned_groups_escalate_in_reverse_order_without_following_repl
     assert actual_kill_flow == expected_kill_flow
     assert all(target not in {"4999", "-4999"} for target in _signal_targets(invocation_log))
     assert not any(line.endswith((" 4999", " -4999")) for line in actual_kill_flow)
+
+
+def test_local_no_setsid_failure_cleans_exact_positive_owned_targets(tmp_path: Path) -> None:
+    """Fallback cleanup must escalate against each launched leader, never a group."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    _use_controlled_path_without_setsid(env)
+    env.update(
+        {
+            "STUB_ALLOW_DYNAMIC_PIDS": "1",
+            "STUB_FAIL_FINAL_OUTPUT": "1",
+            "STUB_PREEXISTING_WEB": "0",
+            "STUB_RESIST_TERM": "1",
+        }
+    )
+
+    result = _run_script("start-local.sh", env)
+
+    assert result.returncode != 0
+    pids = _process_pids(env)
+    assert pids.keys() == {"worker", "api", "web"}
+    expected_signals: list[str] = []
+    expected_kill_flow: list[str] = []
+    expected_removals: list[str] = []
+    for label in ("web", "api", "worker"):
+        target = pids[label]
+        expected_signals.extend((f"kill -- {target}", f"kill -9 -- {target}"))
+        expected_kill_flow.extend(
+            [f"signal TERM {target}"]
+            + [f"poll alive {target}"] * 21
+            + [f"signal KILL {target}", f"poll stopped {target}", f"poll stopped {target}"]
+        )
+        expected_removals.append(f"remove dead {target}")
+    runtime_dir = data_dir / "logs" / "runtime"
+    actual = {
+        "signals": [
+            line
+            for line in invocation_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("kill ")
+        ],
+        "kill_flow": Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines(),
+        "removals": Path(env["STUB_PID_REMOVAL_LOG"]).read_text(encoding="utf-8").splitlines(),
+        "pid_files": sorted(path.name for path in runtime_dir.glob("*.pid")),
+        "group_form_signal": Path(env["STUB_GROUP_SIGNALLED"]).exists(),
+    }
+    assert actual == {
+        "signals": expected_signals,
+        "kill_flow": expected_kill_flow,
+        "removals": expected_removals,
+        "pid_files": [],
+        "group_form_signal": False,
+    }
+
+
+def test_cloudflare_no_setsid_failure_cleans_exact_positive_owned_targets(tmp_path: Path) -> None:
+    """Public-local fallback cleanup must retain its own positive launch targets."""
+
+    env, invocation_log, data_dir = _script_test_environment(tmp_path)
+    _use_controlled_path_without_setsid(env)
+    env.update(
+        {
+            "CLOUDFLARE_HOSTNAME": "local.example.test",
+            "STUB_ALLOW_DYNAMIC_PIDS": "1",
+            "STUB_FAIL": "curl",
+            "STUB_RESIST_TERM": "1",
+        }
+    )
+
+    result = _run_script("start-cloudflare.sh", env)
+
+    assert result.returncode != 0
+    pids = _process_pids(env)
+    assert pids.keys() == {"worker", "api"}
+    expected_signals: list[str] = []
+    expected_kill_flow: list[str] = []
+    expected_removals: list[str] = []
+    for label in ("api", "worker"):
+        target = pids[label]
+        expected_signals.extend((f"kill -- {target}", f"kill -9 -- {target}"))
+        expected_kill_flow.extend(
+            [f"signal TERM {target}"]
+            + [f"poll alive {target}"] * 21
+            + [f"signal KILL {target}", f"poll stopped {target}", f"poll stopped {target}"]
+        )
+        expected_removals.append(f"remove dead {target}")
+    runtime_dir = data_dir / "logs" / "runtime"
+    actual = {
+        "signals": [
+            line
+            for line in invocation_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("kill ")
+        ],
+        "kill_flow": Path(env["STUB_KILL_LOG"]).read_text(encoding="utf-8").splitlines(),
+        "removals": Path(env["STUB_PID_REMOVAL_LOG"]).read_text(encoding="utf-8").splitlines(),
+        "pid_files": sorted(path.name for path in runtime_dir.glob("*.pid")),
+        "group_form_signal": Path(env["STUB_GROUP_SIGNALLED"]).exists(),
+    }
+    assert actual == {
+        "signals": expected_signals,
+        "kill_flow": expected_kill_flow,
+        "removals": expected_removals,
+        "pid_files": [],
+        "group_form_signal": False,
+    }
 
 
 def test_unkillable_owned_target_preserves_its_pid_file(tmp_path: Path) -> None:

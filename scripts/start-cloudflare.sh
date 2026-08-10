@@ -40,6 +40,8 @@ OWNED_WORKER_PID=""
 OWNED_API_PID=""
 OWNED_WORKER_TARGET=""
 OWNED_API_TARGET=""
+DETACHED_PID=""
+DETACHED_TARGET=""
 
 VITE_API_BASE_URL="$PUBLIC_URL" npm --prefix "$ROOT/web" run build
 
@@ -74,20 +76,17 @@ start_detached() {
   shift
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "$@" >>"$log_file" 2>&1 &
+    DETACHED_PID=$!
+    DETACHED_TARGET="-$DETACHED_PID"
+    for _ in {1..20}; do
+      kill -0 -- "$DETACHED_TARGET" 2>/dev/null && break
+      sleep 0.01
+    done
   else
     nohup "$@" >>"$log_file" 2>&1 &
+    DETACHED_PID=$!
+    DETACHED_TARGET="$DETACHED_PID"
   fi
-  echo $!
-}
-
-capture_owned_target() {
-  local pid="$1"
-  local target="-$pid"
-  for _ in {1..20}; do
-    kill -0 -- "$target" 2>/dev/null && break
-    sleep 0.01
-  done
-  printf '%s\n' "$target"
 }
 
 stop_owned_pid_file() {
@@ -144,15 +143,17 @@ else
     --max-bytes "${LOG_ROTATE_MAX_BYTES:-1000000}" \
     --keep "${LOG_ROTATE_KEEP:-5}" \
     --force >/dev/null
-  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker >"$IMPORT_WORKER_PID_FILE"
-  OWNED_WORKER_PID="$(cat "$IMPORT_WORKER_PID_FILE")"
-  OWNED_WORKER_TARGET="$(capture_owned_target "$OWNED_WORKER_PID")"
+  start_detached "$RUNTIME_DIR/import-worker.log" "$PYTHON_BIN" -m app.import_worker
+  OWNED_WORKER_PID="$DETACHED_PID"
+  OWNED_WORKER_TARGET="$DETACHED_TARGET"
+  printf '%s\n' "$OWNED_WORKER_PID" >"$IMPORT_WORKER_PID_FILE"
 fi
 wait_for_import_worker
 
-start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api >"$RUNTIME_DIR/mobile-api.pid"
-OWNED_API_PID="$(cat "$RUNTIME_DIR/mobile-api.pid")"
-OWNED_API_TARGET="$(capture_owned_target "$OWNED_API_PID")"
+start_detached "$RUNTIME_DIR/mobile-api.log" "$PYTHON_BIN" -m app.mobile_api
+OWNED_API_PID="$DETACHED_PID"
+OWNED_API_TARGET="$DETACHED_TARGET"
+printf '%s\n' "$OWNED_API_PID" >"$RUNTIME_DIR/mobile-api.pid"
 
 "$PYTHON_BIN" scripts/ops.py wait-health --base-url "http://127.0.0.1:${API_PORT}" --timeout "${API_START_TIMEOUT:-45}"
 curl -fsS --max-time 20 "$PUBLIC_URL/api/ready" >/dev/null
