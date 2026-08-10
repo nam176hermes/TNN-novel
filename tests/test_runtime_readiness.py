@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 from fastapi import Response
+from pydantic import ValidationError
 
 from app.database.db import init_db
+from app.mobile_api.config import MobileAPISettings
 
 
 def _request():
@@ -109,3 +111,48 @@ async def test_worker_release_mismatch_is_not_claim_capable(tmp_path: Path, monk
     assert response.status_code == 503
     assert payload["job_processing"]["status"] == "release_mismatch"
     assert payload["release"]["match"] == "false"
+
+
+def test_preview_worker_runtime_dependency_requires_a_claim_capable_external_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.mobile_api.routers import import_routes
+
+    data_dir = tmp_path / "preview-runtime"
+    data_dir.mkdir()
+    db_path = data_dir / "pipeline.db"
+    init_db(db_path)
+    monkeypatch.setattr(import_routes, "get_data_dir", lambda: data_dir, raising=False)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: db_path)
+
+    runtime = import_routes.get_import_worker_runtime()
+
+    assert runtime.required is True
+    assert runtime.status == "missing"
+    assert runtime.queue_claim_capable is False
+    assert runtime.safe_dict().keys() == {
+        "status",
+        "required",
+        "heartbeat_age_seconds",
+        "release_id",
+        "release_match",
+        "queue_claim_capable",
+        "reason",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("import_preview_wait_timeout_seconds", 0),
+        ("import_preview_wait_timeout_seconds", 301),
+        ("import_job_sync_wait_timeout_seconds", 0),
+        ("import_job_sync_wait_timeout_seconds", 7201),
+        ("import_job_wait_poll_seconds", 0),
+        ("import_job_wait_poll_seconds", 2.1),
+    ],
+)
+def test_import_job_wait_settings_reject_unbounded_values(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        MobileAPISettings(**{field: value})

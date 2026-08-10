@@ -69,6 +69,21 @@ class MobileAPISettings(BaseModel):
         gt=0,
     )
     import_job_run_in_api: bool = _parse_bool(os.getenv("IMPORT_JOB_RUN_IN_API", "1"))
+    import_preview_wait_timeout_seconds: float = Field(
+        default=float(os.getenv("IMPORT_PREVIEW_WAIT_TIMEOUT_SECONDS", "60")),
+        gt=0,
+        le=300,
+    )
+    import_job_sync_wait_timeout_seconds: float = Field(
+        default=float(os.getenv("IMPORT_JOB_SYNC_WAIT_TIMEOUT_SECONDS", "3600")),
+        gt=0,
+        le=7200,
+    )
+    import_job_wait_poll_seconds: float = Field(
+        default=float(os.getenv("IMPORT_JOB_WAIT_POLL_SECONDS", "0.10")),
+        gt=0,
+        le=2,
+    )
     import_worker_poll_interval_seconds: float = Field(
         default=float(os.getenv("IMPORT_WORKER_POLL_INTERVAL_SECONDS", "1")),
         gt=0,

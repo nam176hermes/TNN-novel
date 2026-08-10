@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import json
 import logging
@@ -40,7 +40,7 @@ from app.ingestion.source_policies import chapter_url_matches_source_book, get_s
 from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.config import mobile_settings
-from app.mobile_api.dependencies import get_db_path
+from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.mobile_api.schemas import (
     JobResponse,
     ImportJobAcceptedResponse,
@@ -61,6 +61,7 @@ from app.mobile_api.schemas import (
     WizardTextImportResult,
 )
 from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
+from app.mobile_api.services.import_job_wait_service import ImportJobWaitError, wait_for_terminal_import_job
 from app.mobile_api.services.job_service import JobService, get_shared_job_tracker
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.public_mode import is_public_request
@@ -68,6 +69,9 @@ from app.mobile_api.upload_limits import read_upload_bytes_limited, write_upload
 from app.services.import_job_service import ImportJobService
 from app.services.import_job_quotas import ImportJobQuotaError
 from app.services.import_job_factory import create_import_job_service
+from app.import_contracts import BrowserResultState, BrowserTaskResult, ImportOperationKind
+from app.runtime_identity import get_runtime_identity
+from app.runtime_status import WorkerRuntimeStatus, inspect_worker_runtime
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 logger = logging.getLogger(__name__)
@@ -131,6 +135,16 @@ def get_import_job_service(
         worker_id=f"api-{os.getpid()}",
         pipeline=pipeline,
         db_path=Path(getattr(pipeline, "db_path", get_db_path())),
+    )
+
+
+def get_import_worker_runtime() -> WorkerRuntimeStatus:
+    return inspect_worker_runtime(
+        data_dir=get_data_dir(),
+        db_path=get_db_path(),
+        api_identity=get_runtime_identity(component="api"),
+        required=True,
+        max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
     )
 
 
@@ -1124,49 +1138,194 @@ async def import_url_note(
     return {"book_id": book_id, "message": "URL note saved"}
 
 
+def _preview_http_exception(
+    code: str,
+    message: str,
+    status_code: int,
+    *,
+    retryable: bool = False,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "retryable": retryable, "message": message},
+    )
+
+
+def _stored_source_preview_error(
+    result: BrowserTaskResult,
+    *,
+    default_status: int,
+) -> HTTPException | None:
+    try:
+        error_code = FetchErrorCode(result.error_code)
+    except ValueError:
+        return None
+    if error_code in {
+        FetchErrorCode.CANCELLED,
+        FetchErrorCode.IMPORT_FAILED,
+        FetchErrorCode.INTERNAL_ERROR,
+    }:
+        return None
+    error = SourceAdapterError(
+        result.error_message or "Source preview failed",
+        code=error_code,
+        retryable=result.retryable,
+        http_status=result.http_status,
+    )
+    return _source_adapter_http_exception(error, default_status=default_status)
+
+
+def _source_preview_response(payload: dict, *, requested_url: str) -> SourcePreviewResponse:
+    chapters = [dict(chapter) for chapter in payload.get("chapters") or []]
+    preview = dict(payload)
+    preview["chapters"] = chapters
+    preview["chapter_count"] = len(chapters)
+    managed = find_managed_source_for_url(
+        get_db_path(),
+        str(preview.get("source_url") or requested_url),
+        str(preview.get("source") or ""),
+        str((preview.get("policy") or {}).get("source_id") or ""),
+    )
+    preview["managed_source_id"] = str(managed.get("id") or "") if managed else ""
+    preview["managed_source_status"] = str(managed.get("status") or "") if managed else ""
+    preview["managed_source_trust_level"] = str(managed.get("trust_level") or "") if managed else ""
+    preview["automation_allowed"] = bool(managed and managed.get("status") == "VERIFIED")
+    preview["automation_reason"] = (
+        ""
+        if preview["automation_allowed"]
+        else (
+            "Nguồn này chưa được nhập vào Source Hub và xác minh."
+            if managed is None
+            else f"Nguồn đang ở trạng thái {managed.get('status', 'NEEDS_REVIEW')} nên chưa thể tạo job tự động."
+        )
+    )
+    return SourcePreviewResponse.model_validate(preview)
+
+
 @router.post("/url/preview", response_model=SourcePreviewResponse)
 async def preview_source_url(
     data: URLPreviewRequest,
     request: Request,
-    pipeline: PipelineService = Depends(get_pipeline),
+    current_user: dict = Depends(get_current_user),
+    service: ImportJobService = Depends(get_import_job_service),
+    worker_runtime: WorkerRuntimeStatus = Depends(get_import_worker_runtime),
 ):
     """Preview a public novel/book URL and extract candidate chapter links."""
+    owner_user_id = _import_job_owner(current_user)
     try:
-        preview = await asyncio.to_thread(pipeline.preview_source_url, data.url)
-        managed = find_managed_source_for_url(
-            get_db_path(),
-            str(preview.get("source_url") or data.url),
-            str(preview.get("source") or ""),
-            str(preview.get("policy", {}).get("source_id") or ""),
-        )
-        preview["managed_source_id"] = str(managed.get("id") or "") if managed else ""
-        preview["managed_source_status"] = str(managed.get("status") or "") if managed else ""
-        preview["managed_source_trust_level"] = str(managed.get("trust_level") or "") if managed else ""
-        preview["automation_allowed"] = bool(managed and managed.get("status") == "VERIFIED")
-        preview["automation_reason"] = (
-            ""
-            if preview["automation_allowed"]
-            else (
-                "Nguồn này chưa được nhập vào Source Hub và xác minh."
-                if managed is None
-                else f"Nguồn đang ở trạng thái {managed.get('status', 'NEEDS_REVIEW')} nên chưa thể tạo job tự động."
+        source_url = validate_public_http_url(data.url)
+        source_policy = get_source_policy(source_url)
+        if source_policy is None:
+            raise SourceAdapterError(
+                "Unsupported source domain",
+                code=FetchErrorCode.SOURCE_NOT_ALLOWED,
+                retryable=False,
+                http_status=400,
             )
+        if not worker_runtime.queue_claim_capable:
+            raise _preview_http_exception(
+                "worker_unavailable",
+                "Import worker is unavailable",
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                retryable=True,
+            )
+
+        correlation_id = str(uuid.uuid4())
+        deadline_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=mobile_settings.import_preview_wait_timeout_seconds)
+        ).isoformat()
+        job = await asyncio.to_thread(
+            service.create_job,
+            owner_user_id=owner_user_id,
+            source=source_policy.source_id,
+            source_url=source_url,
+            tasks=[
+                {
+                    "canonical_identity": f"{source_policy.source_id}:{source_url}",
+                    "canonical_chapter_url": source_url,
+                    "chapter_number": 0,
+                    "title": "",
+                }
+            ],
+            config_snapshot={"source": source_policy.source_id},
+            operation_kind=ImportOperationKind.PREVIEW,
+            deadline_at=deadline_at,
+            correlation_id=correlation_id,
         )
-        preview.setdefault("bypass_used", False)
-        preview.setdefault("bypass_method", "")
-        preview.setdefault("fetch_method", "")
-        preview.setdefault("fetch_status_code", None)
-        preview.setdefault("fetch_attempts", 0)
-        preview.setdefault("fetch_elapsed_ms", 0)
-        preview.setdefault("fetch_bytes_received", 0)
-        preview.setdefault("fetch_final_url", "")
-        preview.setdefault("fetch_cookies_refreshed", False)
-        preview.setdefault("fetch_cache_hit", False)
-        return preview
+        job = await asyncio.to_thread(service.enqueue_job, job.id, owner_user_id)
+        job = await wait_for_terminal_import_job(
+            request,
+            service,
+            job.id,
+            owner_user_id,
+            timeout_seconds=mobile_settings.import_preview_wait_timeout_seconds,
+            poll_seconds=mobile_settings.import_job_wait_poll_seconds,
+        )
+        result = job.result_snapshot
+        if result is None or job.result_state is not result.state:
+            raise _preview_http_exception(
+                "browser_task_failed",
+                "Browser task failed",
+                status.HTTP_502_BAD_GATEWAY,
+            )
+        if result.state is BrowserResultState.COMPLETED:
+            if result.payload is None:
+                raise _preview_http_exception(
+                    "browser_task_failed",
+                    "Browser task failed",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+            return _source_preview_response(
+                result.payload.model_dump(mode="python"),
+                requested_url=source_url,
+            )
+        if result.state is BrowserResultState.BLOCKED:
+            stored_error = _stored_source_preview_error(result, default_status=400)
+            if stored_error is not None:
+                raise stored_error
+        elif result.state is BrowserResultState.FAILED:
+            stored_error = _stored_source_preview_error(result, default_status=502)
+            if stored_error is not None:
+                raise stored_error
+        elif result.state is BrowserResultState.TIMED_OUT:
+            raise _preview_http_exception(
+                "browser_task_timed_out",
+                "Browser task deadline exceeded",
+                status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+        elif result.state is BrowserResultState.CANCELLED:
+            raise _preview_http_exception(
+                "browser_task_cancelled",
+                "Browser task was cancelled",
+                status.HTTP_409_CONFLICT,
+            )
+        raise _preview_http_exception(
+            "browser_task_failed",
+            "Browser task failed",
+            status.HTTP_502_BAD_GATEWAY,
+        )
+    except ImportJobWaitError as exc:
+        if exc.code == "client_disconnected":
+            raise _preview_http_exception(
+                "client_disconnected",
+                "Client disconnected",
+                499,
+            ) from exc
+        raise _preview_http_exception(
+            "browser_task_timed_out",
+            "Browser task deadline exceeded",
+            status.HTTP_504_GATEWAY_TIMEOUT,
+        ) from exc
     except SourceAdapterError as exc:
         raise _source_adapter_http_exception(exc) from exc
+    except HTTPException:
+        raise
+    except (ImportJobQuotaError, InvalidImportJobTransition, LookupError, PermissionError) as exc:
+        _raise_import_job_error(exc)
+        raise
     except Exception as exc:
-        logger.warning("Source preview failed for %s", data.url, exc_info=True)
+        logger.warning("Source preview failed in external worker")
         record_audit_event(
             event_type="import_failure",
             severity="warning",
@@ -1175,9 +1334,10 @@ async def preview_source_url(
             request=request,
             details={"import_type": "url_preview", "result": "failure"},
         )
-        raise HTTPException(
-            status_code=502,
-            detail="Source preview failed. Check the source URL and server logs.",
+        raise _preview_http_exception(
+            "browser_task_failed",
+            "Browser task failed",
+            status.HTTP_502_BAD_GATEWAY,
         ) from exc
 
 
