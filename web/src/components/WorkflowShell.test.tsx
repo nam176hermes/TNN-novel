@@ -61,7 +61,14 @@ describe('WorkflowShell', () => {
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Đọc truyện' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Tác vụ' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
-    const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    let moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    await userEvent.click(within(moreSheet).getByRole('button', { name: 'Raw chưa dịch' }));
+
+    expect(onViewChange).toHaveBeenCalledWith('raw');
+    expect(screen.queryByRole('dialog', { name: 'Thêm' })).not.toBeInTheDocument();
+
+    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
+    moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
     await userEvent.click(within(moreSheet).getByRole('button', { name: 'Nhập chương' }));
 
     expect(onViewChange).toHaveBeenCalledWith('library');

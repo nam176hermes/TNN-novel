@@ -859,6 +859,36 @@ test('reader shows Vietnamese text and workbench exposes raw/Vietnamese controls
   await expect(page.getByLabel('Bản dịch tiếng Việt')).toHaveCount(0);
 });
 
+test('mobile More opens Raw without overflow at 360, 390, and 412 pixels', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 390, height: 844 });
+  await authenticatedPage(page, state);
+
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await mobileNav.getByRole('button', { name: 'Thêm' }).click();
+
+  const rawButton = page.getByRole('dialog', { name: 'Thêm' })
+    .getByRole('button', { name: 'Raw chưa dịch' });
+  await expect(rawButton).toBeVisible();
+  const rawButtonBox = await rawButton.boundingBox();
+  expect(rawButtonBox).not.toBeNull();
+  expect(rawButtonBox?.width ?? 0).toBeGreaterThanOrEqual(44);
+  expect(rawButtonBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+
+  await rawButton.click();
+  await expect(page.getByRole('heading', { name: 'Raw chưa dịch' })).toBeVisible();
+
+  for (const viewport of [
+    { width: 360, height: 740 },
+    { width: 390, height: 844 },
+    { width: 412, height: 915 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expectVisibleMobileTouchTargets(page, `Raw at ${viewport.width}px`);
+    await expectNoHorizontalOverflow(page);
+  }
+});
+
 test('mobile shell and Reader follow the approved handoff at 390px and 360px', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await page.setViewportSize({ width: 390, height: 844 });
