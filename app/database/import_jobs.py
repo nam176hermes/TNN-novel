@@ -17,6 +17,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.database.connection import get_connection
+from app.import_contracts import (
+    BrowserResultState,
+    BrowserTaskResult,
+    ImportOperationKind,
+    decode_browser_result,
+)
 
 
 class JobStatus(str, Enum):
@@ -152,6 +158,12 @@ class ImportJob:
     cancel_requested_at: str
     config_snapshot: dict[str, Any]
     error_summary: str
+    operation_kind: ImportOperationKind
+    deadline_at: str
+    correlation_id: str
+    result_state: BrowserResultState | None
+    result_snapshot: BrowserTaskResult | None
+    result_published_at: str
     version: int
 
 
@@ -196,6 +208,11 @@ class ImportJobEvent:
 
 
 def _job_from_row(row: sqlite3.Row) -> ImportJob:
+    snapshot = decode_browser_result(str(row["result_snapshot_json"] or ""))
+    stored_result_state = str(row["result_state"] or "")
+    result_state = BrowserResultState(stored_result_state) if stored_result_state else None
+    if result_state is not None and (snapshot is None or result_state is not snapshot.state):
+        raise ValueError("stored browser result state does not match result snapshot")
     return ImportJob(
         id=str(row["id"]),
         owner_user_id=str(row["owner_user_id"] or ""),
@@ -217,6 +234,12 @@ def _job_from_row(row: sqlite3.Row) -> ImportJob:
         cancel_requested_at=str(row["cancel_requested_at"] or ""),
         config_snapshot=_safe_json_loads(row["config_snapshot_json"]),
         error_summary=str(row["error_summary"] or ""),
+        operation_kind=ImportOperationKind(str(row["operation_kind"] or ImportOperationKind.IMPORT_CHAPTERS.value)),
+        deadline_at=str(row["deadline_at"] or ""),
+        correlation_id=str(row["correlation_id"] or ""),
+        result_state=result_state,
+        result_snapshot=snapshot,
+        result_published_at=str(row["result_published_at"] or ""),
         version=int(row["version"] or 0),
     )
 
@@ -278,20 +301,41 @@ class ImportJobRepository:
         total: int = 0,
         book_id: int | None = None,
         config_snapshot: Mapping[str, Any] | None = None,
+        operation_kind: ImportOperationKind = ImportOperationKind.IMPORT_CHAPTERS,
+        deadline_at: str = "",
+        correlation_id: str = "",
     ) -> ImportJob:
         now = _now()
         job_id = uuid.uuid4().hex
         snapshot = sanitize_import_job_payload(config_snapshot)
+        try:
+            normalized_operation_kind = ImportOperationKind(operation_kind)
+        except (TypeError, ValueError):
+            raise ValueError("invalid import operation kind") from None
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 INSERT INTO import_jobs (
                     id, owner_user_id, source, source_url, book_id, status, total,
-                    created_at, config_snapshot_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, config_snapshot_json, operation_kind, deadline_at,
+                    correlation_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, owner_user_id, source, source_url, book_id, JobStatus.QUEUED.value, max(0, total), now, json.dumps(snapshot, ensure_ascii=False, sort_keys=True)),
+                (
+                    job_id,
+                    owner_user_id,
+                    source,
+                    source_url,
+                    book_id,
+                    JobStatus.QUEUED.value,
+                    max(0, total),
+                    now,
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    normalized_operation_kind.value,
+                    str(deadline_at or ""),
+                    str(correlation_id or "")[:128],
+                ),
             )
             self._append_event(conn, job_id, None, "job_created", {"status": JobStatus.QUEUED.value})
             row = self._job_row(conn, job_id, owner_user_id)

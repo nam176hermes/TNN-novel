@@ -604,6 +604,12 @@ def _ensure_import_job_tables(conn: sqlite3.Connection) -> None:
             "cancel_requested_at TEXT NOT NULL DEFAULT ''",
             "config_snapshot_json TEXT NOT NULL DEFAULT '{}'",
             "error_summary TEXT NOT NULL DEFAULT ''",
+            "operation_kind TEXT NOT NULL DEFAULT 'import_chapters'",
+            "deadline_at TEXT NOT NULL DEFAULT ''",
+            "correlation_id TEXT NOT NULL DEFAULT ''",
+            "result_state TEXT NOT NULL DEFAULT ''",
+            "result_snapshot_json TEXT NOT NULL DEFAULT ''",
+            "result_published_at TEXT NOT NULL DEFAULT ''",
             "version INTEGER NOT NULL DEFAULT 0",
         ):
             _add_column_if_missing(conn, "import_jobs", column_sql)
