@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ApiClient } from '../../api/client';
+import { ApiError, type ApiClient } from '../../api/client';
 import type {
   BookAudioPlaylistItem,
   Chapter,
@@ -73,18 +73,37 @@ function sanitizeAudioErrorText(value: string): string {
 }
 
 export function friendlyAudioError(
-  message: string,
+  error: unknown,
   fallback = 'TTS thất bại. Kiểm tra cấu hình audio và log server.',
 ): string {
+  const code = error instanceof ApiError ? error.code : '';
+  if (code === 'gpu_unavailable') {
+    return 'F5 TTS yêu cầu CUDA. GPU hoặc môi trường CUDA trên server hiện không khả dụng.';
+  }
+  if (code === 'runtime_missing') {
+    return 'Thiếu runtime F5 TTS trên server. Cài runtime và các dependency F5 rồi thử lại.';
+  }
+  if (code === 'model_missing') {
+    return 'Thiếu model F5 TTS hoặc checkpoint/vocabulary đã cấu hình trên server.';
+  }
+
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
   const cleaned = sanitizeAudioErrorText(message).toLowerCase();
   if (!cleaned.trim()) return fallback;
   if (cleaned.includes('ffmpeg')) return 'Thiếu ffmpeg hoặc ffmpeg không chạy được. Cài ffmpeg rồi chạy lại audio.';
   if (
+    cleaned.includes('f5 runtime') || cleaned.includes('f5-tts is not installed')
+    || cleaned.includes("no module named 'f5_tts'")
+  ) return 'Thiếu runtime F5 TTS trên server. Cài runtime và các dependency F5 rồi thử lại.';
+  if (
     cleaned.includes('checkpoint') || cleaned.includes('ckpt') || cleaned.includes('vocab')
     || cleaned.includes('model') || cleaned.includes('hugging face')
   ) return 'Thiếu model TTS hoặc file cấu hình. Kiểm tra TTS_CKPT_FILE/TTS_VOCAB_FILE trên server.';
-  if (cleaned.includes('cuda') || cleaned.includes('gpu') || cleaned.includes('out of memory')) {
-    return 'Thiết bị TTS không sẵn sàng. Kiểm tra CUDA/GPU hoặc chuyển TTS_DEVICE=cpu.';
+  if (cleaned.includes('out of memory')) {
+    return 'GPU không đủ bộ nhớ để chạy F5 TTS. Giải phóng VRAM trên server rồi thử lại.';
+  }
+  if (cleaned.includes('cuda') || cleaned.includes('gpu')) {
+    return 'F5 TTS yêu cầu CUDA. GPU hoặc môi trường CUDA trên server hiện không khả dụng.';
   }
   if (cleaned.includes('already running') || cleaned.includes('job already')) {
     return 'Đã có job audio đang chạy. Đợi job hiện tại xong hoặc mở trang Tác vụ để kiểm tra.';
@@ -100,9 +119,7 @@ export function friendlyAudioError(
 }
 
 function audioErrorFromUnknown(error: unknown, fallback: string): string {
-  if (error instanceof Error) return friendlyAudioError(error.message, fallback);
-  if (typeof error === 'string') return friendlyAudioError(error, fallback);
-  return fallback;
+  return friendlyAudioError(error, fallback);
 }
 
 function failedTtsChunkCount(ttsJob: TtsJobStatus | null): number {

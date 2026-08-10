@@ -33,12 +33,18 @@ class RecordingJobService:
 
 
 class UnavailableJobService:
-    def __init__(self) -> None:
+    def __init__(self, code: str = "gpu_unavailable") -> None:
         self.calls = 0
+        self.code = code
 
     def start_tts_job(self, **kwargs) -> str:
         self.calls += 1
-        raise TTSUnavailableError("Local F5 TTS is unavailable: a CUDA GPU is required.")
+        messages = {
+            "gpu_unavailable": "Local F5 TTS is unavailable: a CUDA GPU is required.",
+            "runtime_missing": "Local F5 TTS is unavailable: the F5 runtime is not installed.",
+            "model_missing": "Local F5 TTS is unavailable: required model files or configuration are missing.",
+        }
+        raise TTSUnavailableError(messages[self.code], code=self.code)
 
 
 @pytest.mark.asyncio
@@ -70,8 +76,9 @@ async def test_tts_chapter_endpoint_starts_existing_job_runner() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tts_chapter_endpoint_returns_safe_unavailable() -> None:
-    service = UnavailableJobService()
+@pytest.mark.parametrize("code", ["gpu_unavailable", "runtime_missing", "model_missing"])
+async def test_tts_chapter_endpoint_returns_safe_unavailable(code: str) -> None:
+    service = UnavailableJobService(code)
     app.dependency_overrides[tts_router.get_job_service] = lambda: service
     try:
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
@@ -86,7 +93,8 @@ async def test_tts_chapter_endpoint_returns_safe_unavailable() -> None:
         app.dependency_overrides.pop(tts_router.get_job_service, None)
 
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "tts_unavailable"
+    assert response.json()["detail"]["code"] == code
+    assert response.json()["detail"]["message"].startswith("Local F5 TTS is unavailable:")
     assert service.calls == 1
 
 
@@ -112,7 +120,7 @@ async def test_tts_job_endpoint_returns_safe_unavailable_before_audit(monkeypatc
         app.dependency_overrides.pop(jobs_router.get_job_service, None)
 
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "tts_unavailable"
+    assert response.json()["detail"]["code"] == "gpu_unavailable"
     assert service.calls == 1
 
 

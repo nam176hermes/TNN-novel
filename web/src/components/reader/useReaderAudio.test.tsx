@@ -1,7 +1,8 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../api/client';
 import type { Chapter, JobStatus, TtsJobStatus } from '../../api/types';
-import { useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
+import { friendlyAudioError, useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
 
 const chapters: Chapter[] = [
   { id: 101, book_id: 42, chapter_number: 1, title: 'Sơn biên tiểu thôn', status: 'translated', audio_path: null, has_translation: true },
@@ -391,6 +392,19 @@ describe('useReaderAudio', () => {
     expect(noChapter.result.current.state.canStartChapterJob).toBe(false);
     expect(ready.result.current.state.canStartChapterJob).toBe(true);
     expect(ready.result.current.state.canStartBookJob).toBe(true);
+  });
+
+  it('maps structured F5 capability errors without suggesting CPU fallback', () => {
+    const gpuMessage = friendlyAudioError(new ApiError('unavailable', 503, 'gpu_unavailable'));
+    const runtimeMessage = friendlyAudioError(new ApiError('missing', 503, 'runtime_missing'));
+    const modelMessage = friendlyAudioError(new ApiError('missing', 503, 'model_missing'));
+    const legacyGpuMessage = friendlyAudioError('CUDA GPU is unavailable');
+
+    expect(gpuMessage).toContain('CUDA');
+    expect(runtimeMessage).toContain('runtime F5');
+    expect(modelMessage).toContain('model F5');
+    expect(new Set([gpuMessage, runtimeMessage, modelMessage]).size).toBe(3);
+    expect([gpuMessage, runtimeMessage, modelMessage, legacyGpuMessage].join(' ')).not.toMatch(/TTS_DEVICE|chuyển.*CPU/i);
   });
 
   it('sanitizes job errors and never exposes secrets or absolute paths', async () => {
