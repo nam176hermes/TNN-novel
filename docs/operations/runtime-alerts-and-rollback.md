@@ -200,14 +200,14 @@ resolved image digests through `NOVEL_API_IMAGE_DIGEST` and
 ### Reviewed operational-observability image pins
 
 Release `operational-observability-20260809-r1` was built at
-`2026-08-10T08:31:15Z` from clean source commit
-`4476f2908467761c4b265579d7cb0313757a0701`. Its reviewed local tags and
+`2026-08-10T09:52:18Z` from clean source commit
+`0fdce5a0ea16d7741874cc7e8b6df65a97041b06`. Its reviewed local tags and
 immutable image IDs are:
 
 - `novel-pipeline-api:operational-observability-20260809-r1`:
-  `sha256:ea8cbdaf4fe362e489389dda6dd2dd401049f324bb3fb00024dc32b6ebf6f429`;
+  `sha256:cf257299512228b482eaaaa949f50c59d6cbebb2875abe16d86b08c080e21d3f`;
 - `novel-pipeline-import-worker:operational-observability-20260809-r1`:
-  `sha256:f01336eda33c3e46ac6b5e3874a4a432e1743d1c87c4e957ed1f2466811fe3f9`.
+  `sha256:7e0e22a1fcb23cd44b381dffddb255072c036a6c15f70742673d65fb06895615`.
 
 The exact pins are recorded in
 `deploy/production/compose.release.operational-observability-20260809-r1.yaml`.
