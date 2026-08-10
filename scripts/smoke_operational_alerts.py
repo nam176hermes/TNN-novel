@@ -40,6 +40,10 @@ _SYNTHETIC_RESPONSE_BODY = b"synthetic-response-body"
 _MAX_REQUEST_BYTES = 8 * 1024
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _validated_receipt_dir(raw_value: str) -> Path:
     path = Path(raw_value)
     if not path.is_absolute() or ".." in path.parts or path == Path(path.anchor):
@@ -57,8 +61,8 @@ def _validated_receipt_dir(raw_value: str) -> Path:
     ):
         raise ValueError("Synthetic receipt directory is unsafe")
 
-    forbidden = (PROJECT_ROOT.resolve(), settings.resolved_data_dir.resolve())
-    if canonical in forbidden:
+    forbidden_roots = (PROJECT_ROOT.resolve(), settings.resolved_data_dir.resolve())
+    if any(_is_within(canonical, root) for root in forbidden_roots):
         raise ValueError("Synthetic receipt directory is unsafe")
     return canonical
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import stat
 import sys
 
 from app.config import settings
@@ -21,6 +23,50 @@ _ENVIRONMENT_NAMES = (
     "NOVEL_ALERT_MAX_ATTEMPTS",
 )
 _RECEIPT_STATUSES = frozenset({"delivered", "failed", "resolved"})
+
+
+def _open_database_guard(database_path: Path) -> tuple[int, tuple[int, int]]:
+    database_path = Path(database_path)
+    if (
+        not database_path.is_absolute()
+        or ".." in database_path.parts
+        or database_path == Path(database_path.anchor)
+    ):
+        raise ValueError("Operational database path is unsafe")
+    descriptor = os.open(
+        database_path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+        path_metadata = os.stat(database_path, follow_symlinks=False)
+        identity = (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+        if not stat.S_ISREG(descriptor_metadata.st_mode) or identity != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        ):
+            raise ValueError("Operational database path is unsafe")
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_database_guard(
+    database_path: Path,
+    descriptor: int,
+    identity: tuple[int, int],
+) -> None:
+    descriptor_metadata = os.fstat(descriptor)
+    path_metadata = os.stat(database_path, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(descriptor_metadata.st_mode)
+        or identity != (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+        or identity != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        raise ValueError("Operational database changed during snapshot")
 
 
 def _configuration_from_environment() -> AlertDeliveryConfig:
@@ -44,8 +90,18 @@ def main() -> int:
 
     try:
         data_dir = settings.resolved_data_dir
-        service = OperationalMetricsService(settings.db_path, data_dir)
-        snapshot = service.snapshot(use_cache=False)
+        database_path = settings.db_path
+        database_descriptor, database_identity = _open_database_guard(database_path)
+        try:
+            service = OperationalMetricsService(database_path, data_dir, read_only=True)
+            snapshot = service.snapshot(use_cache=False)
+            _verify_database_guard(
+                database_path,
+                database_descriptor,
+                database_identity,
+            )
+        finally:
+            os.close(database_descriptor)
         dispatcher = OperationalAlertDispatcher(
             config,
             receipt_dir=data_dir / "logs" / "runtime",

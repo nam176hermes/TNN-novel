@@ -71,8 +71,8 @@ It never prints the endpoint, bearer token, response body, or receipt path.
 The synthetic command is the safe preflight. It binds a temporary receiver to
 the literal loopback address `127.0.0.1`, generates one incident per supported
 class, and uses the production dispatcher to write four isolated receipts. It
-does not read the operator database, contact an external host, or write below
-`DATA_DIR`.
+does not read the operator database, contact an external host, or write anywhere
+in the resolved `DATA_DIR` subtree.
 
 ```bash
 set -euo pipefail
@@ -85,11 +85,13 @@ find "$ALERT_SMOKE_DIR" -maxdepth 1 -type f \
 ```
 
 Expect one `class=... status=delivered` line and one receipt for each of the
-four classes. The command rejects filesystem root, the repository root,
-`DATA_DIR`, relative paths, parent traversal, missing/non-directory paths, and
-paths reached through symlinks. Retain the temporary evidence until reviewed;
-remove it only after confirming the exact `mktemp` path and its four bounded
-receipt files.
+four classes. The command rejects filesystem root, the repository tree, the
+resolved `DATA_DIR` tree (including `logs/runtime` and every other descendant),
+relative paths, parent traversal, missing/non-directory paths, and paths reached
+through symlinks. Validation finishes before the receiver or dispatcher starts,
+so a rejected path cannot overwrite production receipts. Retain the temporary
+evidence until reviewed; remove it only after confirming the exact `mktemp`
+path and its four bounded receipt files.
 
 ### Private configuration and manual dispatch
 

@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import time
 from typing import Any
+from urllib.parse import quote
 
 from app.config import settings
 from app.mobile_api.config import mobile_settings
@@ -119,11 +120,18 @@ class OperationalMetricsService:
     db_path: Path
     data_dir: Path
     cache_ttl_seconds: float = 30.0
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         self.db_path = Path(self.db_path)
         self.data_dir = Path(self.data_dir)
         self._cached: tuple[float, dict[str, Any]] | None = None
+
+    def _database_target(self) -> tuple[str, bool]:
+        if not self.read_only:
+            return str(self.db_path), False
+        absolute_path = self.db_path.absolute()
+        return f"file:{quote(str(absolute_path), safe='/')}?mode=ro", True
 
     def snapshot(self, *, now: datetime | None = None, use_cache: bool = True) -> dict[str, Any]:
         monotonic_now = time.monotonic()
@@ -131,15 +139,17 @@ class OperationalMetricsService:
             return self._cached[1]
         resolved_now = now or datetime.now(timezone.utc)
         identity = get_runtime_identity(component="api")
+        database_target, database_is_uri = self._database_target()
         worker = inspect_worker_runtime(
             data_dir=self.data_dir,
-            db_path=self.db_path,
+            db_path=database_target,
+            db_uri=database_is_uri,
             api_identity=identity,
             required=not mobile_settings.import_job_run_in_api,
             max_age_seconds=mobile_settings.import_worker_heartbeat_max_age_seconds,
             now=resolved_now.timestamp(),
         )
-        with sqlite3.connect(str(self.db_path)) as connection:
+        with sqlite3.connect(database_target, uri=database_is_uri) as connection:
             queued = connection.execute(
                 """
                 SELECT COUNT(*) FROM mobile_jobs

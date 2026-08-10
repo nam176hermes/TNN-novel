@@ -58,8 +58,9 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
     observed: dict[str, object] = {}
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path) -> None:
+        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
             observed["metrics_paths"] = (db_path, data_dir)
+            observed["read_only"] = read_only
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, str]:
             observed["use_cache"] = use_cache
@@ -78,6 +79,8 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
             )
 
     data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "pipeline.db").touch()
     monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", data_dir)
     monkeypatch.setattr(
         dispatch_operational_alerts,
@@ -100,6 +103,7 @@ def test_dispatch_cli_uses_fresh_snapshot_and_prints_only_class_status(
     assert result == 0
     assert observed["metrics_paths"] == (data_dir / "pipeline.db", data_dir)
     assert observed["use_cache"] is False
+    assert observed["read_only"] is True
     assert observed["snapshot"] is snapshot
     assert observed["receipt_dir"] == data_dir / "logs" / "runtime"
     assert captured.err == ""
@@ -119,7 +123,7 @@ def test_dispatch_cli_redacts_receipt_persistence_errors_and_returns_nonzero(
     private_path = tmp_path / "private-runtime" / "receipt.json"
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path) -> None:
+        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
             pass
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, object]:
@@ -132,7 +136,10 @@ def test_dispatch_cli_redacts_receipt_persistence_errors_and_returns_nonzero(
         def dispatch(self, snapshot: object) -> tuple[object, ...]:
             raise OSError(f"cannot persist {private_path}")
 
-    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", tmp_path / "data")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "pipeline.db").touch()
+    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", data_dir)
     monkeypatch.setattr(
         dispatch_operational_alerts,
         "OperationalMetricsService",
@@ -168,7 +175,7 @@ def test_dispatch_cli_reads_only_allowlisted_alert_environment(
     }
 
     class FakeMetricsService:
-        def __init__(self, db_path: Path, data_dir: Path) -> None:
+        def __init__(self, db_path: Path, data_dir: Path, *, read_only: bool = False) -> None:
             pass
 
         def snapshot(self, *, use_cache: bool = True) -> dict[str, object]:
@@ -188,7 +195,10 @@ def test_dispatch_cli_reads_only_allowlisted_alert_environment(
         observed_names.append(name)
         return values.get(name, default)
 
-    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", tmp_path / "data")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "pipeline.db").touch()
+    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", data_dir)
     monkeypatch.setattr(dispatch_operational_alerts, "OperationalMetricsService", FakeMetricsService)
     monkeypatch.setattr(dispatch_operational_alerts, "OperationalAlertDispatcher", FakeDispatcher)
     monkeypatch.setattr(dispatch_operational_alerts.os, "getenv", tracked_getenv)
@@ -196,6 +206,27 @@ def test_dispatch_cli_reads_only_allowlisted_alert_environment(
     assert dispatch_operational_alerts.main() == 0
     assert observed_names == list(values)
     assert capsys.readouterr().err == ""
+
+
+def test_dispatch_cli_missing_database_stays_absent_and_error_is_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "private-production-data"
+    data_dir.mkdir()
+    database_path = data_dir / "pipeline.db"
+    monkeypatch.setattr(dispatch_operational_alerts.settings, "data_dir", data_dir)
+    monkeypatch.setenv("NOVEL_ALERT_WEBHOOK_URL", "https://alerts.example.invalid/hook")
+
+    result = dispatch_operational_alerts.main()
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "status=error\n"
+    assert not database_path.exists()
+    assert os.fspath(database_path) not in captured.err
 
 
 def test_synthetic_smoke_delivers_exactly_four_allowlisted_loopback_requests(
@@ -242,6 +273,56 @@ def test_synthetic_smoke_command_output_is_bounded_and_redacted(
         os.fspath(receipt_dir.resolve()),
     ):
         assert private_value not in captured.out
+
+
+@pytest.mark.parametrize("relative_candidate", ["", "logs/runtime", "nested/deeper"])
+def test_synthetic_smoke_rejects_data_subtree_before_server_or_artifacts(
+    relative_candidate: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "operator-data"
+    candidate = data_dir / relative_candidate
+    candidate.mkdir(parents=True, mode=0o700)
+    server_calls: list[object] = []
+
+    def forbidden_server(*args: object, **kwargs: object) -> object:
+        server_calls.append((args, kwargs))
+        raise AssertionError("server must not start for an unsafe receipt directory")
+
+    monkeypatch.setattr(smoke_operational_alerts.settings, "data_dir", data_dir)
+    monkeypatch.setattr(smoke_operational_alerts, "ThreadingHTTPServer", forbidden_server)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        smoke_operational_alerts.run_smoke(candidate)
+
+    assert server_calls == []
+    assert not any(path.name in RECEIPT_FILENAMES for path in candidate.iterdir())
+
+
+def test_synthetic_smoke_rejects_symlink_equivalent_data_path_before_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "operator-data"
+    candidate = data_dir / "logs" / "runtime"
+    candidate.mkdir(parents=True, mode=0o700)
+    alias = tmp_path / "receipt-alias"
+    alias.symlink_to(candidate, target_is_directory=True)
+    server_calls: list[object] = []
+
+    def forbidden_server(*args: object, **kwargs: object) -> object:
+        server_calls.append((args, kwargs))
+        raise AssertionError("server must not start for an unsafe receipt directory")
+
+    monkeypatch.setattr(smoke_operational_alerts.settings, "data_dir", data_dir)
+    monkeypatch.setattr(smoke_operational_alerts, "ThreadingHTTPServer", forbidden_server)
+
+    with pytest.raises(ValueError, match="unsafe"):
+        smoke_operational_alerts.run_smoke(alias)
+
+    assert server_calls == []
+    assert tuple(candidate.iterdir()) == ()
 
 
 @pytest.mark.parametrize(

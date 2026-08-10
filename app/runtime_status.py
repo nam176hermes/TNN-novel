@@ -39,7 +39,8 @@ def _read_heartbeat(path: Path) -> dict[str, Any]:
 def inspect_worker_runtime(
     *,
     data_dir: Path,
-    db_path: Path,
+    db_path: Path | str,
+    db_uri: bool = False,
     api_identity: RuntimeIdentity,
     required: bool,
     max_age_seconds: float,
@@ -64,7 +65,7 @@ def inspect_worker_runtime(
         updated_at = float(heartbeat["updated_at"])
         release_id = str(heartbeat.get("release_id") or "unknown")[:192]
         component = str(heartbeat.get("component") or "")
-        with sqlite3.connect(str(db_path)) as connection:
+        with sqlite3.connect(str(db_path), uri=db_uri) as connection:
             connection.execute("SELECT 1 FROM import_jobs LIMIT 1").fetchone()
             connection.execute("SELECT 1 FROM chapter_tasks LIMIT 1").fetchone()
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, sqlite3.Error):

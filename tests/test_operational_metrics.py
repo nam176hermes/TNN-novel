@@ -105,6 +105,25 @@ def test_operational_snapshot_is_bounded_and_redacted(tmp_path: Path, monkeypatc
         assert forbidden not in serialized.lower()
 
 
+def test_read_only_operational_snapshot_does_not_create_missing_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database_path = data_dir / "missing.db"
+    monkeypatch.setattr(
+        "app.mobile_api.services.operational_metrics_service.mobile_settings.import_job_run_in_api",
+        True,
+    )
+
+    service = OperationalMetricsService(database_path, data_dir, read_only=True)
+
+    with pytest.raises(sqlite3.OperationalError):
+        service.snapshot(use_cache=False)
+    assert not database_path.exists()
+
+
 def test_corrupt_receipt_payload_cannot_leak_source_data_through_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
