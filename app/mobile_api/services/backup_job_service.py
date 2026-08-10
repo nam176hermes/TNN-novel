@@ -209,7 +209,7 @@ class BackupJobCoordinator:
             cached_before = self.tracker.jobs.get(job_id)
             cached_status_before = cached_before.status.lower() if cached_before is not None else ""
             try:
-                self.tracker.update_job(job_id, status=status, **changes)
+                updated = self.tracker.update_job(job_id, status=status, **changes)
             except Exception:
                 persisted = get_mobile_job(self.tracker.db_path, job_id) if self.tracker.db_path else None
                 persisted_status = str((persisted or {}).get("status") or "").lower()
@@ -238,6 +238,18 @@ class BackupJobCoordinator:
                 if attempt:
                     raise
                 continue
+            if not updated:
+                persisted = get_mobile_job(self.tracker.db_path, job_id) if self.tracker.db_path else None
+                persisted_status = str((persisted or {}).get("status") or "").lower()
+                if persisted_status in {"completed", "failed", "cancelled", "canceled"}:
+                    reconciled = JobStatus.from_record(persisted)
+                    cached = self.tracker.jobs.get(job_id)
+                    if cached is None:
+                        self.tracker.jobs[job_id] = reconciled
+                    else:
+                        cached.__dict__.update(reconciled.__dict__)
+                    return "cancelled" if persisted_status in {"cancelled", "canceled"} else persisted_status
+                raise RuntimeError(f"Failed to persist terminal state for backup job {job_id}")
             return self._terminal_result(job_id, fallback=status)
         raise AssertionError("unreachable terminal update retry state")
 

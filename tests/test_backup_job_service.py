@@ -991,6 +991,49 @@ def test_terminal_update_does_not_swallow_pre_persist_failure_for_cancelled_job(
     assert attempts == [job.job_id, job.job_id]
 
 
+def test_missing_job_terminal_update_raises_without_recording_event(
+    tmp_path: Path,
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    tracker = JobTracker(db_path=temp_db_path)
+    service = FakeBackupService(tmp_path / "backups")
+    coordinator = BackupJobCoordinator(tracker=tracker, backup_service=service)
+    job_id = "missing-backup-job"
+    error: RuntimeError | None = None
+
+    try:
+        result = coordinator._update_terminal_job(
+            job_id,
+            status="cancelled",
+            message="Backup cancelled",
+            cancel_requested=True,
+        )
+        coordinator._record_terminal_event(
+            job_id=job_id,
+            result=result,
+            encrypted=False,
+            secrets_included=False,
+            started_at=time.monotonic(),
+        )
+    except RuntimeError as exc:
+        error = exc
+
+    events = terminal_backup_events(temp_db_path, job_id)
+    assert {
+        "error_type": type(error).__name__ if error is not None else None,
+        "archive_call_count": service.call_count,
+        "terminal_events": [
+            (event["severity"], event["details"]["result"])
+            for event in events
+        ],
+    } == {
+        "error_type": "RuntimeError",
+        "archive_call_count": 0,
+        "terminal_events": [],
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("requested_status", "expected_severity"),
