@@ -79,6 +79,8 @@ def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]
     worker = snapshot["worker"]
     if worker["required"] and not worker["queue_claim_capable"]:
         add("worker_not_ready", "critical", "Required import worker cannot claim queued work")
+    if worker.get("required") and worker.get("status") == "stale":
+        add("worker_stale", "critical", "Required import worker heartbeat is stale")
     if snapshot["release"]["worker_match"] is False:
         add("release_mismatch", "critical", "API and worker release identities differ")
     if snapshot["storage"]["disk_free_bytes"] < 100 * 1024 * 1024:
@@ -90,6 +92,8 @@ def evaluate_operational_alerts(snapshot: dict[str, Any]) -> list[dict[str, str]
         add("queue_stale", "warning", "Oldest queued work exceeds one hour")
     if snapshot["jobs"]["failed_or_interrupted"] > 0:
         add("jobs_failed", "warning", "Failed or interrupted jobs require review")
+    if snapshot["jobs"].get("backup_failed", 0) > 0:
+        add("backup_failed", "warning", "A backup job failed")
     recovery_alerts = {
         "missing": ("missing", "No verified recovery receipt is recorded"),
         "corrupt": ("invalid", "Recovery receipt is invalid"),
@@ -160,6 +164,12 @@ class OperationalMetricsService:
             failed += connection.execute(
                 "SELECT COUNT(*) FROM import_jobs WHERE status = 'failed'"
             ).fetchone()[0]
+            backup_failed = connection.execute(
+                """
+                SELECT COUNT(*) FROM mobile_jobs
+                WHERE lower(job_type) = 'backup' AND lower(status) = 'failed'
+                """
+            ).fetchone()[0]
             auth = connection.execute(
                 """
                 SELECT COUNT(*) AS total,
@@ -186,7 +196,7 @@ class OperationalMetricsService:
             },
             "worker": worker_payload,
             "queue": {"depth": int(queued), "oldest_age_seconds": oldest_age},
-            "jobs": {"failed_or_interrupted": int(failed)},
+            "jobs": {"failed_or_interrupted": int(failed), "backup_failed": int(backup_failed)},
             "backup": read_recovery_receipt(
                 self.data_dir,
                 "external_backup",
