@@ -133,8 +133,10 @@ guards, the six exact invariants passed. A final security review then added
 coverage for case/separator variants of credential field names and credential
 query parameters. Compatibility coverage also proves that ordinary lookalike
 query names remain accepted and task URLs are validated before any job row is
-created. The complete three-file invariant group passed `41` tests. Focused
-WS1 backend certification collected and passed `161` tests.
+created. Durable service creation also snapshots one-shot task iterables once
+before validation and persistence. The complete three-file invariant group
+passed `43` tests. Focused WS1 backend certification collected and passed `163`
+tests.
 
 Final repository evidence, run serially with no overlapping Novel-TNN test or
 browser process, was:

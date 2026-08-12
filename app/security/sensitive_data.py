@@ -97,6 +97,6 @@ def is_credential_query_key_name(value: object) -> bool:
 def is_sensitive_payload_key_name(value: object) -> bool:
     """Match content or credential field names forbidden in durable metadata."""
     lowered = str(value).casefold()
-    return is_api_key_name(value) or any(
+    return "credential" in _key_words(value) or is_api_key_name(value) or any(
         marker in lowered for marker in _LEGACY_SENSITIVE_PAYLOAD_MARKERS
     )

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 import random
 import time
 from contextlib import contextmanager
@@ -143,22 +143,23 @@ class ImportJobService:
         owner_user_id: str,
         source: str,
         source_url: str,
-        tasks: list[Mapping[str, Any]],
+        tasks: Iterable[Mapping[str, Any]],
         book_id: int | None = None,
         config_snapshot: Mapping[str, Any] | None = None,
         operation_kind: ImportOperationKind = ImportOperationKind.IMPORT_CHAPTERS,
         deadline_at: str = "",
         correlation_id: str = "",
     ) -> ImportJob:
+        task_snapshot = list(tasks)
         reject_credential_query(source_url)
-        for task in tasks:
+        for task in task_snapshot:
             reject_credential_query(str(task["canonical_chapter_url"]))
         if operation_kind == ImportOperationKind.PREVIEW:
             self._validate_preview_metadata(
                 correlation_id=correlation_id,
                 deadline_at=deadline_at,
             )
-        if len(tasks) > self.quota_policy.max_chapters_per_job:
+        if len(task_snapshot) > self.quota_policy.max_chapters_per_job:
             raise ImportJobQuotaError(
                 "chapter_quota_exceeded",
                 f"A job can include at most {self.quota_policy.max_chapters_per_job} chapters",
@@ -172,14 +173,14 @@ class ImportJobService:
             owner_user_id=owner_user_id,
             source=source,
             source_url=source_url,
-            total=len(tasks),
+            total=len(task_snapshot),
             book_id=book_id,
             config_snapshot=config_snapshot,
             operation_kind=operation_kind,
             deadline_at=deadline_at,
             correlation_id=correlation_id,
         )
-        for task in tasks:
+        for task in task_snapshot:
             self.repository.create_task(
                 job_id=job.id,
                 owner_user_id=owner_user_id,

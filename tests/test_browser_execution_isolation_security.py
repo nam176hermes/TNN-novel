@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from app.database.db import init_db
 from app.database.import_jobs import ImportJobRepository, JobStatus
+from app.database.import_jobs import sanitize_import_job_payload
 from app.import_contracts import (
     BrowserResultState,
     BrowserTaskResult,
@@ -252,6 +254,38 @@ def test_provider_secret_names_and_values_never_enter_worker_job_or_result(
         assert value not in persisted_json
 
 
+def test_generic_credential_keys_are_removed_from_nested_durable_payloads() -> None:
+    canaries = {
+        "credential": "ws1-generic-credential-canary",
+        "user_credential": "ws1-user-credential-canary",
+        "nestedCredential": "ws1-camel-credential-canary",
+    }
+
+    sanitized = sanitize_import_job_payload(
+        {
+            "safe": "keep-public",
+            "nested": [
+                {"safe_list_value": 1, "credential": canaries["credential"]},
+                {
+                    "deeper": {
+                        "user_credential": canaries["user_credential"],
+                        "nestedCredential": canaries["nestedCredential"],
+                    }
+                },
+            ],
+        }
+    )
+
+    assert sanitized == {
+        "safe": "keep-public",
+        "nested": [{"safe_list_value": 1}, {"deeper": {}}],
+    }
+    dumped = json.dumps(sanitized, sort_keys=True)
+    for key, canary in canaries.items():
+        assert key not in dumped
+        assert canary not in dumped
+
+
 def test_durable_job_and_task_urls_reject_credential_queries_before_persistence(
     temp_db_path: Path,
 ) -> None:
@@ -315,6 +349,51 @@ def test_service_rejects_credential_task_url_before_creating_durable_job(
         assert connection.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM import_job_events").fetchone()[0] == 0
     assert canary not in _durable_text_dump(temp_db_path)
+
+
+def test_service_materializes_one_shot_tasks_once_before_validation_and_persistence(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    service = _service(temp_db_path, type("Pipeline", (), {})())
+
+    class OneShotTasks:
+        def __init__(self, values: list[dict[str, object]]) -> None:
+            self.values = values
+            self.iterations = 0
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                return iter(())
+            return iter(self.values)
+
+    tasks = OneShotTasks(
+        [
+            {
+                "canonical_identity": "69shuba:one-shot",
+                "canonical_chapter_url": CHAPTER_URL,
+                "chapter_number": 1,
+                "title": "Fixture chapter",
+            }
+        ]
+    )
+
+    job = service.create_job(
+        owner_user_id=OWNER,
+        source="69shuba",
+        source_url=SOURCE_URL,
+        tasks=tasks,  # type: ignore[arg-type]
+    )
+
+    assert tasks.iterations == 1
+    assert job.total == 1
+    stored_tasks = service.repository.list_tasks(job.id, OWNER)
+    assert len(stored_tasks) == 1
+    assert stored_tasks[0].canonical_chapter_url == CHAPTER_URL
 
 
 @pytest.mark.parametrize("url_field", ["source_url", "fetch_final_url", "chapter_url"])
