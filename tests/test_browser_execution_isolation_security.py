@@ -288,6 +288,35 @@ def test_durable_job_and_task_urls_reject_credential_queries_before_persistence(
     assert task_canary not in _durable_text_dump(temp_db_path)
 
 
+def test_service_rejects_credential_task_url_before_creating_durable_job(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    service = _service(temp_db_path, type("Pipeline", (), {})())
+    canary = "ws1-service-task-query-canary"
+
+    with pytest.raises(ValueError, match="credential query"):
+        service.create_job(
+            owner_user_id=OWNER,
+            source="69shuba",
+            source_url=SOURCE_URL,
+            tasks=[
+                {
+                    "canonical_identity": "69shuba:credential-task",
+                    "canonical_chapter_url": f"{CHAPTER_URL}?access_token={canary}",
+                    "chapter_number": 1,
+                    "title": "Fixture chapter",
+                }
+            ],
+        )
+
+    with sqlite3.connect(temp_db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_job_events").fetchone()[0] == 0
+    assert canary not in _durable_text_dump(temp_db_path)
+
+
 @pytest.mark.parametrize("url_field", ["source_url", "fetch_final_url", "chapter_url"])
 def test_browser_result_publication_rejects_credential_query_urls(
     url_field: str,

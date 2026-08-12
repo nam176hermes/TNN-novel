@@ -131,8 +131,10 @@ The first Task 8 RED run had two narrow failures: CGNAT could reach fallback,
 and `*_API_KEY` config keys could enter the durable snapshot. After the minimal
 guards, the six exact invariants passed. A final security review then added
 coverage for case/separator variants of credential field names and credential
-query parameters; the complete three-file invariant group passed `40` tests.
-Focused WS1 backend certification collected and passed `160` tests.
+query parameters. Compatibility coverage also proves that ordinary lookalike
+query names remain accepted and task URLs are validated before any job row is
+created. The complete three-file invariant group passed `41` tests. Focused
+WS1 backend certification collected and passed `161` tests.
 
 Final repository evidence, run serially with no overlapping Novel-TNN test or
 browser process, was:

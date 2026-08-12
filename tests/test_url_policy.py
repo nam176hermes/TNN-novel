@@ -76,3 +76,57 @@ def test_url_policy_blocks_url_outside_adapter_domains() -> None:
         )
 
     assert exc.value.code == "source_not_allowed"
+
+
+@pytest.mark.parametrize(
+    "query_name",
+    (
+        "apiKeyboard",
+        "tokenizer",
+        "token_budget",
+        "cookie_policy",
+        "passwordless",
+        "secretary",
+    ),
+)
+def test_url_policy_preserves_ordinary_query_names_that_contain_sensitive_fragments(
+    query_name: str,
+) -> None:
+    from app.security.url_policy import validate_fetch_url
+
+    url = f"https://www.69shuba.com/book/1?{query_name}=public-setting"
+
+    result = validate_fetch_url(
+        url,
+        resolver=_resolver({"www.69shuba.com": ["93.184.216.34"]}),
+    )
+
+    assert result.canonical_url == url
+
+
+@pytest.mark.parametrize(
+    "query_name",
+    (
+        "apiKey",
+        "API%2EKEY",
+        "openaiApiKey",
+        "openaiapikey",
+        "remote_api_key",
+        "remoteapikey",
+        "access_token",
+        "refresh-token",
+        "authorization",
+        "admin_password",
+        "client_secret",
+        "cookie",
+        "session_cookie",
+    ),
+)
+def test_url_policy_rejects_precise_credential_query_names(query_name: str) -> None:
+    from app.security.url_policy import UrlPolicyViolation, validate_fetch_url
+
+    with pytest.raises(UrlPolicyViolation, match="credential query"):
+        validate_fetch_url(
+            f"https://www.69shuba.com/book/1?{query_name}=canary",
+            resolver=_resolver({"www.69shuba.com": ["93.184.216.34"]}),
+        )

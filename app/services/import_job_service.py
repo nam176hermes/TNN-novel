@@ -35,6 +35,7 @@ from app.import_contracts import (
     BrowserTaskResult,
     ImportOperationKind,
 )
+from app.security.url_policy import reject_credential_query
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError
 from app.observability import Observability, default_observability
 from app.services.import_job_runtime import BoundedTaskRunner, RetryPolicy
@@ -149,6 +150,9 @@ class ImportJobService:
         deadline_at: str = "",
         correlation_id: str = "",
     ) -> ImportJob:
+        reject_credential_query(source_url)
+        for task in tasks:
+            reject_credential_query(str(task["canonical_chapter_url"]))
         if operation_kind == ImportOperationKind.PREVIEW:
             self._validate_preview_metadata(
                 correlation_id=correlation_id,

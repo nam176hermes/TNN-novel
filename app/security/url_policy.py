@@ -6,7 +6,7 @@ import socket
 from typing import Callable, Iterable
 from urllib.parse import SplitResult, parse_qsl, quote, unquote, urljoin, urlsplit, urlunsplit
 
-from app.security.sensitive_data import is_credential_key_name
+from app.security.sensitive_data import is_credential_query_key_name
 
 
 UrlResolver = Callable[[str, int], Iterable[str]]
@@ -69,7 +69,7 @@ def reject_credential_query(url: str) -> None:
     """Reject URLs whose query field names identify credential material."""
     parsed = _parse_url(url)
     for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
-        if is_credential_key_name(key):
+        if is_credential_query_key_name(key):
             raise UrlPolicyViolation(
                 "URL credential query parameters are not allowed",
                 code="invalid_url",
