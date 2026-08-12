@@ -24,6 +24,8 @@ from app.import_contracts import (
     decode_browser_result,
     encode_browser_result,
 )
+from app.security.sensitive_data import is_sensitive_payload_key_name
+from app.security.url_policy import reject_credential_query
 
 
 class JobStatus(str, Enum):
@@ -114,17 +116,6 @@ _TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.USER_VERIFICATION_REQUIRED: set(),
 }
 
-_SENSITIVE_PAYLOAD_MARKERS = (
-    "html",
-    "content",
-    "cookie",
-    "token",
-    "secret",
-    "password",
-    "authorization",
-    "api_key",
-)
-
 _BROWSER_RESULT_TRANSITIONS: dict[
     BrowserResultState, tuple[TaskStatus, TaskStage, JobStatus]
 ] = {
@@ -199,7 +190,7 @@ def sanitize_import_job_payload(value: Mapping[str, Any] | None) -> dict[str, An
             return {
                 str(key): clean(child)
                 for key, child in item.items()
-                if not any(marker in str(key).lower() for marker in _SENSITIVE_PAYLOAD_MARKERS)
+                if not is_sensitive_payload_key_name(key)
             }
         if isinstance(item, (list, tuple)):
             return [clean(child) for child in item]
@@ -381,6 +372,7 @@ class ImportJobRepository:
         deadline_at: str = "",
         correlation_id: str = "",
     ) -> ImportJob:
+        reject_credential_query(source_url)
         now = _now()
         job_id = uuid.uuid4().hex
         snapshot = sanitize_import_job_payload(config_snapshot)
@@ -577,6 +569,7 @@ class ImportJobRepository:
     ) -> ChapterTask:
         if not canonical_identity or not canonical_chapter_url:
             raise ValueError("canonical task identity and URL are required")
+        reject_credential_query(canonical_chapter_url)
         now = _now()
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")

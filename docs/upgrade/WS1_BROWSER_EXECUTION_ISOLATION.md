@@ -9,14 +9,15 @@ durable coordination changed.
 
 ### Source preview
 
-1. `POST /api/import/url/preview` validates the public source URL, source
-   allowlist, DNS result, and worker readiness.
+1. `POST /api/import/url/preview` validates the URL scheme and shape, source
+   allowlist, credential-free query, and worker readiness before enqueue.
 2. The API creates and enqueues a durable `preview` import job with a bounded
    correlation ID and deadline, then polls SQLite for a terminal result. It
    never calls the source adapter or browser.
-3. The import worker claims the preview task, performs direct HTTP and at most
-   one browser fallback for a blocked attempt, validates the typed bounded
-   result, and publishes it through an atomic lease/version compare-and-set.
+3. The import worker claims the preview task, resolves DNS, validates every
+   destination address and redirect, performs direct HTTP and at most one
+   browser fallback for a blocked attempt, validates the typed bounded result,
+   and publishes it through an atomic lease/version compare-and-set.
 4. The API validates the stored typed result again, enriches managed-source
    policy fields in the API process, and maps it to the existing
    `SourcePreviewResponse`.
@@ -128,9 +129,10 @@ correlation, provider-secret persistence, and the legacy API response fixture.
 
 The first Task 8 RED run had two narrow failures: CGNAT could reach fallback,
 and `*_API_KEY` config keys could enter the durable snapshot. After the minimal
-guards, the six exact invariants passed, and the complete three-file invariant
-group passed `35` tests. Focused WS1 backend certification collected and passed
-`152` tests.
+guards, the six exact invariants passed. A final security review then added
+coverage for case/separator variants of credential field names and credential
+query parameters; the complete three-file invariant group passed `40` tests.
+Focused WS1 backend certification collected and passed `160` tests.
 
 Final repository evidence, run serially with no overlapping Novel-TNN test or
 browser process, was:

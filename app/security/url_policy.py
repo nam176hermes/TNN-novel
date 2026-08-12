@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import ipaddress
 import socket
 from typing import Callable, Iterable
-from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, quote, unquote, urljoin, urlsplit, urlunsplit
+
+from app.security.sensitive_data import is_credential_key_name
 
 
 UrlResolver = Callable[[str, int], Iterable[str]]
@@ -63,6 +65,17 @@ def redacted_url(url: str) -> str:
     return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", "", ""))
 
 
+def reject_credential_query(url: str) -> None:
+    """Reject URLs whose query field names identify credential material."""
+    parsed = _parse_url(url)
+    for key, _value in parse_qsl(parsed.query, keep_blank_values=True):
+        if is_credential_key_name(key):
+            raise UrlPolicyViolation(
+                "URL credential query parameters are not allowed",
+                code="invalid_url",
+            )
+
+
 def validate_fetch_url(
     url: str,
     *,
@@ -71,6 +84,7 @@ def validate_fetch_url(
     allowed_ports: Iterable[int] = DEFAULT_ALLOWED_PORTS,
 ) -> UrlPolicyResult:
     parsed = _parse_url(url)
+    reject_credential_query(url)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise UrlPolicyViolation("Only http/https source URLs are supported", code="invalid_url")

@@ -9,6 +9,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.security.url_policy import reject_credential_query
+
 
 MAX_PUBLIC_STRING_LENGTH = 2_000
 MAX_CORRELATION_ID_LENGTH = 128
@@ -38,6 +40,12 @@ class PreviewChapterResult(BaseModel):
     chapter_number: int
     title: PublicText
     url: PublicText
+
+    @field_validator("url")
+    @classmethod
+    def reject_credential_url(cls, value: str) -> str:
+        reject_credential_query(value)
+        return value
 
 
 class PreviewPolicyResult(BaseModel):
@@ -75,6 +83,13 @@ class PreviewBrowserPayload(BaseModel):
     fetch_final_url: PublicText = ""
     fetch_cookies_refreshed: bool = False
     fetch_cache_hit: bool = False
+
+    @field_validator("source_url", "fetch_final_url")
+    @classmethod
+    def reject_credential_urls(cls, value: str) -> str:
+        if value:
+            reject_credential_query(value)
+        return value
 
 
 class BrowserTaskResult(BaseModel):
@@ -121,8 +136,9 @@ class BrowserTaskResult(BaseModel):
 
 def encode_browser_result(result: BrowserTaskResult) -> str:
     """Serialize a validated result to the canonical bounded JSON representation."""
+    validated = BrowserTaskResult.model_validate(result.model_dump(mode="python"))
     encoded = json.dumps(
-        result.model_dump(mode="json"),
+        validated.model_dump(mode="json"),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

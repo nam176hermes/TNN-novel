@@ -170,3 +170,31 @@ def test_completed_preview_result_rejects_error_metadata(error_metadata: dict[st
             payload=PreviewBrowserPayload.model_validate(_preview_payload()),
             **error_metadata,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "credential_url"),
+    [
+        ("source_url", "https://www.69shuba.com/book/123?apiKey=canary"),
+        ("fetch_final_url", "https://www.69shuba.com/book/123?API-KEY=canary"),
+        ("chapter_url", "https://www.69shuba.com/chapter/1?API%2EKEY=canary"),
+    ],
+)
+def test_preview_result_rejects_credential_query_urls(
+    field: str,
+    credential_url: str,
+) -> None:
+    payload = _preview_payload()
+    if field == "chapter_url":
+        payload["chapters"] = [
+            {
+                "chapter_number": 1,
+                "title": "Chapter 1",
+                "url": credential_url,
+            }
+        ]
+    else:
+        payload[field] = credential_url
+
+    with pytest.raises(ValidationError, match="credential query"):
+        PreviewBrowserPayload.model_validate(payload)

@@ -490,6 +490,71 @@ async def test_preview_endpoint_returns_503_when_worker_missing_or_stale(
 
 
 @pytest.mark.asyncio
+async def test_preview_rejects_obfuscated_credential_query_before_durable_enqueue(
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    monkeypatch.setattr(import_routes, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(pipeline_service_module, "get_db_path", lambda: temp_db_path)
+    monkeypatch.setattr(PipelineService, "preview_source_url", _raise_if_api_previews)
+    enqueue_attempts: list[str] = []
+
+    class EnqueueMustNotBeReached:
+        def create_job(self, **kwargs: object) -> ImportJob:
+            enqueue_attempts.append(str(kwargs.get("source_url") or ""))
+            raise AssertionError("credential query reached durable job creation")
+
+    _set_service_override(EnqueueMustNotBeReached())  # type: ignore[arg-type]
+    _set_runtime_override(_worker_runtime())
+    cases = (
+        ("apiKey", "ws1-route-camel-canary"),
+        ("API-KEY", "ws1-route-hyphen-canary"),
+        ("API.KEY", "ws1-route-dot-canary"),
+        ("api%5Fkey", "ws1-route-percent-underscore-canary"),
+        ("access%2Dtoken", "ws1-route-percent-token-canary"),
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await _auth_headers(client)
+            responses = [
+                await client.post(
+                    "/api/import/url/preview",
+                    json={"url": f"{SOURCE_URL}?{query_key}={canary}"},
+                    headers=headers,
+                )
+                for query_key, canary in cases
+            ]
+    finally:
+        _clear_service_override()
+        _clear_runtime_override()
+
+    assert [response.status_code for response in responses] == [400] * len(cases)
+    assert enqueue_attempts == []
+    for response in responses:
+        assert response.headers["X-Novel-Fetch-Error-Code"] == "invalid_url"
+    with sqlite3.connect(temp_db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM import_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM chapter_tasks").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM import_job_events").fetchone()[0] == 0
+        durable_text: list[str] = []
+        for table in ("import_jobs", "chapter_tasks", "import_job_events"):
+            text_columns = [
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                if "TEXT" in str(row[2]).upper()
+            ]
+            selected = ", ".join(f'"{column}"' for column in text_columns)
+            for row in connection.execute(f"SELECT {selected} FROM {table}").fetchall():
+                durable_text.extend(str(value) for value in row if value is not None)
+    persisted = "\n".join(durable_text)
+    for query_key, canary in cases:
+        assert query_key not in persisted
+        assert canary not in persisted
+
+
+@pytest.mark.asyncio
 async def test_preview_endpoint_maps_blocked_failed_and_timed_out_results(
     temp_db_path: Path,
     tmp_path: Path,
