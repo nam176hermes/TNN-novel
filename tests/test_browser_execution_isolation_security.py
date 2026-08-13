@@ -286,6 +286,44 @@ def test_generic_credential_keys_are_removed_from_nested_durable_payloads() -> N
         assert canary not in dumped
 
 
+def test_joined_lowercase_credential_keys_are_removed_without_scanning_values() -> None:
+    canaries = {
+        "usercredential": "ws1-usercredential-canary",
+        "providercredential": "ws1-providercredential-canary",
+        "apitoken": "ws1-apitoken-canary",
+        "secretkey": "ws1-secretkey-canary",
+        "authcookie": "ws1-authcookie-canary",
+    }
+    safe_value = "ordinary value may mention apitoken without becoming a key"
+
+    sanitized = sanitize_import_job_payload(
+        {
+            "safe_value": safe_value,
+            "usercredentialguide": "keep-user-guide",
+            "nested": [
+                {"providercredential": canaries["providercredential"]},
+                {
+                    "deeper": {
+                        "usercredential": canaries["usercredential"],
+                        "apitoken": canaries["apitoken"],
+                        "secretkey": canaries["secretkey"],
+                        "authcookie": canaries["authcookie"],
+                    }
+                },
+            ],
+        }
+    )
+
+    assert sanitized == {
+        "safe_value": safe_value,
+        "usercredentialguide": "keep-user-guide",
+        "nested": [{}, {"deeper": {}}],
+    }
+    dumped = json.dumps(sanitized, sort_keys=True)
+    for canary in canaries.values():
+        assert canary not in dumped
+
+
 def test_durable_job_and_task_urls_reject_credential_queries_before_persistence(
     temp_db_path: Path,
 ) -> None:

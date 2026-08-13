@@ -120,6 +120,11 @@ def test_url_policy_preserves_ordinary_query_names_that_contain_sensitive_fragme
         "client_secret",
         "cookie",
         "session_cookie",
+        "usercredential",
+        "providercredential",
+        "apitoken",
+        "secretkey",
+        "authcookie",
     ),
 )
 def test_url_policy_rejects_precise_credential_query_names(query_name: str) -> None:
@@ -130,3 +135,26 @@ def test_url_policy_rejects_precise_credential_query_names(query_name: str) -> N
             f"https://www.69shuba.com/book/1?{query_name}=canary",
             resolver=_resolver({"www.69shuba.com": ["93.184.216.34"]}),
         )
+
+
+@pytest.mark.parametrize(
+    "query_name",
+    (
+        "usercredentialguide",
+        "providercredentialing",
+        "apitokenizer",
+        "secretkeyboard",
+        "authcookieless",
+    ),
+)
+def test_url_policy_preserves_joined_credential_lookalikes(query_name: str) -> None:
+    from app.security.url_policy import validate_fetch_url
+
+    url = f"https://www.69shuba.com/book/1?{query_name}=public-setting"
+
+    result = validate_fetch_url(
+        url,
+        resolver=_resolver({"www.69shuba.com": ["93.184.216.34"]}),
+    )
+
+    assert result.canonical_url == url

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import threading
+import time
 
 from app.database.db import init_db
 from app.database.import_jobs import ImportJobRepository, JobStatus, TaskStage
@@ -175,3 +176,71 @@ def test_worker_healthcheck_rejects_missing_or_stale_heartbeat(temp_db_path: Pat
     WorkerHeartbeat(heartbeat_path, clock=lambda: 100).touch()
     assert worker_healthcheck(temp_db_path, heartbeat_path=heartbeat_path, now=120, max_age_seconds=30)
     assert not worker_healthcheck(temp_db_path, heartbeat_path=heartbeat_path, now=131, max_age_seconds=30)
+
+
+def test_run_forever_keeps_heartbeat_fresh_during_blocking_job_and_joins_ticker(
+    tmp_path: Path,
+) -> None:
+    from app.import_worker import DurableImportWorker
+
+    class RecordingHeartbeat:
+        def __init__(self) -> None:
+            self._condition = threading.Condition()
+            self.touch_count = 0
+
+        def touch(self) -> None:
+            with self._condition:
+                self.touch_count += 1
+                self._condition.notify_all()
+
+        def wait_for_touches(self, expected: int, timeout: float) -> bool:
+            deadline = time.monotonic() + timeout
+            with self._condition:
+                while self.touch_count < expected:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                return True
+
+    entered_job = threading.Event()
+    release_job = threading.Event()
+    stop_event = threading.Event()
+    heartbeat = RecordingHeartbeat()
+    worker = DurableImportWorker(
+        object(),  # type: ignore[arg-type]
+        heartbeat_path=tmp_path / "ticker.heartbeat",
+        heartbeat_interval_seconds=0.02,
+        close_browser=lambda: None,
+    )
+    worker.heartbeat = heartbeat  # type: ignore[assignment]
+
+    def blocking_run_once() -> int:
+        entered_job.set()
+        assert release_job.wait(1)
+        stop_event.set()
+        return 1
+
+    worker.run_once = blocking_run_once  # type: ignore[method-assign]
+    runner = threading.Thread(
+        target=worker.run_forever,
+        kwargs={"stop_event": stop_event},
+        name="test-import-worker-runner",
+    )
+    runner.start()
+
+    assert entered_job.wait(1)
+    assert heartbeat.wait_for_touches(3, 0.5), (
+        "heartbeat ticker did not remain active while run_once was blocked"
+    )
+    release_job.set()
+    runner.join(1)
+    assert not runner.is_alive()
+
+    touches_after_join = heartbeat.touch_count
+    time.sleep(0.06)
+    assert heartbeat.touch_count == touches_after_join
+    assert not any(
+        thread.name.startswith("import-worker-heartbeat-") and thread.is_alive()
+        for thread in threading.enumerate()
+    )

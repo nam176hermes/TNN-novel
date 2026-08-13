@@ -35,6 +35,15 @@ _COOKIE_CREDENTIAL_QUALIFIERS = frozenset({"auth", "session"})
 _JOINED_API_KEY_QUALIFIERS = frozenset(
     {"deepseek", "gemini", "openai", "openrouter", "provider", "remote"}
 )
+_JOINED_CREDENTIAL_NAMES = frozenset(
+    {
+        "apitoken",
+        "authcookie",
+        "providercredential",
+        "secretkey",
+        "usercredential",
+    }
+)
 
 
 def _decoded_key_name(value: object) -> str:
@@ -79,6 +88,8 @@ def is_credential_query_key_name(value: object) -> bool:
     words = _key_words(value)
     if not words:
         return False
+    if any(word in _JOINED_CREDENTIAL_NAMES for word in words):
+        return True
     if is_api_key_name(value):
         return True
     if any(word in {"authorization", "credential", "password", "secret"} for word in words):
@@ -97,6 +108,12 @@ def is_credential_query_key_name(value: object) -> bool:
 def is_sensitive_payload_key_name(value: object) -> bool:
     """Match content or credential field names forbidden in durable metadata."""
     lowered = str(value).casefold()
-    return "credential" in _key_words(value) or is_api_key_name(value) or any(
-        marker in lowered for marker in _LEGACY_SENSITIVE_PAYLOAD_MARKERS
+    words = _key_words(value)
+    return (
+        "credential" in words
+        or any(word in _JOINED_CREDENTIAL_NAMES for word in words)
+        or is_api_key_name(value)
+        or any(
+            marker in lowered for marker in _LEGACY_SENSITIVE_PAYLOAD_MARKERS
+        )
     )

@@ -1434,6 +1434,7 @@ function AuthenticatedApp() {
       const response = await jobState.startJob(
         () => session.client.startImportUrlJob(request),
         request.chapters.length || 1,
+        'durable-import',
       );
       if (response) {
         setBackendSuccess(`Đã tạo job import URL: ${response.job_id}`);

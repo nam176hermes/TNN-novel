@@ -1,9 +1,8 @@
 """Dedicated durable import/browser worker process.
 
-The worker consumes the shared SQLite job store.  It owns source and browser
-work in production; FastAPI may retain its legacy in-process execution mode for
-local development only.  The heartbeat contains no job, source, cookie, or
-credential data and is used solely by the container health check.
+The worker consumes the shared SQLite job store and is the only executor of
+source and browser work.  The heartbeat contains no job, source, cookie, or
+credential data and is used solely by readiness and container health checks.
 """
 
 from __future__ import annotations
@@ -128,6 +127,7 @@ class DurableImportWorker:
         *,
         heartbeat_path: Path,
         poll_interval_seconds: float = 1.0,
+        heartbeat_interval_seconds: float = 10.0,
         clock: Callable[[], float] = time.time,
         close_browser: Callable[[], None] | None = None,
     ) -> None:
@@ -138,6 +138,7 @@ class DurableImportWorker:
             worker_id=str(getattr(service, "worker_id", "")),
         )
         self.poll_interval_seconds = max(0.05, poll_interval_seconds)
+        self.heartbeat_interval_seconds = max(0.01, heartbeat_interval_seconds)
         self._close_browser = close_browser or _close_browser_sync
 
     def run_once(self) -> int:
@@ -155,13 +156,27 @@ class DurableImportWorker:
     def run_forever(self, *, stop_event: threading.Event) -> None:
         """Stop accepting new jobs on SIGTERM and leave active leases recoverable."""
 
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=self._touch_heartbeat_until_stopped,
+            args=(heartbeat_stop,),
+            name=f"import-worker-heartbeat-{id(self)}",
+        )
+        heartbeat_thread.start()
         try:
             while not stop_event.is_set():
                 processed = self.run_once()
                 if not processed:
                     stop_event.wait(self.poll_interval_seconds)
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join()
             self._close_browser()
+
+    def _touch_heartbeat_until_stopped(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            self.heartbeat.touch()
+            stop_event.wait(self.heartbeat_interval_seconds)
 
     def _drain_job(self, job: ImportJob) -> None:
         while True:

@@ -102,31 +102,9 @@ jobs:
       - name: Verify browser execution isolation
         run: scripts/smoke-browser-execution-isolation.sh
 
-      - name: Run container
-        run: |
-          docker run -d \
-            --name novel-pipeline-ci \
-            -p 127.0.0.1:7860:7860 \
-            -e PUBLIC_DEPLOY=1 \
-            -e MOBILE_API_SECRET=ci-only-not-a-real-secret-000000000000 \
-            -e MOBILE_API_ADMIN_USERNAME=ci-operator \
-            -e MOBILE_API_ADMIN_PASSWORD=ci-only-not-a-real-password \
-            -e MOBILE_API_CORS_ORIGINS=https://ci.example.test \
-            novel-pipeline-api:ci
-
-      - name: Smoke container
-        run: |
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:7860/api/ready >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:7860/api/ready
-          curl -fsS http://127.0.0.1:7860/ | grep -q '<div id="root"></div>'
-
-      - name: Stop container
-        if: always()
-        run: |
-          docker logs novel-pipeline-ci || true
-          docker rm -f novel-pipeline-ci || true
+      - name: Smoke worker and API runtime
+        env:
+          CI_DOCKER_RELEASE_ID: ${{ github.sha }}
+          CI_DOCKER_GIT_SHA: ${{ github.sha }}
+          CI_DOCKER_IMAGE_DIGEST: sha256:${{ github.sha }}
+        run: scripts/ci-docker-runtime-smoke.sh

@@ -1556,13 +1556,26 @@ async def fetch_source_chapters(
     """Compatibility response backed by the same durable P09 job engine."""
     owner_user_id = _import_job_owner(current_user)
     try:
+        source_url, source_id, tasks = _validated_import_job_selection(data)
         if not worker_runtime.queue_claim_capable:
             raise _import_job_http_error(
                 "worker_unavailable",
                 "Import worker is unavailable",
                 status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        job = _create_durable_import_job(service, data, owner_user_id)
+        job = service.create_job(
+            owner_user_id=owner_user_id,
+            source=data.source.strip() or source_id,
+            source_url=source_url,
+            tasks=tasks,
+            config_snapshot={
+                "title": data.title.strip(),
+                "author": data.author.strip(),
+                "source": data.source.strip() or source_id,
+                "source_url": source_url,
+            },
+        )
+        job = service.enqueue_job(job.id, owner_user_id)
         await wait_for_terminal_import_job(
             request,
             service,

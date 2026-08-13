@@ -109,6 +109,18 @@ def _override_ready_worker() -> None:
     )
 
 
+def _override_unavailable_worker() -> None:
+    app.dependency_overrides[import_routes.get_import_worker_runtime] = lambda: WorkerRuntimeStatus(
+        status="unavailable",
+        required=True,
+        heartbeat_age_seconds=None,
+        release_id="",
+        release_match=False,
+        queue_claim_capable=False,
+        reason="missing",
+    )
+
+
 def _clear_worker_runtime_override() -> None:
     app.dependency_overrides.pop(import_routes.get_import_worker_runtime, None)
 
@@ -725,3 +737,102 @@ async def test_url_fetch_import_failure_returns_typed_safe_metadata(temp_db_path
     assert chapter["started_at"]
     assert chapter["finished_at"]
     assert "chapter body" not in chapter["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_status"),
+    (
+        (
+            {
+                "title": "",
+                "source_url": "https://www.69shuba.com/book/1",
+                "chapters": [
+                    {
+                        "url": "https://www.69shuba.com/book/1/chapter/1",
+                        "chapter_number": 1,
+                    }
+                ],
+            },
+            422,
+        ),
+        (
+            {
+                "title": "Unsupported source",
+                "source_url": "https://unsupported.example/book/1",
+                "chapters": [
+                    {"url": "https://unsupported.example/book/1/chapter/1", "chapter_number": 1}
+                ],
+            },
+            400,
+        ),
+        (
+            {
+                "title": "Mismatched chapter",
+                "source_url": "https://www.69shuba.com/book/1",
+                "chapters": [
+                    {"url": "https://www.69shuba.com/book/2/chapter/1", "chapter_number": 1}
+                ],
+            },
+            400,
+        ),
+        (
+            {
+                "title": "Invalid URL",
+                "source_url": "file:///tmp/private",
+                "chapters": [{"url": "file:///tmp/private/1", "chapter_number": 1}],
+            },
+            400,
+        ),
+    ),
+)
+async def test_url_fetch_validates_request_before_worker_readiness(
+    temp_db_path: Path,
+    payload: dict[str, object],
+    expected_status: int,
+) -> None:
+    init_db(temp_db_path)
+    _override_import_job_service(_durable_service(temp_db_path))
+    _override_unavailable_worker()
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post("/api/import/url/fetch", json=payload, headers=headers)
+    finally:
+        _clear_import_job_service_override()
+        _clear_worker_runtime_override()
+
+    assert response.status_code == expected_status, response.text
+    assert "worker_unavailable" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_url_fetch_valid_request_still_requires_available_worker(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    _override_import_job_service(_durable_service(temp_db_path))
+    _override_unavailable_worker()
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = await auth_headers(client)
+            response = await client.post(
+                "/api/import/url/fetch",
+                json={
+                    "title": "Valid request",
+                    "source_url": "https://www.69shuba.com/book/1",
+                    "chapters": [
+                        {
+                            "url": "https://www.69shuba.com/book/1/chapter/1",
+                            "chapter_number": 1,
+                        }
+                    ],
+                },
+                headers=headers,
+            )
+    finally:
+        _clear_import_job_service_override()
+        _clear_worker_runtime_override()
+
+    assert response.status_code == 503, response.text
+    assert "worker_unavailable" in response.text
