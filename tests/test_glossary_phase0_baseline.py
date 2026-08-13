@@ -133,6 +133,26 @@ def test_glossary_audit_returns_nonzero_only_for_runtime_failure(tmp_path: Path)
     assert str(missing_db) not in result.stderr
 
 
+def test_glossary_audit_sanitizes_symlink_loop_path_failure(tmp_path: Path) -> None:
+    """Fails if --db path-resolution errors leak a traceback or caller path."""
+    loop_path = tmp_path / "loop.db"
+    loop_path.symlink_to(loop_path)
+
+    result = subprocess.run(
+        [sys.executable, "scripts/audit_glossary_baseline.py", "--db", str(loop_path)],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr.strip() == '{"error": "audit_failed"}'
+    assert str(loop_path) not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_glossary_audit_keeps_noncanonical_state_and_scope_values_invalid(tmp_path: Path) -> None:
     """Fails if SQLite values are coerced into canonical states or valid book scopes."""
     db_path = tmp_path / "malformed.db"

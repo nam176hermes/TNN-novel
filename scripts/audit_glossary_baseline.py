@@ -146,7 +146,7 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         report = audit_glossary(args.db)
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
         print(json.dumps({"error": "audit_failed"}), file=__import__("sys").stderr)
         return 1
     print(json.dumps(report, sort_keys=True))
