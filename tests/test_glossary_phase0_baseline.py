@@ -21,11 +21,11 @@ def _database_digest(path: Path) -> str:
 def _insert_term(
     conn: sqlite3.Connection,
     *,
-    book_id: int,
+    book_id: object,
     source: str,
     target: str,
-    approved: int = 1,
-    locked: int = 0,
+    approved: object = 1,
+    locked: object = 0,
     review_status: str = "APPROVED",
     mode: str = "translate",
 ) -> None:
@@ -131,6 +131,69 @@ def test_glossary_audit_returns_nonzero_only_for_runtime_failure(tmp_path: Path)
     assert result.stdout == ""
     assert result.stderr.strip() == '{"error": "audit_failed"}'
     assert str(missing_db) not in result.stderr
+
+
+def test_glossary_audit_keeps_noncanonical_state_and_scope_values_invalid(tmp_path: Path) -> None:
+    """Fails if SQLite values are coerced into canonical states or valid book scopes."""
+    db_path = tmp_path / "malformed.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(SCHEMA)
+    _insert_term(
+        conn,
+        book_id=1,
+        source="scope-collision",
+        target="book-target",
+    )
+    _insert_term(
+        conn,
+        book_id=1.5,
+        source="scope collision",
+        target="fractional-scope-target",
+    )
+    _insert_term(conn, book_id=0, source="scope-global", target="global-target")
+    _insert_term(
+        conn,
+        book_id=1.5,
+        source="scope global",
+        target="fractional-scope-target",
+    )
+    _insert_term(
+        conn,
+        book_id=0,
+        source="lowercase-status",
+        target="state-target",
+        review_status="approved",
+    )
+    _insert_term(
+        conn,
+        book_id=0,
+        source="fractional-approved",
+        target="state-target",
+        approved=1.5,
+    )
+    _insert_term(
+        conn,
+        book_id=0,
+        source="fractional-locked",
+        target="state-target",
+        locked=0.5,
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [sys.executable, "scripts/audit_glossary_baseline.py", "--db", str(db_path)],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["counts"]["state_mismatches"] == 3
+    assert payload["counts"]["normalized_same_book_collisions"] == {"groups": 0, "rows": 0}
+    assert payload["counts"]["global_book_conflicts"] == {"groups": 0, "rows": 0}
 
 
 def test_synthetic_ten_thousand_row_characterization_covers_boundaries(tmp_path: Path) -> None:

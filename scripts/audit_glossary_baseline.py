@@ -33,11 +33,15 @@ def _normalized_value(value: object) -> str:
     )
 
 
-def _integer_or_invalid(value: object) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+def _stored_integer(value: object) -> int | None:
+    """Accept only SQLite integer values; never coerce malformed stored data."""
+    return value if type(value) is int else None
+
+
+def _stored_book_scope(value: object) -> int | None:
+    """Return a valid non-negative stored scope without merging malformed values."""
+    scope = _stored_integer(value)
+    return scope if scope is not None and scope >= 0 else None
 
 
 def _open_query_only(db_path: Path) -> sqlite3.Connection:
@@ -85,9 +89,9 @@ def audit_glossary(db_path: Path) -> dict[str, object]:
         legacy_blank_modes = 0
 
         for book_id, source, target, approved, locked, review_status, mode in rows:
-            approved_value = _integer_or_invalid(approved)
-            locked_value = _integer_or_invalid(locked)
-            numeric_state = (str(review_status or "").strip().upper(), approved_value, locked_value)
+            approved_value = _stored_integer(approved)
+            locked_value = _stored_integer(locked)
+            numeric_state = (review_status, approved_value, locked_value)
             if numeric_state not in _VALID_STATE_TUPLES:
                 state_mismatches += 1
             if approved_value == 1 and not _normalized_value(target):
@@ -99,9 +103,9 @@ def audit_glossary(db_path: Path) -> dict[str, object]:
             if not source_key:
                 continue
             target_key = _normalized_value(target)
-            book_scope = _integer_or_invalid(book_id)
+            book_scope = _stored_book_scope(book_id)
             if book_scope is None:
-                book_scope = -1
+                continue
             same_book[(book_scope, source_key)].append(target_key)
             if book_scope == 0:
                 global_rows[source_key].append(target_key)
