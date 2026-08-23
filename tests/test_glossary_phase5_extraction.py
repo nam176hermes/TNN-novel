@@ -260,6 +260,170 @@ def test_reextract_reconciles_stale_evidence_and_zeroes_real_counts(
     assert evidence_count == 0
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_extractors", "expected_provider_calls"),
+    [
+        ("deterministic", {"deterministic-v2"}, 0),
+        ("hybrid", {"deterministic-v2", "hybrid-v1"}, 1),
+    ],
+)
+def test_empty_raw_file_authoritatively_clears_mode_evidence_without_provider_call(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_extractors: set[str],
+    expected_provider_calls: int,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, f"Book {mode}")
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章",
+        "玄天圣典现世，弟子再次研读玄天圣典。罕词也在此处。",
+    )
+    service = _service(temp_db_path)
+    provider_calls = 0
+    if mode == "hybrid":
+        service = _configure_hybrid(temp_db_path, book_id)
+
+    def fake_provider(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return {
+            "text": json.dumps({
+                "candidates": [{"source_term": "罕词", "target_term": "Rare"}]
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        before_extractors = {
+            str(row["extractor"])
+            for row in conn.execute(
+                "SELECT extractor FROM glossary_term_evidence WHERE chapter_id = ?",
+                (chapter_id,),
+            ).fetchall()
+        }
+        raw_path = Path(
+            conn.execute(
+                "SELECT raw_text_path FROM chapters WHERE id = ?", (chapter_id,)
+            ).fetchone()[0]
+        )
+    raw_path.write_text("", encoding="utf-8")
+
+    result = service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        remaining_evidence = conn.execute(
+            "SELECT COUNT(*) FROM glossary_term_evidence WHERE chapter_id = ? "
+            "AND extractor IN ('deterministic-v2', 'hybrid-v1')",
+            (chapter_id,),
+        ).fetchone()[0]
+        counts = conn.execute(
+            "SELECT source_key, occurrence_count, chapter_count FROM glossary_terms "
+            "WHERE book_id = ? AND source_key IN ('玄天圣典', '罕词') ORDER BY source_key",
+            (book_id,),
+        ).fetchall()
+
+    assert before_extractors == expected_extractors
+    assert provider_calls == expected_provider_calls
+    assert result["warnings"] == []
+    assert remaining_evidence == 0
+    assert all(tuple(row)[1:] == (0, 0) for row in counts)
+
+
+def test_missing_raw_artifact_is_non_authoritative_and_preserves_evidence(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    service = _configure_hybrid(temp_db_path, book_id)
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章",
+        "玄天圣典现世，众人再次研读玄天圣典。罕词也在此处。",
+    )
+    provider_calls = 0
+
+    def fake_provider(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return {
+            "text": json.dumps({
+                "candidates": [{"source_term": "罕词", "target_term": "Rare"}]
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        raw_path = Path(
+            conn.execute(
+                "SELECT raw_text_path FROM chapters WHERE id = ?", (chapter_id,)
+            ).fetchone()[0]
+        )
+        before_evidence = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT term_id, extractor, evidence_json FROM glossary_term_evidence "
+                "WHERE chapter_id = ? ORDER BY term_id, extractor",
+                (chapter_id,),
+            ).fetchall()
+        ]
+        before_counts = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT source_key, occurrence_count, chapter_count, version "
+                "FROM glossary_terms WHERE book_id = ? ORDER BY source_key",
+                (book_id,),
+            ).fetchall()
+        ]
+    raw_path.unlink()
+
+    result = service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        after_evidence = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT term_id, extractor, evidence_json FROM glossary_term_evidence "
+                "WHERE chapter_id = ? ORDER BY term_id, extractor",
+                (chapter_id,),
+            ).fetchall()
+        ]
+        after_counts = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT source_key, occurrence_count, chapter_count, version "
+                "FROM glossary_terms WHERE book_id = ? ORDER BY source_key",
+                (book_id,),
+            ).fetchall()
+        ]
+
+    assert provider_calls == 1
+    assert result == {
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "candidates": [],
+        "warnings": [],
+    }
+    assert after_evidence == before_evidence
+    assert after_counts == before_counts
+
+
 def test_phase5_evidence_remains_mergeable_without_losing_provenance(temp_db_path: Path) -> None:
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Book")
@@ -540,11 +704,17 @@ def test_hybrid_extraction_is_bounded_structured_deduplicated_and_cross_book_saf
             "WHERE g.book_id = ? AND g.source_key = '青云宗' AND e.extractor = 'hybrid-v1'",
             (book_b,),
         ).fetchone()[0]
+        reviewed_hybrid_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence e JOIN glossary_terms g ON g.id = e.term_id "
+            "WHERE g.book_id = ? AND g.source_key = '九幽冥火' AND e.extractor = 'hybrid-v1'",
+            (book_b,),
+        ).fetchone()
 
     assert book_a_target == "A target"
     assert tuple(book_b_term) == ("U Minh Chân Hỏa", "NEEDS_REVIEW", 0, 0)
     assert tuple(reviewed) == ("Reviewed target", "LOCKED", 1, 1)
     assert hybrid_evidence_for_deterministic == 0
+    assert "proposed_targets" not in json.loads(reviewed_hybrid_evidence["evidence_json"])
 
 
 def test_hybrid_success_reconciles_stale_output_but_provider_failure_preserves_last_observation(
@@ -710,7 +880,263 @@ def test_hybrid_retains_pending_proposals_and_conflicts_without_overwriting_revi
     )
     assert evidence[blank_id]["proposed_targets"] == ["New Blank"]
     assert evidence[conflict_id]["proposed_targets"] == ["New Conflict"]
-    assert approved_id not in evidence
+    assert "proposed_targets" not in evidence[approved_id]
+
+
+@pytest.mark.parametrize(
+    ("review_action", "expected_state"),
+    [
+        ("approve", ("APPROVED", 1, 0)),
+        ("lock", ("LOCKED", 1, 1)),
+        ("reject", ("REJECTED", -1, 0)),
+    ],
+)
+def test_reviewed_hybrid_source_is_observed_without_proposal_mutation_until_it_disappears(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    review_action: str,
+    expected_state: tuple[str, int, int],
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, f"Book {review_action}")
+    service = _configure_hybrid(temp_db_path, book_id)
+    chapter_id = _chapter(temp_db_path, tmp_path, book_id, 1, "第一章", "罕词也在此处。")
+    responses: list[object] = [
+        {"text": json.dumps({"candidates": [{"source_term": "罕词", "target_term": "Rare"}]}), "usage": {}},
+        {
+            "text": json.dumps({
+                "candidates": [{"source_term": "罕词", "target_term": "Must Not Replace"}]
+            }),
+            "usage": {},
+        },
+        requests.Timeout("private-provider-timeout"),
+        {"text": json.dumps({"candidates": []}), "usage": {}},
+    ]
+
+    def fake_provider(**_kwargs):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    service.extract_chapter_terms(book_id, chapter_id)
+    repository = GlossaryRepository(temp_db_path)
+    with get_connection(temp_db_path) as conn:
+        term_id = int(
+            conn.execute(
+                "SELECT id FROM glossary_terms WHERE book_id = ? AND source_key = '罕词'",
+                (book_id,),
+            ).fetchone()[0]
+        )
+    repository.update(
+        term_id,
+        notes_vi="reviewed note",
+        alternatives="reviewed alternative",
+    )
+    if review_action == "approve":
+        repository.approve(term_id)
+    elif review_action == "lock":
+        repository.set_locked(term_id, True)
+    else:
+        repository.reject(term_id)
+
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (term_id, chapter_id),
+        ).fetchone()[0]
+
+    service.extract_chapter_terms(book_id, chapter_id)
+    failed = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_failure = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        stable_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (term_id, chapter_id),
+        ).fetchall()
+
+    service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_disappearance = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        remaining_evidence = conn.execute(
+            "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (term_id, chapter_id),
+        ).fetchone()[0]
+
+    assert tuple(before)[1:4] == expected_state
+    assert tuple(before)[:6] == (
+        "Rare", *expected_state, "reviewed note", "reviewed alternative",
+    )
+    assert tuple(before)[6:8] == (1, 1)
+    assert tuple(after_failure) == tuple(before)
+    assert failed["warnings"] == [
+        {"code": "provider_unavailable", "message": "Hybrid glossary extraction was skipped."}
+    ]
+    assert [row["evidence_json"] for row in stable_evidence] == [before_evidence]
+    assert tuple(after_disappearance)[:6] == tuple(before)[:6]
+    assert tuple(after_disappearance)[6:8] == (0, 0)
+    assert after_disappearance["version"] == before["version"] + 1
+    assert remaining_evidence == 0
+
+
+def test_reviewed_hybrid_alias_observation_routes_to_canonical_without_reactivation(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+        variants="圣典",
+    )
+    duplicate_id = put_glossary_term(temp_db_path, book_id, "圣典", "Alias", approved=0)
+    repository = GlossaryRepository(temp_db_path)
+    preview = repository.preview_merge(canonical_id, [duplicate_id])
+    repository.apply_merge(canonical_id, [duplicate_id], preview["digest"])
+    service = _configure_hybrid(temp_db_path, book_id)
+    chapter_id = _chapter(temp_db_path, tmp_path, book_id, 1, "第一章", "圣典再次现世。")
+    monkeypatch.setattr(
+        glossary_module,
+        "call_openai_compatible_chat",
+        lambda **_kwargs: {
+            "text": json.dumps({
+                "candidates": [{"source_term": "圣典", "target_term": "Must Not Replace"}]
+            }),
+            "usage": {},
+        },
+    )
+
+    service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        canonical = conn.execute(
+            "SELECT target_term, review_status, occurrence_count, chapter_count "
+            "FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        duplicate = conn.execute(
+            "SELECT archived_at FROM glossary_terms WHERE id = ?", (duplicate_id,)
+        ).fetchone()
+        evidence_term_ids = {
+            int(row["term_id"])
+            for row in conn.execute(
+                "SELECT term_id FROM glossary_term_evidence WHERE chapter_id = ? "
+                "AND extractor = 'hybrid-v1'",
+                (chapter_id,),
+            ).fetchall()
+        }
+
+    assert tuple(canonical) == ("Canonical", "APPROVED", 1, 1)
+    assert duplicate["archived_at"]
+    assert evidence_term_ids == {canonical_id}
+
+
+def test_rejected_hybrid_source_with_deterministic_evidence_remains_observed(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    service = _configure_hybrid(temp_db_path, book_id)
+    chapter_id = _chapter(temp_db_path, tmp_path, book_id, 1, "第一章", "罕词也在此处。")
+    proposed_targets = iter(("Rare", "Must Not Replace"))
+    monkeypatch.setattr(
+        glossary_module,
+        "call_openai_compatible_chat",
+        lambda **_kwargs: {
+            "text": json.dumps({
+                "candidates": [
+                    {"source_term": "罕词", "target_term": next(proposed_targets)}
+                ]
+            }),
+            "usage": {},
+        },
+    )
+    service.extract_chapter_terms(book_id, chapter_id)
+    repository = GlossaryRepository(temp_db_path)
+    with get_connection(temp_db_path) as conn:
+        term_id = int(
+            conn.execute(
+                "SELECT id FROM glossary_terms WHERE book_id = ? AND source_key = '罕词'",
+                (book_id,),
+            ).fetchone()[0]
+        )
+        raw_path = Path(
+            conn.execute(
+                "SELECT raw_text_path FROM chapters WHERE id = ?", (chapter_id,)
+            ).fetchone()[0]
+        )
+    repository.reject(term_id)
+    raw_path.write_text("罕词出现，罕词再次出现。", encoding="utf-8")
+    repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=chapter_id,
+        chapter_number=1,
+        extractor="deterministic-v2",
+        candidates=[{
+            "source_term": "罕词",
+            "mention_count": 2,
+            "evidence_types": ["repeated_token"],
+        }],
+    )
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT target_term, review_status, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        before_hybrid = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (term_id, chapter_id),
+        ).fetchone()[0]
+
+    service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        after = conn.execute(
+            "SELECT target_term, review_status, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        after_hybrid = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (term_id, chapter_id),
+        ).fetchone()
+
+    assert tuple(before)[:4] == ("Rare", "REJECTED", 2, 1)
+    assert tuple(after) == tuple(before)
+    assert after_hybrid is not None
+    assert json.loads(before_hybrid)["proposed_targets"] == ["Rare"]
+    assert json.loads(after_hybrid["evidence_json"]) == {
+        **json.loads(before_hybrid),
+        "mention_count": 2,
+    }
 
 
 def test_hybrid_retry_and_concurrent_repository_runs_keep_one_identity_without_count_inflation(
@@ -891,6 +1317,62 @@ def test_hybrid_nfkc_matches_compatibility_surface_and_keeps_bounded_original_co
         ).fetchone()
 
     assert tuple(term) == ("ABC神器", "众人发现ＡＢＣ神器。" + ("甲" * 27), 2, 1)
+    assert private_tail not in str(captured["prompt"])
+
+
+def test_hybrid_nfkc_maps_combining_sequence_to_original_bounded_context(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    service = _configure_hybrid(temp_db_path, book_id)
+    original_surface = "A\u030A神器"
+    private_tail = "PRIVATE-COMBINING-TAIL"
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        f"第一章 {original_surface}",
+        f"众人发现{original_surface}。" + ("甲" * MAX_HYBRID_TEXT_CHARS) + private_tail,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_provider(**kwargs):
+        captured.update(kwargs)
+        return {
+            "text": json.dumps({
+                "candidates": [{"source_term": original_surface, "target_term": "Thần khí Å"}]
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            "SELECT id, source_term, source_context, occurrence_count, chapter_count "
+            "FROM glossary_terms WHERE book_id = ? AND source_key = 'å神器'",
+            (book_id,),
+        ).fetchone()
+        evidence = json.loads(
+            conn.execute(
+                "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+                "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+                (term["id"], chapter_id),
+            ).fetchone()[0]
+        )
+
+    assert tuple(term)[1:] == (
+        "Å神器",
+        f"众人发现{original_surface}。" + ("甲" * 27),
+        2,
+        1,
+    )
+    assert evidence["title_match"] is True
     assert private_tail not in str(captured["prompt"])
 
 

@@ -174,6 +174,53 @@ def _phase5_evidence_payload(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[s
     return result
 
 
+def _phase5_counts_from_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[int, int]:
+    observations_by_chapter: dict[int, list[tuple[int, set[str]]]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(str(row["evidence_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        mention_count = payload.get("mention_count", 0) if isinstance(payload, dict) else 0
+        if type(mention_count) is not int or mention_count < 0:
+            mention_count = 0
+        fingerprints = {
+            str(value)[:128]
+            for value in (payload.get("source_fingerprints") or [])
+            if isinstance(value, str) and value
+        } if isinstance(payload, dict) else set()
+        singular = payload.get("source_fingerprint") if isinstance(payload, dict) else None
+        if isinstance(singular, str) and singular:
+            fingerprints.add(singular[:128])
+        if not fingerprints:
+            fingerprints.add("__legacy_observation__")
+        observations_by_chapter.setdefault(int(row["chapter_id"] or 0), []).append(
+            (mention_count, fingerprints)
+        )
+
+    occurrence_count = 0
+    for observations in observations_by_chapter.values():
+        components: list[tuple[int, set[str]]] = []
+        for mention_count, fingerprints in observations:
+            overlapping = [
+                index
+                for index, (_, component_fingerprints) in enumerate(components)
+                if fingerprints & component_fingerprints
+            ]
+            if not overlapping:
+                components.append((mention_count, set(fingerprints)))
+                continue
+            merged_count = mention_count
+            merged_fingerprints = set(fingerprints)
+            for index in reversed(overlapping):
+                component_count, component_fingerprints = components.pop(index)
+                merged_count = max(merged_count, component_count)
+                merged_fingerprints.update(component_fingerprints)
+            components.append((merged_count, merged_fingerprints))
+        occurrence_count += sum(count for count, _ in components)
+    return occurrence_count, len(observations_by_chapter)
+
+
 def _canonical_state(approved: object, locked: object, review_status: object) -> tuple[str, int, int]:
     status = review_status if isinstance(review_status, str) else ""
     expected = CANONICAL_STATES.get(status)
@@ -309,28 +356,17 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
         "ON glossary_term_evidence(term_id, chapter_id, extractor) "
         "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
     )
-    migrated_counts: dict[int, tuple[int, set[int]]] = {}
+    migrated_evidence: dict[int, list[sqlite3.Row]] = {}
     for row in conn.execute(
         "SELECT term_id, chapter_id, evidence_json FROM glossary_term_evidence "
         "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
     ).fetchall():
-        try:
-            payload = json.loads(str(row["evidence_json"] or "{}"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            payload = {}
-        mention_count = payload.get("mention_count", 0) if isinstance(payload, dict) else 0
-        if type(mention_count) is not int or mention_count < 0:
-            mention_count = 0
-        term_id = int(row["term_id"])
-        occurrence_count, chapters = migrated_counts.setdefault(term_id, (0, set()))
-        migrated_counts[term_id] = (
-            occurrence_count + mention_count,
-            chapters | {int(row["chapter_id"])},
-        )
-    for term_id, (occurrence_count, chapters) in migrated_counts.items():
+        migrated_evidence.setdefault(int(row["term_id"]), []).append(row)
+    for term_id, evidence_rows in migrated_evidence.items():
+        occurrence_count, chapter_count = _phase5_counts_from_rows(evidence_rows)
         conn.execute(
             "UPDATE glossary_terms SET occurrence_count = ?, chapter_count = ? WHERE id = ?",
-            (occurrence_count, len(chapters), term_id),
+            (occurrence_count, chapter_count, term_id),
         )
     conn.execute(
         """
@@ -586,22 +622,12 @@ class GlossaryRepository:
 
     @staticmethod
     def _phase5_counts(conn: sqlite3.Connection, term_id: int) -> tuple[int, int]:
-        occurrence_count = 0
-        chapter_ids: set[int] = set()
-        for row in conn.execute(
+        rows = conn.execute(
             "SELECT chapter_id, evidence_json FROM glossary_term_evidence "
             "WHERE term_id = ? AND extractor IN ('deterministic-v2', 'hybrid-v1')",
             (term_id,),
-        ).fetchall():
-            try:
-                payload = json.loads(str(row["evidence_json"] or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
-            value = payload.get("mention_count") if isinstance(payload, dict) else 0
-            if type(value) is int and value >= 0:
-                occurrence_count += value
-            chapter_ids.add(int(row["chapter_id"] or 0))
-        return occurrence_count, len(chapter_ids)
+        ).fetchall()
+        return _phase5_counts_from_rows(rows)
 
     @classmethod
     def _resolve_extraction_row(
@@ -867,16 +893,21 @@ class GlossaryRepository:
                 if blocked:
                     skipped += 1
                     continue
+                observe_only = bool(candidate.get("observe_only")) or (
+                    extractor == "hybrid-v1"
+                    and current is not None
+                    and current["review_status"] in {"APPROVED", "LOCKED", "REJECTED"}
+                )
+                if observe_only and current is None:
+                    skipped += 1
+                    continue
                 if extractor == "hybrid-v1" and current is not None:
-                    if current["review_status"] in {"APPROVED", "LOCKED", "REJECTED"}:
-                        skipped += 1
-                        continue
                     prior_evidence = conn.execute(
                         "SELECT 1 FROM glossary_term_evidence "
                         "WHERE term_id = ? AND chapter_id = ? AND extractor != ? LIMIT 1",
                         (current["id"], chapter_id, extractor),
                     ).fetchone()
-                    if prior_evidence is not None:
+                    if prior_evidence is not None and not observe_only:
                         skipped += 1
                         continue
 
@@ -896,10 +927,6 @@ class GlossaryRepository:
                     ],
                     "title_match": bool(candidate.get("title_match")),
                 }
-                if extractor == "hybrid-v1" and target:
-                    evidence["proposed_targets"] = [target[:200]]
-                evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
                 is_new = current is None
                 if is_new:
                     conn.execute(
@@ -938,6 +965,21 @@ class GlossaryRepository:
                     "WHERE term_id = ? AND chapter_id = ? AND extractor = ?",
                     (term_id, chapter_id, extractor),
                 ).fetchone()
+                if extractor == "hybrid-v1" and target and not observe_only:
+                    evidence["proposed_targets"] = [target[:200]]
+                elif extractor == "hybrid-v1" and observe_only and evidence_row is not None:
+                    try:
+                        prior_payload = json.loads(str(evidence_row["evidence_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        prior_payload = {}
+                    prior_targets = prior_payload.get("proposed_targets") if isinstance(prior_payload, dict) else None
+                    if isinstance(prior_targets, list):
+                        evidence["proposed_targets"] = [
+                            str(value)[:200]
+                            for value in prior_targets[:10]
+                            if isinstance(value, str) and value
+                        ]
+                evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 evidence_changed = evidence_row is None or evidence_row["evidence_json"] != evidence_json
                 if evidence_row is None:
                     conn.execute(
@@ -961,12 +1003,14 @@ class GlossaryRepository:
                 status = str(current["review_status"])
                 retain_blank_proposal = (
                     extractor == "hybrid-v1"
+                    and not observe_only
                     and status in {"NEEDS_REVIEW", "CONFLICT"}
                     and not str(current["target_term"] or "").strip()
                     and bool(target)
                 )
                 target_conflict = (
                     extractor == "hybrid-v1"
+                    and not observe_only
                     and status in {"NEEDS_REVIEW", "CONFLICT"}
                     and bool(str(current["target_term"] or "").strip())
                     and bool(target)

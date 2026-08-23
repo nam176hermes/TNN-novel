@@ -168,17 +168,22 @@ def _context_for(text: str, term: str, radius: int = 28) -> str:
 
 def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -> str:
     normalized_parts: list[str] = []
-    original_indexes: list[int] = []
-    for index, character in enumerate(text):
-        normalized_character = unicodedata.normalize("NFKC", character)
-        normalized_parts.append(normalized_character)
-        original_indexes.extend([index] * len(normalized_character))
+    original_spans: list[tuple[int, int]] = []
+    cluster_start = 0
+    while cluster_start < len(text):
+        cluster_end = cluster_start + 1
+        while cluster_end < len(text) and unicodedata.combining(text[cluster_end]):
+            cluster_end += 1
+        normalized_cluster = unicodedata.normalize("NFKC", text[cluster_start:cluster_end])
+        normalized_parts.append(normalized_cluster)
+        original_spans.extend([(cluster_start, cluster_end)] * len(normalized_cluster))
+        cluster_start = cluster_end
     normalized_text = "".join(normalized_parts)
     normalized_index = normalized_text.find(normalized_term)
     if normalized_index < 0 or not normalized_term:
         return ""
-    original_start = original_indexes[normalized_index]
-    original_end = original_indexes[normalized_index + len(normalized_term) - 1] + 1
+    original_start = original_spans[normalized_index][0]
+    original_end = original_spans[normalized_index + len(normalized_term) - 1][1]
     return text[
         max(0, original_start - radius):min(len(text), original_end + radius)
     ].replace("\n", " ").strip()
@@ -876,6 +881,15 @@ class GlossaryService:
 
         effective_keys = set(resolve_effective_glossary(self.db_path, book_id).reserved_source_keys)
         with get_connection(self.db_path) as conn:
+            reviewed_keys = {
+                str(row["source_key"])
+                for row in conn.execute(
+                    "SELECT source_key FROM glossary_terms WHERE book_id = ? "
+                    "AND review_status IN ('APPROVED', 'LOCKED', 'REJECTED') "
+                    "AND COALESCE(archived_at, '') = ''",
+                    (book_id,),
+                ).fetchall()
+            }
             evidenced_keys = {
                 str(row["source_key"])
                 for row in conn.execute(
@@ -889,11 +903,14 @@ class GlossaryService:
                     (book_id, chapter_id, HYBRID_EXTRACTOR),
                 ).fetchall()
             }
-        return [
-            candidate
-            for candidate in candidates
-            if normalize_source_key(candidate["source_term"]) not in effective_keys | evidenced_keys
-        ], warnings
+        retained: list[dict] = []
+        for candidate in candidates:
+            source_key = normalize_source_key(candidate["source_term"])
+            if source_key in effective_keys | reviewed_keys:
+                retained.append({**candidate, "observe_only": True})
+            elif source_key not in evidenced_keys:
+                retained.append(candidate)
+        return retained, warnings
 
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
@@ -902,6 +919,7 @@ class GlossaryService:
             raise ValueError("Chapter not found")
         raw_path = str(chapter.get("raw_text_path") or "").strip()
         raw_text = ""
+        resolved_raw_path: Path | None = None
         if raw_path:
             try:
                 resolved_raw_path = require_artifact_file(
@@ -914,8 +932,28 @@ class GlossaryService:
                 resolved_raw_path = None
             if resolved_raw_path is not None:
                 raw_text = resolved_raw_path.read_text(encoding="utf-8", errors="replace")
-        if not raw_text:
+        if resolved_raw_path is None:
             return {"created": 0, "updated": 0, "skipped": 0, "candidates": [], "warnings": []}
+        if not raw_text:
+            chapter_number = int(chapter.get("chapter_number") or 0)
+            repository = GlossaryRepository(self.db_path)
+            counts = repository.record_extraction_candidates(
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_number=chapter_number,
+                extractor=DETERMINISTIC_EXTRACTOR,
+                candidates=[],
+            )
+            if self.get_extraction_settings(book_id)["mode"] == "hybrid":
+                hybrid_counts = repository.record_extraction_candidates(
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    chapter_number=chapter_number,
+                    extractor=HYBRID_EXTRACTOR,
+                    candidates=[],
+                )
+                counts = {key: counts[key] + hybrid_counts[key] for key in counts}
+            return {**counts, "candidates": [], "warnings": []}
 
         candidates = extract_candidate_terms_from_text(raw_text, str(chapter.get("title") or ""))
         chapter_number = int(chapter.get("chapter_number") or 0)
