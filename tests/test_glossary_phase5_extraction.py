@@ -300,6 +300,189 @@ def test_deterministic_extraction_uses_title_repetition_suffixes_and_real_idempo
     assert evidence_count == 2
 
 
+def test_deterministic_coalesces_nested_aliases_across_title_and_body_stably(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+        variants="圣典|天书",
+        notes_vi="reviewed note",
+        alternatives="reviewed alternative",
+    )
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章 圣典、天书",
+        "玄天圣典现世。玄天圣典重现。天书另存。",
+    )
+    service = _service(temp_db_path)
+
+    first = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        raw_path = Path(
+            conn.execute(
+                "SELECT raw_text_path FROM chapters WHERE id = ?", (chapter_id,)
+            ).fetchone()[0]
+        )
+        before = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    retry = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_retry = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        retry_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        retry_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    raw_path.write_text("玄天圣典现世。玄天圣典重现。", encoding="utf-8")
+    disappearance = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_disappearance = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        disappearance_payload = json.loads(
+            conn.execute(
+                "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+                "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+                (canonical_id, chapter_id),
+            ).fetchone()[0]
+        )
+
+    first_payload = json.loads(before_evidence)
+    assert all("occurrence_spans" not in candidate for candidate in first["candidates"])
+    assert tuple(before)[:8] == (
+        "Canonical",
+        "APPROVED",
+        1,
+        0,
+        "reviewed note",
+        "reviewed alternative",
+        5,
+        1,
+    )
+    assert first_payload["mention_count"] == 5
+    assert sorted(
+        component["mention_count"] for component in first_payload["mention_components"]
+    ) == [1, 2, 2]
+    assert sorted(
+        len(component["source_fingerprints"])
+        for component in first_payload["mention_components"]
+    ) == [1, 1, 2]
+    assert "occurrence_spans" not in before_evidence
+    assert "玄天圣典" not in before_evidence
+    assert "圣典" not in before_evidence
+    assert "天书" not in before_evidence
+    assert retry["updated"] == 0
+    assert tuple(after_retry) == tuple(before)
+    assert retry_evidence == before_evidence
+    assert retry_history == before_history
+    assert disappearance["updated"] == 1
+    assert tuple(after_disappearance)[:6] == tuple(before)[:6]
+    assert tuple(after_disappearance)[6:8] == (4, 1)
+    assert after_disappearance["version"] == before["version"] + 1
+    assert disappearance_payload["mention_count"] == 4
+
+
+def test_deterministic_caps_canonical_components_without_persisting_surfaces_or_spans(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    surfaces = [f"玄{chr(0x7000 + index)}" for index in range(100)]
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        surfaces[0],
+        "Canonical",
+        approved=1,
+        variants="|".join(surfaces[1:]),
+    )
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章 " + "、".join(surfaces),
+        "旁白。",
+    )
+    service = _service(temp_db_path)
+
+    first = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        evidence_json = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        before_version = conn.execute(
+            "SELECT version FROM glossary_terms WHERE id = ?", (canonical_id,)
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?", (canonical_id,)
+        ).fetchone()[0]
+
+    retry = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        retry_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        retry_version = conn.execute(
+            "SELECT version FROM glossary_terms WHERE id = ?", (canonical_id,)
+        ).fetchone()[0]
+        retry_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?", (canonical_id,)
+        ).fetchone()[0]
+
+    payload = json.loads(evidence_json)
+    assert payload["mention_count"] == 100
+    assert len(payload["mention_components"]) == 100
+    assert len(payload["source_fingerprints"]) == 100
+    assert all(component["mention_count"] == 1 for component in payload["mention_components"])
+    assert all("occurrence_spans" not in candidate for candidate in first["candidates"])
+    assert all(surface not in evidence_json for surface in surfaces)
+    assert "occurrence_spans" not in evidence_json
+    assert retry["updated"] == 0
+    assert retry_evidence == evidence_json
+    assert retry_version == before_version
+    assert retry_history == before_history
+
+
 def test_reextract_reconciles_stale_evidence_and_zeroes_real_counts(
     temp_db_path: Path,
     tmp_path: Path,

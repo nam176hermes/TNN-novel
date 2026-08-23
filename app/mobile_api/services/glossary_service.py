@@ -238,6 +238,12 @@ def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -
     ].replace("\n", " ").strip()
 
 
+def _normalized_extraction_corpus(title: str, text: str) -> tuple[str, str]:
+    normalized_title = unicodedata.normalize("NFKC", title)
+    normalized_text = unicodedata.normalize("NFKC", text)
+    return normalized_title, f"{normalized_title}\n{normalized_text}"
+
+
 def _normalize_candidate_source(source: str, term_type: str) -> str:
     source = source.strip("，。！？、：；（）()[]【】《》“”\"' \n\t")
     for marker in ("来到", "进入", "取出", "拿出", "走入", "回到", "前往", "拜入"):
@@ -282,6 +288,7 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
     """
     text = text or ""
     title = _clean_chapter_title(chapter_title)
+    normalized_title, normalized_corpus = _normalized_extraction_corpus(title, text)
     patterns: list[tuple[str, str] | tuple[str, str, str]] = [
         (rf"[{COMMON_CHINESE_SURNAMES}][\u4e00-\u9fff]{{1,2}}", "character"),
         (r"[\u4e00-\u9fff]{1,8}(?:宗|门|派|阁|宫|殿|教|族)", "sect", "suffix"),
@@ -294,11 +301,16 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
     by_source: dict[str, dict] = {}
 
     def observe(source: str, term_type: str, evidence_type: str, confidence: float) -> None:
-        source = _normalize_candidate_source(source, term_type)
+        source = unicodedata.normalize(
+            "NFKC", _normalize_candidate_source(source, term_type)
+        )
         if not _valid_candidate_source(source):
             return
-        corpus = f"{title}\n{text}" if title else text
-        mentions = len(re.findall(f"(?={re.escape(source)})", corpus))
+        occurrence_spans = [
+            [match.start(), match.start() + len(source)]
+            for match in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
+        ]
+        mentions = len(occurrence_spans)
         item = by_source.get(source)
         if item is None:
             item = {
@@ -307,16 +319,20 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
                 "term_type": term_type,
                 "category": term_type,
                 "confidence": confidence,
-                "source_context": _context_for(text, source),
+                "source_context": _context_for_normalized(text, source),
                 "mention_count": mentions,
-                "title_match": bool(title and source in title),
+                "occurrence_spans": occurrence_spans,
+                "title_match": bool(normalized_title and source in normalized_title),
                 "evidence_types": [evidence_type],
             }
             by_source[source] = item
             return
         item["confidence"] = max(float(item["confidence"]), confidence)
         item["mention_count"] = mentions
-        item["title_match"] = bool(item["title_match"] or (title and source in title))
+        item["occurrence_spans"] = occurrence_spans
+        item["title_match"] = bool(
+            item["title_match"] or (normalized_title and source in normalized_title)
+        )
         if evidence_type not in item["evidence_types"]:
             item["evidence_types"].append(evidence_type)
 
@@ -871,9 +887,9 @@ class GlossaryService:
             warnings.append(
                 {"code": "provider_output_truncated", "message": "Hybrid output was limited to 100 candidates."}
             )
-        normalized_title = unicodedata.normalize("NFKC", bounded_title)
-        normalized_text = unicodedata.normalize("NFKC", bounded_text)
-        normalized_corpus = f"{normalized_title}\n{normalized_text}"
+        normalized_title, normalized_corpus = _normalized_extraction_corpus(
+            bounded_title, bounded_text
+        )
         candidates: list[dict] = []
         seen: set[str] = set()
         invalid_count = duplicate_count = 0
