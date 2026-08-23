@@ -140,6 +140,6 @@ async def test_glossary_export_includes_review_metadata(glossary_api_db: Path) -
     payload = response.json()
     assert payload["total"] == 1
     term = payload["terms"][0]
-    assert term["review_status"] == "APPROVED"
+    assert term["review_status"] == "LOCKED"
     assert term["locked"] == 1
     assert term["source_context"] == "第十章"

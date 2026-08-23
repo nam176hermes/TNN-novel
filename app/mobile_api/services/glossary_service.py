@@ -9,7 +9,6 @@ from app.database.db import (
     update_glossary_term,
     approve_glossary_term,
     reject_glossary_term,
-    delete_glossary_term,
     set_glossary_term_mode,
     set_glossary_term_locked,
     glossary_stats,
@@ -28,6 +27,7 @@ from app.database.db import (
     get_chapter_by_id,
     get_connection,
 )
+from app.database.glossary_repository import GlossaryRepository
 from app.mobile_api.dependencies import get_db_path
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
@@ -242,10 +242,10 @@ class GlossaryService:
         terms, _ = self.list_terms(book_id=book_id, limit=1000, search=query)
         return terms[:limit]
 
-    def add_term(self, term_data: dict) -> int:
+    def add_term(self, term_data: dict, *, actor: str = "", request_id: str = "") -> int:
         """Add a new glossary term."""
         term_type = normalize_term_type(term_data.get("term_type") or term_data.get("category", "term"))
-        put_glossary_term(
+        return put_glossary_term(
             db_path=self.db_path,
             book_id=term_data.get("book_id", 0),
             source=term_data["source_term"],
@@ -266,26 +266,19 @@ class GlossaryService:
             first_seen_chapter_number=term_data.get("first_seen_chapter_number", 0),
             review_status=term_data.get("review_status", ""),
             source_context=term_data.get("source_context", ""),
+            actor=actor,
+            request_id=request_id,
         )
-        # Return the ID of the inserted/updated term (simplified)
-        terms = list_glossary(self.db_path, term_data.get("book_id", 0))
-        for t in reversed(terms):  # Get most recent
-            if t["source_term"] == term_data["source_term"] and t["target_term"] == term_data["target_term"]:
-                return t["id"]
-        return 0
 
-    def update_term(self, term_id: int, updates: dict) -> bool:
+    def update_term(
+        self,
+        term_id: int,
+        updates: dict,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> bool:
         """Update a glossary term."""
-        # Get current term
-        terms = list_glossary(self.db_path)
-        current = None
-        for t in terms:
-            if t["id"] == term_id:
-                current = t
-                break
-        if not current:
-            return False
-
         return update_glossary_term(
             db_path=self.db_path,
             term_id=term_id,
@@ -304,27 +297,45 @@ class GlossaryService:
             gender=updates.get("gender"),
             review_status=updates.get("review_status"),
             source_context=updates.get("source_context"),
+            actor=actor,
+            request_id=request_id,
         )
 
-    def delete_term(self, term_id: int) -> bool:
-        """Hard-delete a glossary term for explicit destructive actions."""
-        return delete_glossary_term(self.db_path, term_id)
+    def delete_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
+        """Archive a glossary term while preserving the existing API contract."""
+        return GlossaryRepository(self.db_path).archive(term_id, actor=actor, request_id=request_id)
 
-    def approve_term(self, term_id: int) -> bool:
+    def restore_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
+        return GlossaryRepository(self.db_path).restore(term_id, actor=actor, request_id=request_id)
+
+    def approve_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Approve a pending glossary term."""
-        return approve_glossary_term(self.db_path, term_id)
+        return approve_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
-    def reject_term(self, term_id: int) -> bool:
+    def reject_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Reject/delete a pending glossary term."""
-        return reject_glossary_term(self.db_path, term_id)
+        return reject_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
     def set_term_mode(self, term_id: int, mode: str) -> bool:
         """Set the mode of a glossary term."""
         return set_glossary_term_mode(self.db_path, term_id, mode)
 
-    def set_term_locked(self, term_id: int, locked: bool) -> bool:
+    def set_term_locked(
+        self,
+        term_id: int,
+        locked: bool,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> bool:
         """Lock or unlock a glossary term."""
-        return set_glossary_term_locked(self.db_path, term_id, locked)
+        return set_glossary_term_locked(
+            self.db_path,
+            term_id,
+            locked,
+            actor=actor,
+            request_id=request_id,
+        )
 
     def get_stats(self, book_id: int | None = None) -> dict:
         """Get glossary statistics."""

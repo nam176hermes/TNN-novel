@@ -205,10 +205,25 @@ CREATE TABLE IF NOT EXISTS glossary_terms (
     first_seen_chapter_number INTEGER DEFAULT 0,
     review_status TEXT DEFAULT '',
     source_context TEXT DEFAULT '',
+    source_key TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT NOT NULL DEFAULT '',
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT '',
     UNIQUE(book_id, source_term)
+);
+
+CREATE TABLE IF NOT EXISTS glossary_term_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    term_id INTEGER NOT NULL,
+    book_id INTEGER NOT NULL DEFAULT 0,
+    chapter_id INTEGER NOT NULL DEFAULT 0,
+    extractor TEXT NOT NULL DEFAULT '',
+    evidence_type TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (term_id) REFERENCES glossary_terms(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS style_profiles (

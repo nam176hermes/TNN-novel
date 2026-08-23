@@ -18,6 +18,12 @@ def get_glossary_service():
     return GlossaryService()
 
 
+def _mutation_metadata(request: Request) -> tuple[str, str]:
+    user = getattr(request.state, "user", {})
+    request_id = request.headers.get("X-Request-ID", "") or request.headers.get("X-Correlation-ID", "")
+    return str(user.get("username") or ""), request_id
+
+
 @router.get("")
 async def list_glossary(
     book_id: int | None = Query(None),
@@ -133,10 +139,12 @@ async def clear_tm(
 @router.post("/terms", response_model=dict, status_code=201)
 async def add_term(
     term: GlossaryTermCreate,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Add a new glossary term."""
-    term_id = svc.add_term(term.model_dump())
+    actor, request_id = _mutation_metadata(request)
+    term_id = svc.add_term(term.model_dump(), actor=actor, request_id=request_id)
     return {"id": term_id, "message": "Term added"}
 
 
@@ -144,10 +152,17 @@ async def add_term(
 async def update_term(
     term_id: int,
     update: GlossaryTermUpdate,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Update a glossary term."""
-    success = svc.update_term(term_id, update.model_dump(exclude_none=True))
+    actor, request_id = _mutation_metadata(request)
+    success = svc.update_term(
+        term_id,
+        update.model_dump(exclude_none=True),
+        actor=actor,
+        request_id=request_id,
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term updated"}
@@ -156,10 +171,12 @@ async def update_term(
 @router.post("/terms/{term_id}/lock", response_model=dict)
 async def lock_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Lock a glossary term so translation prompts treat it as non-negotiable."""
-    success = svc.set_term_locked(term_id, True)
+    actor, request_id = _mutation_metadata(request)
+    success = svc.set_term_locked(term_id, True, actor=actor, request_id=request_id)
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term locked"}
@@ -168,10 +185,12 @@ async def lock_term(
 @router.post("/terms/{term_id}/unlock", response_model=dict)
 async def unlock_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Unlock a glossary term."""
-    success = svc.set_term_locked(term_id, False)
+    actor, request_id = _mutation_metadata(request)
+    success = svc.set_term_locked(term_id, False, actor=actor, request_id=request_id)
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term unlocked"}
@@ -184,7 +203,12 @@ async def delete_term(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Delete a glossary term."""
-    success = svc.delete_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = svc.delete_term(
+        term_id,
+        actor=actor,
+        request_id=request_id,
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     record_audit_event(
@@ -198,13 +222,33 @@ async def delete_term(
     return {"message": "Term deleted"}
 
 
+@router.post("/terms/{term_id}/restore", response_model=dict)
+async def restore_term(
+    term_id: int,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    """Restore an archived glossary term."""
+    actor, request_id = _mutation_metadata(request)
+    success = svc.restore_term(
+        term_id,
+        actor=actor,
+        request_id=request_id,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Term not found")
+    return {"message": "Term restored"}
+
+
 @router.post("/terms/{term_id}/approve", response_model=dict)
 async def approve_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Approve a pending glossary term."""
-    success = svc.approve_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = svc.approve_term(term_id, actor=actor, request_id=request_id)
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term approved"}
@@ -213,10 +257,12 @@ async def approve_term(
 @router.post("/terms/{term_id}/reject", response_model=dict)
 async def reject_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Reject a pending glossary term."""
-    success = svc.reject_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = svc.reject_term(term_id, actor=actor, request_id=request_id)
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term rejected"}
