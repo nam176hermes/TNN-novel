@@ -1,5 +1,5 @@
 import { BookMarked, Search, ShieldCheck, Sparkles, UserRound, X } from 'lucide-react';
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { ApiError } from '../api/client';
 import type {
   BookGlossarySettings,
@@ -419,15 +419,45 @@ export default function GlossaryStyleView({
   const detailRequestIdRef = useRef(0);
   const detailTermIdRef = useRef<number | null>(null);
   const lastSearchRef = useRef(query.q);
+  const extractionPanelRef = useRef<HTMLDetailsElement | null>(null);
+  const extractionRequestIdRef = useRef(0);
+  const extractionBookIdRef = useRef(bookId);
+  const extractionLoaderRef = useRef(onLoadExtractionSettings);
+  extractionBookIdRef.current = bookId;
+  extractionLoaderRef.current = onLoadExtractionSettings;
+
+  const loadExtractionSettings = useCallback(async (targetBookId: number) => {
+    const loader = extractionLoaderRef.current;
+    if (!loader) return;
+    const requestId = ++extractionRequestIdRef.current;
+    setExtractionLoaded(false);
+    setOperationError('');
+    try {
+      const settings = await loader(targetBookId);
+      if (
+        requestId !== extractionRequestIdRef.current
+        || extractionBookIdRef.current !== targetBookId
+        || settings.book_id !== targetBookId
+      ) return;
+      setExtractionMode(settings.mode);
+      setExtractionProviderId(settings.provider_id);
+      setExtractionLoaded(true);
+    } catch (reason) {
+      if (requestId !== extractionRequestIdRef.current) return;
+      setOperationError(operationErrorMessage(reason));
+    }
+  }, []);
 
   useEffect(() => setSearch(query.q), [query.q]);
   useEffect(() => setSelectedIds(new Set()), [glossaryTerms]);
   useEffect(() => {
+    extractionRequestIdRef.current += 1;
     setExtractionMode('deterministic');
     setExtractionProviderId('');
     setExtractionLoaded(false);
     setExtractionStatus('');
-  }, [bookId]);
+    if (bookId && extractionPanelRef.current?.open) void loadExtractionSettings(bookId);
+  }, [bookId, loadExtractionSettings]);
   useEffect(() => {
     if (!onQueryChange || search === lastSearchRef.current) return;
     const timer = window.setTimeout(() => {
@@ -444,6 +474,7 @@ export default function GlossaryStyleView({
   useEffect(() => () => {
     detailRequestIdRef.current += 1;
     detailAbortRef.current?.abort();
+    extractionRequestIdRef.current += 1;
   }, []);
 
   const focusQueue = () => window.setTimeout(() => queueHeadingRef.current?.focus(), 0);
@@ -609,42 +640,37 @@ export default function GlossaryStyleView({
   const configuredProviders = providers.filter((provider) => (
     provider.enabled === 1 && (!provider.api_key_env || provider.api_key_set)
   ));
-  const loadExtractionSettings = async () => {
-    if (!bookId || !onLoadExtractionSettings || extractionLoaded) return;
-    setOperationError('');
-    try {
-      const settings = await onLoadExtractionSettings(bookId);
-      setExtractionMode(settings.mode);
-      setExtractionProviderId(settings.provider_id);
-      setExtractionLoaded(true);
-    } catch (reason) {
-      setOperationError(operationErrorMessage(reason));
-    }
-  };
   const saveExtractionSettings = async () => {
-    if (!bookId || !onSaveExtractionSettings) return;
+    if (!bookId || !onSaveExtractionSettings || !extractionLoaded) return;
+    const targetBookId = bookId;
     setOperationError(''); setExtractionStatus('');
     try {
-      const settings = await onSaveExtractionSettings(bookId, {
+      const settings = await onSaveExtractionSettings(targetBookId, {
         mode: extractionMode,
         provider_id: extractionMode === 'hybrid' ? extractionProviderId : '',
       });
+      if (extractionBookIdRef.current !== targetBookId || settings.book_id !== targetBookId) return;
       setExtractionMode(settings.mode);
       setExtractionProviderId(settings.provider_id);
       setExtractionStatus('Đã lưu cài đặt trích xuất.');
     } catch (reason) {
+      if (extractionBookIdRef.current !== targetBookId) return;
       setOperationError(operationErrorMessage(reason));
     }
   };
   const reextractChapter = async () => {
-    if (!bookId || !chapterId || !onReextractChapter) return;
+    if (!bookId || !chapterId || !onReextractChapter || !extractionLoaded) return;
+    const targetBookId = bookId;
+    const targetChapterId = chapterId;
     setOperationError(''); setExtractionStatus('');
     try {
-      const result = await onReextractChapter(bookId, chapterId);
+      const result = await onReextractChapter(targetBookId, targetChapterId);
+      if (extractionBookIdRef.current !== targetBookId) return;
       setExtractionStatus(
         `${result.created} thuật ngữ mới · ${result.updated} cập nhật · ${result.warnings.length} cảnh báo`,
       );
     } catch (reason) {
+      if (extractionBookIdRef.current !== targetBookId) return;
       setOperationError(operationErrorMessage(reason));
     }
   };
@@ -765,14 +791,14 @@ export default function GlossaryStyleView({
 
       {bookId && onLoadExtractionSettings && onSaveExtractionSettings ? (
         <details className="panel glossary-operation-panel" onToggle={(event) => {
-          if (event.currentTarget.open) void loadExtractionSettings();
-        }}>
+          if (event.currentTarget.open && !extractionLoaded) void loadExtractionSettings(bookId);
+        }} ref={extractionPanelRef}>
           <summary>Trích xuất thuật ngữ</summary>
           <div className="glossary-review-filters">
-            <label>Chế độ trích xuất<select aria-label="Chế độ trích xuất" onChange={(event) => setExtractionMode(event.target.value as BookGlossarySettings['mode'])} value={extractionMode}><option value="deterministic">Deterministic</option><option value="hybrid">Hybrid</option></select></label>
-            {extractionMode === 'hybrid' ? <label>Provider trích xuất<select aria-label="Provider trích xuất" onChange={(event) => setExtractionProviderId(event.target.value)} value={extractionProviderId}><option value="">Chọn provider</option>{configuredProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select></label> : null}
-            <button disabled={extractionMode === 'hybrid' && !extractionProviderId} onClick={() => void saveExtractionSettings()} type="button">Lưu cài đặt trích xuất</button>
-            {chapterId && onReextractChapter ? <button onClick={() => void reextractChapter()} type="button">Trích xuất lại chương</button> : null}
+            <label>Chế độ trích xuất<select aria-label="Chế độ trích xuất" disabled={!extractionLoaded} onChange={(event) => setExtractionMode(event.target.value as BookGlossarySettings['mode'])} value={extractionMode}><option value="deterministic">Deterministic</option><option value="hybrid">Hybrid</option></select></label>
+            {extractionMode === 'hybrid' ? <label>Provider trích xuất<select aria-label="Provider trích xuất" disabled={!extractionLoaded} onChange={(event) => setExtractionProviderId(event.target.value)} value={extractionProviderId}><option value="">Chọn provider</option>{configuredProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select></label> : null}
+            <button disabled={!extractionLoaded || (extractionMode === 'hybrid' && !extractionProviderId)} onClick={() => void saveExtractionSettings()} type="button">Lưu cài đặt trích xuất</button>
+            {chapterId && onReextractChapter ? <button disabled={!extractionLoaded} onClick={() => void reextractChapter()} type="button">Trích xuất lại chương</button> : null}
           </div>
           {extractionStatus ? <p role="status">{extractionStatus}</p> : null}
         </details>

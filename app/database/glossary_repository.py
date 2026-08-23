@@ -84,6 +84,7 @@ IMPORT_FIELDS = {
 IMPORT_POLICIES = {"skip_conflicts", "reject_conflicts"}
 SQLITE_INTEGER_MIN = -(2**63)
 SQLITE_INTEGER_MAX = 2**63 - 1
+PHASE5_EXTRACTORS = {"deterministic-v2", "hybrid-v1"}
 EXPORT_FIELDS = (
     "id", "book_id", "source_term", "target_term", "category", "confidence", "approved",
     "locked", "review_status", "mode", "pinyin", "notes_vi", "variants", "occurrence_count",
@@ -117,6 +118,60 @@ def normalize_source_key(value: str) -> str:
 
 def _target_is_blank(value: object) -> bool:
     return not "".join(unicodedata.normalize("NFKC", str(value or "")).split())
+
+
+def _phase5_evidence_payload(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
+    evidence_types: set[str] = set()
+    mention_counts: list[int] = []
+    provenance_book_ids: set[int] = set()
+    source_fingerprints: set[str] = set()
+    proposed_targets: set[str] = set()
+    title_match = False
+    for row in rows:
+        try:
+            payload = json.loads(str(row["evidence_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        value = payload.get("mention_count")
+        if type(value) is int and value >= 0:
+            mention_counts.append(value)
+        evidence_types.update(
+            str(item)[:64]
+            for item in payload.get("evidence_types") or []
+            if isinstance(item, str) and item
+        )
+        singular_fingerprint = payload.get("source_fingerprint")
+        if isinstance(singular_fingerprint, str) and singular_fingerprint:
+            source_fingerprints.add(singular_fingerprint[:128])
+        source_fingerprints.update(
+            str(item)[:128]
+            for item in payload.get("source_fingerprints") or []
+            if isinstance(item, str) and item
+        )
+        provenance_book_ids.add(int(row["book_id"] or 0))
+        provenance_book_ids.update(
+            int(item)
+            for item in payload.get("provenance_book_ids") or []
+            if type(item) is int and item >= 0
+        )
+        proposed_targets.update(
+            str(item)[:200]
+            for item in payload.get("proposed_targets") or []
+            if isinstance(item, str) and item
+        )
+        title_match = title_match or bool(payload.get("title_match"))
+    result: dict[str, Any] = {
+        "evidence_types": sorted(evidence_types)[:16],
+        "mention_count": max(mention_counts, default=0),
+        "provenance_book_ids": sorted(provenance_book_ids)[:100],
+        "source_fingerprints": sorted(source_fingerprints)[:100],
+        "title_match": title_match,
+    }
+    if proposed_targets:
+        result["proposed_targets"] = sorted(proposed_targets)[:10]
+    return result
 
 
 def _canonical_state(approved: object, locked: object, review_status: object) -> tuple[str, int, int]:
@@ -215,20 +270,68 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_evidence_term ON glossary_term_evidence(term_id, id)")
     phase5_index = next(
-        (
-            row
-            for row in conn.execute("PRAGMA index_list(glossary_term_evidence)").fetchall()
-            if row["name"] == "idx_glossary_evidence_phase5_unique"
-        ),
+        (row for row in conn.execute("PRAGMA index_list(glossary_term_evidence)")
+         if row["name"] == "idx_glossary_evidence_phase5_unique"),
         None,
     )
-    if phase5_index is not None and int(phase5_index["unique"] or 0) == 1:
+    if phase5_index is not None and int(phase5_index["unique"] or 0) != 1:
         conn.execute("DROP INDEX idx_glossary_evidence_phase5_unique")
+    duplicate_identities = conn.execute(
+        """
+        SELECT term_id, chapter_id, extractor
+        FROM glossary_term_evidence
+        WHERE extractor IN ('deterministic-v2', 'hybrid-v1')
+        GROUP BY term_id, chapter_id, extractor
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for identity in duplicate_identities:
+        rows = conn.execute(
+            """
+            SELECT * FROM glossary_term_evidence
+            WHERE term_id = ? AND chapter_id = ? AND extractor = ?
+            ORDER BY id
+            """,
+            (identity["term_id"], identity["chapter_id"], identity["extractor"]),
+        ).fetchall()
+        keep_id = int(rows[0]["id"])
+        conn.execute(
+            "UPDATE glossary_term_evidence SET evidence_type = 'chapter_observation', evidence_json = ? "
+            "WHERE id = ?",
+            (json.dumps(_phase5_evidence_payload(rows), ensure_ascii=False, sort_keys=True, separators=(",", ":")), keep_id),
+        )
+        conn.execute(
+            f"DELETE FROM glossary_term_evidence WHERE id IN ({','.join('?' for _ in rows[1:])})",
+            tuple(int(row["id"]) for row in rows[1:]),
+        )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_glossary_evidence_phase5_unique "
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_glossary_evidence_phase5_unique "
         "ON glossary_term_evidence(term_id, chapter_id, extractor) "
         "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
     )
+    migrated_counts: dict[int, tuple[int, set[int]]] = {}
+    for row in conn.execute(
+        "SELECT term_id, chapter_id, evidence_json FROM glossary_term_evidence "
+        "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
+    ).fetchall():
+        try:
+            payload = json.loads(str(row["evidence_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        mention_count = payload.get("mention_count", 0) if isinstance(payload, dict) else 0
+        if type(mention_count) is not int or mention_count < 0:
+            mention_count = 0
+        term_id = int(row["term_id"])
+        occurrence_count, chapters = migrated_counts.setdefault(term_id, (0, set()))
+        migrated_counts[term_id] = (
+            occurrence_count + mention_count,
+            chapters | {int(row["chapter_id"])},
+        )
+    for term_id, (occurrence_count, chapters) in migrated_counts.items():
+        conn.execute(
+            "UPDATE glossary_terms SET occurrence_count = ?, chapter_count = ? WHERE id = ?",
+            (occurrence_count, len(chapters), term_id),
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS book_glossary_settings (
@@ -482,6 +585,78 @@ class GlossaryRepository:
         ).fetchall()
 
     @staticmethod
+    def _phase5_counts(conn: sqlite3.Connection, term_id: int) -> tuple[int, int]:
+        occurrence_count = 0
+        chapter_ids: set[int] = set()
+        for row in conn.execute(
+            "SELECT chapter_id, evidence_json FROM glossary_term_evidence "
+            "WHERE term_id = ? AND extractor IN ('deterministic-v2', 'hybrid-v1')",
+            (term_id,),
+        ).fetchall():
+            try:
+                payload = json.loads(str(row["evidence_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            value = payload.get("mention_count") if isinstance(payload, dict) else 0
+            if type(value) is int and value >= 0:
+                occurrence_count += value
+            chapter_ids.add(int(row["chapter_id"] or 0))
+        return occurrence_count, len(chapter_ids)
+
+    @classmethod
+    def _resolve_extraction_row(
+        cls,
+        conn: sqlite3.Connection,
+        book_id: int,
+        source_key: str,
+    ) -> tuple[sqlite3.Row | None, bool]:
+        rows = cls._source_rows(conn, book_id, source_key)
+        active_rows = [row for row in rows if not row["archived_at"]]
+        if len(active_rows) == 1:
+            return active_rows[0], False
+        if len(active_rows) > 1:
+            return None, True
+        for archived in rows:
+            relations = conn.execute(
+                """
+                SELECT e.term_id, e.evidence_json
+                FROM glossary_term_evidence e
+                JOIN glossary_terms canonical ON canonical.id = e.term_id
+                WHERE e.book_id = ?
+                  AND canonical.book_id = ?
+                  AND COALESCE(canonical.archived_at, '') = ''
+                  AND e.extractor = 'merge-v1'
+                  AND e.evidence_type = 'merge_alias'
+                ORDER BY e.id DESC
+                """,
+                (book_id, book_id),
+            ).fetchall()
+            for relation in relations:
+                try:
+                    relation_payload = json.loads(str(relation["evidence_json"] or "{}"))
+                    merged_term_id = int(relation_payload.get("merged_term_id") or 0)
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if merged_term_id != int(archived["id"]):
+                    continue
+                canonical = cls._row(conn, int(relation["term_id"]))
+                if canonical is not None:
+                    return canonical, False
+        variant_rows = [
+            row
+            for row in conn.execute(
+                "SELECT * FROM glossary_terms WHERE book_id = ? AND COALESCE(archived_at, '') = '' ORDER BY id",
+                (book_id,),
+            ).fetchall()
+            if source_key in _variant_keys(row["variants"])
+        ]
+        if len(variant_rows) == 1:
+            return variant_rows[0], False
+        if rows or len(variant_rows) > 1:
+            return None, True
+        return None, False
+
+    @staticmethod
     def _log(
         conn: sqlite3.Connection,
         action: str,
@@ -669,18 +844,27 @@ class GlossaryRepository:
         request_id = f"chapter:{chapter_id}"
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            prior_term_ids = {
+                int(row["term_id"])
+                for row in conn.execute(
+                    """
+                    SELECT e.term_id
+                    FROM glossary_term_evidence e
+                    JOIN glossary_terms g ON g.id = e.term_id
+                    WHERE g.book_id = ? AND e.chapter_id = ? AND e.extractor = ?
+                    """,
+                    (book_id, chapter_id, extractor),
+                ).fetchall()
+            }
+            observed_term_ids: set[int] = set()
             for candidate in candidates:
                 source = " ".join(unicodedata.normalize("NFKC", str(candidate.get("source_term") or "")).split())
                 source_key = normalize_source_key(source)
                 if not source_key or source_key in skipped_keys:
                     skipped += 1
                     continue
-                rows = self._source_rows(conn, book_id, source_key)
-                if len(rows) > 1:
-                    skipped += 1
-                    continue
-                current = rows[0] if rows else None
-                if current is not None and current["archived_at"]:
+                current, blocked = self._resolve_extraction_row(conn, book_id, source_key)
+                if blocked:
                     skipped += 1
                     continue
                 if extractor == "hybrid-v1" and current is not None:
@@ -689,8 +873,8 @@ class GlossaryRepository:
                         continue
                     prior_evidence = conn.execute(
                         "SELECT 1 FROM glossary_term_evidence "
-                        "WHERE term_id = ? AND chapter_id = ? LIMIT 1",
-                        (current["id"], chapter_id),
+                        "WHERE term_id = ? AND chapter_id = ? AND extractor != ? LIMIT 1",
+                        (current["id"], chapter_id, extractor),
                     ).fetchone()
                     if prior_evidence is not None:
                         skipped += 1
@@ -702,13 +886,18 @@ class GlossaryRepository:
                 evidence = {
                     "evidence_types": sorted(
                         {str(value) for value in candidate.get("evidence_types") or [] if str(value)}
-                    ),
+                    )[:16],
                     "mention_count": mention_count,
-                    "source_fingerprint": hashlib.sha256(
-                        f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
-                    ).hexdigest(),
+                    "provenance_book_ids": [book_id],
+                    "source_fingerprints": [
+                        hashlib.sha256(
+                            f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
+                        ).hexdigest()
+                    ],
                     "title_match": bool(candidate.get("title_match")),
                 }
+                if extractor == "hybrid-v1" and target:
+                    evidence["proposed_targets"] = [target[:200]]
                 evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
                 is_new = current is None
@@ -742,6 +931,7 @@ class GlossaryRepository:
                     created += 1
                 else:
                     term_id = int(current["id"])
+                observed_term_ids.add(term_id)
 
                 evidence_row = conn.execute(
                     "SELECT id, evidence_json FROM glossary_term_evidence "
@@ -765,25 +955,16 @@ class GlossaryRepository:
                         (evidence_json, evidence_row["id"]),
                     )
 
-                evidence_rows = conn.execute(
-                    "SELECT chapter_id, evidence_json FROM glossary_term_evidence "
-                    "WHERE term_id = ? AND extractor IN ('deterministic-v2', 'hybrid-v1')",
-                    (term_id,),
-                ).fetchall()
-                occurrence_count = 0
-                chapter_ids: set[int] = set()
-                for row in evidence_rows:
-                    try:
-                        payload = json.loads(str(row["evidence_json"] or "{}"))
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        payload = {}
-                    value = payload.get("mention_count") if isinstance(payload, dict) else 0
-                    if type(value) is int and value >= 0:
-                        occurrence_count += value
-                    chapter_ids.add(int(row["chapter_id"] or 0))
+                occurrence_count, chapter_count = self._phase5_counts(conn, term_id)
 
                 before = dict(current)
                 status = str(current["review_status"])
+                retain_blank_proposal = (
+                    extractor == "hybrid-v1"
+                    and status in {"NEEDS_REVIEW", "CONFLICT"}
+                    and not str(current["target_term"] or "").strip()
+                    and bool(target)
+                )
                 target_conflict = (
                     extractor == "hybrid-v1"
                     and status in {"NEEDS_REVIEW", "CONFLICT"}
@@ -791,10 +972,22 @@ class GlossaryRepository:
                     and bool(target)
                     and str(current["target_term"]).strip() != target
                 )
+                alternatives = str(current["alternatives"] or "")
+                if target_conflict:
+                    alternative_keys = {
+                        normalize_source_key(part)
+                        for part in re.split(r"[,;\n|]+", alternatives)
+                        if normalize_source_key(part)
+                    }
+                    proposed_alternatives = f"{alternatives}|{target}" if alternatives else target
+                    if normalize_source_key(target) not in alternative_keys and len(proposed_alternatives) <= 1000:
+                        alternatives = proposed_alternatives
                 row_changed = (
                     int(current["occurrence_count"] or 0) != occurrence_count
-                    or int(current["chapter_count"] or 0) != len(chapter_ids)
+                    or int(current["chapter_count"] or 0) != chapter_count
                     or (target_conflict and status != "CONFLICT")
+                    or retain_blank_proposal
+                    or alternatives != str(current["alternatives"] or "")
                 )
                 if is_new:
                     after = dict(self._row(conn, term_id))
@@ -804,6 +997,8 @@ class GlossaryRepository:
                         """
                         UPDATE glossary_terms
                         SET occurrence_count = ?, chapter_count = ?,
+                            target_term = CASE WHEN ? THEN ? ELSE target_term END,
+                            alternatives = ?,
                             review_status = CASE WHEN ? THEN 'CONFLICT' ELSE review_status END,
                             approved = CASE WHEN ? THEN 0 ELSE approved END,
                             locked = CASE WHEN ? THEN 0 ELSE locked END,
@@ -812,7 +1007,10 @@ class GlossaryRepository:
                         """,
                         (
                             occurrence_count,
-                            len(chapter_ids),
+                            chapter_count,
+                            int(retain_blank_proposal),
+                            target,
+                            alternatives,
                             int(target_conflict),
                             int(target_conflict),
                             int(target_conflict),
@@ -825,6 +1023,46 @@ class GlossaryRepository:
                     updated += 1
                 elif not is_new and not evidence_changed:
                     skipped += 1
+
+            stale_term_ids = prior_term_ids - observed_term_ids
+            if stale_term_ids:
+                placeholders = ",".join("?" for _ in stale_term_ids)
+                conn.execute(
+                    f"""
+                    DELETE FROM glossary_term_evidence
+                    WHERE term_id IN ({placeholders}) AND chapter_id = ? AND extractor = ?
+                    """,
+                    (*sorted(stale_term_ids), chapter_id, extractor),
+                )
+                for term_id in sorted(stale_term_ids):
+                    current = self._row(conn, term_id)
+                    if current is None:
+                        continue
+                    occurrence_count, chapter_count = self._phase5_counts(conn, term_id)
+                    if (
+                        int(current["occurrence_count"] or 0) == occurrence_count
+                        and int(current["chapter_count"] or 0) == chapter_count
+                    ):
+                        continue
+                    before = dict(current)
+                    conn.execute(
+                        """
+                        UPDATE glossary_terms
+                        SET occurrence_count = ?, chapter_count = ?,
+                            updated_at = CURRENT_TIMESTAMP, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (occurrence_count, chapter_count, term_id),
+                    )
+                    self._log(
+                        conn,
+                        "observe",
+                        before,
+                        dict(self._row(conn, term_id)),
+                        actor,
+                        request_id,
+                    )
+                    updated += 1
             conn.commit()
         return {"created": created, "updated": updated, "skipped": skipped}
 
@@ -1468,10 +1706,49 @@ class GlossaryRepository:
                 raise GlossaryStateConflict("preview_mismatch")
             canonical_before = dict(self._row(conn, canonical_id))
             placeholders = ",".join("?" for _ in duplicate_ids)
+            all_ids = [canonical_id, *duplicate_ids]
+            all_placeholders = ",".join("?" for _ in all_ids)
+            phase5_rows = conn.execute(
+                f"""
+                SELECT * FROM glossary_term_evidence
+                WHERE term_id IN ({all_placeholders})
+                  AND extractor IN ('deterministic-v2', 'hybrid-v1')
+                ORDER BY id
+                """,
+                all_ids,
+            ).fetchall()
+            phase5_groups: dict[tuple[int, str], list[sqlite3.Row]] = {}
+            for row in phase5_rows:
+                phase5_groups.setdefault((int(row["chapter_id"]), str(row["extractor"])), []).append(row)
+            for rows in phase5_groups.values():
+                keep = rows[0]
+                if len(rows) > 1:
+                    conn.execute(
+                        f"DELETE FROM glossary_term_evidence WHERE id IN ({','.join('?' for _ in rows[1:])})",
+                        tuple(int(row["id"]) for row in rows[1:]),
+                    )
+                conn.execute(
+                    """
+                    UPDATE glossary_term_evidence
+                    SET term_id = ?, evidence_type = 'chapter_observation', evidence_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        canonical_id,
+                        json.dumps(
+                            _phase5_evidence_payload(rows),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        keep["id"],
+                    ),
+                )
             conn.execute(
                 f"""
                 UPDATE glossary_term_evidence SET term_id = ?
                 WHERE term_id IN ({placeholders})
+                  AND extractor NOT IN ('deterministic-v2', 'hybrid-v1')
                 """,
                 (canonical_id, *duplicate_ids),
             )
@@ -1479,13 +1756,17 @@ class GlossaryRepository:
                 f"UPDATE glossary_history SET term_id = ? WHERE term_id IN ({placeholders})",
                 (canonical_id, *duplicate_ids),
             )
+            occurrence_count, chapter_count = self._phase5_counts(conn, canonical_id)
+            if not phase5_rows:
+                occurrence_count = int(preview["occurrence_count"] or 0)
             conn.execute(
                 """
                 UPDATE glossary_terms
-                SET occurrence_count = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                SET occurrence_count = ?, chapter_count = ?,
+                    updated_at = CURRENT_TIMESTAMP, version = version + 1
                 WHERE id = ?
                 """,
-                (preview["occurrence_count"], canonical_id),
+                (occurrence_count, chapter_count, canonical_id),
             )
             canonical_after = dict(self._row(conn, canonical_id))
             self._log(
@@ -1505,6 +1786,26 @@ class GlossaryRepository:
                 after = dict(self._row(conn, duplicate_id))
                 self._log(
                     conn, "merge_archive", before, after, self._actor(actor), request_id
+                )
+                conn.execute(
+                    """
+                    INSERT INTO glossary_term_evidence
+                        (term_id, book_id, chapter_id, extractor, evidence_type, evidence_json)
+                    VALUES (?, ?, 0, 'merge-v1', 'merge_alias', ?)
+                    """,
+                    (
+                        canonical_id,
+                        int(before["book_id"] or 0),
+                        json.dumps(
+                            {
+                                "canonical_term_id": canonical_id,
+                                "merged_source_key": str(before["source_key"] or "")[:500],
+                                "merged_term_id": duplicate_id,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
                 )
             conn.commit()
         return {**preview, "merged": len(duplicate_ids)}

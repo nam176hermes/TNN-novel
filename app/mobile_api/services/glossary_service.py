@@ -166,6 +166,24 @@ def _context_for(text: str, term: str, radius: int = 28) -> str:
     return text[start:end].replace("\n", " ").strip()
 
 
+def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -> str:
+    normalized_parts: list[str] = []
+    original_indexes: list[int] = []
+    for index, character in enumerate(text):
+        normalized_character = unicodedata.normalize("NFKC", character)
+        normalized_parts.append(normalized_character)
+        original_indexes.extend([index] * len(normalized_character))
+    normalized_text = "".join(normalized_parts)
+    normalized_index = normalized_text.find(normalized_term)
+    if normalized_index < 0 or not normalized_term:
+        return ""
+    original_start = original_indexes[normalized_index]
+    original_end = original_indexes[normalized_index + len(normalized_term) - 1] + 1
+    return text[
+        max(0, original_start - radius):min(len(text), original_end + radius)
+    ].replace("\n", " ").strip()
+
+
 def _normalize_candidate_source(source: str, term_type: str) -> str:
     source = source.strip("，。！？、：；（）()[]【】《》“”\"' \n\t")
     for marker in ("来到", "进入", "取出", "拿出", "走入", "回到", "前往", "拜入"):
@@ -750,18 +768,18 @@ class GlossaryService:
         chapter_title: str,
         raw_text: str,
         provider_id: str,
-    ) -> tuple[list[dict], list[dict]]:
+    ) -> tuple[list[dict] | None, list[dict]]:
         warnings: list[dict] = []
         provider = next(
             (item for item in list_model_providers(self.db_path) if item["id"] == provider_id),
             None,
         )
         if provider is None or int(provider.get("enabled") or 0) != 1:
-            return [], [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
         api_key_env = str(provider.get("api_key_env") or "").strip()
         api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
         if api_key_env and not api_key:
-            return [], [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
 
         bounded_title = _clean_chapter_title(chapter_title)[:200]
         bounded_text = raw_text[:MAX_HYBRID_TEXT_CHARS]
@@ -784,7 +802,7 @@ class GlossaryService:
                 response_format={"type": "json_object"},
             )
         except requests.RequestException:
-            return [], [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}]
 
         try:
             payload = json.loads(str(response.get("text") or ""))
@@ -792,14 +810,16 @@ class GlossaryService:
             if not isinstance(payload, dict) or not isinstance(raw_candidates, list):
                 raise ValueError("invalid_candidates")
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return [], [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}]
 
         if len(raw_candidates) > MAX_HYBRID_CANDIDATES:
             raw_candidates = raw_candidates[:MAX_HYBRID_CANDIDATES]
             warnings.append(
                 {"code": "provider_output_truncated", "message": "Hybrid output was limited to 100 candidates."}
             )
-        corpus = f"{bounded_title}\n{bounded_text}"
+        normalized_title = unicodedata.normalize("NFKC", bounded_title)
+        normalized_text = unicodedata.normalize("NFKC", bounded_text)
+        normalized_corpus = f"{normalized_title}\n{normalized_text}"
         candidates: list[dict] = []
         seen: set[str] = set()
         invalid_count = duplicate_count = 0
@@ -816,7 +836,7 @@ class GlossaryService:
             if (
                 not source_key
                 or len(source) > 64
-                or source not in corpus
+                or source not in normalized_corpus
                 or not isinstance(target_value, str)
                 or len(target_value) > 200
                 or isinstance(confidence_value, bool)
@@ -839,9 +859,9 @@ class GlossaryService:
                     "term_type": term_type,
                     "category": term_type,
                     "confidence": float(confidence_value),
-                    "source_context": _context_for(bounded_text, source),
-                    "mention_count": len(re.findall(f"(?={re.escape(source)})", corpus)),
-                    "title_match": bool(bounded_title and source in bounded_title),
+                    "source_context": _context_for_normalized(bounded_text, source),
+                    "mention_count": len(re.findall(f"(?={re.escape(source)})", normalized_corpus)),
+                    "title_match": bool(normalized_title and source in normalized_title),
                     "evidence_types": ["provider_structured_json"],
                 }
             )
@@ -864,8 +884,9 @@ class GlossaryService:
                     FROM glossary_term_evidence e
                     JOIN glossary_terms g ON g.id = e.term_id
                     WHERE g.book_id = ? AND e.chapter_id = ?
+                      AND e.extractor != ?
                     """,
-                    (book_id, chapter_id),
+                    (book_id, chapter_id, HYBRID_EXTRACTOR),
                 ).fetchall()
             }
         return [
@@ -916,15 +937,16 @@ class GlossaryService:
                 raw_text=raw_text,
                 provider_id=str(extraction_settings["provider_id"]),
             )
-            hybrid_counts = repository.record_extraction_candidates(
-                book_id=book_id,
-                chapter_id=chapter_id,
-                chapter_number=chapter_number,
-                extractor=HYBRID_EXTRACTOR,
-                candidates=hybrid,
-            )
-            counts = {key: counts[key] + hybrid_counts[key] for key in counts}
-            candidates = [*candidates, *hybrid]
+            if hybrid is not None:
+                hybrid_counts = repository.record_extraction_candidates(
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    chapter_number=chapter_number,
+                    extractor=HYBRID_EXTRACTOR,
+                    candidates=hybrid,
+                )
+                counts = {key: counts[key] + hybrid_counts[key] for key in counts}
+                candidates = [*candidates, *hybrid]
         return {**counts, "candidates": candidates, "warnings": warnings}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:

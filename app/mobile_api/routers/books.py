@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from app.database.db import get_book_by_id
 from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
@@ -77,6 +78,15 @@ def _glossary_settings_error(exc: ValueError) -> HTTPException:
     )
 
 
+def _owned_glossary_service(book_id: int, current_user: dict) -> GlossaryService:
+    service = GlossaryService()
+    book = get_book_by_id(service.db_path, book_id)
+    owner_user_id = str(current_user.get("user_id") or current_user.get("username") or "").strip()
+    if book is None or not owner_user_id or str(book.get("owner_user_id") or "") != owner_user_id:
+        raise HTTPException(status_code=404, detail={"code": "book_not_found"})
+    return service
+
+
 @router.get("/books", response_model=list[dict])
 async def list_books(
     pipeline: PipelineService = Depends(get_pipeline),
@@ -109,10 +119,10 @@ async def create_book(
 @router.get("/books/{book_id}/glossary-settings", response_model=dict)
 async def get_book_glossary_settings(
     book_id: int,
-    _current_user: UserResponse = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     try:
-        return GlossaryService().get_extraction_settings(book_id)
+        return _owned_glossary_service(book_id, current_user).get_extraction_settings(book_id)
     except ValueError as exc:
         raise _glossary_settings_error(exc) from None
 
@@ -121,10 +131,10 @@ async def get_book_glossary_settings(
 async def update_book_glossary_settings(
     book_id: int,
     update: BookGlossarySettingsUpdate,
-    _current_user: UserResponse = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     try:
-        return GlossaryService().update_extraction_settings(
+        return _owned_glossary_service(book_id, current_user).update_extraction_settings(
             book_id,
             mode=update.mode,
             provider_id=update.provider_id,
@@ -653,10 +663,10 @@ async def update_chapter_translation(
 async def reextract_chapter_glossary(
     book_id: int,
     chapter_id: int,
-    _current_user: UserResponse = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ):
     try:
-        return GlossaryService().extract_chapter_terms(book_id, chapter_id)
+        return _owned_glossary_service(book_id, current_user).extract_chapter_terms(book_id, chapter_id)
     except ValueError:
         raise HTTPException(status_code=404, detail={"code": "chapter_not_found"}) from None
 

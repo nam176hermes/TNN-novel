@@ -226,10 +226,6 @@ CREATE TABLE IF NOT EXISTS glossary_term_evidence (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (term_id) REFERENCES glossary_terms(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_glossary_evidence_phase5_unique
-    ON glossary_term_evidence(term_id, chapter_id, extractor)
-    WHERE extractor IN ('deterministic-v2', 'hybrid-v1');
-
 CREATE TABLE IF NOT EXISTS book_glossary_settings (
     book_id INTEGER PRIMARY KEY,
     extraction_mode TEXT NOT NULL DEFAULT 'deterministic'

@@ -47,6 +47,15 @@ TTS_JOB_FAILURE_DETAIL = "TTS job failed. Check TTS settings and server logs."
 DAILY_JOB_FAILURE_DETAIL = "Daily job failed. Check provider settings and server logs."
 QA_JOB_FAILURE_DETAIL = "QA failed. Check provider settings and server logs."
 IMPORT_CHAPTER_FAILURE_DETAIL = "import failed; check server logs"
+GLOSSARY_WARNING_LIMIT = 10
+GLOSSARY_WARNING_MESSAGES = {
+    "provider_not_configured": "Hybrid glossary extraction was skipped.",
+    "provider_unavailable": "Hybrid glossary extraction was skipped.",
+    "provider_malformed_response": "Hybrid glossary extraction was skipped.",
+    "provider_output_truncated": "Hybrid output was limited to 100 candidates.",
+    "provider_duplicates_ignored": "Duplicate hybrid candidates were ignored.",
+    "provider_items_ignored": "Invalid hybrid candidates were ignored.",
+}
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -68,6 +77,20 @@ def _safe_stage_timings(value: object) -> list[dict]:
             safe_item["error"] = "Stage failed. Check server logs."
         safe_timings.append(safe_item)
     return safe_timings
+
+
+def _safe_glossary_warnings(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    safe: list[dict[str, str]] = []
+    for item in value[:GLOSSARY_WARNING_LIMIT]:
+        code = str(item.get("code") or "") if isinstance(item, dict) else ""
+        message = GLOSSARY_WARNING_MESSAGES.get(code)
+        if message is None:
+            code = "extraction_warning"
+            message = "Glossary extraction completed with a warning."
+        safe.append({"code": code, "message": message})
+    return safe
 
 
 class JobStatus:
@@ -1189,6 +1212,9 @@ class JobService:
                                 job_id,
                                 effective_glossary,
                             )
+                            safe_glossary_warnings = _safe_glossary_warnings(
+                                extracted.get("warnings")
+                            )
                             record_job_log(
                                 self.pipeline.db_path,
                                 job_id=job_id,
@@ -1202,6 +1228,16 @@ class JobService:
                                     "warning_count": len(qa_report.get("issues") or []),
                                     "glossary_candidates_created": extracted.get("created", 0),
                                     "glossary_candidates_updated": extracted.get("updated", 0),
+                                    "glossary_warning_count": len(extracted.get("warnings") or []),
+                                    "glossary_warning_codes": ",".join(
+                                        warning["code"] for warning in safe_glossary_warnings
+                                    ),
+                                    "glossary_warning_messages": " | ".join(
+                                        warning["message"] for warning in safe_glossary_warnings
+                                    ),
+                                    "glossary_warnings_truncated": len(
+                                        extracted.get("warnings") or []
+                                    ) > GLOSSARY_WARNING_LIMIT,
                                 },
                             )
                         except Exception:

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { StyleProfile } from '../api/types';
@@ -65,6 +65,60 @@ describe('GlossaryStyleView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Trích xuất lại chương' }));
     expect(onReextractChapter).toHaveBeenCalledWith(42, 9);
     expect(await screen.findByRole('status')).toHaveTextContent('1 thuật ngữ mới');
+  });
+
+  it('reloads open extraction settings on book switch and ignores stale completions', async () => {
+    let resolveBookA!: (settings: {
+      book_id: number; max_candidates_per_chapter: number; mode: 'hybrid'; provider_id: string;
+    }) => void;
+    let resolveBookB!: typeof resolveBookA;
+    const bookA = new Promise<Parameters<typeof resolveBookA>[0]>((resolve) => { resolveBookA = resolve; });
+    const bookB = new Promise<Parameters<typeof resolveBookB>[0]>((resolve) => { resolveBookB = resolve; });
+    const onLoadExtractionSettings = vi.fn((bookId: number) => bookId === 1 ? bookA : bookB);
+    const onSaveExtractionSettings = vi.fn().mockResolvedValue({
+      book_id: 2, max_candidates_per_chapter: 100, mode: 'hybrid', provider_id: 'provider-b',
+    });
+    const onReextractChapter = vi.fn().mockResolvedValue({
+      created: 0, updated: 0, skipped: 0, warnings: [],
+    });
+    const shared = {
+      onLoadExtractionSettings,
+      onReextractChapter,
+      onSaveExtractionSettings,
+      providers: ['provider-a', 'provider-b'].map((id) => ({
+        api_key_env: '', api_key_set: false, base_url: 'http://localhost',
+        cost_input_per_1m: 0, cost_output_per_1m: 0, enabled: 1, id, label: id,
+        model: 'fake', notes: '', supports_batch: 0, supports_streaming: 0, temperature: 0,
+        timeout_seconds: 1,
+      })),
+    };
+    const { rerender } = render(<GlossaryStyleView {...props({
+      ...shared, bookId: 1, chapterId: 11,
+    })} />);
+
+    await userEvent.click(screen.getByText('Trích xuất thuật ngữ'));
+    expect(onLoadExtractionSettings).toHaveBeenCalledWith(1);
+    rerender(<GlossaryStyleView {...props({ ...shared, bookId: 2, chapterId: 22 })} />);
+
+    await waitFor(() => expect(onLoadExtractionSettings).toHaveBeenCalledWith(2));
+    expect(screen.getByRole('button', { name: 'Lưu cài đặt trích xuất' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Trích xuất lại chương' })).toBeDisabled();
+
+    await act(async () => resolveBookB({
+      book_id: 2, max_candidates_per_chapter: 100, mode: 'hybrid', provider_id: 'provider-b',
+    }));
+    expect(await screen.findByLabelText('Provider trích xuất')).toHaveValue('provider-b');
+    await act(async () => resolveBookA({
+      book_id: 1, max_candidates_per_chapter: 100, mode: 'hybrid', provider_id: 'provider-a',
+    }));
+    expect(screen.getByLabelText('Provider trích xuất')).toHaveValue('provider-b');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu cài đặt trích xuất' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Trích xuất lại chương' }));
+    expect(onSaveExtractionSettings).toHaveBeenCalledWith(2, {
+      mode: 'hybrid', provider_id: 'provider-b',
+    });
+    expect(onReextractChapter).toHaveBeenCalledWith(2, 22);
   });
 
   it('preserves blank target cells and treats an endpoint empty-scope metadata row as zero items', () => {
