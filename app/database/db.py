@@ -4646,6 +4646,7 @@ def put_glossary_term(
     source_context: str = "",
     actor: str = "",
     request_id: str = "",
+    confidence: float = 1.0,
 ) -> int:
     """Insert or update through the canonical glossary state machine."""
     return GlossaryRepository(db_path).put(
@@ -4668,6 +4669,7 @@ def put_glossary_term(
         first_seen_chapter_number=first_seen_chapter_number,
         review_status=review_status,
         source_context=source_context,
+        confidence=confidence,
         actor=actor,
         request_id=request_id,
     )
@@ -5068,28 +5070,13 @@ def glossary_coverage(db_path: Path, book_id: int, source_text: str) -> dict:
 
 
 def auto_approve_glossary(db_path: Path, min_occurrences: int = 3, book_id: Optional[int] = None) -> int:
-    """Auto-approve pending terms that have been seen multiple times.
+    """Leave extracted candidates pending for explicit human review.
 
-    A term seen 3+ times across translations is likely correct.
-    Returns count of auto-approved terms.
+    The legacy entry point remains for compatibility, but occurrence count is
+    evidence rather than approval authority under the canonical state model.
     """
-    with get_connection(db_path) as conn:
-        if book_id is not None:
-            cur = conn.execute(
-                """UPDATE glossary_terms SET approved = 1, mode = COALESCE(NULLIF(mode,''), 'translate')
-                   WHERE approved = 0 AND occurrence_count >= ? AND book_id IN (0, ?)
-                     AND COALESCE(archived_at, '') = ''""",
-                (min_occurrences, book_id),
-            )
-        else:
-            cur = conn.execute(
-                """UPDATE glossary_terms SET approved = 1, mode = COALESCE(NULLIF(mode,''), 'translate')
-                   WHERE approved = 0 AND occurrence_count >= ?
-                     AND COALESCE(archived_at, '') = ''""",
-                (min_occurrences,),
-            )
-        conn.commit()
-        return cur.rowcount
+    del db_path, min_occurrences, book_id
+    return 0
 
 
 def get_glossary_conflicts(db_path: Path, book_id: Optional[int] = None) -> list[dict]:

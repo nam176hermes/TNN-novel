@@ -40,7 +40,7 @@ def _target_is_blank(value: object) -> bool:
 
 
 def _canonical_state(approved: object, locked: object, review_status: object) -> tuple[str, int, int]:
-    status = str(review_status or "").strip()
+    status = review_status if isinstance(review_status, str) else ""
     expected = CANONICAL_STATES.get(status)
     if (
         expected is not None
@@ -91,6 +91,32 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
             (source_key, *state, row["id"]),
         )
 
+    active_groups: dict[tuple[int, str], list[sqlite3.Row]] = {}
+    for row in conn.execute(
+        """
+        SELECT id, book_id, source_key, target_term
+        FROM glossary_terms
+        WHERE review_status IN ('APPROVED', 'LOCKED')
+          AND COALESCE(archived_at, '') = ''
+        ORDER BY id
+        """
+    ).fetchall():
+        active_groups.setdefault((int(row["book_id"] or 0), row["source_key"]), []).append(row)
+    for rows in active_groups.values():
+        targets = {
+            " ".join(unicodedata.normalize("NFKC", str(row["target_term"] or "")).split())
+            for row in rows
+        }
+        if len(targets) > 1:
+            conn.executemany(
+                """
+                UPDATE glossary_terms
+                SET review_status = 'CONFLICT', approved = 0, locked = 0
+                WHERE id = ?
+                """,
+                ((row["id"],) for row in rows),
+            )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS glossary_term_evidence (
@@ -140,6 +166,20 @@ class GlossaryRepository:
         request_id: str,
     ) -> None:
         ensure_history_table(conn)
+        def bounded_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+            if not row:
+                return {}
+            return {
+                "id": row["id"],
+                "book_id": row["book_id"],
+                "review_status": row["review_status"],
+                "approved": row["approved"],
+                "locked": row["locked"],
+                "version": row["version"],
+                "archived": bool(row["archived_at"]),
+                "target_present": not _target_is_blank(row["target_term"]),
+            }
+
         conn.execute(
             """
             INSERT INTO glossary_history
@@ -157,8 +197,8 @@ class GlossaryRepository:
                 before.get("mode", ""),
                 after.get("mode", ""),
                 actor,
-                json.dumps(before, ensure_ascii=False, sort_keys=True),
-                json.dumps(after, ensure_ascii=False, sort_keys=True),
+                json.dumps(bounded_snapshot(before), ensure_ascii=False, sort_keys=True),
+                json.dumps(bounded_snapshot(after), ensure_ascii=False, sort_keys=True),
                 actor,
                 request_id,
                 after["version"],
@@ -166,7 +206,7 @@ class GlossaryRepository:
         )
 
     @staticmethod
-    def _assert_target_and_conflicts(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    def _assert_target_and_conflicts(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> None:
         if _target_is_blank(row["target_term"]):
             raise GlossaryStateConflict("target_required")
         targets = conn.execute(
@@ -203,16 +243,17 @@ class GlossaryRepository:
                 conn.execute(
                     """
                     INSERT INTO glossary_terms
-                        (book_id, source_term, source_key, target_term, category, approved, mode,
+                        (book_id, source_term, source_key, target_term, category, confidence, approved, mode,
                          pinyin, notes_vi, variants, occurrence_count, priority, locked, genre,
                          term_type, alternatives, gender, first_seen_chapter_id,
                          first_seen_chapter_number, review_status, source_context, last_seen,
                          updated_at, version, archived_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, '')
                     """,
                     (
-                        book_id, source, source_key, target, values["category"], state[1], values["mode"],
+                        book_id, source, source_key, target, values["category"], values["confidence"],
+                        state[1], values["mode"],
                         values["pinyin"], values["notes_vi"], values["variants"], values["priority"],
                         state[2], values["genre"], values["term_type"], values["alternatives"],
                         values["gender"], values["first_seen_chapter_id"], values["first_seen_chapter_number"],
@@ -227,14 +268,16 @@ class GlossaryRepository:
                 target_to_store = target
                 if (current["locked"] == 1 or current["approved"] != 0) and int(values["approved"] or 0) <= 0:
                     target_to_store = current["target_term"]
-                state = (current["review_status"], current["approved"], current["locked"])
-                if current["review_status"] not in {"APPROVED", "LOCKED", "REJECTED", "CONFLICT"}:
+                state = _canonical_state(current["approved"], current["locked"], current["review_status"])
+                if state[0] == "NEEDS_REVIEW":
                     state = _requested_state(values["approved"], values["locked"], values["review_status"])
+                if _target_is_blank(target_to_store) and state[0] in {"APPROVED", "LOCKED"}:
+                    state = ("CONFLICT", 0, 0)
                 conn.execute(
                     """
                     UPDATE glossary_terms
                     SET target_term = ?, category = ?, mode = ?, pinyin = ?, notes_vi = ?, variants = ?,
-                        priority = ?, locked = ?, genre = ?, term_type = ?,
+                        confidence = ?, priority = ?, locked = ?, genre = ?, term_type = ?,
                         alternatives = COALESCE(NULLIF(?, ''), alternatives),
                         gender = COALESCE(NULLIF(?, ''), gender),
                         first_seen_chapter_id = CASE WHEN first_seen_chapter_id = 0 THEN ? ELSE first_seen_chapter_id END,
@@ -247,7 +290,8 @@ class GlossaryRepository:
                     """,
                     (
                         target_to_store, values["category"], values["mode"], values["pinyin"],
-                        values["notes_vi"], values["variants"], values["priority"], state[2], values["genre"],
+                        values["notes_vi"], values["variants"], values["confidence"], values["priority"],
+                        state[2], values["genre"],
                         values["term_type"], values["alternatives"], values["gender"],
                         values["first_seen_chapter_id"], values["first_seen_chapter_number"], state[0], state[1],
                         values["source_context"], term_id,
@@ -258,6 +302,71 @@ class GlossaryRepository:
             self._log(conn, action, before, after, self._actor(actor), request_id)
             conn.commit()
             return term_id
+
+    @staticmethod
+    def _requested_update_state(current: sqlite3.Row, changes: dict[str, Any]) -> tuple[str, int, int]:
+        if "locked" in changes:
+            locked = int(changes["locked"] or 0)
+            if locked not in {0, 1}:
+                raise GlossaryStateConflict("invalid_transition")
+            state = ("LOCKED", 1, 1) if locked else ("APPROVED", 1, 0)
+            if "approved" in changes and int(changes["approved"]) != state[1]:
+                raise GlossaryStateConflict("invalid_transition")
+            if "review_status" in changes:
+                status = str(changes["review_status"] or "").strip().upper()
+                if status != state[0]:
+                    raise GlossaryStateConflict("invalid_transition")
+            return state
+        if "review_status" in changes:
+            status = str(changes["review_status"] or "").strip().upper()
+            if status not in CANONICAL_STATES:
+                raise GlossaryStateConflict("invalid_transition")
+            state = (status, *CANONICAL_STATES[status])
+            if "approved" in changes and int(changes["approved"]) != state[1]:
+                raise GlossaryStateConflict("invalid_transition")
+            return state
+        if "approved" in changes:
+            approved = int(changes["approved"])
+            states = {-1: ("REJECTED", -1, 0), 0: ("NEEDS_REVIEW", 0, 0), 1: ("APPROVED", 1, 0)}
+            if approved not in states:
+                raise GlossaryStateConflict("invalid_transition")
+            return states[approved]
+        return _canonical_state(current["approved"], current["locked"], current["review_status"])
+
+    def _validate_transition(
+        self,
+        conn: sqlite3.Connection,
+        current: sqlite3.Row,
+        action: str,
+        candidate: sqlite3.Row | dict[str, Any],
+    ) -> bool:
+        current_state = (current["review_status"], current["approved"], current["locked"])
+        if action == "unlock":
+            if current_state != ("LOCKED", 1, 1):
+                return False
+            self._assert_target_and_conflicts(conn, candidate)
+        elif action == "reject":
+            if current["locked"] == 1:
+                raise GlossaryStateConflict("locked_term")
+            if current["review_status"] == "REJECTED" and current["approved"] == -1:
+                return False
+        elif action == "approve":
+            if current["approved"] != 0:
+                return False
+            self._assert_target_and_conflicts(conn, candidate)
+        elif action == "lock":
+            if current_state == ("LOCKED", 1, 1):
+                return False
+            self._assert_target_and_conflicts(conn, candidate)
+        elif action == "needs_review":
+            if current_state != ("NEEDS_REVIEW", 0, 0):
+                raise GlossaryStateConflict("invalid_transition")
+        elif action == "conflict":
+            if current["locked"] == 1:
+                raise GlossaryStateConflict("invalid_transition")
+        else:
+            raise GlossaryStateConflict("invalid_transition")
+        return True
 
     def update(self, term_id: int, *, actor: str = "", request_id: str = "", **updates: Any) -> bool:
         if updates.get("mode") is not None and updates["mode"] not in {"", "translate", "context", "transliterate"}:
@@ -272,20 +381,25 @@ class GlossaryRepository:
             before = dict(current)
             merged = {**before, **changes}
             state_change = {"approved", "locked", "review_status"} & changes.keys()
-            if "locked" in changes:
-                state = ("LOCKED", 1, 1) if int(changes["locked"] or 0) == 1 else ("APPROVED", 1, 0)
-            elif "review_status" in changes:
-                status = str(changes["review_status"] or "").strip().upper()
-                state = (status, *CANONICAL_STATES[status]) if status in CANONICAL_STATES else ("CONFLICT", 0, 0)
-            elif "approved" in changes:
-                state = _requested_state(changes["approved"], 0, "")
-            else:
-                state = (current["review_status"], current["approved"], current["locked"])
-            if state[0] == "REJECTED" and current["locked"] == 1:
-                raise GlossaryStateConflict("locked_term")
+            state = self._requested_update_state(current, changes)
             merged.update(review_status=state[0], approved=state[1], locked=state[2])
-            if state_change and state[0] in {"APPROVED", "LOCKED"}:
-                self._assert_target_and_conflicts(conn, merged)
+            if state_change:
+                if "locked" in changes:
+                    action = "lock" if int(changes["locked"] or 0) else "unlock"
+                else:
+                    action = {
+                        "APPROVED": "unlock" if current["locked"] == 1 else "approve",
+                        "LOCKED": "lock",
+                        "REJECTED": "reject",
+                        "NEEDS_REVIEW": "needs_review",
+                        "CONFLICT": "conflict",
+                    }[state[0]]
+                current_state = (current["review_status"], current["approved"], current["locked"])
+                if state == current_state and action not in {"lock", "unlock"}:
+                    if state[0] in {"APPROVED", "LOCKED"}:
+                        self._assert_target_and_conflicts(conn, merged)
+                elif not self._validate_transition(conn, current, action, merged):
+                    raise GlossaryStateConflict("invalid_transition")
             elif _target_is_blank(merged["target_term"]) and state[0] in {"APPROVED", "LOCKED"}:
                 state = ("CONFLICT", 0, 0)
             changes.update(review_status=state[0], approved=state[1], locked=state[2])
@@ -304,11 +418,7 @@ class GlossaryRepository:
             current = self._row(conn, term_id)
             if current is None or current["archived_at"]:
                 return False
-            if action == "reject" and current["locked"] == 1:
-                raise GlossaryStateConflict("locked_term")
-            if action in {"approve", "lock"}:
-                self._assert_target_and_conflicts(conn, current)
-            if action == "approve" and current["approved"] != 0:
+            if not self._validate_transition(conn, current, action, current):
                 return False
             before = dict(current)
             conn.execute(

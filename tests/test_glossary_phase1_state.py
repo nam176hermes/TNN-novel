@@ -169,6 +169,7 @@ def test_phase1_migration_is_additive_idempotent_and_repairs_legacy_states(tmp_p
         ("LOCKED", 0, 1, ("CONFLICT", 0, 0)),
         ("CONFLICT", 0, 1, ("CONFLICT", 0, 0)),
         ("APPROVED", 1.5, 0, ("CONFLICT", 0, 0)),
+        (" APPROVED ", 1, 0, ("CONFLICT", 0, 0)),
         ("unknown", 0, 0, ("CONFLICT", 0, 0)),
     ],
 )
@@ -188,6 +189,23 @@ def test_migration_enforces_the_canonical_state_truth_table(
 
     with get_connection(db_path) as conn:
         assert _state(conn, "state") == expected
+
+
+def test_migration_marks_normalized_active_target_group_conflict(tmp_path: Path) -> None:
+    db_path = tmp_path / "normalized-conflict.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(LEGACY_GLOSSARY_SCHEMA)
+        _legacy_term(conn, "Ａ Beta", "one", "APPROVED", 1, 0)
+        _legacy_term(conn, "a beta", "two", "APPROVED", 1, 0)
+
+    init_db(db_path)
+    init_db(db_path)
+
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT review_status, approved, locked FROM glossary_terms ORDER BY id"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("CONFLICT", 0, 0), ("CONFLICT", 0, 0)]
 
 
 def test_source_key_normalizes_latin_compatibility_whitespace_and_preserves_han(temp_db_path: Path) -> None:
@@ -331,6 +349,64 @@ def test_generic_update_approval_requires_a_nonblank_target(temp_db_path: Path) 
     _assert_conflict(exc, "target_required")
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"approved": 0},
+        {"review_status": "NEEDS_REVIEW"},
+    ],
+)
+def test_generic_update_cannot_downgrade_a_locked_term(
+    temp_db_path: Path,
+    updates: dict[str, object],
+) -> None:
+    init_db(temp_db_path)
+    term_id = put_glossary_term(temp_db_path, 6, "锁定状态", "khóa", locked=1)
+
+    with pytest.raises(Exception) as exc:
+        update_glossary_term(temp_db_path, term_id, **updates)
+
+    _assert_conflict(exc, "invalid_transition")
+
+
+def test_unlock_only_transitions_a_valid_locked_term(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    pending_id = put_glossary_term(temp_db_path, 6, "待审解锁", "chờ", approved=0)
+    locked_id = put_glossary_term(temp_db_path, 6, "损坏锁", "khóa", locked=1)
+    with get_connection(temp_db_path) as conn:
+        conn.execute("UPDATE glossary_terms SET target_term = '' WHERE id = ?", (locked_id,))
+        conn.commit()
+
+    assert not set_glossary_term_locked(temp_db_path, pending_id, False)
+    with pytest.raises(Exception) as exc:
+        set_glossary_term_locked(temp_db_path, locked_id, False)
+
+    _assert_conflict(exc, "target_required")
+    with get_connection(temp_db_path) as conn:
+        assert _state(conn, "待审解锁") == ("NEEDS_REVIEW", 0, 0)
+        assert _state(conn, "损坏锁") == ("LOCKED", 1, 1)
+
+
+def test_generic_unlock_rejects_an_already_approved_term(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    term_id = put_glossary_term(temp_db_path, 6, "已批准", "đã duyệt")
+
+    with pytest.raises(Exception) as exc:
+        update_glossary_term(temp_db_path, term_id, locked=0)
+
+    _assert_conflict(exc, "invalid_transition")
+
+
+def test_existing_pending_blank_upsert_cannot_become_approved(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    term_id = put_glossary_term(temp_db_path, 6, "空白更新", "", approved=0)
+
+    assert put_glossary_term(temp_db_path, 6, "空白更新", "", approved=1) == term_id
+
+    with get_connection(temp_db_path) as conn:
+        assert _state(conn, "空白更新") == ("CONFLICT", 0, 0)
+
+
 def test_approve_and_lock_refuse_unresolved_same_scope_normalized_target_conflict(temp_db_path: Path) -> None:
     init_db(temp_db_path)
     with get_connection(temp_db_path) as conn:
@@ -420,6 +496,35 @@ def test_history_failure_rolls_back_term_mutation(temp_db_path: Path) -> None:
     with get_connection(temp_db_path) as conn:
         after = dict(conn.execute("SELECT * FROM glossary_terms WHERE id = ?", (term_id,)).fetchone())
     assert after == before
+
+
+def test_history_snapshots_exclude_unbounded_content_fields(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    secret = "private-context-" + "x" * 5000
+    term_id = put_glossary_term(
+        temp_db_path,
+        12,
+        "隐私",
+        "riêng tư",
+        notes_vi=secret,
+        alternatives=secret,
+        source_context=secret,
+    )
+    update_glossary_term(temp_db_path, term_id, notes_vi=secret + "-updated")
+
+    with get_connection(temp_db_path) as conn:
+        rows = conn.execute(
+            "SELECT before_json, after_json FROM glossary_history WHERE term_id = ? ORDER BY id",
+            (term_id,),
+        ).fetchall()
+
+    assert len(rows) == 2
+    for row in rows:
+        assert secret not in row["before_json"]
+        assert secret not in row["after_json"]
+        assert len(row["before_json"]) < 1024
+        assert len(row["after_json"]) < 1024
+        assert "source_context" not in json.loads(row["after_json"])
 
 
 def test_archive_hides_old_readers_restore_api_recovers_and_locked_tuple_stays_compatible(

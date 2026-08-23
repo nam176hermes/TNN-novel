@@ -27,7 +27,11 @@ from app.database.db import (
     get_chapter_by_id,
     get_connection,
 )
-from app.database.glossary_repository import GlossaryRepository
+from app.database.glossary_repository import (
+    GlossaryRepository,
+    GlossaryStateConflict,
+    normalize_source_key,
+)
 from app.mobile_api.dependencies import get_db_path
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
@@ -454,63 +458,64 @@ class GlossaryService:
         updated = 0
         skipped = 0
         chapter_number = int(chapter.get("chapter_number") or 0)
-        with get_connection(self.db_path) as conn:
-            for candidate in candidates:
-                source = str(candidate["source_term"])
-                existing = conn.execute(
-                    "SELECT id, review_status FROM glossary_terms WHERE book_id = ? AND source_term = ?",
-                    (book_id, source),
-                ).fetchone()
-                if existing and str(existing["review_status"] or "").upper() in {"APPROVED", "LOCKED", "REJECTED"}:
-                    skipped += 1
-                    continue
-                if existing:
-                    conn.execute(
-                        """
-                        UPDATE glossary_terms
-                        SET occurrence_count = occurrence_count + 1,
-                            last_seen = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP,
-                            source_context = COALESCE(NULLIF(?, ''), source_context),
-                            review_status = CASE
-                                WHEN review_status IS NULL OR review_status = '' THEN 'NEEDS_REVIEW'
-                                ELSE review_status
-                            END
-                        WHERE id = ?
-                        """,
-                        (candidate.get("source_context") or "", existing["id"]),
-                    )
-                    updated += 1
-                    continue
-                conn.execute(
+        for candidate in candidates:
+            source = str(candidate["source_term"])
+            source_key = normalize_source_key(source)
+            with get_connection(self.db_path) as conn:
+                rows = conn.execute(
                     """
-                    INSERT INTO glossary_terms
-                    (book_id, source_term, target_term, category, confidence, approved, mode,
-                     term_type, first_seen_chapter_id, first_seen_chapter_number,
-                     review_status, source_context, occurrence_count, last_seen, updated_at)
-                    VALUES (?, ?, '', ?, ?, 0, 'translate', ?, ?, ?, 'NEEDS_REVIEW', ?, 1,
-                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    SELECT id, target_term, review_status, approved, locked, archived_at
+                    FROM glossary_terms
+                    WHERE book_id = ? AND source_key = ?
+                    ORDER BY id
                     """,
-                    (
-                        book_id,
-                        source,
-                        candidate.get("category") or candidate.get("term_type") or "other",
-                        float(candidate.get("confidence") or 0.5),
-                        normalize_term_type(candidate.get("term_type")),
-                        chapter_id,
-                        chapter_number,
-                        candidate.get("source_context") or "",
-                    ),
+                    (book_id, source_key),
+                ).fetchall()
+            if len(rows) > 1 or (
+                rows
+                and (
+                    rows[0]["archived_at"]
+                    or (rows[0]["review_status"], rows[0]["approved"], rows[0]["locked"])
+                    != ("NEEDS_REVIEW", 0, 0)
                 )
+            ):
+                skipped += 1
+                continue
+            put_glossary_term(
+                self.db_path,
+                book_id,
+                source,
+                str(rows[0]["target_term"] or "") if rows else "",
+                category=candidate.get("category") or candidate.get("term_type") or "other",
+                confidence=float(candidate.get("confidence") or 0.5),
+                approved=0,
+                mode="translate",
+                term_type=normalize_term_type(candidate.get("term_type")),
+                first_seen_chapter_id=chapter_id,
+                first_seen_chapter_number=chapter_number,
+                review_status="NEEDS_REVIEW",
+                source_context=candidate.get("source_context") or "",
+                actor="deterministic-extractor",
+                request_id=f"chapter:{chapter_id}",
+            )
+            if rows:
+                updated += 1
+            else:
                 created += 1
-            conn.commit()
         return {"created": created, "updated": updated, "skipped": skipped, "candidates": candidates}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""
         return get_low_coverage_chapters(self.db_path, book_id, threshold)
 
-    def import_glossary(self, data: list[dict], format: str = "json") -> dict:
+    def import_glossary(
+        self,
+        data: list[dict],
+        format: str = "json",
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
         """Import glossary from JSON or CSV."""
         added = 0
         updated = 0
@@ -533,22 +538,29 @@ class GlossaryService:
 
                 if existing:
                     # Update existing
-                    self.update_term(existing["id"], {
-                        "target_term": item.get("target_term", existing["target_term"]),
-                        "category": item.get("category", existing.get("category", "term")),
-                        "mode": item.get("mode", existing.get("mode", "translate")),
-                        "pinyin": item.get("pinyin", existing.get("pinyin", "")),
-                        "notes_vi": item.get("notes_vi", existing.get("notes_vi", "")),
-                        "variants": item.get("variants", existing.get("variants", "")),
-                        # Keep existing approved status unless explicitly set
-                        "approved": item.get("approved", existing.get("approved", 1)),
-                    })
+                    self.update_term(
+                        existing["id"],
+                        {
+                            "target_term": item.get("target_term", existing["target_term"]),
+                            "category": item.get("category", existing.get("category", "term")),
+                            "mode": item.get("mode", existing.get("mode", "translate")),
+                            "pinyin": item.get("pinyin", existing.get("pinyin", "")),
+                            "notes_vi": item.get("notes_vi", existing.get("notes_vi", "")),
+                            "variants": item.get("variants", existing.get("variants", "")),
+                            # Keep existing approved status unless explicitly set
+                            "approved": item.get("approved", existing.get("approved", 1)),
+                        },
+                        actor=actor,
+                        request_id=request_id,
+                    )
                     updated += 1
                 else:
                     # Add new
-                    self.add_term(item)
+                    self.add_term(item, actor=actor, request_id=request_id)
                     added += 1
 
+            except GlossaryStateConflict:
+                raise
             except Exception as exc:
                 errors.append(f"Failed to process item {item}: {exc}")
 

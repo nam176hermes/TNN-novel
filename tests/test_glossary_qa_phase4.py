@@ -109,8 +109,8 @@ def test_extract_chapter_terms_creates_reviewable_candidates(temp_db_path: Path,
     assert result["created"] >= 3
     with get_connection(temp_db_path) as conn:
         rows = conn.execute(
-            """SELECT source_term, review_status, first_seen_chapter_id,
-                      first_seen_chapter_number, source_context
+            """SELECT id, source_term, source_key, review_status, approved, locked, version,
+                      first_seen_chapter_id, first_seen_chapter_number, source_context
                FROM glossary_terms
                WHERE book_id = ?
                ORDER BY source_term""",
@@ -122,9 +122,31 @@ def test_extract_chapter_terms_creates_reviewable_candidates(temp_db_path: Path,
     assert "青云宗" in terms
     assert "筑基丹" in terms
     assert terms["青云宗"]["review_status"] == "NEEDS_REVIEW"
+    assert (terms["青云宗"]["approved"], terms["青云宗"]["locked"]) == (0, 0)
+    assert terms["青云宗"]["source_key"] == "青云宗"
+    assert terms["青云宗"]["version"] == 1
     assert terms["青云宗"]["first_seen_chapter_id"] == chapter_id
     assert terms["青云宗"]["first_seen_chapter_number"] == 3
     assert "青云宗" in terms["青云宗"]["source_context"]
+    with get_connection(temp_db_path) as conn:
+        history_count = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (terms["青云宗"]["id"],),
+        ).fetchone()[0]
+    assert history_count == 1
+
+    service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        updated = conn.execute(
+            "SELECT version, occurrence_count FROM glossary_terms WHERE id = ?",
+            (terms["青云宗"]["id"],),
+        ).fetchone()
+        history_count = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (terms["青云宗"]["id"],),
+        ).fetchone()[0]
+    assert tuple(updated) == (2, 2)
+    assert history_count == 2
 
 
 def test_extraction_does_not_overwrite_approved_glossary_translation(temp_db_path: Path, tmp_path: Path) -> None:

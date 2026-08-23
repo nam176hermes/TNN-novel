@@ -742,7 +742,7 @@ def test_glossary_occurrence_count_tracks_repeated_terms(temp_db_path: Path):
     assert row[1] == 0
 
 
-def test_auto_approve_glossary(temp_db_path: Path):
+def test_auto_approve_glossary_leaves_candidates_pending(temp_db_path: Path):
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Test Book")
 
@@ -751,12 +751,13 @@ def test_auto_approve_glossary(temp_db_path: Path):
     put_glossary_term(temp_db_path, book_id, "灵兽", "linh thú", mode="", approved=0)
 
     count = auto_approve_glossary(temp_db_path, min_occurrences=3, book_id=book_id)
-    assert count == 1
+    assert count == 0
 
     conn = get_connection(temp_db_path)
-    row = conn.execute("SELECT approved, mode FROM glossary_terms WHERE source_term = '灵兽'").fetchone()
-    assert row[0] == 1
-    assert row[1] == "translate"
+    row = conn.execute(
+        "SELECT review_status, approved, locked, mode FROM glossary_terms WHERE source_term = '灵兽'"
+    ).fetchone()
+    assert tuple(row) == ("NEEDS_REVIEW", 0, 0, "")
 
 
 def test_get_glossary_conflicts(temp_db_path: Path):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from app.database.glossary_repository import GlossaryStateConflict
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
     GlossaryTermCreate,
@@ -22,6 +23,13 @@ def _mutation_metadata(request: Request) -> tuple[str, str]:
     user = getattr(request.state, "user", {})
     request_id = request.headers.get("X-Request-ID", "") or request.headers.get("X-Correlation-ID", "")
     return str(user.get("username") or ""), request_id
+
+
+def _state_mutation(call):
+    try:
+        return call()
+    except GlossaryStateConflict as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from None
 
 
 @router.get("")
@@ -144,7 +152,9 @@ async def add_term(
 ):
     """Add a new glossary term."""
     actor, request_id = _mutation_metadata(request)
-    term_id = svc.add_term(term.model_dump(), actor=actor, request_id=request_id)
+    term_id = _state_mutation(
+        lambda: svc.add_term(term.model_dump(), actor=actor, request_id=request_id)
+    )
     return {"id": term_id, "message": "Term added"}
 
 
@@ -157,11 +167,13 @@ async def update_term(
 ):
     """Update a glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.update_term(
-        term_id,
-        update.model_dump(exclude_none=True),
-        actor=actor,
-        request_id=request_id,
+    success = _state_mutation(
+        lambda: svc.update_term(
+            term_id,
+            update.model_dump(exclude_none=True),
+            actor=actor,
+            request_id=request_id,
+        )
     )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
@@ -176,7 +188,9 @@ async def lock_term(
 ):
     """Lock a glossary term so translation prompts treat it as non-negotiable."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.set_term_locked(term_id, True, actor=actor, request_id=request_id)
+    success = _state_mutation(
+        lambda: svc.set_term_locked(term_id, True, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term locked"}
@@ -190,7 +204,9 @@ async def unlock_term(
 ):
     """Unlock a glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.set_term_locked(term_id, False, actor=actor, request_id=request_id)
+    success = _state_mutation(
+        lambda: svc.set_term_locked(term_id, False, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term unlocked"}
@@ -204,10 +220,12 @@ async def delete_term(
 ):
     """Delete a glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.delete_term(
-        term_id,
-        actor=actor,
-        request_id=request_id,
+    success = _state_mutation(
+        lambda: svc.delete_term(
+            term_id,
+            actor=actor,
+            request_id=request_id,
+        )
     )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
@@ -230,10 +248,12 @@ async def restore_term(
 ):
     """Restore an archived glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.restore_term(
-        term_id,
-        actor=actor,
-        request_id=request_id,
+    success = _state_mutation(
+        lambda: svc.restore_term(
+            term_id,
+            actor=actor,
+            request_id=request_id,
+        )
     )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
@@ -248,7 +268,9 @@ async def approve_term(
 ):
     """Approve a pending glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.approve_term(term_id, actor=actor, request_id=request_id)
+    success = _state_mutation(
+        lambda: svc.approve_term(term_id, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term approved"}
@@ -262,7 +284,9 @@ async def reject_term(
 ):
     """Reject a pending glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = svc.reject_term(term_id, actor=actor, request_id=request_id)
+    success = _state_mutation(
+        lambda: svc.reject_term(term_id, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term rejected"}
@@ -275,7 +299,10 @@ async def import_glossary(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Import glossary from JSON."""
-    result = svc.import_glossary(data)
+    actor, request_id = _mutation_metadata(request)
+    result = _state_mutation(
+        lambda: svc.import_glossary(data, actor=actor, request_id=request_id)
+    )
     record_audit_event(
         event_type="import_complete",
         severity="info",

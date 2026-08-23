@@ -143,3 +143,56 @@ async def test_glossary_export_includes_review_metadata(glossary_api_db: Path) -
     assert term["review_status"] == "LOCKED"
     assert term["locked"] == 1
     assert term["source_context"] == "第十章"
+
+
+@pytest.mark.asyncio
+async def test_glossary_api_maps_state_conflict_to_sanitized_409(glossary_api_db: Path) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    term_id = put_glossary_term(glossary_api_db, book_id, "锁定", "khóa", locked=1)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        conflict = await client.post(f"/api/glossary/terms/{term_id}/reject", headers=headers)
+        missing = await client.post("/api/glossary/terms/999999/approve", headers=headers)
+
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": {"code": "locked_term"}}
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_glossary_import_history_keeps_authenticated_mutation_metadata(glossary_api_db: Path) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    existing_id = put_glossary_term(glossary_api_db, book_id, "旧词", "cũ", approved=0)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        headers["X-Request-ID"] = "req-import"
+        response = await client.post(
+            "/api/glossary/import",
+            json=[
+                {"book_id": book_id, "source_term": "旧词", "target_term": "mới", "approved": 0},
+                {"book_id": book_id, "source_term": "新词", "target_term": "từ mới", "approved": 0},
+            ],
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"added": 1, "updated": 1, "errors": []}
+    with get_connection(glossary_api_db) as conn:
+        new_id = conn.execute(
+            "SELECT id FROM glossary_terms WHERE book_id = ? AND source_term = '新词'",
+            (book_id,),
+        ).fetchone()["id"]
+        history = conn.execute(
+            """
+            SELECT term_id, actor, request_id FROM glossary_history
+            WHERE term_id IN (?, ?) ORDER BY id DESC LIMIT 2
+            """,
+            (existing_id, new_id),
+        ).fetchall()
+    assert {row["term_id"] for row in history} == {existing_id, new_id}
+    assert all(row["actor"] == mobile_settings.admin_username for row in history)
+    assert all(row["request_id"] == "req-import" for row in history)
