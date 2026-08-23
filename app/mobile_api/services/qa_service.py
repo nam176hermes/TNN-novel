@@ -7,10 +7,10 @@ from typing import Protocol
 
 from app.database.db import (
     get_qa_report as db_get_qa_report,
-    list_glossary,
     list_qa_reports,
     save_qa_report,
 )
+from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
 
 
 class ChapterContentReader(Protocol):
@@ -197,13 +197,22 @@ class QAService:
             return report
         return None
 
-    def run_deterministic_qa(self, book_id: int, chapter_id: int, job_id: str = "") -> dict:
+    def run_deterministic_qa(
+        self,
+        book_id: int,
+        chapter_id: int,
+        job_id: str = "",
+        effective_glossary: EffectiveGlossary | None = None,
+    ) -> dict:
         """Run deterministic chapter QA without calling an LLM provider."""
         source_text = self.pipeline.get_chapter_source(chapter_id) or ""
         translated_text = self.pipeline.get_chapter_translation(chapter_id) or ""
         if not translated_text:
             raise ValueError(f"No translation for chapter {chapter_id}")
-        glossary_terms = list_glossary(self.pipeline.db_path, book_id)
+        glossary_terms = (
+            effective_glossary
+            or resolve_effective_glossary(self.pipeline.db_path, book_id)
+        ).locked_terms
         report = build_deterministic_chapter_qa_report(
             book_id=book_id,
             chapter_id=chapter_id,
@@ -255,7 +264,7 @@ class QAService:
                 chapter_id=chapter_id,
                 source_text=source_text,
                 translated_text=translated_text,
-                glossary_terms=list_glossary(self.pipeline.db_path, book_id),
+                glossary_terms=resolve_effective_glossary(self.pipeline.db_path, book_id).locked_terms,
             )
             report.setdefault("issues", [])
             report["issues"] = [*report.get("issues", []), *deterministic.get("issues", [])]

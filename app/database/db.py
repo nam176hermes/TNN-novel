@@ -15,12 +15,12 @@ from app.database import auth_repository as _auth_repository
 from app.database import operations_repository as _operations_repository
 from app.database import reader_repository as _reader_repository
 from app.database.connection import get_connection
+from app.database.glossary_resolver import resolve_effective_glossary
 from app.database.schema import SCHEMA
 from app.database.glossary_repository import GlossaryRepository, migrate_glossary_phase1
 from app.mobile_api.job_states import normalize_job_state
 from app.mobile_api.services.import_metadata import normalize_book_key
 from app.security.url_policy import UrlPolicyViolation, validate_fetch_url
-from app.translation.styleguide_config import get_locked_terms
 
 
 _utcnow_text = _auth_repository._utcnow_text
@@ -57,7 +57,7 @@ list_reader_xray_entities = _reader_repository.list_reader_xray_entities
 list_reader_timeline_events = _reader_repository.list_reader_timeline_events
 
 
-CURRENT_SCHEMA_VERSION = "2026-07-14-import-job-persistence-phase5"
+CURRENT_SCHEMA_VERSION = "2026-08-23-glossary-phase2-resolver"
 
 
 @dataclass(frozen=True)
@@ -1147,6 +1147,8 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mobile_jobs_state ON mobile_jobs(state)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mobile_jobs_lease_expires_at ON mobile_jobs(lease_expires_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mobile_jobs_owner_user_id ON mobile_jobs(owner_user_id)")
+
+    _add_column_if_missing(conn, "style_profiles", "revision INTEGER NOT NULL DEFAULT 1")
 
     conn.execute(
         """
@@ -4547,80 +4549,9 @@ def sort_glossary_terms(terms: list[dict]) -> list[dict]:
 
 # ── Glossary ───────────────────────────────────────────────────────────────
 
-def _split_glossary_variants(variants: str | None) -> list[str]:
-    if not variants:
-        return []
-    normalized = variants
-    for separator in ("|", "/", ",", "，", ";", "；", "\n", "\r"):
-        normalized = normalized.replace(separator, "|")
-    seen: set[str] = set()
-    result: list[str] = []
-    for variant in (part.strip() for part in normalized.split("|")):
-        if variant and variant not in seen:
-            seen.add(variant)
-            result.append(variant)
-    return result
-
-
-def _styleguide_locked_term_row(term: dict, index: int = 0) -> dict:
-    term_type = str(term.get("term_type") or "term").strip() or "term"
-    return {
-        "id": -100000 - index,
-        "book_id": 0,
-        "source_term": str(term.get("source") or "").strip(),
-        "target_term": str(term.get("target") or "").strip(),
-        "category": term_type,
-        "approved": 1,
-        "mode": str(term.get("mode") or "translate").strip() or "translate",
-        "pinyin": str(term.get("pinyin") or "").strip(),
-        "notes_vi": str(term.get("note") or "").strip(),
-        "variants": str(term.get("variants") or "").strip(),
-        "occurrence_count": 0,
-        "priority": int(term.get("priority") or 0),
-        "locked": 1,
-        "genre": str(term.get("genre") or "").strip(),
-        "term_type": term_type,
-    }
-
-
-def _styleguide_locked_term_rows(genre: str | None = None) -> list[dict]:
-    rows: list[dict] = []
-    for index, term in enumerate(get_locked_terms()):
-        row = _styleguide_locked_term_row(term, index)
-        if not row["source_term"] or not row["target_term"]:
-            continue
-        if genre and row["genre"] and row["genre"] != genre:
-            continue
-        rows.append(row)
-    return rows
-
-
 def load_glossary(db_path: Path, book_id: int = 0) -> dict[str, str]:
-    """Load approved translate-mode glossary terms for forced substitution.
-
-    Only returns terms with mode='translate'. Terms with mode='context' or
-    mode='transliterate' are handled separately (prompt context / name map).
-    """
-    glossary: dict[str, str] = {}
-    for term in _styleguide_locked_term_rows():
-        if term["mode"] != "translate":
-            continue
-        glossary[term["source_term"]] = term["target_term"]
-        for variant in _split_glossary_variants(term.get("variants")):
-            glossary.setdefault(variant, term["target_term"])
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """SELECT source_term, target_term, variants FROM glossary_terms
-               WHERE book_id IN (0, ?) AND approved = 1 AND mode = 'translate'
-                 AND COALESCE(archived_at, '') = ''
-               ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC""",
-            (book_id,),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+    """Compatibility wrapper for effective exact translate terms."""
+    return dict(resolve_effective_glossary(db_path, book_id).translate_mapping)
 
 
 def put_glossary_term(
@@ -4741,40 +4672,11 @@ def load_locked_glossary_terms(
     book_id: int = 0,
     genre: str | None = None,
 ) -> list[dict]:
-    """Load approved locked glossary terms for prompt enforcement."""
-    with get_connection(db_path) as conn:
-        params: list[object] = [book_id]
-        genre_clause = ""
-        if genre:
-            genre_clause = "AND (genre = '' OR genre = ?)"
-            params.append(genre)
-        rows = conn.execute(
-            f"""
-            SELECT * FROM glossary_terms
-            WHERE book_id IN (0, ?)
-              AND approved = 1
-              AND locked = 1
-              AND COALESCE(archived_at, '') = ''
-              {genre_clause}
-            ORDER BY book_id DESC, priority DESC, LENGTH(source_term) DESC
-            """,
-            params,
-        ).fetchall()
-        db_terms = [dict(row) for row in rows]
-    seen_sources = {str(term.get("source_term") or "") for term in db_terms}
-    combined = db_terms + [
-        term for term in _styleguide_locked_term_rows(genre=genre)
-        if term["source_term"] not in seen_sources
-    ]
-    combined.sort(
-        key=lambda term: (
-            int(term.get("book_id") or 0),
-            int(term.get("priority") or 0),
-            len(str(term.get("source_term") or "")),
-        ),
-        reverse=True,
-    )
-    return combined
+    """Compatibility wrapper for effective exact locked terms."""
+    resolved = resolve_effective_glossary(db_path, book_id, style_profile_id=genre)
+    if genre:
+        return list(resolved.locked_terms)
+    return [term for term in resolved.exact_terms if int(term.get("locked") or 0) == 1]
 
 
 def select_prompt_glossary_terms(
@@ -4785,38 +4687,14 @@ def select_prompt_glossary_terms(
     max_terms: int = 40,
     max_chars: int = 2200,
 ) -> list[dict]:
-    """Select a bounded, deterministic glossary subset for prompt injection.
-
-    Rejected/pending terms are excluded. Book-specific rows naturally override
-    global rows because they sort before global rows for the same source term.
-    """
+    """Select a bounded, deterministic subset from the effective prompt view."""
     source_text = source_text or ""
     selected: list[dict] = []
     used_chars = 0
     seen_sources: set[str] = set()
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM glossary_terms
-            WHERE book_id IN (0, ?)
-              AND approved = 1
-              AND COALESCE(review_status, '') != 'REJECTED'
-              AND source_term != ''
-              AND target_term != ''
-              AND COALESCE(archived_at, '') = ''
-            ORDER BY
-              locked DESC,
-              book_id DESC,
-              priority DESC,
-              confidence DESC,
-              occurrence_count DESC,
-              LENGTH(source_term) DESC,
-              source_term ASC
-            """,
-            (book_id,),
-        ).fetchall()
-    for row in rows:
-        term = dict(row)
+    for term in resolve_effective_glossary(db_path, book_id).prompt_terms:
+        if term.get("styleguide"):
+            continue
         source = str(term.get("source_term") or "")
         target = str(term.get("target_term") or "")
         if source in seen_sources:
@@ -4846,51 +4724,13 @@ def set_glossary_term_locked(
 
 
 def load_glossary_by_mode(db_path: Path, book_id: int = 0, mode: str = "translate") -> dict[str, str]:
-    """Load glossary filtered by mode (translate/context/transliterate)."""
-    glossary: dict[str, str] = {}
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT source_term, target_term, variants FROM glossary_terms
-            WHERE book_id IN (0, ?) AND approved = 1 AND mode = ?
-              AND COALESCE(archived_at, '') = ''
-            ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC
-            """,
-            (book_id, mode),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+    """Compatibility wrapper for one effective glossary mode."""
+    return resolve_effective_glossary(db_path, book_id).mapping_for_mode(mode)
 
 
 def load_glossary_names(db_path: Path, book_id: int = 0) -> dict[str, str]:
-    """Load transliteration / name map for use in the translation prompt.
-
-    Includes all name-related categories:
-    - ho_ten_pho_bien: common Vietnamese names
-    - pntt_ten_rieng: book-specific character names (e.g. Phàm Nhân Tu Tiên)
-    - Any term with mode='transliterate'
-    """
-    glossary: dict[str, str] = {}
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT source_term, target_term, variants FROM glossary_terms
-            WHERE book_id IN (0, ?) AND approved = 1
-              AND COALESCE(archived_at, '') = ''
-              AND (category IN ('ho_ten_pho_bien', 'pntt_ten_rieng')
-                   OR mode = 'transliterate')
-            ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC
-            """,
-            (book_id,),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+    """Compatibility wrapper for effective exact transliterations."""
+    return dict(resolve_effective_glossary(db_path, book_id).name_mapping)
 
 
 # ── Summaries ──────────────────────────────────────────────────────────────
@@ -5040,9 +4880,7 @@ def glossary_coverage(db_path: Path, book_id: int, source_text: str) -> dict:
         total_chars: total chars in source text
         coverage_pct: percentage of text covered by glossary terms
     """
-    glossary = load_glossary(db_path, book_id)
-    names = load_glossary_names(db_path, book_id)
-    all_terms = {**glossary, **names}
+    all_terms = resolve_effective_glossary(db_path, book_id).prompt_mapping
 
     hits = []
     matched_spans: list[tuple[int, int]] = []

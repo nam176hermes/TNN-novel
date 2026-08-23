@@ -15,16 +15,27 @@ from typing import Optional
 from app.database.db import get_connection
 
 
-def _make_cache_key(text: str, source_lang: str, target_lang: str, model: str) -> str:
-    fingerprint = f"{text}:{source_lang}:{target_lang}:{model}"
+def _make_cache_key(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: str,
+    glossary_fingerprint: str = "",
+) -> str:
+    fingerprint = f"{text}:{source_lang}:{target_lang}:{model}:{glossary_fingerprint}"
     return "tcache_" + hashlib.md5(fingerprint.encode("utf-8")).hexdigest()
 
 
 def get_cached_translation(
-    db_path: Path, text: str, source_lang: str, target_lang: str, model: str
+    db_path: Path,
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: str,
+    glossary_fingerprint: str = "",
 ) -> Optional[str]:
     """Return cached translation or None."""
-    key = _make_cache_key(text, source_lang, target_lang, model)
+    key = _make_cache_key(text, source_lang, target_lang, model, glossary_fingerprint)
     with get_connection(db_path) as conn:
         row = conn.execute(
             "SELECT content, expiry_ts FROM translation_cache WHERE cache_key = ?", (key,)
@@ -44,10 +55,17 @@ def get_cached_translation(
 
 
 def set_cached_translation(
-    db_path: Path, text: str, source_lang: str, target_lang: str, model: str, content: str, ttl_days: int = 7
+    db_path: Path,
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: str,
+    content: str,
+    ttl_days: int = 7,
+    glossary_fingerprint: str = "",
 ) -> None:
     """Store translation in cache."""
-    key = _make_cache_key(text, source_lang, target_lang, model)
+    key = _make_cache_key(text, source_lang, target_lang, model, glossary_fingerprint)
     compressed = gzip.compress(content.encode("utf-8"))
     expiry_ts = time.time() + ttl_days * 86400
     with get_connection(db_path) as conn:

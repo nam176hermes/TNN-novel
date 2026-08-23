@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS style_profiles (
     preferred_terms TEXT DEFAULT '',
     banned_modern_terms TEXT DEFAULT '',
     prompt_rules TEXT DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
     is_default INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP

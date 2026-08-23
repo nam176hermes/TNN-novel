@@ -36,9 +36,6 @@ from app.database.db import (
     get_provider_defaults,
     get_reader_dictionary_cache,
     get_reader_ai_cache,
-    load_glossary,
-    load_glossary_names,
-    list_glossary,
     list_chapters,
     list_model_providers,
     list_reader_annotations,
@@ -58,6 +55,7 @@ from app.database.db import (
     upsert_reader_ai_cache,
     upsert_reader_dictionary_cache,
 )
+from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
 from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
 from app.mobile_api.services.content_file_service import ContentFileService
@@ -2684,7 +2682,10 @@ class PipelineService:
         if cached:
             return cached
 
-        fallback_terms = _matching_reader_terms(load_glossary(self.db_path, book_id), selected_text)
+        fallback_terms = _matching_reader_terms(
+            resolve_effective_glossary(self.db_path, book_id).prompt_mapping,
+            selected_text,
+        )
         provider_options = self._reader_ai_provider_options()
         raw_payload: dict = {}
         if provider_options:
@@ -2743,10 +2744,7 @@ class PipelineService:
             list_chapters(self.db_path, book_id),
             key=lambda item: int(item.get("chapter_number") or 0),
         )
-        glossary = {
-            **load_glossary(self.db_path, book_id),
-            **load_glossary_names(self.db_path, book_id),
-        }
+        glossary = resolve_effective_glossary(self.db_path, book_id).prompt_mapping
         candidates: dict[str, dict] = {}
         chapter_payloads: list[tuple[dict, list[str]]] = []
 
@@ -3897,7 +3895,7 @@ class PipelineService:
 
         glossary_sources = [
             _reader_dictionary_glossary_result(term)
-            for term in list_glossary(self.db_path, book_id)
+            for term in resolve_effective_glossary(self.db_path, book_id).dictionary_terms
         ]
         builtin_sources = _reader_dictionary_builtin_pack_results()
         file_sources = _reader_dictionary_file_pack_results(self.data_dir)
@@ -3952,7 +3950,7 @@ class PipelineService:
             current_chapter_number = int(chapter.get("chapter_number") or 0)
 
         offline_sources: list[dict] = []
-        glossary_terms = list_glossary(self.db_path, book_id)
+        glossary_terms = resolve_effective_glossary(self.db_path, book_id).dictionary_terms
         for term in glossary_terms:
             variants = _dictionary_split_variants(term.get("variants"))
             if _dictionary_query_matches(
@@ -4173,6 +4171,7 @@ class PipelineService:
         style_profile_id: str | None = None,
         chunk_size: int | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        effective_glossary: EffectiveGlossary | None = None,
     ) -> str:
         book = get_book_by_id(self.db_path, book_id)
         if not book:
@@ -4197,6 +4196,7 @@ class PipelineService:
             style_profile_id=style_profile_id,
             chunk_size=chunk_size,
             cancel_check=cancel_check,
+            effective_glossary=effective_glossary,
         )
         self.update_chapter_translation(chapter_id, translated)
         return translated
@@ -4212,6 +4212,7 @@ class PipelineService:
         chunk_size: int | None = None,
         stage_callback: Callable[[dict], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        effective_glossary: EffectiveGlossary | None = None,
     ) -> dict:
         preset = get_translation_preset(preset_id)
         effective_chunk_size = chunk_size if chunk_size is not None else preset.chunk_size
@@ -4266,6 +4267,7 @@ class PipelineService:
                 style_profile_id=style_profile_id,
                 chunk_size=effective_chunk_size,
                 cancel_check=cancel_check,
+                effective_glossary=effective_glossary,
             )
         except Exception as exc:
             notify_stage("translate", "failed", translate_options, stage_started_at, str(exc))
