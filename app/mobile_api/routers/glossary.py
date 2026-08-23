@@ -300,9 +300,7 @@ async def import_glossary(
 ):
     """Import glossary from JSON."""
     actor, request_id = _mutation_metadata(request)
-    result = _state_mutation(
-        lambda: svc.import_glossary(data, actor=actor, request_id=request_id)
-    )
+    result = svc.import_glossary(data, actor=actor, request_id=request_id)
     record_audit_event(
         event_type="import_complete",
         severity="info",

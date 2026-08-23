@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.database.db import add_book, add_chapter, get_connection, init_db, update_chapter_paths
+from app.database.db import (
+    add_book,
+    add_chapter,
+    get_connection,
+    init_db,
+    update_chapter_paths,
+    update_glossary_term,
+)
 from app.scheduler.daily_queue import (
     add_pending_glossary_term,
     approve_glossary_term,
@@ -71,3 +78,62 @@ def test_dashboard_glossary_helpers_use_canonical_state_history_and_archive(temp
     assert archived is not None and archived["archived_at"]
     assert actions == ["add", "add", "approve", "archive"]
     assert get_pending_glossary(temp_db_path, book_id) == []
+
+
+def test_dashboard_candidate_refresh_preserves_reviewer_metadata(temp_db_path: Path) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    add_pending_glossary_term(temp_db_path, book_id, "待审", "initial", category="term")
+    term_id = get_pending_glossary(temp_db_path, book_id)[0]["id"]
+    assert update_glossary_term(
+        temp_db_path,
+        term_id,
+        target_term="reviewed target",
+        category="reviewed category",
+        mode="context",
+        pinyin="reviewed pinyin",
+        notes_vi="reviewed notes",
+        variants="reviewed variants",
+        priority=77,
+        term_type="concept",
+    )
+
+    add_pending_glossary_term(
+        temp_db_path,
+        book_id,
+        "待审",
+        "background target",
+        category="background category",
+        confidence=0.1,
+    )
+
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            """
+            SELECT target_term, category, mode, pinyin, notes_vi, variants,
+                   priority, term_type, occurrence_count, version
+            FROM glossary_terms WHERE id = ?
+            """,
+            (term_id,),
+        ).fetchone()
+        actions = [
+            row["action"]
+            for row in conn.execute(
+                "SELECT action FROM glossary_history WHERE term_id = ? ORDER BY id",
+                (term_id,),
+            )
+        ]
+
+    assert tuple(term) == (
+        "reviewed target",
+        "reviewed category",
+        "context",
+        "reviewed pinyin",
+        "reviewed notes",
+        "reviewed variants",
+        77,
+        "concept",
+        2,
+        3,
+    )
+    assert actions == ["add", "update", "observe"]

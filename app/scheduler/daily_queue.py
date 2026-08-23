@@ -145,6 +145,7 @@ def add_pending_glossary_term(
         confidence=confidence,
         approved=0,
         review_status="NEEDS_REVIEW",
+        preserve_existing=True,
     )
 
 

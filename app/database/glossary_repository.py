@@ -232,6 +232,28 @@ class GlossaryRepository:
             rows = self._source_rows(conn, book_id, source_key)
             if len(rows) > 1:
                 raise GlossaryStateConflict("normalized_source_collision")
+            if rows and values["preserve_existing"]:
+                current = rows[0]
+                term_id = int(current["id"])
+                current_state = (current["review_status"], current["approved"], current["locked"])
+                if current["archived_at"] or current_state != ("NEEDS_REVIEW", 0, 0):
+                    return term_id
+                before = dict(current)
+                conn.execute(
+                    """
+                    UPDATE glossary_terms
+                    SET occurrence_count = occurrence_count + 1,
+                        last_seen = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP,
+                        version = version + 1
+                    WHERE id = ?
+                    """,
+                    (term_id,),
+                )
+                after = dict(self._row(conn, term_id))
+                self._log(conn, "observe", before, after, self._actor(actor), request_id)
+                conn.commit()
+                return term_id
             before = dict(rows[0]) if rows else {}
             if rows and rows[0]["archived_at"]:
                 raise GlossaryStateConflict("archived_term")

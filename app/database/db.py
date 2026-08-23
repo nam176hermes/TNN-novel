@@ -4647,6 +4647,7 @@ def put_glossary_term(
     actor: str = "",
     request_id: str = "",
     confidence: float = 1.0,
+    preserve_existing: bool = False,
 ) -> int:
     """Insert or update through the canonical glossary state machine."""
     return GlossaryRepository(db_path).put(
@@ -4670,6 +4671,7 @@ def put_glossary_term(
         review_status=review_status,
         source_context=source_context,
         confidence=confidence,
+        preserve_existing=preserve_existing,
         actor=actor,
         request_id=request_id,
     )

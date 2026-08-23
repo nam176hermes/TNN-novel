@@ -196,3 +196,39 @@ async def test_glossary_import_history_keeps_authenticated_mutation_metadata(glo
     assert {row["term_id"] for row in history} == {existing_id, new_id}
     assert all(row["actor"] == mobile_settings.admin_username for row in history)
     assert all(row["request_id"] == "req-import" for row in history)
+
+
+@pytest.mark.asyncio
+async def test_glossary_import_reports_later_conflict_after_committed_prefix(glossary_api_db: Path) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    locked_id = put_glossary_term(glossary_api_db, book_id, "锁定", "khóa", locked=1)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await auth_headers(client)
+        response = await client.post(
+            "/api/glossary/import",
+            json=[
+                {"book_id": book_id, "source_term": "先成功", "target_term": "thành công", "approved": 0},
+                {"book_id": book_id, "source_term": "锁定", "target_term": "khóa", "approved": 0},
+            ],
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "added": 1,
+        "updated": 0,
+        "errors": ["item 2: invalid_transition"],
+    }
+    with get_connection(glossary_api_db) as conn:
+        committed = conn.execute(
+            "SELECT version FROM glossary_terms WHERE book_id = ? AND source_term = '先成功'",
+            (book_id,),
+        ).fetchone()
+        locked = conn.execute(
+            "SELECT version, review_status, approved, locked FROM glossary_terms WHERE id = ?",
+            (locked_id,),
+        ).fetchone()
+    assert committed is not None and committed["version"] == 1
+    assert tuple(locked) == (1, "LOCKED", 1, 1)

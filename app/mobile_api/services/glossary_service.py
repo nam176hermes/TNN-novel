@@ -497,6 +497,7 @@ class GlossaryService:
                 source_context=candidate.get("source_context") or "",
                 actor="deterministic-extractor",
                 request_id=f"chapter:{chapter_id}",
+                preserve_existing=True,
             )
             if rows:
                 updated += 1
@@ -521,11 +522,11 @@ class GlossaryService:
         updated = 0
         errors = []
 
-        for item in data:
+        for item_number, item in enumerate(data, start=1):
             try:
                 # Validate required fields
                 if "source_term" not in item or "target_term" not in item:
-                    errors.append(f"Missing source_term or target_term in item: {item}")
+                    errors.append(f"item {item_number}: missing_required_fields")
                     continue
 
                 # Check if term exists
@@ -559,10 +560,10 @@ class GlossaryService:
                     self.add_term(item, actor=actor, request_id=request_id)
                     added += 1
 
-            except GlossaryStateConflict:
-                raise
-            except Exception as exc:
-                errors.append(f"Failed to process item {item}: {exc}")
+            except GlossaryStateConflict as exc:
+                errors.append(f"item {item_number}: {exc.code}")
+            except Exception:
+                errors.append(f"item {item_number}: invalid_item")
 
         return {"added": added, "updated": updated, "errors": errors}
 

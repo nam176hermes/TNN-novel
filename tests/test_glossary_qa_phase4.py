@@ -12,6 +12,7 @@ from app.database.db import (
     init_db,
     load_glossary,
     put_glossary_term,
+    update_glossary_term,
     update_chapter_paths,
 )
 import app.database.db as db
@@ -135,18 +136,45 @@ def test_extract_chapter_terms_creates_reviewable_candidates(temp_db_path: Path,
         ).fetchone()[0]
     assert history_count == 1
 
+    assert update_glossary_term(
+        temp_db_path,
+        terms["青云宗"]["id"],
+        target_term="reviewed target",
+        category="reviewed category",
+        mode="context",
+        pinyin="reviewed pinyin",
+        notes_vi="reviewed notes",
+        variants="reviewed variants",
+        priority=77,
+        term_type="concept",
+    )
     service.extract_chapter_terms(book_id, chapter_id)
     with get_connection(temp_db_path) as conn:
         updated = conn.execute(
-            "SELECT version, occurrence_count FROM glossary_terms WHERE id = ?",
+            """
+            SELECT version, occurrence_count, target_term, category, mode, pinyin,
+                   notes_vi, variants, priority, term_type
+            FROM glossary_terms WHERE id = ?
+            """,
             (terms["青云宗"]["id"],),
         ).fetchone()
         history_count = conn.execute(
             "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
             (terms["青云宗"]["id"],),
         ).fetchone()[0]
-    assert tuple(updated) == (2, 2)
-    assert history_count == 2
+    assert tuple(updated) == (
+        3,
+        2,
+        "reviewed target",
+        "reviewed category",
+        "context",
+        "reviewed pinyin",
+        "reviewed notes",
+        "reviewed variants",
+        77,
+        "concept",
+    )
+    assert history_count == 3
 
 
 def test_extraction_does_not_overwrite_approved_glossary_translation(temp_db_path: Path, tmp_path: Path) -> None:
