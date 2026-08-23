@@ -163,7 +163,7 @@ def test_extract_chapter_terms_creates_reviewable_candidates(temp_db_path: Path,
             (terms["青云宗"]["id"],),
         ).fetchone()[0]
     assert tuple(updated) == (
-        3,
+        2,
         2,
         "reviewed target",
         "reviewed category",
@@ -174,7 +174,7 @@ def test_extract_chapter_terms_creates_reviewable_candidates(temp_db_path: Path,
         77,
         "concept",
     )
-    assert history_count == 3
+    assert history_count == 2
 
 
 def test_extraction_does_not_overwrite_approved_glossary_translation(temp_db_path: Path, tmp_path: Path) -> None:

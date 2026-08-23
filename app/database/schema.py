@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS glossary_terms (
     notes_vi TEXT DEFAULT '',
     variants TEXT DEFAULT '',
     occurrence_count INTEGER DEFAULT 0,
+    chapter_count INTEGER DEFAULT 0,
     priority INTEGER DEFAULT 0,
     locked INTEGER DEFAULT 0,
     genre TEXT DEFAULT '',
@@ -224,6 +225,18 @@ CREATE TABLE IF NOT EXISTS glossary_term_evidence (
     evidence_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (term_id) REFERENCES glossary_terms(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_glossary_evidence_phase5_unique
+    ON glossary_term_evidence(term_id, chapter_id, extractor)
+    WHERE extractor IN ('deterministic-v2', 'hybrid-v1');
+
+CREATE TABLE IF NOT EXISTS book_glossary_settings (
+    book_id INTEGER PRIMARY KEY,
+    extraction_mode TEXT NOT NULL DEFAULT 'deterministic'
+        CHECK(extraction_mode IN ('deterministic', 'hybrid')),
+    provider_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS style_profiles (

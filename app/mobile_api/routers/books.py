@@ -10,6 +10,7 @@ from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
     BookCreate,
+    BookGlossarySettingsUpdate,
     BookUpdate,
     ParagraphPolishRequest,
     ReaderAnnotationCreate,
@@ -24,6 +25,7 @@ from app.mobile_api.schemas import (
     UserResponse,
 )
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.mobile_api.services.glossary_service import GlossaryService
 from app.mobile_api.upload_limits import read_upload_bytes_limited
 from app.storage.artifact_paths import ArtifactPathError, ResolutionStatus
 
@@ -67,6 +69,14 @@ def _safe_chapter_response(chapter: dict) -> dict:
     return payload
 
 
+def _glossary_settings_error(exc: ValueError) -> HTTPException:
+    code = str(exc)
+    return HTTPException(
+        status_code=404 if code == "book_not_found" else 422,
+        detail={"code": code},
+    )
+
+
 @router.get("/books", response_model=list[dict])
 async def list_books(
     pipeline: PipelineService = Depends(get_pipeline),
@@ -94,6 +104,33 @@ async def create_book(
         source_url=book.source_url,
     )
     return _safe_book_response(pipeline.get_book(book_id))
+
+
+@router.get("/books/{book_id}/glossary-settings", response_model=dict)
+async def get_book_glossary_settings(
+    book_id: int,
+    _current_user: UserResponse = Depends(get_current_user),
+):
+    try:
+        return GlossaryService().get_extraction_settings(book_id)
+    except ValueError as exc:
+        raise _glossary_settings_error(exc) from None
+
+
+@router.patch("/books/{book_id}/glossary-settings", response_model=dict)
+async def update_book_glossary_settings(
+    book_id: int,
+    update: BookGlossarySettingsUpdate,
+    _current_user: UserResponse = Depends(get_current_user),
+):
+    try:
+        return GlossaryService().update_extraction_settings(
+            book_id,
+            mode=update.mode,
+            provider_id=update.provider_id,
+        )
+    except ValueError as exc:
+        raise _glossary_settings_error(exc) from None
 
 
 @router.get("/books/{book_id}", response_model=dict)
@@ -610,6 +647,18 @@ async def update_chapter_translation(
     if not success:
         raise HTTPException(status_code=404, detail="Chapter not found")
     return {"message": "Translation updated"}
+
+
+@router.post("/books/{book_id}/chapters/{chapter_id}/glossary/re-extract", response_model=dict)
+async def reextract_chapter_glossary(
+    book_id: int,
+    chapter_id: int,
+    _current_user: UserResponse = Depends(get_current_user),
+):
+    try:
+        return GlossaryService().extract_chapter_terms(book_id, chapter_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail={"code": "chapter_not_found"}) from None
 
 
 @router.delete("/books/{book_id}/chapters/{chapter_id}/translation", response_model=dict)

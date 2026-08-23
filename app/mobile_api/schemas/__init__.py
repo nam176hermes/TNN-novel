@@ -127,6 +127,11 @@ class BookUpdate(BaseModel):
     source_url: str | None = None
 
 
+class BookGlossarySettingsUpdate(BaseModel):
+    mode: Literal["deterministic", "hybrid"]
+    provider_id: str = Field(default="", max_length=100)
+
+
 class BookResponse(BaseModel):
     id: int
     title: str

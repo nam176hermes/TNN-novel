@@ -1458,6 +1458,20 @@ export type GlossaryImportResult = {
   errors: string[];
 };
 
+export type BookGlossarySettings = {
+  book_id: number;
+  mode: 'deterministic' | 'hybrid';
+  provider_id: string;
+  max_candidates_per_chapter: 100;
+};
+
+export type GlossaryExtractionResult = {
+  created: number;
+  updated: number;
+  skipped: number;
+  warnings: Array<{ code: string; message: string }>;
+};
+
 export type Book = {
   id: number;
   title: string;

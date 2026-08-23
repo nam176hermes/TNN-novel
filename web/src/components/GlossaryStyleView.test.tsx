@@ -30,6 +30,43 @@ function props(overrides: Record<string, unknown> = {}) {
 }
 
 describe('GlossaryStyleView', () => {
+  it('loads and saves per-book extraction settings and re-extracts the selected chapter', async () => {
+    const onLoadExtractionSettings = vi.fn().mockResolvedValue({
+      book_id: 42, max_candidates_per_chapter: 100, mode: 'deterministic', provider_id: '',
+    });
+    const onSaveExtractionSettings = vi.fn().mockResolvedValue({
+      book_id: 42, max_candidates_per_chapter: 100, mode: 'hybrid', provider_id: 'ollama',
+    });
+    const onReextractChapter = vi.fn().mockResolvedValue({
+      created: 1, updated: 0, skipped: 0, warnings: [],
+    });
+    render(<GlossaryStyleView {...props({
+      bookId: 42,
+      chapterId: 9,
+      onLoadExtractionSettings,
+      onReextractChapter,
+      onSaveExtractionSettings,
+      providers: [{
+        api_key_env: '', api_key_set: false, base_url: 'http://localhost:11434/v1',
+        cost_input_per_1m: 0, cost_output_per_1m: 0, enabled: 1, id: 'ollama', label: 'Ollama',
+        model: 'qwen', notes: '', supports_batch: 0, supports_streaming: 1, temperature: 0.3,
+        timeout_seconds: 180,
+      }],
+    })} />);
+
+    await userEvent.click(screen.getByText('Trích xuất thuật ngữ'));
+    expect(onLoadExtractionSettings).toHaveBeenCalledWith(42);
+    expect(await screen.findByLabelText('Chế độ trích xuất')).toHaveValue('deterministic');
+    await userEvent.selectOptions(screen.getByLabelText('Chế độ trích xuất'), 'hybrid');
+    await userEvent.selectOptions(screen.getByLabelText('Provider trích xuất'), 'ollama');
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu cài đặt trích xuất' }));
+    expect(onSaveExtractionSettings).toHaveBeenCalledWith(42, { mode: 'hybrid', provider_id: 'ollama' });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Trích xuất lại chương' }));
+    expect(onReextractChapter).toHaveBeenCalledWith(42, 9);
+    expect(await screen.findByRole('status')).toHaveTextContent('1 thuật ngữ mới');
+  });
+
   it('preserves blank target cells and treats an endpoint empty-scope metadata row as zero items', () => {
     const header = [
       'schema_version', 'scope', 'scope_book_id', 'id', 'book_id', 'source_term',

@@ -151,6 +151,7 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
         "source_key TEXT NOT NULL DEFAULT ''",
         "version INTEGER NOT NULL DEFAULT 0",
         "archived_at TEXT NOT NULL DEFAULT ''",
+        "chapter_count INTEGER NOT NULL DEFAULT 0",
     ):
         if definition.split()[0] not in columns:
             conn.execute(f"ALTER TABLE glossary_terms ADD COLUMN {definition}")
@@ -213,6 +214,33 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_evidence_term ON glossary_term_evidence(term_id, id)")
+    phase5_index = next(
+        (
+            row
+            for row in conn.execute("PRAGMA index_list(glossary_term_evidence)").fetchall()
+            if row["name"] == "idx_glossary_evidence_phase5_unique"
+        ),
+        None,
+    )
+    if phase5_index is not None and int(phase5_index["unique"] or 0) == 1:
+        conn.execute("DROP INDEX idx_glossary_evidence_phase5_unique")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_glossary_evidence_phase5_unique "
+        "ON glossary_term_evidence(term_id, chapter_id, extractor) "
+        "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS book_glossary_settings (
+            book_id INTEGER PRIMARY KEY,
+            extraction_mode TEXT NOT NULL DEFAULT 'deterministic'
+                CHECK(extraction_mode IN ('deterministic', 'hybrid')),
+            provider_id TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_terms_source_key ON glossary_terms(book_id, source_key)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_glossary_terms_scope_status "
@@ -621,6 +649,184 @@ class GlossaryRepository:
             self._log(conn, action, before, after, self._actor(actor), request_id)
             conn.commit()
             return term_id
+
+    def record_extraction_candidates(
+        self,
+        *,
+        book_id: int,
+        chapter_id: int,
+        chapter_number: int,
+        extractor: str,
+        candidates: list[dict[str, Any]],
+        skip_source_keys: set[str] | None = None,
+    ) -> dict[str, int]:
+        """Persist bounded extraction evidence without inflating retry counts."""
+        if extractor not in {"deterministic-v2", "hybrid-v1"}:
+            raise ValueError("invalid_extractor")
+        skipped_keys = skip_source_keys or set()
+        created = updated = skipped = 0
+        actor = f"{extractor}-extractor"
+        request_id = f"chapter:{chapter_id}"
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for candidate in candidates:
+                source = " ".join(unicodedata.normalize("NFKC", str(candidate.get("source_term") or "")).split())
+                source_key = normalize_source_key(source)
+                if not source_key or source_key in skipped_keys:
+                    skipped += 1
+                    continue
+                rows = self._source_rows(conn, book_id, source_key)
+                if len(rows) > 1:
+                    skipped += 1
+                    continue
+                current = rows[0] if rows else None
+                if current is not None and current["archived_at"]:
+                    skipped += 1
+                    continue
+                if extractor == "hybrid-v1" and current is not None:
+                    if current["review_status"] in {"APPROVED", "LOCKED", "REJECTED"}:
+                        skipped += 1
+                        continue
+                    prior_evidence = conn.execute(
+                        "SELECT 1 FROM glossary_term_evidence "
+                        "WHERE term_id = ? AND chapter_id = ? LIMIT 1",
+                        (current["id"], chapter_id),
+                    ).fetchone()
+                    if prior_evidence is not None:
+                        skipped += 1
+                        continue
+
+                mention_count = max(0, int(candidate.get("mention_count") or 0))
+                target = str(candidate.get("target_term") or "").strip()
+                term_type = str(candidate.get("term_type") or "other").strip().lower() or "other"
+                evidence = {
+                    "evidence_types": sorted(
+                        {str(value) for value in candidate.get("evidence_types") or [] if str(value)}
+                    ),
+                    "mention_count": mention_count,
+                    "source_fingerprint": hashlib.sha256(
+                        f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
+                    ).hexdigest(),
+                    "title_match": bool(candidate.get("title_match")),
+                }
+                evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+                is_new = current is None
+                if is_new:
+                    conn.execute(
+                        """
+                        INSERT INTO glossary_terms
+                            (book_id, source_term, source_key, target_term, category, confidence,
+                             approved, mode, occurrence_count, chapter_count, locked, term_type,
+                             first_seen_chapter_id, first_seen_chapter_number, review_status,
+                             source_context, last_seen, updated_at, version, archived_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, 'translate', ?, 1, 0, ?, ?, ?,
+                                'NEEDS_REVIEW', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, '')
+                        """,
+                        (
+                            book_id,
+                            source,
+                            source_key,
+                            target,
+                            term_type,
+                            float(candidate.get("confidence") or 0.5),
+                            mention_count,
+                            term_type,
+                            chapter_id,
+                            chapter_number,
+                            str(candidate.get("source_context") or "")[:200],
+                        ),
+                    )
+                    term_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    current = self._row(conn, term_id)
+                    created += 1
+                else:
+                    term_id = int(current["id"])
+
+                evidence_row = conn.execute(
+                    "SELECT id, evidence_json FROM glossary_term_evidence "
+                    "WHERE term_id = ? AND chapter_id = ? AND extractor = ?",
+                    (term_id, chapter_id, extractor),
+                ).fetchone()
+                evidence_changed = evidence_row is None or evidence_row["evidence_json"] != evidence_json
+                if evidence_row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO glossary_term_evidence
+                            (term_id, book_id, chapter_id, extractor, evidence_type, evidence_json)
+                        VALUES (?, ?, ?, ?, 'chapter_observation', ?)
+                        """,
+                        (term_id, book_id, chapter_id, extractor, evidence_json),
+                    )
+                elif evidence_changed:
+                    conn.execute(
+                        "UPDATE glossary_term_evidence SET evidence_json = ?, evidence_type = 'chapter_observation' "
+                        "WHERE id = ?",
+                        (evidence_json, evidence_row["id"]),
+                    )
+
+                evidence_rows = conn.execute(
+                    "SELECT chapter_id, evidence_json FROM glossary_term_evidence "
+                    "WHERE term_id = ? AND extractor IN ('deterministic-v2', 'hybrid-v1')",
+                    (term_id,),
+                ).fetchall()
+                occurrence_count = 0
+                chapter_ids: set[int] = set()
+                for row in evidence_rows:
+                    try:
+                        payload = json.loads(str(row["evidence_json"] or "{}"))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        payload = {}
+                    value = payload.get("mention_count") if isinstance(payload, dict) else 0
+                    if type(value) is int and value >= 0:
+                        occurrence_count += value
+                    chapter_ids.add(int(row["chapter_id"] or 0))
+
+                before = dict(current)
+                status = str(current["review_status"])
+                target_conflict = (
+                    extractor == "hybrid-v1"
+                    and status in {"NEEDS_REVIEW", "CONFLICT"}
+                    and bool(str(current["target_term"] or "").strip())
+                    and bool(target)
+                    and str(current["target_term"]).strip() != target
+                )
+                row_changed = (
+                    int(current["occurrence_count"] or 0) != occurrence_count
+                    or int(current["chapter_count"] or 0) != len(chapter_ids)
+                    or (target_conflict and status != "CONFLICT")
+                )
+                if is_new:
+                    after = dict(self._row(conn, term_id))
+                    self._log(conn, "add", {}, after, actor, request_id)
+                elif row_changed:
+                    conn.execute(
+                        """
+                        UPDATE glossary_terms
+                        SET occurrence_count = ?, chapter_count = ?,
+                            review_status = CASE WHEN ? THEN 'CONFLICT' ELSE review_status END,
+                            approved = CASE WHEN ? THEN 0 ELSE approved END,
+                            locked = CASE WHEN ? THEN 0 ELSE locked END,
+                            updated_at = CURRENT_TIMESTAMP, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (
+                            occurrence_count,
+                            len(chapter_ids),
+                            int(target_conflict),
+                            int(target_conflict),
+                            int(target_conflict),
+                            term_id,
+                        ),
+                    )
+                    after = dict(self._row(conn, term_id))
+                    self._log(conn, "observe", before, after, actor, request_id)
+                if not is_new and evidence_changed:
+                    updated += 1
+                elif not is_new and not evidence_changed:
+                    skipped += 1
+            conn.commit()
+        return {"created": created, "updated": updated, "skipped": skipped}
 
     @staticmethod
     def _requested_update_state(current: sqlite3.Row, changes: dict[str, Any]) -> tuple[str, int, int]:

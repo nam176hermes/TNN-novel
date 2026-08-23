@@ -107,6 +107,7 @@ def call_openai_compatible_chat(
     temperature: float = 0.3,
     timeout: int = 180,
     max_retries: int = 2,
+    response_format: dict | None = None,
 ) -> dict:
     """Call an OpenAI-compatible chat completions endpoint."""
     stripped_api_key = api_key.strip()
@@ -114,15 +115,18 @@ def call_openai_compatible_chat(
 
     for attempt in range(max(0, max_retries) + 1):
         try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "stream": False,
+            }
+            if response_format is not None:
+                payload["response_format"] = response_format
             response = requests.post(
                 url,
                 headers={"Authorization": f"Bearer {stripped_api_key}"} if stripped_api_key else {},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "stream": False,
-                },
+                json=payload,
                 timeout=timeout,
             )
             response.raise_for_status()

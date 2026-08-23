@@ -5245,7 +5245,18 @@ class PipelineService:
                 from app.mobile_api.services.glossary_service import GlossaryService
                 from app.mobile_api.services.qa_service import QAService
 
-                GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
+                extraction = GlossaryService.from_db_path(self.db_path).extract_chapter_terms(
+                    book_id, chapter_id_for_followup
+                )
+                for warning in extraction.get("warnings") or []:
+                    warnings.append(
+                        {
+                            "type": "glossary_extraction_warning",
+                            "message": str(warning.get("message") or "Glossary extraction was skipped."),
+                            "chapter_number": int(item["chapter_number"]),
+                            "reason": str(warning.get("code") or "extraction_warning"),
+                        }
+                    )
                 if item.get("translated_final_path"):
                     QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
             except Exception:

@@ -1,6 +1,7 @@
 import type {
   AudiobookExportFormat,
   Book,
+  BookGlossarySettings,
   BookAudioPlaylistResponse,
   BookUpdate,
   ChapterApi,
@@ -31,6 +32,7 @@ import type {
   GlossaryImportItem,
   GlossaryImportPreview,
   GlossaryImportResult,
+  GlossaryExtractionResult,
   GlossaryMergePreview,
   ImportFileRequest,
   ImportJobAccepted,
@@ -1599,6 +1601,36 @@ export class ApiClient {
 
     const data = (await response.json()) as { results: TmSearchResult[] };
     return data.results;
+  }
+
+  async getBookGlossarySettings(bookId: number): Promise<BookGlossarySettings> {
+    const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/glossary-settings`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load glossary extraction settings');
+    return (await response.json()) as BookGlossarySettings;
+  }
+
+  async updateBookGlossarySettings(
+    bookId: number,
+    settings: Pick<BookGlossarySettings, 'mode' | 'provider_id'>,
+  ): Promise<BookGlossarySettings> {
+    const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/glossary-settings`, {
+      method: 'PATCH',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    });
+    await this.assertOk(response, 'Failed to update glossary extraction settings');
+    return (await response.json()) as BookGlossarySettings;
+  }
+
+  async reextractChapterGlossary(bookId: number, chapterId: number): Promise<GlossaryExtractionResult> {
+    const response = await this.fetcher(
+      `${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/glossary/re-extract`,
+      { method: 'POST', headers: this.headers() },
+    );
+    await this.assertOk(response, 'Failed to re-extract chapter glossary');
+    return (await response.json()) as GlossaryExtractionResult;
   }
 
   async getGlossaryTerms(bookId?: number, options: ApiRequestOptions = {}): Promise<GlossaryTerm[]> {

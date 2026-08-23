@@ -2,6 +2,7 @@ import { BookMarked, Search, ShieldCheck, Sparkles, UserRound, X } from 'lucide-
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { ApiError } from '../api/client';
 import type {
+  BookGlossarySettings,
   GlossaryFacets,
   GlossaryBulkAction,
   GlossaryBulkTermRef,
@@ -13,6 +14,8 @@ import type {
   GlossaryTerm,
   GlossaryTermDetail,
   GlossaryTermUpdate,
+  GlossaryExtractionResult,
+  Provider,
   StyleProfile,
 } from '../api/types';
 import type { LoadState } from '../state/types';
@@ -29,6 +32,8 @@ const fallbackQuery: GlossaryQuery = {
 type GlossaryImportPolicy = 'skip_conflicts' | 'reject_conflicts';
 
 export type GlossaryStyleViewProps = {
+  bookId?: number;
+  chapterId?: number;
   profiles: StyleProfile[];
   selectedProfileId: string;
   glossaryTerms: GlossaryTerm[];
@@ -50,6 +55,7 @@ export type GlossaryStyleViewProps = {
   onExport?(format: 'json' | 'csv'): void | Promise<void>;
   onLoadConflicts?(page?: number): Promise<GlossaryConflictPage>;
   onLoadTermDetail?(termId: number, options?: { signal?: AbortSignal }): Promise<GlossaryTermDetail>;
+  onLoadExtractionSettings?(bookId: number): Promise<BookGlossarySettings>;
   onLockToggle(termId: number, locked: boolean): void | Promise<void>;
   onPageChange?(page: number): void;
   onProfileChange(profileId: string): void;
@@ -57,9 +63,15 @@ export type GlossaryStyleViewProps = {
   onPreviewMerge?(canonicalId: number, duplicateIds: number[]): Promise<GlossaryMergePreview>;
   onQueryChange?(updates: Partial<GlossaryQuery>): void;
   onRejectTerm(termId: number): void | Promise<void>;
+  onReextractChapter?(bookId: number, chapterId: number): Promise<GlossaryExtractionResult>;
   onRestoreTerm?(termId: number): void | Promise<void>;
   onSaveAndApproveTerm(termId: number, updates: GlossaryTermUpdate, locked: boolean): void | Promise<void>;
+  onSaveExtractionSettings?(
+    bookId: number,
+    settings: Pick<BookGlossarySettings, 'mode' | 'provider_id'>,
+  ): Promise<BookGlossarySettings>;
   onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<void>;
+  providers?: Provider[];
 };
 
 const importIntegerFields = new Set([
@@ -367,13 +379,15 @@ const tabs = [
 ] as const;
 
 export default function GlossaryStyleView({
+  bookId, chapterId,
   profiles, selectedProfileId, glossaryTerms, error = '', facets = emptyFacets,
   loadState = glossaryTerms.length ? 'ready' : 'empty', page = 1, pages = 0, perPage = 50,
   query = fallbackQuery, total = glossaryTerms.length, onApproveTerm, onCreateBookOverride,
   onApplyImport, onApplyMerge, onArchiveTerm, onBulkAction, onCreateTerm, onExport,
-  onLoadConflicts, onLoadTermDetail, onLockToggle, onPageChange, onPreviewImport,
-  onPreviewMerge, onProfileChange, onQueryChange, onRejectTerm, onRestoreTerm,
-  onSaveAndApproveTerm, onUpdateTerm,
+  onLoadConflicts, onLoadExtractionSettings, onLoadTermDetail, onLockToggle, onPageChange,
+  onPreviewImport, onPreviewMerge, onProfileChange, onQueryChange, onRejectTerm,
+  onReextractChapter, onRestoreTerm, onSaveAndApproveTerm, onSaveExtractionSettings,
+  onUpdateTerm, providers = [],
 }: GlossaryStyleViewProps) {
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
   const [search, setSearch] = useState(query.q);
@@ -393,6 +407,10 @@ export default function GlossaryStyleView({
   const [importItems, setImportItems] = useState<GlossaryImportItem[]>([]);
   const [importPreview, setImportPreview] = useState<GlossaryImportPreview | null>(null);
   const [importPolicy, setImportPolicy] = useState<GlossaryImportPolicy>('skip_conflicts');
+  const [extractionMode, setExtractionMode] = useState<BookGlossarySettings['mode']>('deterministic');
+  const [extractionProviderId, setExtractionProviderId] = useState('');
+  const [extractionLoaded, setExtractionLoaded] = useState(false);
+  const [extractionStatus, setExtractionStatus] = useState('');
   const queueHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const detailDrawerRef = useRef<HTMLElement | null>(null);
   const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -404,6 +422,12 @@ export default function GlossaryStyleView({
 
   useEffect(() => setSearch(query.q), [query.q]);
   useEffect(() => setSelectedIds(new Set()), [glossaryTerms]);
+  useEffect(() => {
+    setExtractionMode('deterministic');
+    setExtractionProviderId('');
+    setExtractionLoaded(false);
+    setExtractionStatus('');
+  }, [bookId]);
   useEffect(() => {
     if (!onQueryChange || search === lastSearchRef.current) return;
     const timer = window.setTimeout(() => {
@@ -582,6 +606,48 @@ export default function GlossaryStyleView({
       setOperationError(operationErrorMessage(reason));
     }
   };
+  const configuredProviders = providers.filter((provider) => (
+    provider.enabled === 1 && (!provider.api_key_env || provider.api_key_set)
+  ));
+  const loadExtractionSettings = async () => {
+    if (!bookId || !onLoadExtractionSettings || extractionLoaded) return;
+    setOperationError('');
+    try {
+      const settings = await onLoadExtractionSettings(bookId);
+      setExtractionMode(settings.mode);
+      setExtractionProviderId(settings.provider_id);
+      setExtractionLoaded(true);
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+    }
+  };
+  const saveExtractionSettings = async () => {
+    if (!bookId || !onSaveExtractionSettings) return;
+    setOperationError(''); setExtractionStatus('');
+    try {
+      const settings = await onSaveExtractionSettings(bookId, {
+        mode: extractionMode,
+        provider_id: extractionMode === 'hybrid' ? extractionProviderId : '',
+      });
+      setExtractionMode(settings.mode);
+      setExtractionProviderId(settings.provider_id);
+      setExtractionStatus('Đã lưu cài đặt trích xuất.');
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+    }
+  };
+  const reextractChapter = async () => {
+    if (!bookId || !chapterId || !onReextractChapter) return;
+    setOperationError(''); setExtractionStatus('');
+    try {
+      const result = await onReextractChapter(bookId, chapterId);
+      setExtractionStatus(
+        `${result.created} thuật ngữ mới · ${result.updated} cập nhật · ${result.warnings.length} cảnh báo`,
+      );
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+    }
+  };
 
   return (
     <section aria-labelledby="glossary-style-title" className="workflow-management-view glossary-style-view">
@@ -694,6 +760,21 @@ export default function GlossaryStyleView({
               <button onClick={() => void applyImport()} type="button">Áp dụng nhập</button>
             </div>
           ) : null}
+        </details>
+      ) : null}
+
+      {bookId && onLoadExtractionSettings && onSaveExtractionSettings ? (
+        <details className="panel glossary-operation-panel" onToggle={(event) => {
+          if (event.currentTarget.open) void loadExtractionSettings();
+        }}>
+          <summary>Trích xuất thuật ngữ</summary>
+          <div className="glossary-review-filters">
+            <label>Chế độ trích xuất<select aria-label="Chế độ trích xuất" onChange={(event) => setExtractionMode(event.target.value as BookGlossarySettings['mode'])} value={extractionMode}><option value="deterministic">Deterministic</option><option value="hybrid">Hybrid</option></select></label>
+            {extractionMode === 'hybrid' ? <label>Provider trích xuất<select aria-label="Provider trích xuất" onChange={(event) => setExtractionProviderId(event.target.value)} value={extractionProviderId}><option value="">Chọn provider</option>{configuredProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}</select></label> : null}
+            <button disabled={extractionMode === 'hybrid' && !extractionProviderId} onClick={() => void saveExtractionSettings()} type="button">Lưu cài đặt trích xuất</button>
+            {chapterId && onReextractChapter ? <button onClick={() => void reextractChapter()} type="button">Trích xuất lại chương</button> : null}
+          </div>
+          {extractionStatus ? <p role="status">{extractionStatus}</p> : null}
         </details>
       ) : null}
 

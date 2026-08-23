@@ -3,6 +3,39 @@ import { fixtureGlossaryTerm } from '../test/fixtures';
 import { ApiClient } from './client';
 
 describe('glossary and TM API', () => {
+  it('loads and updates extraction settings and re-extracts a chapter', async () => {
+    const settings = {
+      book_id: 42, max_candidates_per_chapter: 100, mode: 'deterministic' as const, provider_id: '',
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => settings })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ...settings, mode: 'hybrid', provider_id: 'ollama' }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ created: 1, updated: 0, skipped: 0, warnings: [] }) });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    await client.getBookGlossarySettings(42);
+    await client.updateBookGlossarySettings(42, { mode: 'hybrid', provider_id: 'ollama' });
+    await client.reextractChapterGlossary(42, 9);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1, 'http://test/api/books/42/glossary-settings', expect.objectContaining({ headers: expect.anything() }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://test/api/books/42/glossary-settings',
+      expect.objectContaining({
+        body: JSON.stringify({ mode: 'hybrid', provider_id: 'ollama' }), method: 'PATCH',
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/books/42/chapters/9/glossary/re-extract',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
   it('drives bulk review, conflict merge, safe import, archive restore, and export contracts', async () => {
     const preview = {
       actions: [], affected: [], conflict_policy: 'skip_conflicts' as const,

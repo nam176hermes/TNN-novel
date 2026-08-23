@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from collections import Counter
+import json
+import os
 import re
+import unicodedata
 from pathlib import Path
+
+import requests
 
 from app.database.db import (
     put_glossary_term,
@@ -24,7 +30,9 @@ from app.database.db import (
     search_fuzzy_tm,
     clear_fuzzy_tm,
     get_chapter_by_id,
+    get_book_by_id,
     get_connection,
+    list_model_providers,
 )
 from app.database.glossary_repository import (
     GlossaryRepository,
@@ -36,6 +44,7 @@ from app.database.glossary_resolver import resolve_effective_glossary
 from app.mobile_api.dependencies import get_db_path
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
+from app.translation.ollama_client import call_openai_compatible_chat
 
 
 PRIORITY_TERM_TYPE_WEIGHTS = {
@@ -66,6 +75,61 @@ COMMON_SOURCE_TERMS = {
     "一个",
     "一下",
     "自己",
+    "什么",
+    "怎么",
+    "他们",
+    "我们",
+    "你们",
+}
+
+COMMON_TERM_BOUNDARIES = set("的了是在有不也都就这那其而与及又将把被着过")
+DETERMINISTIC_EXTRACTOR = "deterministic-v2"
+HYBRID_EXTRACTOR = "hybrid-v1"
+MAX_HYBRID_TEXT_CHARS = 12_000
+MAX_HYBRID_CANDIDATES = 100
+HYBRID_WARNING_MESSAGE = "Hybrid glossary extraction was skipped."
+VALID_EXTRACTED_TERM_TYPES = {
+    "artifact", "character", "concept", "cultivation", "idiom", "location", "organization",
+    "other", "place", "realm", "sect", "skill", "technique", "term", "title",
+}
+SUFFIX_TERM_TYPES = {
+    "剑诀": "skill",
+    "神通": "skill",
+    "道君": "title",
+    "真人": "title",
+    "宗": "sect",
+    "门": "sect",
+    "派": "sect",
+    "阁": "sect",
+    "宫": "sect",
+    "殿": "sect",
+    "教": "sect",
+    "族": "sect",
+    "境": "realm",
+    "期": "realm",
+    "层": "realm",
+    "阶": "realm",
+    "功": "skill",
+    "法": "skill",
+    "术": "skill",
+    "诀": "skill",
+    "典": "skill",
+    "丹": "artifact",
+    "剑": "artifact",
+    "珠": "artifact",
+    "符": "artifact",
+    "炉": "artifact",
+    "鼎": "artifact",
+    "印": "artifact",
+    "幡": "artifact",
+    "山": "place",
+    "城": "place",
+    "谷": "place",
+    "峰": "place",
+    "岛": "place",
+    "洲": "place",
+    "界": "place",
+    "域": "place",
 }
 
 TERM_TYPE_ALIASES = {
@@ -113,40 +177,114 @@ def _normalize_candidate_source(source: str, term_type: str) -> str:
     return source
 
 
-def extract_candidate_terms_from_text(text: str) -> list[dict]:
+def _candidate_term_type(source: str, fallback: str = "term") -> str:
+    for suffix, term_type in SUFFIX_TERM_TYPES.items():
+        if source.endswith(suffix):
+            return term_type
+    return fallback
+
+
+def _valid_candidate_source(source: str) -> bool:
+    return (
+        2 <= len(source) <= 32
+        and source not in COMMON_SOURCE_TERMS
+        and source[0] not in COMMON_TERM_BOUNDARIES
+        and source[-1] not in COMMON_TERM_BOUNDARIES
+        and bool(re.fullmatch(r"[\u3400-\u9fff]+", source))
+    )
+
+
+def _clean_chapter_title(title: str) -> str:
+    return re.sub(
+        r"^\s*第[〇零一二三四五六七八九十百千万两\d]+章\s*[:：\-—]?\s*",
+        "",
+        str(title or ""),
+    ).strip()
+
+
+def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> list[dict]:
     """Lightweight Chinese webnovel term extraction.
 
     It is intentionally conservative and review-first: candidates are never
     auto-approved and are safe to run after import or translation jobs.
     """
     text = text or ""
-    patterns: list[tuple[str, str]] = [
+    title = _clean_chapter_title(chapter_title)
+    patterns: list[tuple[str, str] | tuple[str, str, str]] = [
         (rf"[{COMMON_CHINESE_SURNAMES}][\u4e00-\u9fff]{{1,2}}", "character"),
-        (r"[\u4e00-\u9fff]{2,8}(?:宗|门|派|阁|宫|殿|教|族)", "sect"),
-        (r"[\u4e00-\u9fff]{1,6}(?:境|期|层|阶)", "realm"),
-        (r"[\u4e00-\u9fff]{1,8}(?:功|法|术|诀|剑诀|神通)", "skill"),
-        (r"[\u4e00-\u9fff]{1,8}(?:丹|剑|珠|符|炉|鼎|印|幡)", "artifact"),
-        (r"[\u4e00-\u9fff]{2,8}(?:山|城|谷|峰|岛|洲|界|域)", "place"),
+        (r"[\u4e00-\u9fff]{1,8}(?:宗|门|派|阁|宫|殿|教|族)", "sect", "suffix"),
+        (r"[\u4e00-\u9fff]{1,6}(?:境|期|层|阶)", "realm", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:剑诀|神通|功|法|术|诀|典)", "skill", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:丹|剑|珠|符|炉|鼎|印|幡)", "artifact", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:山|城|谷|峰|岛|洲|界|域)", "place", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:道君|真人)", "title", "suffix"),
     ]
-    seen: set[str] = set()
-    candidates: list[dict] = []
-    for pattern, term_type in patterns:
+    by_source: dict[str, dict] = {}
+
+    def observe(source: str, term_type: str, evidence_type: str, confidence: float) -> None:
+        source = _normalize_candidate_source(source, term_type)
+        if not _valid_candidate_source(source):
+            return
+        corpus = f"{title}\n{text}" if title else text
+        mentions = len(re.findall(f"(?={re.escape(source)})", corpus))
+        item = by_source.get(source)
+        if item is None:
+            item = {
+                "source_term": source,
+                "target_term": "",
+                "term_type": term_type,
+                "category": term_type,
+                "confidence": confidence,
+                "source_context": _context_for(text, source),
+                "mention_count": mentions,
+                "title_match": bool(title and source in title),
+                "evidence_types": [evidence_type],
+            }
+            by_source[source] = item
+            return
+        item["confidence"] = max(float(item["confidence"]), confidence)
+        item["mention_count"] = mentions
+        item["title_match"] = bool(item["title_match"] or (title and source in title))
+        if evidence_type not in item["evidence_types"]:
+            item["evidence_types"].append(evidence_type)
+
+    for pattern, term_type, *evidence in patterns:
         for match in re.finditer(pattern, text):
-            source = _normalize_candidate_source(match.group(0), term_type)
-            if len(source) < 2 or source in COMMON_SOURCE_TERMS or source in seen:
-                continue
-            seen.add(source)
-            candidates.append(
-                {
-                    "source_term": source,
-                    "target_term": "",
-                    "term_type": term_type,
-                    "category": term_type,
-                    "confidence": 0.55 if term_type == "character" else 0.65,
-                    "source_context": _context_for(text, source),
-                }
+            observe(
+                match.group(0),
+                term_type,
+                evidence[0] if evidence else "name_pattern",
+                0.55 if term_type == "character" else 0.65,
             )
-    return candidates
+
+    for source in re.findall(r"[\u3400-\u9fff]{2,32}", title):
+        observe(source, _candidate_term_type(source, "title"), "chapter_title", 0.75)
+
+    ngram_counts: Counter[str] = Counter()
+    for run in re.findall(r"[\u3400-\u9fff]+", text):
+        for size in range(2, min(6, len(run)) + 1):
+            ngram_counts.update(run[index:index + size] for index in range(len(run) - size + 1))
+    repeated = [
+        (source, count)
+        for source, count in ngram_counts.items()
+        if count >= 2 and _valid_candidate_source(source)
+    ]
+    maximal: list[tuple[str, int]] = []
+    for source, count in sorted(repeated, key=lambda item: (-len(item[0]), -item[1], item[0])):
+        if any(source in longer and longer_count >= count for longer, longer_count in maximal):
+            continue
+        maximal.append((source, count))
+        observe(source, _candidate_term_type(source), "repeated_ngram", min(0.8, 0.5 + count * 0.05))
+
+    return sorted(
+        by_source.values(),
+        key=lambda item: (
+            -int(bool(item["title_match"])),
+            -int(item["mention_count"]),
+            -len(str(item["source_term"])),
+            str(item["source_term"]),
+        ),
+    )
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -552,6 +690,190 @@ class GlossaryService:
             request_id=request_id,
         )
 
+    def get_extraction_settings(self, book_id: int) -> dict:
+        if get_book_by_id(self.db_path, book_id) is None:
+            raise ValueError("book_not_found")
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT extraction_mode, provider_id FROM book_glossary_settings WHERE book_id = ?",
+                (book_id,),
+            ).fetchone()
+        return {
+            "book_id": book_id,
+            "mode": str(row["extraction_mode"]) if row else "deterministic",
+            "provider_id": str(row["provider_id"] or "") if row else "",
+            "max_candidates_per_chapter": MAX_HYBRID_CANDIDATES,
+        }
+
+    def update_extraction_settings(self, book_id: int, *, mode: str, provider_id: str = "") -> dict:
+        if get_book_by_id(self.db_path, book_id) is None:
+            raise ValueError("book_not_found")
+        if mode not in {"deterministic", "hybrid"}:
+            raise ValueError("invalid_extraction_mode")
+        resolved_provider_id = str(provider_id or "").strip() if mode == "hybrid" else ""
+        if mode == "hybrid":
+            provider = next(
+                (item for item in list_model_providers(self.db_path) if item["id"] == resolved_provider_id),
+                None,
+            )
+            if (
+                provider is None
+                or int(provider.get("enabled") or 0) != 1
+                or not str(provider.get("base_url") or "").strip()
+                or not str(provider.get("model") or "").strip()
+                or (
+                    bool(str(provider.get("api_key_env") or "").strip())
+                    and not bool(provider.get("api_key_set"))
+                )
+            ):
+                raise ValueError("provider_not_configured")
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO book_glossary_settings (book_id, extraction_mode, provider_id, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    extraction_mode = excluded.extraction_mode,
+                    provider_id = excluded.provider_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (book_id, mode, resolved_provider_id),
+            )
+            conn.commit()
+        return self.get_extraction_settings(book_id)
+
+    def _hybrid_candidates(
+        self,
+        *,
+        book_id: int,
+        chapter_id: int,
+        chapter_title: str,
+        raw_text: str,
+        provider_id: str,
+    ) -> tuple[list[dict], list[dict]]:
+        warnings: list[dict] = []
+        provider = next(
+            (item for item in list_model_providers(self.db_path) if item["id"] == provider_id),
+            None,
+        )
+        if provider is None or int(provider.get("enabled") or 0) != 1:
+            return [], [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+        api_key_env = str(provider.get("api_key_env") or "").strip()
+        api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+        if api_key_env and not api_key:
+            return [], [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+
+        bounded_title = _clean_chapter_title(chapter_title)[:200]
+        bounded_text = raw_text[:MAX_HYBRID_TEXT_CHARS]
+        prompt = (
+            "Extract glossary candidates from this Chinese web-novel chapter. "
+            "Return one JSON object with a candidates array. Each item may contain only "
+            "source_term, target_term, term_type, and confidence. Do not return more than 100 items. "
+            "Candidates are review suggestions, never approvals.\n"
+            f"TITLE:\n{bounded_title}\nCHAPTER:\n{bounded_text}"
+        )
+        try:
+            response = call_openai_compatible_chat(
+                prompt=prompt,
+                base_url=str(provider["base_url"]),
+                model=str(provider["model"]),
+                api_key=api_key,
+                temperature=0.0,
+                timeout=min(60, max(1, int(provider.get("timeout_seconds") or 60))),
+                max_retries=0,
+                response_format={"type": "json_object"},
+            )
+        except requests.RequestException:
+            return [], [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}]
+
+        try:
+            payload = json.loads(str(response.get("text") or ""))
+            raw_candidates = payload["candidates"]
+            if not isinstance(payload, dict) or not isinstance(raw_candidates, list):
+                raise ValueError("invalid_candidates")
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return [], [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}]
+
+        if len(raw_candidates) > MAX_HYBRID_CANDIDATES:
+            raw_candidates = raw_candidates[:MAX_HYBRID_CANDIDATES]
+            warnings.append(
+                {"code": "provider_output_truncated", "message": "Hybrid output was limited to 100 candidates."}
+            )
+        corpus = f"{bounded_title}\n{bounded_text}"
+        candidates: list[dict] = []
+        seen: set[str] = set()
+        invalid_count = duplicate_count = 0
+        for item in raw_candidates:
+            if not isinstance(item, dict) or not isinstance(item.get("source_term"), str):
+                invalid_count += 1
+                continue
+            source = " ".join(
+                unicodedata.normalize("NFKC", str(item["source_term"])).split()
+            )
+            source_key = normalize_source_key(source)
+            target_value = item.get("target_term", "")
+            confidence_value = item.get("confidence", 0.5)
+            if (
+                not source_key
+                or len(source) > 64
+                or source not in corpus
+                or not isinstance(target_value, str)
+                or len(target_value) > 200
+                or isinstance(confidence_value, bool)
+                or not isinstance(confidence_value, int | float)
+                or not 0 <= float(confidence_value) <= 1
+            ):
+                invalid_count += 1
+                continue
+            if source_key in seen:
+                duplicate_count += 1
+                continue
+            seen.add(source_key)
+            term_type = normalize_term_type(str(item.get("term_type") or "other"))
+            if term_type not in VALID_EXTRACTED_TERM_TYPES:
+                term_type = "other"
+            candidates.append(
+                {
+                    "source_term": source,
+                    "target_term": target_value.strip(),
+                    "term_type": term_type,
+                    "category": term_type,
+                    "confidence": float(confidence_value),
+                    "source_context": _context_for(bounded_text, source),
+                    "mention_count": len(re.findall(f"(?={re.escape(source)})", corpus)),
+                    "title_match": bool(bounded_title and source in bounded_title),
+                    "evidence_types": ["provider_structured_json"],
+                }
+            )
+        if duplicate_count:
+            warnings.append(
+                {"code": "provider_duplicates_ignored", "message": "Duplicate hybrid candidates were ignored."}
+            )
+        if invalid_count:
+            warnings.append(
+                {"code": "provider_items_ignored", "message": "Invalid hybrid candidates were ignored."}
+            )
+
+        effective_keys = set(resolve_effective_glossary(self.db_path, book_id).reserved_source_keys)
+        with get_connection(self.db_path) as conn:
+            evidenced_keys = {
+                str(row["source_key"])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT g.source_key
+                    FROM glossary_term_evidence e
+                    JOIN glossary_terms g ON g.id = e.term_id
+                    WHERE g.book_id = ? AND e.chapter_id = ?
+                    """,
+                    (book_id, chapter_id),
+                ).fetchall()
+            }
+        return [
+            candidate
+            for candidate in candidates
+            if normalize_source_key(candidate["source_term"]) not in effective_keys | evidenced_keys
+        ], warnings
+
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
         chapter = get_chapter_by_id(self.db_path, chapter_id)
@@ -572,59 +894,38 @@ class GlossaryService:
             if resolved_raw_path is not None:
                 raw_text = resolved_raw_path.read_text(encoding="utf-8", errors="replace")
         if not raw_text:
-            return {"created": 0, "updated": 0, "skipped": 0, "candidates": []}
+            return {"created": 0, "updated": 0, "skipped": 0, "candidates": [], "warnings": []}
 
-        candidates = extract_candidate_terms_from_text(raw_text)
-        created = 0
-        updated = 0
-        skipped = 0
+        candidates = extract_candidate_terms_from_text(raw_text, str(chapter.get("title") or ""))
         chapter_number = int(chapter.get("chapter_number") or 0)
-        for candidate in candidates:
-            source = str(candidate["source_term"])
-            source_key = normalize_source_key(source)
-            with get_connection(self.db_path) as conn:
-                rows = conn.execute(
-                    """
-                    SELECT id, target_term, review_status, approved, locked, archived_at
-                    FROM glossary_terms
-                    WHERE book_id = ? AND source_key = ?
-                    ORDER BY id
-                    """,
-                    (book_id, source_key),
-                ).fetchall()
-            if len(rows) > 1 or (
-                rows
-                and (
-                    rows[0]["archived_at"]
-                    or (rows[0]["review_status"], rows[0]["approved"], rows[0]["locked"])
-                    != ("NEEDS_REVIEW", 0, 0)
-                )
-            ):
-                skipped += 1
-                continue
-            put_glossary_term(
-                self.db_path,
-                book_id,
-                source,
-                str(rows[0]["target_term"] or "") if rows else "",
-                category=candidate.get("category") or candidate.get("term_type") or "other",
-                confidence=float(candidate.get("confidence") or 0.5),
-                approved=0,
-                mode="translate",
-                term_type=normalize_term_type(candidate.get("term_type")),
-                first_seen_chapter_id=chapter_id,
-                first_seen_chapter_number=chapter_number,
-                review_status="NEEDS_REVIEW",
-                source_context=candidate.get("source_context") or "",
-                actor="deterministic-extractor",
-                request_id=f"chapter:{chapter_id}",
-                preserve_existing=True,
+        repository = GlossaryRepository(self.db_path)
+        counts = repository.record_extraction_candidates(
+            book_id=book_id,
+            chapter_id=chapter_id,
+            chapter_number=chapter_number,
+            extractor=DETERMINISTIC_EXTRACTOR,
+            candidates=candidates,
+        )
+        warnings: list[dict] = []
+        extraction_settings = self.get_extraction_settings(book_id)
+        if extraction_settings["mode"] == "hybrid":
+            hybrid, warnings = self._hybrid_candidates(
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_title=str(chapter.get("title") or ""),
+                raw_text=raw_text,
+                provider_id=str(extraction_settings["provider_id"]),
             )
-            if rows:
-                updated += 1
-            else:
-                created += 1
-        return {"created": created, "updated": updated, "skipped": skipped, "candidates": candidates}
+            hybrid_counts = repository.record_extraction_candidates(
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_number=chapter_number,
+                extractor=HYBRID_EXTRACTOR,
+                candidates=hybrid,
+            )
+            counts = {key: counts[key] + hybrid_counts[key] for key in counts}
+            candidates = [*candidates, *hybrid]
+        return {**counts, "candidates": candidates, "warnings": warnings}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""

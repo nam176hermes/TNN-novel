@@ -1987,6 +1987,8 @@ function AuthenticatedApp() {
           <>
             {statusMessages}
             <GlossaryStyleView
+              bookId={assistBookId ?? undefined}
+              chapterId={selectedChapter?.book_id === assistBookId ? selectedChapter.id : undefined}
               error={glossaryState.terms.error}
               facets={glossaryState.facets}
               glossaryTerms={glossaryState.terms.data}
@@ -2013,6 +2015,7 @@ function AuthenticatedApp() {
                 triggerBrowserDownload(download.blob, download.filename);
               }, 'Glossary export failed')}
               onLoadConflicts={glossaryState.loadConflicts}
+              onLoadExtractionSettings={(bookId) => session.client.getBookGlossarySettings(bookId)}
               onLoadTermDetail={glossaryState.loadTermDetail}
               onLockToggle={handleGlossaryLockToggle}
               onPageChange={(page) => glossaryState.setQuery({ page })}
@@ -2021,15 +2024,24 @@ function AuthenticatedApp() {
               onPreviewMerge={glossaryState.previewMerge}
               onQueryChange={glossaryState.setQuery}
               onRejectTerm={handleGlossaryReject}
+              onReextractChapter={async (bookId, chapterId) => {
+                const result = await session.client.reextractChapterGlossary(bookId, chapterId);
+                await glossaryState.refresh();
+                return result;
+              }}
               onRestoreTerm={(termId) => handleGlossaryPhase4(
                 () => glossaryState.restoreTerm(termId), 'Glossary restore failed',
               )}
               onSaveAndApproveTerm={handleGlossarySaveAndApprove}
+              onSaveExtractionSettings={(bookId, settings) => (
+                session.client.updateBookGlossarySettings(bookId, settings)
+              )}
               onUpdateTerm={handleGlossaryTermUpdate}
               page={glossaryState.page}
               pages={glossaryState.pages}
               perPage={glossaryState.perPage}
               profiles={styleState.profiles.data}
+              providers={providersState.providers.data}
               query={glossaryState.query}
               selectedProfileId={styleState.selectedStyleProfileId}
               total={glossaryState.total}

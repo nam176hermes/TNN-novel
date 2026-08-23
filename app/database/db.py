@@ -57,7 +57,7 @@ list_reader_xray_entities = _reader_repository.list_reader_xray_entities
 list_reader_timeline_events = _reader_repository.list_reader_timeline_events
 
 
-CURRENT_SCHEMA_VERSION = "2026-08-23-glossary-phase2-resolver"
+CURRENT_SCHEMA_VERSION = "2026-08-23-glossary-phase5-extraction"
 
 
 @dataclass(frozen=True)
