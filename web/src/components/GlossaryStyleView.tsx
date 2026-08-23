@@ -66,6 +66,13 @@ const importIntegerFields = new Set([
   'id', 'version', 'book_id', 'approved', 'locked', 'occurrence_count', 'priority',
   'first_seen_chapter_id', 'first_seen_chapter_number',
 ]);
+const csvMetadataFields = new Set(['schema_version', 'scope', 'scope_book_id']);
+const canonicalCsvItemFields = [
+  'id', 'book_id', 'source_term', 'target_term', 'category', 'confidence', 'approved',
+  'locked', 'review_status', 'mode', 'pinyin', 'notes_vi', 'variants', 'occurrence_count',
+  'priority', 'genre', 'term_type', 'alternatives', 'gender', 'first_seen_chapter_id',
+  'first_seen_chapter_number', 'source_context', 'archived_at', 'version', 'archived',
+];
 
 function csvRows(text: string): string[][] {
   const rows: string[][] = [];
@@ -181,15 +188,24 @@ export function parseGlossaryImportText(text: string): GlossaryImportItem[] {
   for (const required of ['schema_version', 'scope', 'source_term', 'target_term']) {
     if (!headers.includes(required)) throw new Error(`CSV thiếu cột ${required}.`);
   }
-  const items = rows.slice(1).map((values, index) => {
+  const parsedItems = rows.slice(1).map((values, index): GlossaryImportItem | null => {
     if (values.length !== headers.length) throw new Error(`Dòng CSV ${index + 1} sai số lượng cột.`);
     const record = Object.fromEntries(headers.map((header, column) => [header, values[column]]));
     if (record.schema_version !== '1') throw new Error(`Dòng CSV ${index + 1} có schema không hỗ trợ.`);
     if (!['all', 'book', 'global'].includes(record.scope)) throw new Error(`Dòng CSV ${index + 1} có scope không hợp lệ.`);
+    const scopeBookId = Number(record.scope_book_id ?? (record.scope === 'book' ? Number.NaN : 0));
+    if (
+      canonicalCsvItemFields.every((fieldName) => headers.includes(fieldName))
+      && canonicalCsvItemFields.every((fieldName) => record[fieldName] === '')
+    ) {
+      validateImportScope({ type: record.scope, book_id: scopeBookId }, []);
+      return null;
+    }
     const item: Record<string, unknown> = {};
     for (const [fieldName, rawValue] of Object.entries(record)) {
-      if (['schema_version', 'scope', 'scope_book_id'].includes(fieldName) || rawValue === '') continue;
+      if (csvMetadataFields.has(fieldName)) continue;
       if (importIntegerFields.has(fieldName)) {
+        if (fieldName === 'occurrence_count' && rawValue === '') continue;
         const number = Number(rawValue);
         if (!Number.isSafeInteger(number)) throw new Error(`Dòng CSV ${index + 1}: ${fieldName} không hợp lệ.`);
         item[fieldName] = number;
@@ -205,10 +221,10 @@ export function parseGlossaryImportText(text: string): GlossaryImportItem[] {
       }
     }
     const validated = validateImportItems([item]);
-    const scopeBookId = Number(record.scope_book_id ?? (record.scope === 'book' ? Number.NaN : 0));
     validateImportScope({ type: record.scope, book_id: scopeBookId }, validated);
     return validated[0];
   });
+  const items = parsedItems.filter((item): item is GlossaryImportItem => item !== null);
   return validateImportItems(items);
 }
 
@@ -633,10 +649,13 @@ export default function GlossaryStyleView({
           {conflicts?.items.map((conflict) => (
             <fieldset key={conflict.id}>
               <legend>{conflict.types.join(' · ')}</legend>
+              {conflict.members_truncated ? (
+                <p>Đang hiển thị lô {conflict.members.length}/{conflict.member_total} thành viên. Hợp nhất lô này rồi lặp lại để xử lý phần còn lại.</p>
+              ) : null}
               {conflict.members.map((term) => (
                 <label key={term.id}>
                   <input aria-label={`Chọn canonical ${term.source_term}`} checked={activeConflictId === conflict.id && canonicalId === term.id} name="glossary-canonical" onChange={() => { setActiveConflictId(conflict.id); setCanonicalId(term.id); setMergePreview(null); }} type="radio" />
-                  {term.source_term} → {term.target_term} · {term.book_id === 0 ? 'Toàn cục' : 'Trong sách'} · v{term.version ?? 0}
+                  {term.source_term} → {term.target_term} · {term.book_id === 0 ? 'Toàn cục' : 'Trong sách'} · v{term.version ?? 0}{term.id === conflict.canonical_id ? ' · canonical mặc định' : ''}
                 </label>
               ))}
             </fieldset>

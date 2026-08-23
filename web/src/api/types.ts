@@ -1416,6 +1416,9 @@ export type GlossaryBulkTermRef = { id: number; expected_version: number };
 export type GlossaryConflictGroup = {
   id: string;
   types: Array<'global_book' | 'normalized_duplicate' | 'primary_variant'>;
+  canonical_id: number;
+  member_total: number;
+  members_truncated: boolean;
   members: GlossaryTerm[];
 };
 

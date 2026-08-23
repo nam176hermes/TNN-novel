@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { StyleProfile } from '../api/types';
 import { fixtureGlossaryTerm, fixtureStyleProfile } from '../test/fixtures';
-import GlossaryStyleView from './GlossaryStyleView';
+import GlossaryStyleView, { parseGlossaryImportText } from './GlossaryStyleView';
 
 afterEach(cleanup);
 
@@ -30,6 +30,33 @@ function props(overrides: Record<string, unknown> = {}) {
 }
 
 describe('GlossaryStyleView', () => {
+  it('preserves blank target cells and treats an endpoint empty-scope metadata row as zero items', () => {
+    const header = [
+      'schema_version', 'scope', 'scope_book_id', 'id', 'book_id', 'source_term',
+      'target_term', 'category', 'confidence', 'approved', 'locked', 'review_status',
+      'mode', 'pinyin', 'notes_vi', 'variants', 'occurrence_count', 'priority',
+      'genre', 'term_type', 'alternatives', 'gender', 'first_seen_chapter_id',
+      'first_seen_chapter_number', 'source_context', 'archived_at', 'version', 'archived',
+    ];
+    const emptyMetadataRow = ['1', 'book', '42', ...Array(header.length - 3).fill('')];
+    const blankTargetRow = [
+      '1', 'book', '42', '7', '42', '待译', '', 'term', '1', '0', '0',
+      'NEEDS_REVIEW', 'translate', '', '', '', '', '0', '', 'term', '', '',
+      '0', '0', '', '', '1', 'false',
+    ];
+
+    expect(parseGlossaryImportText([header.join(','), blankTargetRow.join(',')].join('\n')))
+      .toEqual([expect.objectContaining({
+        approved: 0,
+        book_id: 42,
+        review_status: 'NEEDS_REVIEW',
+        source_term: '待译',
+        target_term: '',
+      })]);
+    expect(parseGlossaryImportText([header.join(','), emptyMetadataRow.join(',')].join('\n')))
+      .toEqual([]);
+  });
+
   it('selects versioned rows for bulk review and exposes create archive and restore actions', async () => {
     const onArchiveTerm = vi.fn().mockResolvedValue(undefined);
     const onBulkAction = vi.fn().mockResolvedValue(undefined);
@@ -126,6 +153,51 @@ describe('GlossaryStyleView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Xuất CSV' }));
     expect(onExport).toHaveBeenNthCalledWith(1, 'json');
     expect(onExport).toHaveBeenNthCalledWith(2, 'csv');
+  });
+
+  it('labels a partial conflict batch and reloads the remainder for repeated merge resolution', async () => {
+    const memberA = { ...fixtureGlossaryTerm, id: 7, source_term: 'Ａ B', target_term: 'Một', version: 3 };
+    const memberB = { ...fixtureGlossaryTerm, id: 8, source_term: 'a b', target_term: 'Hai', version: 4 };
+    const memberC = { ...fixtureGlossaryTerm, id: 9, source_term: 'a b', target_term: 'Ba', version: 2 };
+    const onLoadConflicts = vi.fn()
+      .mockResolvedValueOnce({
+        items: [{
+          canonical_id: 7, id: 'stable-group', member_total: 250,
+          members: [memberA, memberB], members_truncated: true, types: ['normalized_duplicate'],
+        }],
+        page: 1, pages: 1, per_page: 50, total: 1,
+      })
+      .mockResolvedValueOnce({
+        items: [{
+          canonical_id: 7, id: 'stable-group', member_total: 2,
+          members: [memberA, memberC], members_truncated: false, types: ['normalized_duplicate'],
+        }],
+        page: 1, pages: 1, per_page: 50, total: 1,
+      })
+      .mockResolvedValueOnce({ items: [], page: 1, pages: 0, per_page: 50, total: 0 });
+    const onPreviewMerge = vi.fn()
+      .mockResolvedValueOnce({ canonical_id: 7, duplicate_ids: [8], digest: 'a'.repeat(64) })
+      .mockResolvedValueOnce({ canonical_id: 7, duplicate_ids: [9], digest: 'b'.repeat(64) });
+    const onApplyMerge = vi.fn().mockResolvedValue(undefined);
+    render(<GlossaryStyleView {...props({ onApplyMerge, onLoadConflicts, onPreviewMerge })} />);
+
+    await userEvent.click(screen.getByText('Xung đột & hợp nhất'));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải xung đột' }));
+    expect(await screen.findByText(/lô 2\/250 thành viên/)).toHaveTextContent('lặp lại');
+    await userEvent.click(screen.getByRole('radio', { name: 'Chọn canonical Ａ B' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước hợp nhất' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng hợp nhất' }));
+
+    expect(await screen.findByText(/a b → Ba/)).toBeVisible();
+    await userEvent.click(screen.getByRole('radio', { name: 'Chọn canonical Ａ B' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước hợp nhất' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng hợp nhất' }));
+
+    expect(await screen.findByText('Không có xung đột.')).toBeVisible();
+    expect(onPreviewMerge).toHaveBeenNthCalledWith(1, 7, [8]);
+    expect(onPreviewMerge).toHaveBeenNthCalledWith(2, 7, [9]);
+    expect(onApplyMerge).toHaveBeenCalledTimes(2);
+    expect(onLoadConflicts).toHaveBeenCalledTimes(3);
   });
 
   it('accepts exported JSON envelopes and CSV with an explicit conflict policy', async () => {

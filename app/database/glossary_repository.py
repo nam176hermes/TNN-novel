@@ -894,23 +894,36 @@ class GlossaryRepository:
                 SELECT id, book_id, source_key, variants
                 FROM glossary_terms
                 WHERE {' AND '.join(where)}
-                ORDER BY id
             ),
             normalized AS (
-                SELECT GROUP_CONCAT(id) AS member_ids, 'normalized_duplicate' AS conflict_type
+                SELECT 'normalized_duplicate' AS conflict_type,
+                       book_id AS group_book_id,
+                       source_key,
+                       MIN(id) AS canonical_id,
+                       NULL AS secondary_id,
+                       COUNT(*) AS member_total
                 FROM eligible
                 GROUP BY book_id, source_key
                 HAVING COUNT(*) > 1
             ),
             global_book AS (
-                SELECT GROUP_CONCAT(id) AS member_ids, 'global_book' AS conflict_type
+                SELECT 'global_book' AS conflict_type,
+                       -1 AS group_book_id,
+                       source_key,
+                       MIN(id) AS canonical_id,
+                       NULL AS secondary_id,
+                       COUNT(*) AS member_total
                 FROM eligible
                 GROUP BY source_key
                 HAVING MIN(book_id) = 0 AND MAX(book_id) > 0
             ),
             primary_variant AS (
-                SELECT printf('%d,%d', a.id, b.id) AS member_ids,
-                       'primary_variant' AS conflict_type
+                SELECT 'primary_variant' AS conflict_type,
+                       -2 AS group_book_id,
+                       printf('%d:%d', a.id, b.id) AS source_key,
+                       a.id AS canonical_id,
+                       b.id AS secondary_id,
+                       2 AS member_total
                 FROM eligible a
                 JOIN eligible b ON a.id < b.id
                 WHERE glossary_variant_has(a.variants, b.source_key) = 1
@@ -920,11 +933,6 @@ class GlossaryRepository:
                 SELECT * FROM normalized
                 UNION ALL SELECT * FROM global_book
                 UNION ALL SELECT * FROM primary_variant
-            ),
-            grouped AS (
-                SELECT member_ids, GROUP_CONCAT(conflict_type) AS conflict_types
-                FROM candidates
-                GROUP BY member_ids
             )
         """
         with get_connection(self.db_path) as conn:
@@ -934,54 +942,95 @@ class GlossaryRepository:
                 lambda variants, source_key: int(str(source_key or "") in _variant_keys(variants)),
                 deterministic=True,
             )
-            total = int(conn.execute(f"{ctes} SELECT COUNT(*) FROM grouped", params).fetchone()[0])
+            total = int(conn.execute(f"{ctes} SELECT COUNT(*) FROM candidates", params).fetchone()[0])
             groups = conn.execute(
                 f"""
                 {ctes}
-                SELECT member_ids, conflict_types
-                FROM grouped
-                ORDER BY conflict_types, member_ids
+                SELECT conflict_type, group_book_id, source_key, canonical_id,
+                       secondary_id, member_total
+                FROM candidates
+                ORDER BY conflict_type, group_book_id, source_key, canonical_id,
+                         COALESCE(secondary_id, 0)
                 LIMIT ? OFFSET ?
                 """,
                 (*params, per_page, offset),
             ).fetchall()
-            member_ids = sorted(
-                {
-                    int(term_id)
-                    for group in groups
-                    for term_id in str(group["member_ids"] or "").split(",")
-                    if term_id
-                }
-            )
-            resources: dict[int, dict[str, Any]] = {}
-            if member_ids:
-                placeholders = ",".join("?" for _ in member_ids)
+            members_by_group: dict[int, list[dict[str, Any]]] = {
+                index: [] for index in range(len(groups))
+            }
+            if groups:
+                member_selects: list[str] = []
+                member_params: list[Any] = []
+                active = [
+                    "COALESCE(archived_at, '') = ''",
+                    "review_status != 'REJECTED'",
+                    "source_key != ''",
+                ]
+                for index, group in enumerate(groups):
+                    conditions = list(active)
+                    conflict_type = str(group["conflict_type"])
+                    if conflict_type == "normalized_duplicate":
+                        conditions.extend(("book_id = ?", "source_key = ?"))
+                        member_params.extend((group["group_book_id"], group["source_key"]))
+                    elif conflict_type == "global_book":
+                        conditions.append("source_key = ?")
+                        member_params.append(group["source_key"])
+                        if book_id is not None:
+                            conditions.append("book_id IN (0, ?)")
+                            member_params.append(book_id)
+                    else:
+                        conditions.append("id IN (?, ?)")
+                        member_params.extend((group["canonical_id"], group["secondary_id"]))
+                    member_selects.append(
+                        f"""
+                        SELECT {index} AS group_index, id
+                        FROM (
+                            SELECT id
+                            FROM glossary_terms
+                            WHERE {' AND '.join(conditions)}
+                            ORDER BY id
+                            LIMIT 200
+                        )
+                        """
+                    )
                 rows = conn.execute(
                     f"""
-                    SELECT g.*, COUNT(e.id) AS evidence_count
-                    FROM glossary_terms g
-                    LEFT JOIN glossary_term_evidence e ON e.term_id = g.id
-                    WHERE g.id IN ({placeholders})
-                    GROUP BY g.id
-                    ORDER BY g.id
-                    """,
-                    member_ids,
-                ).fetchall()
-                resources = {
-                    int(row["id"]): self._resource(
-                        row, evidence_count=int(row["evidence_count"] or 0)
+                    WITH selected_members AS (
+                        {' UNION ALL '.join(member_selects)}
                     )
-                    for row in rows
-                }
+                    SELECT m.group_index, g.*, COUNT(e.id) AS evidence_count
+                    FROM selected_members m
+                    JOIN glossary_terms g ON g.id = m.id
+                    LEFT JOIN glossary_term_evidence e ON e.term_id = g.id
+                    GROUP BY m.group_index, g.id
+                    ORDER BY m.group_index, g.id
+                    """,
+                    member_params,
+                ).fetchall()
+                for row in rows:
+                    members_by_group[int(row["group_index"])].append(
+                        self._resource(
+                            row, evidence_count=int(row["evidence_count"] or 0)
+                        )
+                    )
         items = []
-        for group in groups:
-            ids = tuple(int(value) for value in str(group["member_ids"]).split(","))
-            types = sorted(set(str(group["conflict_types"]).split(",")))
+        for index, group in enumerate(groups):
+            members = members_by_group[index]
+            member_total = int(group["member_total"])
+            conflict_type = str(group["conflict_type"])
+            identity = {
+                "type": conflict_type,
+                "book_id": int(group["group_book_id"]),
+                "source_key": str(group["source_key"]),
+            }
             items.append(
                 {
-                    "id": _stable_digest({"ids": ids})[:16],
-                    "types": types,
-                    "members": [resources[term_id] for term_id in ids],
+                    "id": _stable_digest(identity)[:16],
+                    "types": [conflict_type],
+                    "canonical_id": int(group["canonical_id"]),
+                    "member_total": member_total,
+                    "members_truncated": member_total > len(members),
+                    "members": members,
                 }
             )
         return {
@@ -1041,23 +1090,27 @@ class GlossaryRepository:
             source_keys = [row["conflict_key"] for row in candidates if row["conflict_type"] == "source_conflict"]
             target_keys = [row["conflict_key"] for row in candidates if row["conflict_type"] == "target_reuse"]
             source_details: dict[str, list[dict[str, Any]]] = {}
+            source_member_totals: dict[str, int] = {}
             if source_keys:
                 placeholders = ",".join("?" for _ in source_keys)
                 rows = conn.execute(
                     f"""
                     WITH ranked AS (
                         SELECT source_term, book_id, target_term, approved, mode,
+                               COUNT(*) OVER (PARTITION BY source_term) AS member_total,
                                ROW_NUMBER() OVER (PARTITION BY source_term ORDER BY book_id, id) AS member_number
                         FROM glossary_terms
-                        WHERE source_term IN ({placeholders}) AND COALESCE(archived_at, '') = ''
+                        WHERE source_term IN ({placeholders}) AND {where_sql}
                     )
                     SELECT * FROM ranked WHERE member_number <= ?
                     ORDER BY source_term, member_number
                     """,
-                    (*source_keys, member_limit),
+                    (*source_keys, *params, member_limit),
                 ).fetchall()
                 for row in rows:
-                    source_details.setdefault(str(row["source_term"]), []).append(
+                    key = str(row["source_term"])
+                    source_member_totals[key] = int(row["member_total"])
+                    source_details.setdefault(key, []).append(
                         {
                             "book_id": row["book_id"],
                             "target_term": row["target_term"],
@@ -1066,27 +1119,30 @@ class GlossaryRepository:
                         }
                     )
             target_details: dict[str, list[dict[str, Any]]] = {}
+            target_member_totals: dict[str, int] = {}
             if target_keys:
                 placeholders = ",".join("?" for _ in target_keys)
                 rows = conn.execute(
                     f"""
                     WITH ranked AS (
                         SELECT target_term, book_id, source_term, approved, mode, term_type, locked,
+                               COUNT(*) OVER (PARTITION BY target_term) AS member_total,
                                ROW_NUMBER() OVER (
                                    PARTITION BY target_term
                                    ORDER BY locked DESC, book_id DESC, source_term, id
                                ) AS member_number
                         FROM glossary_terms
-                        WHERE target_term IN ({placeholders}) AND approved >= 0
-                          AND COALESCE(archived_at, '') = ''
+                        WHERE target_term IN ({placeholders}) AND {where_sql}
                     )
                     SELECT * FROM ranked WHERE member_number <= ?
                     ORDER BY target_term, member_number
                     """,
-                    (*target_keys, member_limit),
+                    (*target_keys, *params, member_limit),
                 ).fetchall()
                 for row in rows:
-                    target_details.setdefault(str(row["target_term"]), []).append(
+                    key = str(row["target_term"])
+                    target_member_totals[key] = int(row["member_total"])
+                    target_details.setdefault(key, []).append(
                         {
                             "book_id": row["book_id"],
                             "source_term": row["source_term"],
@@ -1100,21 +1156,25 @@ class GlossaryRepository:
         for row in candidates:
             key = str(row["conflict_key"])
             if row["conflict_type"] == "source_conflict":
+                member_total = source_member_totals.get(key, 0)
                 conflicts.append(
                     {
                         "type": "source_conflict",
                         "source_term": key,
                         "targets": source_details.get(key, []),
-                        "truncated": int(row["conflict_count"]) > member_limit,
+                        "member_total": member_total,
+                        "truncated": member_total > member_limit,
                     }
                 )
             else:
+                member_total = target_member_totals.get(key, 0)
                 conflicts.append(
                     {
                         "type": "target_reuse",
                         "target_term": key,
                         "sources": target_details.get(key, []),
-                        "truncated": int(row["conflict_count"]) > member_limit,
+                        "member_total": member_total,
+                        "truncated": member_total > member_limit,
                     }
                 )
         return conflicts
@@ -1347,7 +1407,7 @@ class GlossaryRepository:
             if "archived" in raw and not isinstance(archived_value, bool):
                 errors.append({"item": item_number, "field": "archived", "code": "invalid_type"})
                 continue
-            if state[0] in {"APPROVED", "LOCKED"} and _target_is_blank(target):
+            if not archived_value and state[0] in {"APPROVED", "LOCKED"} and _target_is_blank(target):
                 errors.append({"item": item_number, "field": "target_term", "code": "target_required"})
                 continue
             source_key = normalize_source_key(source)

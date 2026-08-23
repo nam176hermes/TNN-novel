@@ -8,7 +8,11 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 
-from app.database.glossary_repository import GlossaryStateConflict, GlossaryValidationError
+from app.database.glossary_repository import (
+    EXPORT_FIELDS,
+    GlossaryStateConflict,
+    GlossaryValidationError,
+)
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
     GlossaryBulkRequest,
@@ -66,7 +70,7 @@ async def _bounded_json(request: Request):
         raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
 
 
-def _csv_import_item(row: dict[str, str], item_number: int) -> dict:
+def _csv_import_item(row: dict[str, str], item_number: int) -> dict | None:
     if None in row or any(value is None for value in row.values()):
         raise HTTPException(status_code=422, detail={"code": "invalid_csv"})
     if row.get("schema_version") != "1":
@@ -79,16 +83,29 @@ def _csv_import_item(row: dict[str, str], item_number: int) -> dict:
         )
     if row.get("scope") not in {"all", "book", "global"}:
         raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    item_fields = [key for key in row if key not in {"schema_version", "scope", "scope_book_id"}]
+    if (
+        set(EXPORT_FIELDS).issubset(row)
+        and "archived" in row
+        and all(row[key] == "" for key in item_fields)
+    ):
+        _validate_import_scope(
+            row["scope"], row.get("scope_book_id"), [], csv_value=True
+        )
+        return None
     item = {
         key: value
         for key, value in row.items()
-        if key not in {"schema_version", "scope", "scope_book_id"} and value != ""
+        if key not in {"schema_version", "scope", "scope_book_id"}
     }
     for field in (
         "id", "book_id", "approved", "locked", "occurrence_count", "priority",
         "first_seen_chapter_id", "first_seen_chapter_number", "version",
     ):
         if field in item:
+            if field == "occurrence_count" and item[field] == "":
+                item.pop(field)
+                continue
             try:
                 item[field] = int(item[field])
             except (TypeError, ValueError, OverflowError):
@@ -175,7 +192,12 @@ async def _bounded_import_payload(request: Request) -> tuple[dict, bool]:
                 or not required.issubset(reader.fieldnames)
             ):
                 raise HTTPException(status_code=422, detail={"code": "invalid_csv_schema"})
-            rows = [_csv_import_item(row, index) for index, row in enumerate(reader, start=1)]
+            parsed_rows = [
+                _csv_import_item(row, index) for index, row in enumerate(reader, start=1)
+            ]
+            if len(parsed_rows) > MAX_IMPORT_ROWS:
+                raise HTTPException(status_code=422, detail={"code": "row_limit_exceeded"})
+            rows = [row for row in parsed_rows if row is not None]
         except UnicodeDecodeError:
             raise HTTPException(status_code=422, detail={"code": "invalid_csv"}) from None
         return {"items": _bounded_items(rows)}, True
@@ -653,18 +675,20 @@ async def export_glossary(
     )
     if format == "csv":
         output = io.StringIO()
-        fieldnames = ["schema_version", "scope", "scope_book_id", *(terms[0].keys() if terms else [])]
+        fieldnames = [
+            "schema_version", "scope", "scope_book_id", *EXPORT_FIELDS, "archived",
+        ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(
-            {
-                "schema_version": 1,
-                "scope": resolved_scope,
-                "scope_book_id": book_id or 0,
-                **term,
-            }
-            for term in terms
-        )
+        metadata = {
+            "schema_version": 1,
+            "scope": resolved_scope,
+            "scope_book_id": book_id or 0,
+        }
+        if terms:
+            writer.writerows({**metadata, **term} for term in terms)
+        else:
+            writer.writerow(metadata)
         return Response(
             content=output.getvalue(),
             media_type="text/csv",

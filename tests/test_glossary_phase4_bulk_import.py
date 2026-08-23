@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -809,6 +810,109 @@ async def test_exported_json_envelope_and_csv_are_direct_preview_and_apply_input
 
 
 @pytest.mark.asyncio
+async def test_endpoint_exports_round_trip_blank_targets_and_empty_scopes_without_reshaping(
+    glossary_api_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    put_glossary_term(
+        glossary_api_db, book_id, "待译", "", approved=0, review_status="NEEDS_REVIEW"
+    )
+    archived_id = put_glossary_term(
+        glossary_api_db, book_id, "旧待译", "", approved=0, review_status="CONFLICT"
+    )
+    empty_book_id = add_book(glossary_api_db, "Empty")
+    with get_connection(glossary_api_db) as conn:
+        conn.execute(
+            "UPDATE glossary_terms SET archived_at = '2026-08-23T00:00:00Z', "
+            "approved = 1, review_status = 'APPROVED' WHERE id = ?",
+            (archived_id,),
+        )
+        conn.commit()
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await _auth_headers(client)
+        blank_csv = await client.get(
+            f"/api/glossary/export?book_id={book_id}&format=csv&scope=book", headers=headers
+        )
+        empty_json = await client.get(
+            f"/api/glossary/export?book_id={empty_book_id}&format=json&scope=book",
+            headers=headers,
+        )
+        empty_csv = await client.get(
+            f"/api/glossary/export?book_id={empty_book_id}&format=csv&scope=book",
+            headers=headers,
+        )
+        empty_json_preview = await client.post(
+            "/api/glossary/import/preview", content=empty_json.content,
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        empty_json_apply = await client.post(
+            "/api/glossary/import/apply",
+            json={**empty_json.json(), "digest": empty_json_preview.json()["digest"]},
+            headers=headers,
+        )
+        empty_csv_preview = await client.post(
+            "/api/glossary/import/preview", content=empty_csv.content,
+            headers={**headers, "Content-Type": "text/csv"},
+        )
+        empty_csv_apply = await client.post(
+            f"/api/glossary/import/apply?digest={empty_csv_preview.json().get('digest', '0' * 64)}",
+            content=empty_csv.content,
+            headers={**headers, "Content-Type": "text/csv"},
+        )
+
+    expected_header = [
+        "schema_version", "scope", "scope_book_id", "id", "book_id", "source_term",
+        "target_term", "category", "confidence", "approved", "locked", "review_status",
+        "mode", "pinyin", "notes_vi", "variants", "occurrence_count", "priority",
+        "genre", "term_type", "alternatives", "gender", "first_seen_chapter_id",
+        "first_seen_chapter_number", "source_context", "archived_at", "version", "archived",
+    ]
+    empty_rows = list(csv.reader(empty_csv.text.splitlines()))
+    assert empty_rows[0] == expected_header
+    assert empty_rows[1][:3] == ["1", "book", str(empty_book_id)]
+    assert all(value == "" for value in empty_rows[1][3:])
+    assert empty_json_preview.status_code == 200
+    assert empty_json_preview.json()["summary"] == {"added": 0, "updated": 0, "skipped": 0}
+    assert empty_json_apply.status_code == 200
+    assert empty_json_apply.json() == {"added": 0, "updated": 0, "skipped": 0, "errors": []}
+    assert empty_csv_preview.status_code == 200
+    assert empty_csv_preview.json()["summary"] == {"added": 0, "updated": 0, "skipped": 0}
+    assert empty_csv_apply.status_code == 200
+    assert empty_csv_apply.json() == {"added": 0, "updated": 0, "skipped": 0, "errors": []}
+
+    destination = tmp_path / "blank-target-round-trip.sqlite"
+    init_db(destination)
+    monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: destination)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await _auth_headers(client)
+        preview = await client.post(
+            "/api/glossary/import/preview", content=blank_csv.content,
+            headers={**headers, "Content-Type": "text/csv"},
+        )
+        applied = await client.post(
+            f"/api/glossary/import/apply?digest={preview.json().get('digest', '0' * 64)}",
+            content=blank_csv.content,
+            headers={**headers, "Content-Type": "text/csv"},
+        )
+
+    assert preview.status_code == 200
+    assert applied.status_code == 200
+    with get_connection(destination) as conn:
+        rows = conn.execute(
+            "SELECT source_term, target_term, review_status, approved, archived_at "
+            "FROM glossary_terms ORDER BY source_term"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("待译", "", "NEEDS_REVIEW", 0, ""),
+        ("旧待译", "", "APPROVED", 1, "2026-08-23T00:00:00Z"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_import_rejects_malformed_csv_and_scope_mismatch_with_typed_422(
     glossary_api_db: Path,
 ) -> None:
@@ -923,6 +1027,8 @@ async def test_conflict_query_uses_sql_pagination_and_never_calls_unbounded_lega
     assert result["total"] == 8
     normalized_sql = [" ".join(statement.split()).upper() for statement in statements]
     assert any("LIMIT 3 OFFSET 3" in statement for statement in normalized_sql)
+    assert any("LIMIT 200" in statement for statement in normalized_sql)
+    assert not any("GROUP_CONCAT(ID)" in statement for statement in normalized_sql)
     assert not any(
         "SELECT G.*" in statement
         and "LIMIT" not in statement
@@ -945,3 +1051,119 @@ async def test_conflict_query_uses_sql_pagination_and_never_calls_unbounded_lega
         )
     assert response.status_code == 200
     assert len(response.json()["conflicts"]) <= 3
+
+
+@pytest.mark.asyncio
+async def test_large_conflict_group_is_resolved_in_stable_mergeable_200_member_batches(
+    glossary_api_db: Path,
+) -> None:
+    book_id = add_book(glossary_api_db, "Book")
+    with get_connection(glossary_api_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO glossary_terms
+                (book_id, source_term, source_key, target_term, approved, locked,
+                 review_status, version, archived_at)
+            VALUES (?, ?, 'same-key', ?, 0, 0, 'CONFLICT', 1, '')
+            """,
+            [(book_id, f"unique-{index:03d}", f"target-{index:03d}") for index in range(250)],
+        )
+        conn.commit()
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        headers = await _auth_headers(client)
+        first_page = await client.get(
+            f"/api/glossary/conflicts?book_id={book_id}&page=1&per_page=1&include_legacy=false",
+            headers=headers,
+        )
+        first_group = first_page.json()["items"][0]
+        first_ids = [member["id"] for member in first_group["members"]]
+        first_canonical = first_group.get("canonical_id", first_ids[0])
+        first_preview = await client.post(
+            "/api/glossary/conflicts/merge/preview",
+            json={"canonical_id": first_canonical, "duplicate_ids": first_ids[1:]},
+            headers=headers,
+        )
+        first_apply = await client.post(
+            "/api/glossary/conflicts/merge/apply",
+            json={
+                "canonical_id": first_canonical,
+                "duplicate_ids": first_ids[1:],
+                "digest": first_preview.json().get("digest", "0" * 64),
+            },
+            headers=headers,
+        )
+        second_page = await client.get(
+            f"/api/glossary/conflicts?book_id={book_id}&page=1&per_page=1&include_legacy=false",
+            headers=headers,
+        )
+        second_group = second_page.json()["items"][0]
+        second_ids = [member["id"] for member in second_group["members"]]
+        second_canonical = second_group.get("canonical_id", second_ids[0])
+        second_preview = await client.post(
+            "/api/glossary/conflicts/merge/preview",
+            json={"canonical_id": second_canonical, "duplicate_ids": second_ids[1:]},
+            headers=headers,
+        )
+        second_apply = await client.post(
+            "/api/glossary/conflicts/merge/apply",
+            json={
+                "canonical_id": second_canonical,
+                "duplicate_ids": second_ids[1:],
+                "digest": second_preview.json().get("digest", "0" * 64),
+            },
+            headers=headers,
+        )
+        resolved = await client.get(
+            f"/api/glossary/conflicts?book_id={book_id}&page=1&per_page=1&include_legacy=false",
+            headers=headers,
+        )
+
+    assert first_page.status_code == 200
+    assert first_group.get("member_total") == 250
+    assert first_group.get("members_truncated") is True
+    assert len(first_ids) == 200
+    assert first_group.get("canonical_id") == first_ids[0]
+    assert first_preview.status_code == 200
+    assert first_apply.status_code == 200
+    assert first_apply.json()["merged"] == 199
+    assert second_group["id"] == first_group["id"]
+    assert second_group.get("canonical_id") == first_group.get("canonical_id")
+    assert second_group.get("member_total") == 51
+    assert second_group.get("members_truncated") is False
+    assert len(second_ids) == 51
+    assert second_ids[0] == first_ids[0]
+    assert second_preview.status_code == 200
+    assert second_apply.status_code == 200
+    assert second_apply.json()["merged"] == 50
+    assert resolved.status_code == 200
+    assert resolved.json()["items"] == []
+
+
+def test_legacy_conflict_truncation_uses_member_rows_not_distinct_target_count(
+    glossary_api_db: Path,
+) -> None:
+    rows = []
+    for index in range(25):
+        book_id = add_book(glossary_api_db, f"Book {index}")
+        rows.append((book_id, f"target-{index % 2}"))
+    with get_connection(glossary_api_db) as conn:
+        conn.executemany(
+            """
+            INSERT INTO glossary_terms
+                (book_id, source_term, source_key, target_term, approved, locked,
+                 review_status, version, term_type)
+            VALUES (?, 'shared-source', 'shared-source', ?, 0, 0, 'NEEDS_REVIEW', 1, 'other')
+            """,
+            rows,
+        )
+        conn.commit()
+
+    from app.database.glossary_repository import GlossaryRepository
+
+    conflict = GlossaryRepository(glossary_api_db).query_legacy_conflicts(
+        limit=1, member_limit=20
+    )[0]
+    assert len(conflict["targets"]) == 20
+    assert conflict["truncated"] is True
