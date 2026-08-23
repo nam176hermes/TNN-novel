@@ -122,6 +122,7 @@ def _target_is_blank(value: object) -> bool:
 
 MAX_PHASE5_COMPONENTS = 100
 MAX_PHASE5_OCCURRENCE_SPANS = 250_000
+MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
 
 def _payload_mention_components(payload: object) -> list[tuple[int, set[str]]]:
@@ -232,6 +233,7 @@ def _candidate_mention_components(
     spans: list[tuple[int, int, str]] = []
     fallback: list[tuple[int, set[str]]] = []
     fingerprints: set[str] = set()
+    remaining_span_capacity = MAX_PHASE5_OCCURRENCE_SPANS
     for candidate in candidates:
         source_key = str(candidate["_source_key"])
         fingerprint = hashlib.sha256(
@@ -241,17 +243,25 @@ def _candidate_mention_components(
         raw_spans = candidate.get("occurrence_spans")
         valid_spans: list[tuple[int, int]] = []
         if isinstance(raw_spans, list):
-            for raw_span in raw_spans[:MAX_PHASE5_OCCURRENCE_SPANS]:
+            bounded_spans = raw_spans[:remaining_span_capacity]
+            remaining_span_capacity -= len(bounded_spans)
+            for raw_span in bounded_spans:
                 if (
                     isinstance(raw_span, (list, tuple))
                     and len(raw_span) == 2
                     and type(raw_span[0]) is int
                     and type(raw_span[1]) is int
-                    and 0 <= raw_span[0] < raw_span[1] <= MAX_PHASE5_OCCURRENCE_SPANS
+                    and 0 <= raw_span[0] < raw_span[1] <= MAX_SQLITE_INTEGER
                 ):
                     valid_spans.append((raw_span[0], raw_span[1]))
-        if valid_spans or isinstance(raw_spans, list):
+        if isinstance(raw_spans, list):
             spans.extend((start, end, fingerprint) for start, end in valid_spans)
+            overflow_count = max(
+                0,
+                int(candidate.get("mention_count") or 0) - len(valid_spans),
+            )
+            if overflow_count:
+                fallback.append((overflow_count, {fingerprint}))
         else:
             fallback.append((max(0, int(candidate.get("mention_count") or 0)), {fingerprint}))
 

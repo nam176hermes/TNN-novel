@@ -416,13 +416,19 @@ def test_deterministic_coalesces_nested_aliases_across_title_and_body_stably(
     assert disappearance_payload["mention_count"] == 4
 
 
+@pytest.mark.parametrize(
+    ("surface_count", "expected_component_count"),
+    [(100, 100), (101, 100)],
+)
 def test_deterministic_caps_canonical_components_without_persisting_surfaces_or_spans(
     temp_db_path: Path,
     tmp_path: Path,
+    surface_count: int,
+    expected_component_count: int,
 ) -> None:
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Book")
-    surfaces = [f"玄{chr(0x7000 + index)}" for index in range(100)]
+    surfaces = [f"玄{chr(0x7000 + index)}" for index in range(surface_count)]
     canonical_id = put_glossary_term(
         temp_db_path,
         book_id,
@@ -470,16 +476,143 @@ def test_deterministic_caps_canonical_components_without_persisting_surfaces_or_
         ).fetchone()[0]
 
     payload = json.loads(evidence_json)
-    assert payload["mention_count"] == 100
-    assert len(payload["mention_components"]) == 100
+    assert payload["mention_count"] == surface_count
+    assert len(payload["mention_components"]) == expected_component_count
     assert len(payload["source_fingerprints"]) == 100
-    assert all(component["mention_count"] == 1 for component in payload["mention_components"])
+    assert sum(
+        component["mention_count"] for component in payload["mention_components"]
+    ) == surface_count
     assert all("occurrence_spans" not in candidate for candidate in first["candidates"])
     assert all(surface not in evidence_json for surface in surfaces)
     assert "occurrence_spans" not in evidence_json
     assert retry["updated"] == 0
     assert retry_evidence == evidence_json
     assert retry_version == before_version
+    assert retry_history == before_history
+
+
+def test_deterministic_persists_late_safe_occurrence_coordinates(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    term_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+    )
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章",
+        ("x" * 250_001) + "。玄天圣典",
+    )
+
+    result = _service(temp_db_path).extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            "SELECT occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        evidence_json = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (term_id, chapter_id),
+        ).fetchone()[0]
+
+    public = next(
+        candidate
+        for candidate in result["candidates"]
+        if candidate["source_term"] == "玄天圣典"
+    )
+    assert public["mention_count"] == 1
+    assert "occurrence_spans" not in public
+    assert json.loads(evidence_json)["mention_count"] == 1
+    assert "occurrence_spans" not in evidence_json
+    assert "玄天圣典" not in evidence_json
+    assert tuple(term) == (1, 1)
+
+
+def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_count(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    term_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "洪荒圣典",
+        "Canonical",
+        approved=1,
+    )
+    repository = GlossaryRepository(temp_db_path)
+    candidate = {
+        "source_term": "洪荒圣典",
+        "mention_count": 250_001,
+        "occurrence_spans": [
+            [index * 2, index * 2 + 1] for index in range(250_001)
+        ],
+        "evidence_types": ["repeated_ngram"],
+    }
+
+    repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=99,
+        chapter_number=99,
+        extractor="deterministic-v2",
+        candidates=[candidate],
+    )
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 99 AND extractor = 'deterministic-v2'",
+            (term_id,),
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?", (term_id,)
+        ).fetchone()[0]
+
+    retry = repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=99,
+        chapter_number=99,
+        extractor="deterministic-v2",
+        candidates=[candidate],
+    )
+    with get_connection(temp_db_path) as conn:
+        after = conn.execute(
+            "SELECT occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        retry_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 99 AND extractor = 'deterministic-v2'",
+            (term_id,),
+        ).fetchone()[0]
+        retry_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?", (term_id,)
+        ).fetchone()[0]
+
+    payload = json.loads(before_evidence)
+    assert tuple(before)[:2] == (250_001, 1)
+    assert payload["mention_count"] == 250_001
+    assert len(payload["mention_components"]) == 1
+    assert payload["mention_components"][0]["mention_count"] == 250_001
+    assert "occurrence_spans" not in before_evidence
+    assert "洪荒圣典" not in before_evidence
+    assert retry["updated"] == 0
+    assert tuple(after) == tuple(before)
+    assert retry_evidence == before_evidence
     assert retry_history == before_history
 
 
