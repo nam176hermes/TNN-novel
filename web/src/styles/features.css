@@ -3507,6 +3507,74 @@
   scrollbar-gutter: stable;
 }
 
+.glossary-review-tabs,
+.glossary-review-filters,
+.glossary-pagination {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.glossary-review-tabs button[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.glossary-review-filters label {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.glossary-pagination {
+  justify-content: flex-end;
+}
+
+.glossary-row-actions {
+  min-width: 170px;
+}
+
+.glossary-detail-drawer {
+  background: var(--surface-raised, #10191c);
+  border-left: 1px solid rgb(255 255 255 / 12%);
+  bottom: 0;
+  box-shadow: -18px 0 40px rgb(0 0 0 / 38%);
+  max-width: min(92vw, 520px);
+  overflow: auto;
+  padding: 18px;
+  position: fixed;
+  right: 0;
+  top: 0;
+  width: 100%;
+  z-index: 40;
+}
+
+.glossary-detail-drawer > header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.glossary-detail-metadata div {
+  border-bottom: 1px solid rgb(255 255 255 / 8%);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  padding: 7px 0;
+}
+
+.glossary-detail-metadata dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.glossary-detail-drawer pre {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .glossary-table-wrap:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -3621,11 +3689,6 @@
 
 .glossary-management-table th:nth-child(7),
 .glossary-management-table td:nth-child(7) {
-  width: 13%;
-}
-
-.glossary-management-table th:nth-child(8),
-.glossary-management-table td:nth-child(8) {
   width: 20%;
 }
 
@@ -3867,6 +3930,28 @@
     overflow-x: visible;
   }
 
+  .glossary-review-tabs,
+  .glossary-review-filters,
+  .glossary-pagination {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+    overflow: visible;
+  }
+
+  .glossary-review-tabs button,
+  .glossary-review-filters label,
+  .glossary-review-filters select,
+  .glossary-pagination button {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .glossary-detail-drawer {
+    border-left: 0;
+    max-width: 100vw;
+  }
+
   .glossary-filter-tabs .status-chip-success {
     justify-self: start;
   }
@@ -3874,11 +3959,10 @@
   .glossary-management-table th:nth-child(1)::before { content: "Gốc"; }
   .glossary-management-table td:nth-child(2)::before { content: "Bản dịch"; }
   .glossary-management-table td:nth-child(3)::before { content: "Loại"; }
-  .glossary-management-table td:nth-child(4)::before { content: "Thể loại"; }
-  .glossary-management-table td:nth-child(5)::before { content: "Ưu tiên"; }
-  .glossary-management-table td:nth-child(6)::before { content: "Duyệt"; }
-  .glossary-management-table td:nth-child(7)::before { content: "Khóa"; }
-  .glossary-management-table td:nth-child(8)::before { content: "Thao tác"; }
+  .glossary-management-table td:nth-child(4)::before { content: "Ưu tiên"; }
+  .glossary-management-table td:nth-child(5)::before { content: "Trạng thái"; }
+  .glossary-management-table td:nth-child(6)::before { content: "Bằng chứng"; }
+  .glossary-management-table td:nth-child(7)::before { content: "Thao tác"; }
 
   .glossary-management-table input,
   .glossary-management-table select {

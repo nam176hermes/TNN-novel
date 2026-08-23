@@ -868,6 +868,7 @@ class GlossaryTermUpdate(BaseModel):
     gender: str | None = None
     review_status: str | None = None
     source_context: str | None = None
+    expected_version: int | None = Field(default=None, ge=0)
 
 
 class TranslationMemoryEntryCreate(BaseModel):
@@ -905,6 +906,10 @@ class GlossaryTermResponse(BaseModel):
     source_context: str = ""
     created_at: str = ""
     updated_at: str = ""
+    version: int = 0
+    canonical_status: str = ""
+    inherited: bool = False
+    evidence_count: int = 0
 
 
 class GlossarySearchResponse(BaseModel):
@@ -917,6 +922,9 @@ class GlossaryListResponse(BaseModel):
     total: int = 0
     page: int = 1
     per_page: int = 50
+    pages: int = 0
+    scope: str = "all"
+    facets: dict[str, dict[str, int]] = Field(default_factory=dict)
 
 
 class ImportGlossaryResponse(BaseModel):

@@ -2,6 +2,43 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
 
 describe('glossary and TM API', () => {
+  it('queries a bounded review page with filters and an abort signal', async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        facets: { locked: { '0': 1 }, mode: {}, review_status: { NEEDS_REVIEW: 1 }, scope: { book: 1 }, term_type: {} },
+        items: [],
+        page: 1,
+        pages: 0,
+        per_page: 50,
+        scope: 'book',
+        total: 0,
+      }),
+    });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+
+    const result = await client.queryGlossaryTerms(
+      {
+        book_id: 42,
+        page: 1,
+        per_page: 50,
+        q: '筑基',
+        review_status: 'NEEDS_REVIEW,CONFLICT',
+        scope: 'book',
+        sort: 'review',
+      },
+      { signal: controller.signal },
+    );
+
+    expect(result.scope).toBe('book');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/glossary?book_id=42&page=1&per_page=50&q=%E7%AD%91%E5%9F%BA&review_status=NEEDS_REVIEW%2CCONFLICT&scope=book&sort=review',
+      expect.objectContaining({ signal: controller.signal }),
+    );
+  });
+
   it('searches translation memory', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

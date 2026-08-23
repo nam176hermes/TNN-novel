@@ -21,7 +21,10 @@ import type {
   SystemBackupList,
   SystemBackupRequest,
   GlossaryTerm,
-  GlossaryTermUpdate,
+  GlossaryPage,
+  GlossaryQuery,
+  GlossaryTermDetail,
+  GlossaryVersionedUpdate,
   ImportFileRequest,
   ImportJobAccepted,
   ImportJobEvent,
@@ -1602,13 +1605,55 @@ export class ApiClient {
     return data.items;
   }
 
-  async updateGlossaryTerm(termId: number, updates: GlossaryTermUpdate): Promise<void> {
+  async queryGlossaryTerms(query: GlossaryQuery, options: ApiRequestOptions = {}): Promise<GlossaryPage> {
+    const params = new URLSearchParams();
+    if (query.book_id !== undefined) params.set('book_id', String(query.book_id));
+    params.set('page', String(query.page));
+    params.set('per_page', String(Math.min(query.per_page, 50)));
+    if (query.q) params.set('q', query.q);
+    if (query.review_status) params.set('review_status', query.review_status);
+    if (query.term_type) params.set('term_type', query.term_type);
+    if (query.mode) params.set('mode', query.mode);
+    if (query.locked !== undefined) params.set('locked', String(query.locked));
+    params.set('scope', query.scope);
+    params.set('sort', query.sort);
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary?${params}`, {
+      headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    await this.assertOk(response, 'Failed to load glossary review queue');
+    return (await response.json()) as GlossaryPage;
+  }
+
+  async updateGlossaryTerm(termId: number, updates: GlossaryVersionedUpdate): Promise<GlossaryTerm> {
     const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms/${termId}`, {
       method: 'PATCH',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     });
     await this.assertOk(response, 'Failed to update glossary term');
+    return (await response.json()) as GlossaryTerm;
+  }
+
+  async createGlossaryTerm(
+    term: Partial<GlossaryTerm> & Pick<GlossaryTerm, 'book_id' | 'source_term' | 'target_term'>,
+  ): Promise<GlossaryTerm> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(term),
+    });
+    await this.assertOk(response, 'Failed to create glossary term');
+    return (await response.json()) as GlossaryTerm;
+  }
+
+  async getGlossaryTermDetail(termId: number, options: ApiRequestOptions = {}): Promise<GlossaryTermDetail> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms/${termId}`, {
+      headers: this.headers(),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    await this.assertOk(response, 'Failed to load glossary term detail');
+    return (await response.json()) as GlossaryTermDetail;
   }
 
   async lockGlossaryTerm(termId: number): Promise<void> {

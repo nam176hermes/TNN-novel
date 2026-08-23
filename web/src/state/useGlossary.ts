@@ -1,9 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, type ApiClient } from '../api/client';
-import type { GlossaryTerm, GlossaryTermUpdate, TmSearchResult } from '../api/types';
+import type {
+  GlossaryFacets,
+  GlossaryPage,
+  GlossaryQuery,
+  GlossaryTerm,
+  GlossaryTermUpdate,
+  TmSearchResult,
+} from '../api/types';
 import { formatError, type AsyncState, type LoadState } from './types';
 
 const emptyTerms: AsyncState<GlossaryTerm[]> = { data: [], error: '', state: 'idle' };
+const emptyFacets: GlossaryFacets = { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} };
+const defaultQuery: GlossaryQuery = {
+  page: 1,
+  per_page: 50,
+  q: '',
+  review_status: 'NEEDS_REVIEW,CONFLICT',
+  scope: 'book',
+  sort: 'review',
+};
 
 export function useGlossary(
   client: ApiClient,
@@ -11,12 +27,23 @@ export function useGlossary(
   bookId: number | null,
   sourceText: string,
   onAuthError?: () => void,
+  reviewQueue = true,
 ) {
   const [terms, setTerms] = useState<AsyncState<GlossaryTerm[]>>(emptyTerms);
+  const [query, setQueryState] = useState<GlossaryQuery>(defaultQuery);
+  const [pageData, setPageData] = useState<Pick<GlossaryPage, 'facets' | 'page' | 'pages' | 'per_page' | 'scope' | 'total'>>({
+    facets: emptyFacets,
+    page: 1,
+    pages: 0,
+    per_page: 50,
+    scope: 'book',
+    total: 0,
+  });
   const [tmResults, setTmResults] = useState<TmSearchResult[]>([]);
   const [tmState, setTmState] = useState<LoadState>('idle');
   const [tmError, setTmError] = useState('');
   const termsRequestIdRef = useRef(0);
+  const termsAbortRef = useRef<AbortController | null>(null);
   const tmRequestIdRef = useRef(0);
   const bookIdRef = useRef(bookId);
   const enabledRef = useRef(enabled);
@@ -27,7 +54,9 @@ export function useGlossary(
   const resetTerms = useCallback(
     (state: LoadState = 'idle') => {
       termsRequestIdRef.current += 1;
+      termsAbortRef.current?.abort();
       setTerms({ data: [], error: '', state });
+      setPageData((current) => ({ ...current, facets: emptyFacets, page: 1, pages: 0, total: 0 }));
     },
     [],
   );
@@ -46,6 +75,9 @@ export function useGlossary(
       return [];
     }
 
+    termsAbortRef.current?.abort();
+    const controller = new AbortController();
+    termsAbortRef.current = controller;
     const requestId = termsRequestIdRef.current + 1;
     termsRequestIdRef.current = requestId;
     setTerms((current) => ({ data: current.data, error: '', state: 'loading' }));
@@ -53,21 +85,46 @@ export function useGlossary(
     const requestedBookId = bookId;
 
     try {
-      const nextTerms = await client.getGlossaryTerms(requestedBookId);
+      const requestedQuery = { ...query, book_id: requestedBookId, per_page: Math.min(query.per_page, 50) };
+      let nextPage: GlossaryPage;
+      if (reviewQueue && typeof client.queryGlossaryTerms === 'function') {
+        nextPage = await client.queryGlossaryTerms(requestedQuery, { signal: controller.signal });
+      } else {
+        const items = await client.getGlossaryTerms(requestedBookId);
+        nextPage = {
+          facets: emptyFacets,
+          items,
+          page: 1,
+          pages: items.length > 0 ? 1 : 0,
+          per_page: 50,
+          scope: 'book',
+          total: items.length,
+        };
+      }
+      if (!nextPage) return [];
       if (
         requestId !== termsRequestIdRef.current ||
         !enabledRef.current ||
         bookIdRef.current !== requestedBookId
       ) {
-        return nextTerms;
+        return nextPage.items;
       }
       setTerms({
-        data: nextTerms,
+        data: nextPage.items,
         error: '',
-        state: nextTerms.length > 0 ? 'ready' : 'empty',
+        state: nextPage.items.length > 0 ? 'ready' : 'empty',
       });
-      return nextTerms;
+      setPageData({
+        facets: nextPage.facets,
+        page: nextPage.page,
+        pages: nextPage.pages,
+        per_page: nextPage.per_page,
+        scope: nextPage.scope,
+        total: nextPage.total,
+      });
+      return nextPage.items;
     } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) return [];
       if (
         requestId !== termsRequestIdRef.current ||
         !enabledRef.current ||
@@ -81,7 +138,16 @@ export function useGlossary(
       setTerms((current) => ({ data: current.data, error: formatError(error), state: 'error' }));
       throw error;
     }
-  }, [bookId, client, enabled, onAuthError, resetTerms, resetTm]);
+  }, [bookId, client, enabled, onAuthError, query, resetTerms, resetTm, reviewQueue]);
+
+  const setQuery = useCallback((updates: Partial<GlossaryQuery>) => {
+    setQueryState((current) => ({
+      ...current,
+      ...updates,
+      page: updates.page ?? 1,
+      per_page: Math.min(updates.per_page ?? current.per_page, 50),
+    }));
+  }, []);
 
   const updateTerm = useCallback(
     async (termId: number, updates: GlossaryTermUpdate) => {
@@ -89,7 +155,11 @@ export function useGlossary(
       if (!enabledRef.current || actionBookId === null) return;
 
       try {
-        await client.updateGlossaryTerm(termId, updates);
+        const version = terms.data.find((term) => term.id === termId)?.version;
+        await client.updateGlossaryTerm(termId, {
+          ...updates,
+          ...(version === undefined ? {} : { expected_version: version }),
+        });
         if (enabledRef.current && bookIdRef.current === actionBookId) {
           await refresh();
         }
@@ -100,7 +170,7 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh],
+    [client, onAuthError, refresh, terms.data],
   );
 
   const toggleLock = useCallback(
@@ -173,10 +243,12 @@ export function useGlossary(
       if (!enabledRef.current || actionBookId === null) return;
 
       try {
+        const version = terms.data.find((term) => term.id === termId)?.version;
         await client.updateGlossaryTerm(termId, {
           ...updates,
           approved: 1,
           locked: locked ? 1 : 0,
+          ...(version === undefined ? {} : { expected_version: version }),
         });
         if (enabledRef.current && bookIdRef.current === actionBookId) {
           await refresh();
@@ -188,7 +260,36 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh],
+    [client, onAuthError, refresh, terms.data],
+  );
+
+  const createBookOverride = useCallback(
+    async (term: GlossaryTerm) => {
+      const currentBookId = bookIdRef.current;
+      if (!enabledRef.current || currentBookId === null) return;
+      await client.createGlossaryTerm({
+        approved: 0,
+        book_id: currentBookId,
+        category: term.category,
+        genre: term.genre,
+        locked: 0,
+        mode: term.mode,
+        priority: term.priority,
+        review_status: 'NEEDS_REVIEW',
+        source_context: term.source_context,
+        source_term: term.source_term,
+        target_term: term.target_term,
+        term_type: term.term_type,
+        variants: term.variants,
+      });
+      await refresh();
+    },
+    [client, refresh],
+  );
+
+  const loadTermDetail = useCallback(
+    (termId: number) => client.getGlossaryTermDetail(termId),
+    [client],
   );
 
   const searchTranslationMemory = useCallback(
@@ -246,17 +347,27 @@ export function useGlossary(
 
   return {
     approveTerm,
+    createBookOverride,
+    facets: pageData.facets,
+    loadTermDetail,
+    page: pageData.page,
+    pages: pageData.pages,
     pendingCount,
+    perPage: pageData.per_page,
+    query,
     rejectTerm,
     refresh,
     relevantTerms,
     saveAndApproveTerm,
     searchTranslationMemory,
+    setQuery,
+    scope: pageData.scope,
     terms,
     tmError,
     tmResults,
     tmState,
     toggleLock,
+    total: pageData.total,
     updateTerm,
   };
 }

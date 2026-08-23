@@ -1309,6 +1309,78 @@ export type GlossaryTerm = {
   source_context?: string;
   created_at?: string;
   updated_at?: string;
+  version?: number;
+  canonical_status?: string;
+  inherited?: boolean;
+  evidence_count?: number;
+};
+
+export type GlossaryScope = 'all' | 'book' | 'global' | 'effective';
+
+export type GlossarySort =
+  | 'review'
+  | 'source_asc'
+  | 'source_desc'
+  | 'updated_desc'
+  | 'updated_asc'
+  | 'priority_desc'
+  | 'evidence_desc';
+
+export type GlossaryQuery = {
+  book_id?: number;
+  page: number;
+  per_page: number;
+  q: string;
+  review_status: string;
+  term_type?: string;
+  mode?: string;
+  locked?: boolean;
+  scope: GlossaryScope;
+  sort: GlossarySort;
+};
+
+export type GlossaryFacets = {
+  review_status: Record<string, number>;
+  term_type: Record<string, number>;
+  mode: Record<string, number>;
+  locked: Record<string, number>;
+  scope: Record<string, number>;
+};
+
+export type GlossaryPage = {
+  items: GlossaryTerm[];
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+  scope: GlossaryScope;
+  facets: GlossaryFacets;
+};
+
+export type GlossaryEvidence = {
+  id: number;
+  evidence_type: string;
+  extractor: string;
+  created_at: string;
+  chapter_id?: number;
+  evidence?: Record<string, unknown>;
+};
+
+export type GlossaryHistory = {
+  id: number;
+  action: string;
+  actor: string;
+  request_id: string;
+  version: number;
+  created_at?: string;
+  timestamp?: string;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+};
+
+export type GlossaryTermDetail = GlossaryTerm & {
+  evidence: GlossaryEvidence[];
+  history: GlossaryHistory[];
 };
 
 export type GlossaryTermUpdate = Partial<
@@ -1331,6 +1403,8 @@ export type GlossaryTermUpdate = Partial<
     | 'source_context'
   >
 >;
+
+export type GlossaryVersionedUpdate = GlossaryTermUpdate & { expected_version?: number };
 
 export type Book = {
   id: number;

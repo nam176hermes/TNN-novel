@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.database.glossary_repository import GlossaryStateConflict
@@ -37,27 +39,44 @@ async def list_glossary(
     book_id: int | None = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=500),
+    q: str = Query("", max_length=200),
+    review_status: str = Query("", max_length=120),
+    term_type: str | None = Query(None, max_length=40),
     mode: str | None = Query(None),
+    locked: bool | None = Query(None),
+    scope: Literal["all", "book", "global", "effective"] | None = Query(None),
+    sort: Literal[
+        "review", "source_asc", "source_desc", "updated_desc", "updated_asc", "priority_desc", "evidence_desc"
+    ] = Query("review"),
     approved: int | None = Query(None),
-    include_weak: bool = Query(False),
+    include_weak: bool | None = Query(None),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """List glossary terms with pagination and filtering."""
-    offset = (page - 1) * per_page
-    items, total = svc.list_terms(
+    """List a bounded glossary review page using SQL filters and facets."""
+    statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
+    if any(status not in {"NEEDS_REVIEW", "APPROVED", "REJECTED", "LOCKED", "CONFLICT"} for status in statuses):
+        raise HTTPException(status_code=422, detail={"code": "invalid_review_status"})
+    if mode is not None and mode not in {"", "translate", "context", "transliterate"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_mode"})
+    if scope in {"book", "effective"} and book_id is None:
+        raise HTTPException(status_code=422, detail={"code": "book_id_required"})
+
+    legacy_call = approved is not None or include_weak is not None or per_page > 200
+    resolved_scope = scope or ("legacy" if legacy_call else ("effective" if book_id is not None else "all"))
+    return svc.query_terms(
         book_id=book_id,
-        limit=per_page,
-        offset=offset,
+        page=page,
+        per_page=per_page,
+        q=q,
+        review_status=review_status,
+        term_type=term_type,
         mode=mode,
+        locked=locked,
+        scope=resolved_scope,
+        sort=sort,
         approved=approved,
-        include_weak=include_weak,
+        include_weak=bool(include_weak),
     )
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-    }
 
 
 @router.get("/search")
@@ -152,10 +171,20 @@ async def add_term(
 ):
     """Add a new glossary term."""
     actor, request_id = _mutation_metadata(request)
-    term_id = _state_mutation(
-        lambda: svc.add_term(term.model_dump(), actor=actor, request_id=request_id)
+    return _state_mutation(
+        lambda: svc.add_term_resource(term.model_dump(), actor=actor, request_id=request_id)
     )
-    return {"id": term_id, "message": "Term added"}
+
+
+@router.get("/terms/{term_id}", response_model=dict)
+async def get_term_detail(
+    term_id: int,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    resource = svc.get_term_detail(term_id)
+    if resource is None:
+        raise HTTPException(status_code=404, detail="Term not found")
+    return resource
 
 
 @router.patch("/terms/{term_id}", response_model=dict)
@@ -167,17 +196,17 @@ async def update_term(
 ):
     """Update a glossary term."""
     actor, request_id = _mutation_metadata(request)
-    success = _state_mutation(
-        lambda: svc.update_term(
+    resource = _state_mutation(
+        lambda: svc.update_term_resource(
             term_id,
             update.model_dump(exclude_none=True),
             actor=actor,
             request_id=request_id,
         )
     )
-    if not success:
+    if resource is None:
         raise HTTPException(status_code=404, detail="Term not found")
-    return {"message": "Term updated"}
+    return resource
 
 
 @router.post("/terms/{term_id}/lock", response_model=dict)

@@ -20,6 +20,29 @@ CANONICAL_STATES = {
     "CONFLICT": (0, 0),
 }
 
+WEAK_SOURCE_TERMS = {
+    "的", "了", "是", "在", "有", "不", "也", "都", "就", "这", "那", "然后", "只是", "一个", "一下", "自己",
+}
+QUERY_SCOPES = {"all", "book", "global", "effective", "legacy"}
+QUERY_SORTS = {
+    "review": """
+        (CASE WHEN approved = 0 THEN 0 ELSE -10 END
+         + locked * 20 + priority
+         + CASE term_type
+             WHEN 'realm' THEN 100 WHEN 'sect' THEN 90 WHEN 'character' THEN 85
+             WHEN 'place' THEN 85 WHEN 'artifact' THEN 80 WHEN 'technique' THEN 75
+             WHEN 'concept' THEN 70 WHEN 'title' THEN 65 ELSE 0 END
+         + CASE WHEN occurrence_count >= 2 THEN MIN(occurrence_count, 10) * 6 ELSE 0 END) DESC,
+        occurrence_count DESC, length(source_term) DESC, source_term COLLATE NOCASE ASC, id ASC
+    """,
+    "source_asc": "source_term COLLATE NOCASE ASC, id ASC",
+    "source_desc": "source_term COLLATE NOCASE DESC, id DESC",
+    "updated_desc": "updated_at DESC, id DESC",
+    "updated_asc": "updated_at ASC, id ASC",
+    "priority_desc": "priority DESC, source_term COLLATE NOCASE ASC, id ASC",
+    "evidence_desc": "evidence_count DESC, source_term COLLATE NOCASE ASC, id ASC",
+}
+
 
 class GlossaryStateConflict(Exception):
     def __init__(self, code: str) -> None:
@@ -134,6 +157,18 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_evidence_term ON glossary_term_evidence(term_id, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_terms_source_key ON glossary_terms(book_id, source_key)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_glossary_terms_scope_status "
+        "ON glossary_terms(book_id, archived_at, review_status, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_glossary_terms_review_filters "
+        "ON glossary_terms(review_status, term_type, mode, locked, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_glossary_terms_effective_source "
+        "ON glossary_terms(source_key, book_id, archived_at, review_status)"
+    )
     ensure_history_table(conn)
 
 
@@ -148,6 +183,198 @@ class GlossaryRepository:
     @staticmethod
     def _row(conn: sqlite3.Connection, term_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM glossary_terms WHERE id = ?", (term_id,)).fetchone()
+
+    @staticmethod
+    def _resource(row: sqlite3.Row | dict[str, Any], *, inherited: bool = False, evidence_count: int = 0) -> dict[str, Any]:
+        resource = dict(row)
+        resource["canonical_status"] = str(resource.get("review_status") or "CONFLICT")
+        resource["version"] = int(resource.get("version") or 0)
+        resource["inherited"] = inherited
+        resource["evidence_count"] = evidence_count
+        return resource
+
+    def get_resource(self, term_id: int) -> dict[str, Any] | None:
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT g.*, (SELECT COUNT(*) FROM glossary_term_evidence e WHERE e.term_id = g.id) AS evidence_count
+                FROM glossary_terms g
+                WHERE g.id = ? AND COALESCE(g.archived_at, '') = ''
+                """,
+                (term_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._resource(row, evidence_count=int(row["evidence_count"] or 0))
+
+    def get_detail(self, term_id: int) -> dict[str, Any] | None:
+        resource = self.get_resource(term_id)
+        if resource is None:
+            return None
+        with get_connection(self.db_path) as conn:
+            evidence_rows = conn.execute(
+                "SELECT * FROM glossary_term_evidence WHERE term_id = ? ORDER BY id",
+                (term_id,),
+            ).fetchall()
+            history_rows = conn.execute(
+                "SELECT * FROM glossary_history WHERE term_id = ? ORDER BY id",
+                (term_id,),
+            ).fetchall()
+
+        evidence: list[dict[str, Any]] = []
+        for row in evidence_rows:
+            item = dict(row)
+            try:
+                item["evidence"] = json.loads(str(item.pop("evidence_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["evidence"] = {}
+            evidence.append(item)
+        history: list[dict[str, Any]] = []
+        for row in history_rows:
+            item = dict(row)
+            for key in ("before_json", "after_json"):
+                try:
+                    item[key.removesuffix("_json")] = json.loads(str(item.pop(key) or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item[key.removesuffix("_json")] = {}
+            history.append(item)
+        resource.update(evidence=evidence, history=history)
+        return resource
+
+    @staticmethod
+    def _query_cte(
+        *,
+        book_id: int | None,
+        q: str,
+        review_statuses: tuple[str, ...],
+        term_type: str | None,
+        mode: str | None,
+        locked: bool | None,
+        scope: str,
+        approved: int | None,
+        include_weak: bool,
+        effective_ids: tuple[int, ...] | None,
+    ) -> tuple[str, list[Any]]:
+        if scope not in QUERY_SCOPES:
+            raise ValueError("invalid_scope")
+        where = ["COALESCE(g.archived_at, '') = ''"]
+        params: list[Any] = []
+        if scope == "book":
+            if book_id is None:
+                raise ValueError("book_id_required")
+            where.append("g.book_id = ?")
+            params.append(book_id)
+        elif scope == "global":
+            where.append("g.book_id = 0")
+        elif scope == "legacy" and book_id is not None:
+            where.append("g.book_id IN (0, ?)")
+            params.append(book_id)
+        elif scope == "effective":
+            if book_id is None:
+                raise ValueError("book_id_required")
+            if effective_ids is None:
+                raise ValueError("effective_ids_required")
+            where.append("g.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))")
+            params.append(json.dumps(effective_ids))
+        if q:
+            like = f"%{q.casefold()}%"
+            where.append(
+                "(LOWER(g.source_term) LIKE ? OR LOWER(g.target_term) LIKE ? OR LOWER(g.source_key) LIKE ? "
+                "OR LOWER(g.term_type) LIKE ? OR LOWER(g.notes_vi) LIKE ?)"
+            )
+            params.extend((like, like, like, like, like))
+        if review_statuses:
+            where.append(f"g.review_status IN ({','.join('?' for _ in review_statuses)})")
+            params.extend(review_statuses)
+        if term_type:
+            where.append("g.term_type = ?")
+            params.append(term_type)
+        if mode:
+            where.append("g.mode = ?")
+            params.append(mode)
+        if locked is not None:
+            where.append("g.locked = ?")
+            params.append(int(locked))
+        if approved is not None:
+            where.append("g.approved = ?")
+            params.append(approved)
+        if not include_weak:
+            where.extend(
+                [
+                    "TRIM(g.source_term) != ''",
+                    "TRIM(g.target_term) != ''",
+                    "length(TRIM(g.source_term)) > 1",
+                    f"g.source_term NOT IN ({','.join('?' for _ in WEAK_SOURCE_TERMS)})",
+                ]
+            )
+            params.extend(sorted(WEAK_SOURCE_TERMS))
+        cte = f"""
+            WITH filtered AS (
+                SELECT g.*,
+                       CASE WHEN ? = 'effective' AND g.book_id = 0 THEN 1 ELSE 0 END AS inherited,
+                       CASE WHEN g.book_id = 0 THEN 'global' ELSE 'book' END AS scope_label,
+                       g.review_status AS canonical_status,
+                       (SELECT COUNT(*) FROM glossary_term_evidence e WHERE e.term_id = g.id) AS evidence_count
+                FROM glossary_terms g
+                WHERE {' AND '.join(where)}
+            )
+        """
+        return cte, [scope, *params]
+
+    def query(
+        self,
+        *,
+        book_id: int | None = None,
+        q: str = "",
+        review_statuses: tuple[str, ...] = (),
+        term_type: str | None = None,
+        mode: str | None = None,
+        locked: bool | None = None,
+        scope: str = "all",
+        sort: str = "review",
+        limit: int = 50,
+        offset: int = 0,
+        approved: int | None = None,
+        include_weak: bool = False,
+        effective_ids: tuple[int, ...] | None = None,
+    ) -> dict[str, Any]:
+        order_by = QUERY_SORTS.get(sort)
+        if order_by is None:
+            raise ValueError("invalid_sort")
+        cte, params = self._query_cte(
+            book_id=book_id,
+            q=q.strip(),
+            review_statuses=review_statuses,
+            term_type=term_type,
+            mode=mode,
+            locked=locked,
+            scope=scope,
+            approved=approved,
+            include_weak=include_weak,
+            effective_ids=effective_ids,
+        )
+        facet_sql = cte + """
+            SELECT 'review_status' AS facet, review_status AS value, COUNT(*) AS count FROM filtered GROUP BY review_status
+            UNION ALL SELECT 'term_type', term_type, COUNT(*) FROM filtered GROUP BY term_type
+            UNION ALL SELECT 'mode', mode, COUNT(*) FROM filtered GROUP BY mode
+            UNION ALL SELECT 'locked', CAST(locked AS TEXT), COUNT(*) FROM filtered GROUP BY locked
+            UNION ALL SELECT 'scope', scope_label, COUNT(*) FROM filtered GROUP BY scope_label
+        """
+        page_sql = cte + f"SELECT * FROM filtered ORDER BY {order_by} LIMIT ? OFFSET ?"
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(page_sql, (*params, limit, offset)).fetchall()
+            facet_rows = conn.execute(facet_sql, params).fetchall()
+        facets: dict[str, dict[str, int]] = {
+            "review_status": {}, "term_type": {}, "mode": {}, "locked": {}, "scope": {},
+        }
+        for row in facet_rows:
+            facets[str(row["facet"])][str(row["value"] or "")] = int(row["count"] or 0)
+        total = sum(facets["review_status"].values())
+        return {
+            "items": [self._resource(row, inherited=bool(row["inherited"]), evidence_count=int(row["evidence_count"])) for row in rows],
+            "total": total,
+            "facets": facets,
+        }
 
     @staticmethod
     def _source_rows(conn: sqlite3.Connection, book_id: int, source_key: str) -> list[sqlite3.Row]:
@@ -393,11 +620,16 @@ class GlossaryRepository:
     def update(self, term_id: int, *, actor: str = "", request_id: str = "", **updates: Any) -> bool:
         if updates.get("mode") is not None and updates["mode"] not in {"", "translate", "context", "transliterate"}:
             raise ValueError(f"Invalid mode: {updates['mode']}")
+        expected_version = updates.pop("expected_version", None)
         changes = {key: value for key, value in updates.items() if value is not None}
         with get_connection(self.db_path) as conn:
+            if expected_version is not None:
+                conn.execute("BEGIN IMMEDIATE")
             current = self._row(conn, term_id)
             if current is None or current["archived_at"]:
                 return False
+            if expected_version is not None and int(current["version"] or 0) != int(expected_version):
+                raise GlossaryStateConflict("stale_version")
             if not changes:
                 return True
             before = dict(current)

@@ -32,6 +32,7 @@ from app.database.glossary_repository import (
     GlossaryStateConflict,
     normalize_source_key,
 )
+from app.database.glossary_resolver import resolve_effective_glossary
 from app.mobile_api.dependencies import get_db_path
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
@@ -215,31 +216,71 @@ class GlossaryService:
         approved: int | None = None,
         include_weak: bool = False,
     ) -> tuple[list[dict], int]:
-        """List glossary terms with pagination and filtering."""
-        # For simplicity, we'll load all and filter (in production, add SQL WHERE clauses)
-        all_terms = list_glossary(self.db_path, book_id)
+        """Compatibility wrapper over the SQL review query."""
+        result = GlossaryRepository(self.db_path).query(
+            book_id=book_id,
+            q=search or "",
+            mode=mode,
+            scope="legacy",
+            limit=limit,
+            offset=offset,
+            approved=approved,
+            include_weak=include_weak,
+        )
+        return result["items"], result["total"]
 
-        # Apply filters
-        filtered = all_terms
-        if search:
-            search_lower = search.lower()
-            filtered = [
-                t for t in filtered
-                if search_lower in t["source_term"].lower()
-                or search_lower in t["target_term"].lower()
-            ]
-        if mode is not None:
-            filtered = [t for t in filtered if t.get("mode") == mode]
-        if approved is not None:
-            filtered = [t for t in filtered if t.get("approved") == approved]
-        if not include_weak:
-            filtered = [t for t in filtered if not _is_weak_term(t)]
-        filtered = _sort_glossary_for_review(filtered)
-
-        total = len(filtered)
-        # Apply pagination
-        paginated = filtered[offset:offset + limit]
-        return paginated, total
+    def query_terms(
+        self,
+        *,
+        book_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+        q: str = "",
+        review_status: str = "",
+        term_type: str | None = None,
+        mode: str | None = None,
+        locked: bool | None = None,
+        scope: str = "all",
+        sort: str = "review",
+        approved: int | None = None,
+        include_weak: bool = False,
+    ) -> dict:
+        per_page = min(per_page, 200)
+        statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
+        effective_ids = None
+        if scope == "effective":
+            effective_ids = tuple(
+                sorted(
+                    {
+                        int(term["id"])
+                        for term in resolve_effective_glossary(self.db_path, int(book_id or 0)).dictionary_terms
+                        if int(term["id"]) > 0
+                    }
+                )
+            )
+        result = GlossaryRepository(self.db_path).query(
+            book_id=book_id,
+            q=q,
+            review_statuses=statuses,
+            term_type=term_type,
+            mode=mode,
+            locked=locked,
+            scope=scope,
+            sort=sort,
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            approved=approved,
+            include_weak=include_weak,
+            effective_ids=effective_ids,
+        )
+        total = result["total"]
+        result.update(
+            page=page,
+            per_page=per_page,
+            pages=(total + per_page - 1) // per_page,
+            scope="all" if scope == "legacy" else scope,
+        )
+        return result
 
     def search_terms(self, query: str, book_id: int | None = None, limit: int = 20) -> list[dict]:
         """Search glossary terms."""
@@ -274,6 +315,13 @@ class GlossaryService:
             request_id=request_id,
         )
 
+    def add_term_resource(self, term_data: dict, *, actor: str = "", request_id: str = "") -> dict:
+        term_id = self.add_term(term_data, actor=actor, request_id=request_id)
+        resource = GlossaryRepository(self.db_path).get_resource(term_id)
+        if resource is None:
+            raise GlossaryStateConflict("term_not_created")
+        return resource
+
     def update_term(
         self,
         term_id: int,
@@ -301,9 +349,25 @@ class GlossaryService:
             gender=updates.get("gender"),
             review_status=updates.get("review_status"),
             source_context=updates.get("source_context"),
+            expected_version=updates.get("expected_version"),
             actor=actor,
             request_id=request_id,
         )
+
+    def update_term_resource(
+        self,
+        term_id: int,
+        updates: dict,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict | None:
+        if not self.update_term(term_id, updates, actor=actor, request_id=request_id):
+            return None
+        return GlossaryRepository(self.db_path).get_resource(term_id)
+
+    def get_term_detail(self, term_id: int) -> dict | None:
+        return GlossaryRepository(self.db_path).get_detail(term_id)
 
     def delete_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Archive a glossary term while preserving the existing API contract."""

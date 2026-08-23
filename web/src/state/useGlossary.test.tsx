@@ -14,6 +14,43 @@ function deferred<T>() {
 }
 
 describe('useGlossary', () => {
+  it('requests the default queue and aborts a stale server page request', async () => {
+    const first = deferred<never>();
+    const page = {
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [fixtureGlossaryTerm],
+      page: 1,
+      pages: 1,
+      per_page: 50,
+      scope: 'book' as const,
+      total: 1,
+    };
+    const queryGlossaryTerms = vi
+      .fn()
+      .mockImplementationOnce((_query, options) => {
+        options.signal.addEventListener('abort', () => first.resolve(undefined as never));
+        return first.promise;
+      })
+      .mockResolvedValueOnce(page);
+    const client = { queryGlossaryTerms, searchTm: vi.fn() } as unknown as ApiClient;
+    const { result } = renderHook(() => useGlossary(client, true, 42, '筑基'));
+
+    await waitFor(() => expect(queryGlossaryTerms).toHaveBeenCalledTimes(1));
+    expect(queryGlossaryTerms.mock.calls[0][0]).toMatchObject({
+      book_id: 42,
+      page: 1,
+      per_page: 50,
+      review_status: 'NEEDS_REVIEW,CONFLICT',
+      scope: 'book',
+    });
+
+    act(() => result.current.setQuery({ review_status: 'APPROVED' }));
+
+    await waitFor(() => expect(queryGlossaryTerms).toHaveBeenCalledTimes(2));
+    expect(queryGlossaryTerms.mock.calls[0][1].signal.aborted).toBe(true);
+    await waitFor(() => expect(result.current.terms.data[0]?.source_term).toBe('筑基'));
+  });
+
   it('loads glossary terms, derives pending count, finds source hits, and searches TM', async () => {
     const client = {
       getGlossaryTerms: vi.fn().mockResolvedValue([fixtureGlossaryTerm]),

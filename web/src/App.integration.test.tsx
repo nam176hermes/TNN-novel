@@ -1210,6 +1210,20 @@ describe('App live data wiring', () => {
           json: async () => ({ items: [fixtureGlossaryTerm] }),
         };
       }
+      if (target.endsWith('/api/glossary?book_id=42&page=1&per_page=50&review_status=NEEDS_REVIEW%2CCONFLICT&scope=book&sort=review')) {
+        return {
+          ok: true,
+          json: async () => ({
+            facets: { locked: { '1': 1 }, mode: {}, review_status: { NEEDS_REVIEW: 1 }, scope: { book: 1 }, term_type: { realm: 1 } },
+            items: [fixtureGlossaryTerm],
+            page: 1,
+            pages: 1,
+            per_page: 50,
+            scope: 'book',
+            total: 1,
+          }),
+        };
+      }
 
       if (target.endsWith('/api/books/42/chapters/4201/qa')) {
         return {

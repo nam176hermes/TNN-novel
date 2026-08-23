@@ -286,6 +286,7 @@ function AuthenticatedApp() {
     assistBookId,
     chapterText.sourceText,
     expireSession,
+    activeView === 'glossary',
   );
   const loadTranslatedBooks = useCallback(async (): Promise<TranslatedBookSummary[]> => {
     if (!session.isAuthenticated) {
@@ -1968,15 +1969,27 @@ function AuthenticatedApp() {
           <>
             {statusMessages}
             <GlossaryStyleView
+              error={glossaryState.terms.error}
+              facets={glossaryState.facets}
               glossaryTerms={glossaryState.terms.data}
+              loadState={glossaryState.terms.state}
               onApproveTerm={handleGlossaryApprove}
+              onCreateBookOverride={glossaryState.createBookOverride}
+              onLoadTermDetail={glossaryState.loadTermDetail}
               onLockToggle={handleGlossaryLockToggle}
+              onPageChange={(page) => glossaryState.setQuery({ page })}
               onProfileChange={handleStyleProfileChange}
+              onQueryChange={glossaryState.setQuery}
               onRejectTerm={handleGlossaryReject}
               onSaveAndApproveTerm={handleGlossarySaveAndApprove}
               onUpdateTerm={handleGlossaryTermUpdate}
+              page={glossaryState.page}
+              pages={glossaryState.pages}
+              perPage={glossaryState.perPage}
               profiles={styleState.profiles.data}
+              query={glossaryState.query}
               selectedProfileId={styleState.selectedStyleProfileId}
+              total={glossaryState.total}
             />
           </>
         );

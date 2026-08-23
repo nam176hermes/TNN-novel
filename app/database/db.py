@@ -4627,6 +4627,7 @@ def update_glossary_term(
     gender: str | None = None,
     review_status: str | None = None,
     source_context: str | None = None,
+    expected_version: int | None = None,
     actor: str = "",
     request_id: str = "",
 ) -> bool:
@@ -4648,6 +4649,7 @@ def update_glossary_term(
         gender=gender,
         review_status=review_status,
         source_context=source_context,
+        expected_version=expected_version,
         actor=actor,
         request_id=request_id,
     )
