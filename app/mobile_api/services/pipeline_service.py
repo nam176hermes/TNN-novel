@@ -56,6 +56,7 @@ from app.database.db import (
     upsert_reader_dictionary_cache,
 )
 from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
+from app.database.glossary_repository import normalize_source_key
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
 from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
 from app.mobile_api.services.content_file_service import ContentFileService
@@ -1456,9 +1457,70 @@ def fetch_online_dictionary_lookup(query: str, *, timeout: float = ONLINE_DICTIO
     return results
 
 
-def _reader_dictionary_builtin_results(query: str) -> list[dict]:
+def _reader_dictionary_builtin_is_shadowed(
+    entry: Mapping[str, object],
+    reserved_source_keys: frozenset[str],
+) -> bool:
+    surfaces = [entry.get("term"), *(entry.get("variants") or [])]
+    return any(
+        normalize_source_key(str(surface or "")) in reserved_source_keys
+        for surface in surfaces
+        if str(surface or "").strip()
+    )
+
+
+def _reader_dictionary_source_keys(source: Mapping[str, object]) -> frozenset[str]:
+    variants = source.get("variants") or []
+    if isinstance(variants, str):
+        variant_values = _dictionary_split_variants(variants)
+    else:
+        variant_values = [str(item) for item in variants]
+    return frozenset(
+        key
+        for surface in [source.get("term"), *variant_values]
+        if (key := normalize_source_key(str(surface or "")))
+    )
+
+
+def _reader_effective_dictionary_terms(
+    effective_glossary: EffectiveGlossary,
+    supplemental_sources: list[dict],
+) -> tuple[list[Mapping[str, object]], frozenset[str]]:
+    supplemental = [
+        (
+            _reader_dictionary_source_keys(source),
+            normalize_source_key(str(source.get("target") or "")),
+        )
+        for source in supplemental_sources
+    ]
+    terms: list[Mapping[str, object]] = []
+    styleguide_winning_keys: set[str] = set()
+    for term in effective_glossary.dictionary_terms:
+        if not term.get("styleguide"):
+            terms.append(term)
+            continue
+        term_keys = _reader_dictionary_source_keys(
+            {
+                "term": term.get("source_term"),
+                "variants": term.get("variants"),
+            }
+        )
+        target_key = normalize_source_key(str(term.get("target_term") or ""))
+        if any(term_keys & source_keys and target_key == source_target for source_keys, source_target in supplemental):
+            continue
+        terms.append(term)
+        styleguide_winning_keys.update(term_keys)
+    return terms, frozenset(styleguide_winning_keys)
+
+
+def _reader_dictionary_builtin_results(
+    query: str,
+    reserved_source_keys: frozenset[str] = frozenset(),
+) -> list[dict]:
     results: list[dict] = []
     for entry in READER_BUILTIN_DICTIONARY:
+        if _reader_dictionary_builtin_is_shadowed(entry, reserved_source_keys):
+            continue
         variants = [str(item) for item in entry.get("variants", []) if str(item).strip()]
         if not _dictionary_query_matches(
             query,
@@ -1485,8 +1547,14 @@ def _reader_dictionary_builtin_entry(entry: dict[str, object]) -> dict:
     }
 
 
-def _reader_dictionary_builtin_pack_results() -> list[dict]:
-    return [_reader_dictionary_builtin_entry(entry) for entry in READER_BUILTIN_DICTIONARY]
+def _reader_dictionary_builtin_pack_results(
+    reserved_source_keys: frozenset[str] = frozenset(),
+) -> list[dict]:
+    return [
+        _reader_dictionary_builtin_entry(entry)
+        for entry in READER_BUILTIN_DICTIONARY
+        if not _reader_dictionary_builtin_is_shadowed(entry, reserved_source_keys)
+    ]
 
 
 def _reader_dictionary_file_entry(row: dict, provider: str) -> dict | None:
@@ -3893,12 +3961,20 @@ class PipelineService:
                 return None
             current_chapter_number = int(chapter.get("chapter_number") or 0)
 
+        effective_glossary = resolve_effective_glossary(self.db_path, book_id)
+        raw_builtin_sources = _reader_dictionary_builtin_pack_results()
+        file_sources = _reader_dictionary_file_pack_results(self.data_dir)
+        dictionary_terms, styleguide_winning_keys = _reader_effective_dictionary_terms(
+            effective_glossary,
+            [*raw_builtin_sources, *file_sources],
+        )
         glossary_sources = [
             _reader_dictionary_glossary_result(term)
-            for term in resolve_effective_glossary(self.db_path, book_id).dictionary_terms
+            for term in dictionary_terms
         ]
-        builtin_sources = _reader_dictionary_builtin_pack_results()
-        file_sources = _reader_dictionary_file_pack_results(self.data_dir)
+        builtin_sources = _reader_dictionary_builtin_pack_results(
+            effective_glossary.reserved_source_keys | styleguide_winning_keys
+        )
 
         self._ensure_reader_xray_auto_extracted(book_id)
         xray_sources = [
@@ -3950,7 +4026,13 @@ class PipelineService:
             current_chapter_number = int(chapter.get("chapter_number") or 0)
 
         offline_sources: list[dict] = []
-        glossary_terms = resolve_effective_glossary(self.db_path, book_id).dictionary_terms
+        effective_glossary = resolve_effective_glossary(self.db_path, book_id)
+        raw_builtin_sources = _reader_dictionary_builtin_results(normalized_query)
+        file_sources = _reader_dictionary_file_results(self.data_dir, normalized_query)
+        glossary_terms, styleguide_winning_keys = _reader_effective_dictionary_terms(
+            effective_glossary,
+            [*raw_builtin_sources, *file_sources],
+        )
         for term in glossary_terms:
             variants = _dictionary_split_variants(term.get("variants"))
             if _dictionary_query_matches(
@@ -3962,8 +4044,13 @@ class PipelineService:
             ):
                 offline_sources.append(_reader_dictionary_glossary_result(term))
 
-        offline_sources.extend(_reader_dictionary_builtin_results(normalized_query))
-        offline_sources.extend(_reader_dictionary_file_results(self.data_dir, normalized_query))
+        offline_sources.extend(
+            _reader_dictionary_builtin_results(
+                normalized_query,
+                effective_glossary.reserved_source_keys | styleguide_winning_keys,
+            )
+        )
+        offline_sources.extend(file_sources)
 
         self._ensure_reader_xray_auto_extracted(book_id)
         entities = list_reader_xray_entities(

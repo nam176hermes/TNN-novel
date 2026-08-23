@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from app.database.connection import get_connection
 from app.database.glossary_repository import normalize_source_key
@@ -24,6 +26,16 @@ def _split_variants(value: str | None) -> list[str]:
 
 def _target_key(value: object) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
+
+
+def _deep_freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
 
 
 def _style_profile(conn, profile_id: str | None) -> dict | None:
@@ -77,22 +89,25 @@ def _styleguide_rows(genre: str | None) -> list[dict]:
 class EffectiveGlossary:
     book_id: int
     fingerprint: str
-    style_profile: dict | None
+    style_profile: Mapping[str, object] | None
     style_revision: str
-    prompt_mapping: dict[str, str]
-    translate_mapping: dict[str, str]
-    name_mapping: dict[str, str]
-    prompt_terms: tuple[dict, ...]
-    exact_terms: tuple[dict, ...]
-    locked_terms: tuple[dict, ...]
-    dictionary_terms: tuple[dict, ...]
+    prompt_mapping: Mapping[str, str]
+    translate_mapping: Mapping[str, str]
+    name_mapping: Mapping[str, str]
+    prompt_terms: tuple[Mapping[str, object], ...]
+    exact_terms: tuple[Mapping[str, object], ...]
+    locked_terms: tuple[Mapping[str, object], ...]
+    dictionary_terms: tuple[Mapping[str, object], ...]
+    reserved_source_keys: frozenset[str]
 
-    def mapping_for_mode(self, mode: str) -> dict[str, str]:
-        return {
-            term["source_term"]: term["target_term"]
-            for term in self.prompt_terms
-            if term["mode"] == mode
-        }
+    def mapping_for_mode(self, mode: str) -> Mapping[str, str]:
+        return MappingProxyType(
+            {
+                str(term["source_term"]): str(term["target_term"])
+                for term in self.prompt_terms
+                if term["mode"] == mode
+            }
+        )
 
 
 def resolve_effective_glossary(
@@ -122,6 +137,12 @@ def resolve_effective_glossary(
         ]
 
     genre = str(profile.get("id") or "") if profile else None
+    database_source_keys = {
+        normalize_source_key(surface)
+        for row in rows
+        for surface in [str(row["source_term"]), *_split_variants(row.get("variants"))]
+        if normalize_source_key(surface)
+    }
     book_primary_keys = {
         str(row.get("source_key") or normalize_source_key(row["source_term"]))
         for row in rows
@@ -202,8 +223,7 @@ def resolve_effective_glossary(
     dictionary_terms: list[dict] = []
     by_id: dict[int, list[dict]] = {}
     for term in flattened:
-        if not term.get("styleguide"):
-            by_id.setdefault(int(term["id"]), []).append(term)
+        by_id.setdefault(int(term["id"]), []).append(term)
     for term_id in sorted(by_id):
         effective = by_id[term_id]
         primary = next((term for term in effective if not term["is_variant"]), effective[0])
@@ -234,7 +254,8 @@ def resolve_effective_glossary(
         ).encode("utf-8")
     ).hexdigest()
     prompt_mapping = {term["source_term"]: term["target_term"] for term in flattened}
-    exact_terms = tuple(term for term in flattened if term["mode"] in EXACT_MODES)
+    frozen_terms = tuple(_deep_freeze(term) for term in flattened)
+    exact_terms = tuple(term for term in frozen_terms if term["mode"] in EXACT_MODES)
     locked_terms = tuple(
         term
         for term in exact_terms
@@ -248,21 +269,22 @@ def resolve_effective_glossary(
     return EffectiveGlossary(
         book_id=book_id,
         fingerprint=fingerprint,
-        style_profile=profile,
+        style_profile=_deep_freeze(profile) if profile is not None else None,
         style_revision=style_revision,
-        prompt_mapping=prompt_mapping,
-        translate_mapping={
-            term["source_term"]: term["target_term"]
+        prompt_mapping=_deep_freeze(prompt_mapping),
+        translate_mapping=_deep_freeze({
+            str(term["source_term"]): str(term["target_term"])
             for term in exact_terms
             if term["mode"] == "translate"
-        },
-        name_mapping={
-            term["source_term"]: term["target_term"]
+        }),
+        name_mapping=_deep_freeze({
+            str(term["source_term"]): str(term["target_term"])
             for term in exact_terms
             if term["mode"] == "transliterate"
-        },
-        prompt_terms=tuple(flattened),
+        }),
+        prompt_terms=frozen_terms,
         exact_terms=exact_terms,
         locked_terms=locked_terms,
-        dictionary_terms=tuple(dictionary_terms),
+        dictionary_terms=tuple(_deep_freeze(term) for term in dictionary_terms),
+        reserved_source_keys=frozenset(database_source_keys),
     )

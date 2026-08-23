@@ -21,6 +21,7 @@ from app.database.db import (
     update_glossary_term,
 )
 from app.mobile_api.services.job_service import JobService, JobTracker
+from app.mobile_api.services.glossary_service import GlossaryService
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
 from app.translation import styleguide_config
@@ -167,20 +168,113 @@ def test_reader_dictionary_uses_only_effective_rows_and_book_override(temp_db_pa
     pipeline.data_dir = tmp_path
 
     pack = pipeline.get_reader_dictionary_pack(book_id)
+    lookup = pipeline.lookup_reader_dictionary(book_id, query="丹田", include_online=False)
 
     assert pack is not None
-    glossary_sources = [item for item in pack["sources"] if item["source"] == "glossary"]
-    assert [item["target"] for item in glossary_sources] == ["đan điền sách"]
+    assert lookup is not None
+    assert [
+        (item["source"], item["target"])
+        for item in pack["sources"]
+        if item["term"] == "丹田"
+    ] == [("glossary", "đan điền sách")]
+    assert [
+        (item["source"], item["target"])
+        for item in lookup["sources"]
+        if item["term"] == "丹田"
+    ] == [("glossary", "đan điền sách")]
+
+
+def test_reader_dictionary_includes_styleguide_only_effective_survivor(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    monkeypatch.setattr(
+        styleguide_config,
+        "get_locked_terms",
+        lambda: [
+            {
+                "source": "仙侠",
+                "target": "tiên hiệp",
+                "genre": "tien_hiep",
+                "term_type": "genre",
+                "priority": 80,
+                "mode": "translate",
+            }
+        ],
+    )
+    book_id = add_book(temp_db_path, "Reader styleguide")
+    pipeline = object.__new__(PipelineService)
+    pipeline.db_path = temp_db_path
+    pipeline.data_dir = tmp_path
+
+    pack = pipeline.get_reader_dictionary_pack(book_id)
+    lookup = pipeline.lookup_reader_dictionary(book_id, query="仙侠", include_online=False)
+
+    assert pack is not None
+    assert lookup is not None
+    assert [
+        (item["source"], item["term"], item["target"])
+        for item in pack["sources"]
+        if item["term"] == "仙侠"
+    ] == [("glossary", "仙侠", "tiên hiệp")]
+    assert [
+        (item["source"], item["term"], item["target"])
+        for item in lookup["sources"]
+        if item["term"] == "仙侠"
+    ] == [("glossary", "仙侠", "tiên hiệp")]
+
+
+@pytest.mark.parametrize("mutation_target", ["mapping", "term_row"])
+def test_effective_snapshot_rejects_nested_mutation(
+    temp_db_path: Path,
+    mutation_target: str,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Immutable snapshot")
+    put_glossary_term(temp_db_path, book_id, "秘词", "mục tiêu", mode="translate")
+    snapshot = db_mod.resolve_effective_glossary(temp_db_path, book_id)
+
+    with pytest.raises(TypeError):
+        if mutation_target == "mapping":
+            snapshot.prompt_mapping["秘词"] = "mutated"
+        else:
+            snapshot.prompt_terms[0]["target_term"] = "mutated"
+
+    assert snapshot.prompt_mapping["秘词"] == "mục tiêu"
+    assert snapshot.prompt_terms[0]["target_term"] == "mục tiêu"
 
 
 @pytest.mark.asyncio
-async def test_translation_job_persists_only_fingerprint_and_keeps_start_snapshot(temp_db_path: Path) -> None:
+async def test_translation_job_persists_only_fingerprint_and_keeps_start_snapshot(
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     init_db(temp_db_path)
     assert hasattr(db_mod, "resolve_effective_glossary")
     book_id = add_book(temp_db_path, "Stable job")
     chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
     term_id = put_glossary_term(temp_db_path, book_id, "秘词", "mục tiêu cũ", mode="translate")
     captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        GlossaryService,
+        "extract_chapter_terms",
+        lambda *_args, **_kwargs: {"created": 0, "updated": 0},
+    )
+
+    def capture_qa_snapshot(
+        _service: QAService,
+        _book_id: int,
+        _chapter_id: int,
+        _job_id: str = "",
+        effective_glossary=None,
+    ) -> dict:
+        captured["qa_snapshot"] = effective_glossary
+        return {"overall_status": "PASS", "issues": []}
+
+    monkeypatch.setattr(QAService, "run_deterministic_qa", capture_qa_snapshot)
 
     class DeferredTracker(JobTracker):
         def __init__(self) -> None:
@@ -227,5 +321,6 @@ async def test_translation_job_persists_only_fingerprint_and_keeps_start_snapsho
     await tracker.pending
 
     snapshot = captured["effective_glossary"]
+    assert captured["qa_snapshot"] is snapshot
     assert snapshot.fingerprint == original.fingerprint
     assert snapshot.translate_mapping["秘词"] == "mục tiêu cũ"
