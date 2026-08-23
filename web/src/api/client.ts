@@ -25,6 +25,13 @@ import type {
   GlossaryQuery,
   GlossaryTermDetail,
   GlossaryVersionedUpdate,
+  GlossaryBulkAction,
+  GlossaryBulkTermRef,
+  GlossaryConflictPage,
+  GlossaryImportItem,
+  GlossaryImportPreview,
+  GlossaryImportResult,
+  GlossaryMergePreview,
   ImportFileRequest,
   ImportJobAccepted,
   ImportJobEvent,
@@ -1626,6 +1633,7 @@ export class ApiClient {
     if (query.book_id !== undefined) params.set('book_id', String(query.book_id));
     params.set('page', String(query.page));
     params.set('per_page', String(Math.min(query.per_page, 50)));
+    if (query.archived) params.set('archived', 'true');
     if (query.q) params.set('q', query.q);
     if (query.review_status) params.set('review_status', query.review_status);
     if (query.term_type) params.set('term_type', query.term_type);
@@ -1670,6 +1678,112 @@ export class ApiClient {
     });
     await this.assertOk(response, 'Failed to load glossary term detail');
     return (await response.json()) as GlossaryTermDetail;
+  }
+
+  async bulkGlossaryTerms(action: GlossaryBulkAction, terms: GlossaryBulkTermRef[]): Promise<void> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms/bulk`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, terms }),
+    });
+    await this.assertOk(response, 'Failed to update glossary terms');
+  }
+
+  async getGlossaryConflicts(bookId?: number, page = 1): Promise<GlossaryConflictPage> {
+    const params = new URLSearchParams();
+    if (bookId !== undefined) params.set('book_id', String(bookId));
+    params.set('page', String(page));
+    params.set('per_page', '50');
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/conflicts?${params}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load glossary conflicts');
+    return (await response.json()) as GlossaryConflictPage;
+  }
+
+  async previewGlossaryMerge(canonicalId: number, duplicateIds: number[]): Promise<GlossaryMergePreview> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/conflicts/merge/preview`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ canonical_id: canonicalId, duplicate_ids: duplicateIds }),
+    });
+    await this.assertOk(response, 'Failed to preview glossary merge');
+    return (await response.json()) as GlossaryMergePreview;
+  }
+
+  async applyGlossaryMerge(
+    canonicalId: number,
+    duplicateIds: number[],
+    digest: string,
+  ): Promise<GlossaryMergePreview> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/conflicts/merge/apply`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ canonical_id: canonicalId, duplicate_ids: duplicateIds, digest }),
+    });
+    await this.assertOk(response, 'Failed to merge glossary conflict');
+    return (await response.json()) as GlossaryMergePreview;
+  }
+
+  async previewGlossaryImport(
+    items: GlossaryImportItem[],
+    conflictPolicy: 'skip_conflicts' | 'reject_conflicts' = 'skip_conflicts',
+  ): Promise<GlossaryImportPreview> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/import/preview`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conflict_policy: conflictPolicy, items }),
+    });
+    await this.assertOk(response, 'Failed to preview glossary import');
+    return (await response.json()) as GlossaryImportPreview;
+  }
+
+  async applyGlossaryImport(
+    items: GlossaryImportItem[],
+    digest: string,
+    conflictPolicy: 'skip_conflicts' | 'reject_conflicts' = 'skip_conflicts',
+  ): Promise<GlossaryImportResult> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/import/apply`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conflict_policy: conflictPolicy, digest, items }),
+    });
+    await this.assertOk(response, 'Failed to apply glossary import');
+    return (await response.json()) as GlossaryImportResult;
+  }
+
+  async archiveGlossaryTerm(termId: number): Promise<void> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms/${termId}`, {
+      method: 'DELETE', headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to archive glossary term');
+  }
+
+  async restoreGlossaryTerm(termId: number): Promise<void> {
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/terms/${termId}/restore`, {
+      method: 'POST', headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to restore glossary term');
+  }
+
+  async downloadGlossaryExport(bookId: number | undefined, format: 'json' | 'csv'): Promise<ExportDownload> {
+    const params = new URLSearchParams();
+    if (bookId !== undefined) params.set('book_id', String(bookId));
+    params.set('format', format);
+    params.set('scope', bookId === undefined ? 'all' : 'book');
+    const response = await this.fetcher(`${this.baseUrl}/api/glossary/export?${params}`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to export glossary');
+    const blob = await response.blob();
+    return {
+      blob,
+      filename: filenameFromContentDisposition(
+        response.headers.get('content-disposition'),
+        `glossary.${format}`,
+      ),
+      mediaType: response.headers.get('content-type') ?? blob.type,
+    };
   }
 
   async lockGlossaryTerm(termId: number): Promise<void> {

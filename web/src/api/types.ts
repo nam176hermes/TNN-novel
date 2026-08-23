@@ -1313,6 +1313,8 @@ export type GlossaryTerm = {
   canonical_status?: string;
   inherited?: boolean;
   evidence_count?: number;
+  archived?: boolean;
+  archived_at?: string;
 };
 
 export type GlossaryScope = 'all' | 'book' | 'global' | 'effective';
@@ -1337,6 +1339,7 @@ export type GlossaryQuery = {
   locked?: boolean;
   scope: GlossaryScope;
   sort: GlossarySort;
+  archived?: boolean;
 };
 
 export type GlossaryFacets = {
@@ -1405,6 +1408,52 @@ export type GlossaryTermUpdate = Partial<
 >;
 
 export type GlossaryVersionedUpdate = GlossaryTermUpdate & { expected_version?: number };
+
+export type GlossaryBulkAction = 'approve' | 'reject' | 'lock' | 'archive';
+
+export type GlossaryBulkTermRef = { id: number; expected_version: number };
+
+export type GlossaryConflictGroup = {
+  id: string;
+  types: Array<'global_book' | 'normalized_duplicate' | 'primary_variant'>;
+  members: GlossaryTerm[];
+};
+
+export type GlossaryConflictPage = {
+  items: GlossaryConflictGroup[];
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+};
+
+export type GlossaryMergePreview = {
+  canonical_id: number;
+  duplicate_ids: number[];
+  digest: string;
+  evidence_count?: number;
+  history_count?: number;
+  occurrence_count?: number;
+  merged?: number;
+};
+
+export type GlossaryImportItem = Partial<GlossaryTerm> & Pick<GlossaryTerm, 'source_term' | 'target_term'>;
+
+export type GlossaryImportPreview = {
+  schema_version: number;
+  digest: string;
+  conflict_policy: 'skip_conflicts' | 'reject_conflicts';
+  summary: { added: number; updated: number; skipped: number };
+  actions: Array<{ item: number; action: 'add' | 'update' | 'skip'; code?: string; id?: number }>;
+  affected: Array<Record<string, unknown>>;
+};
+
+export type GlossaryImportResult = {
+  added: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+};
 
 export type Book = {
   id: number;

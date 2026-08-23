@@ -871,6 +871,25 @@ class GlossaryTermUpdate(BaseModel):
     expected_version: int | None = Field(default=None, ge=0)
 
 
+class GlossaryBulkTermRef(BaseModel):
+    id: int = Field(gt=0)
+    expected_version: int = Field(ge=0)
+
+
+class GlossaryBulkRequest(BaseModel):
+    action: Literal["approve", "reject", "lock", "archive"]
+    terms: list[GlossaryBulkTermRef] = Field(min_length=1, max_length=200)
+
+
+class GlossaryMergePreviewRequest(BaseModel):
+    canonical_id: int = Field(gt=0)
+    duplicate_ids: list[int] = Field(min_length=1, max_length=199)
+
+
+class GlossaryMergeApplyRequest(GlossaryMergePreviewRequest):
+    digest: str = Field(min_length=1, max_length=128)
+
+
 class TranslationMemoryEntryCreate(BaseModel):
     source_text: str = Field(..., min_length=1)
     translation_text: str = Field(..., min_length=1)

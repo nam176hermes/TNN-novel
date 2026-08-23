@@ -1066,6 +1066,15 @@ function AuthenticatedApp() {
     }
   }
 
+  async function handleGlossaryPhase4(call: () => Promise<unknown>, label: string): Promise<void> {
+    setBackendError('');
+    try {
+      await call();
+    } catch (error) {
+      handleJobError(error, label);
+    }
+  }
+
   async function handleTestProvider(providerId: string): Promise<void> {
     setBackendError('');
 
@@ -1973,14 +1982,39 @@ function AuthenticatedApp() {
               facets={glossaryState.facets}
               glossaryTerms={glossaryState.terms.data}
               loadState={glossaryState.terms.state}
+              onApplyImport={(items, digest) => handleGlossaryPhase4(
+                () => glossaryState.applyImport(items, digest), 'Glossary import failed',
+              )}
+              onApplyMerge={(canonicalId, duplicateIds, digest) => handleGlossaryPhase4(
+                () => glossaryState.applyMerge(canonicalId, duplicateIds, digest), 'Glossary merge failed',
+              )}
               onApproveTerm={handleGlossaryApprove}
+              onArchiveTerm={(termId) => handleGlossaryPhase4(
+                () => glossaryState.archiveTerm(termId), 'Glossary archive failed',
+              )}
+              onBulkAction={(action, terms) => handleGlossaryPhase4(
+                () => glossaryState.bulkTerms(action, terms), 'Glossary bulk update failed',
+              )}
+              onCreateTerm={(term) => handleGlossaryPhase4(
+                () => glossaryState.createTerm(term), 'Glossary create failed',
+              )}
               onCreateBookOverride={glossaryState.createBookOverride}
+              onExport={(format) => handleGlossaryPhase4(async () => {
+                const download = await session.client.downloadGlossaryExport(assistBookId ?? undefined, format);
+                triggerBrowserDownload(download.blob, download.filename);
+              }, 'Glossary export failed')}
+              onLoadConflicts={glossaryState.loadConflicts}
               onLoadTermDetail={glossaryState.loadTermDetail}
               onLockToggle={handleGlossaryLockToggle}
               onPageChange={(page) => glossaryState.setQuery({ page })}
               onProfileChange={handleStyleProfileChange}
+              onPreviewImport={glossaryState.previewImport}
+              onPreviewMerge={glossaryState.previewMerge}
               onQueryChange={glossaryState.setQuery}
               onRejectTerm={handleGlossaryReject}
+              onRestoreTerm={(termId) => handleGlossaryPhase4(
+                () => glossaryState.restoreTerm(termId), 'Glossary restore failed',
+              )}
               onSaveAndApproveTerm={handleGlossarySaveAndApprove}
               onUpdateTerm={handleGlossaryTermUpdate}
               page={glossaryState.page}

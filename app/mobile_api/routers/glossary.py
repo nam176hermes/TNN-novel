@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 
-from app.database.glossary_repository import GlossaryStateConflict
+from app.database.glossary_repository import GlossaryStateConflict, GlossaryValidationError
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
+    GlossaryBulkRequest,
+    GlossaryMergeApplyRequest,
+    GlossaryMergePreviewRequest,
     GlossaryTermCreate,
     GlossaryTermUpdate,
     ImportGlossaryResponse,
@@ -15,6 +22,8 @@ from app.mobile_api.schemas import (
 from app.mobile_api.services.glossary_service import GlossaryService
 
 router = APIRouter(prefix="/api/glossary", tags=["glossary"])
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_ROWS = 5_000
 
 
 def get_glossary_service():
@@ -34,6 +43,34 @@ def _state_mutation(call):
         raise HTTPException(status_code=409, detail={"code": exc.code}) from None
 
 
+def _validated_mutation(call):
+    try:
+        return _state_mutation(call)
+    except GlossaryValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "validation_failed", "errors": exc.errors},
+        ) from None
+
+
+async def _bounded_json(request: Request):
+    body = await request.body()
+    if len(body) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "payload_too_large"})
+    try:
+        return json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
+
+
+def _bounded_items(value) -> list[dict]:
+    if not isinstance(value, list):
+        raise HTTPException(status_code=422, detail={"code": "items_required"})
+    if len(value) > MAX_IMPORT_ROWS:
+        raise HTTPException(status_code=422, detail={"code": "row_limit_exceeded"})
+    return value
+
+
 @router.get("")
 async def list_glossary(
     book_id: int | None = Query(None),
@@ -50,6 +87,7 @@ async def list_glossary(
     ] = Query("review"),
     approved: int | None = Query(None),
     include_weak: bool | None = Query(None),
+    archived: bool = Query(False),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """List a bounded glossary review page using SQL filters and facets."""
@@ -76,6 +114,7 @@ async def list_glossary(
         sort=sort,
         approved=approved,
         include_weak=bool(include_weak),
+        archived=archived,
     )
 
 
@@ -93,11 +132,43 @@ async def search_glossary(
 @router.get("/conflicts")
 async def list_glossary_conflicts(
     book_id: int | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """List glossary conflicts and target reuse warnings."""
-    conflicts = svc.get_conflicts(book_id)
-    return {"conflicts": conflicts, "total": len(conflicts)}
+    """List bounded global/book, primary/variant, and normalized conflicts."""
+    result = svc.query_conflicts(book_id, page, per_page)
+    # Keep the legacy source/target-reuse collection intact while exposing the
+    # paginated merge-candidate collection additively under ``items``.
+    return {**result, "conflicts": svc.get_conflicts(book_id)}
+
+
+@router.post("/conflicts/merge/preview", response_model=dict)
+async def preview_conflict_merge(
+    merge: GlossaryMergePreviewRequest,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    return _state_mutation(
+        lambda: svc.preview_merge(merge.canonical_id, merge.duplicate_ids)
+    )
+
+
+@router.post("/conflicts/merge/apply", response_model=dict)
+async def apply_conflict_merge(
+    merge: GlossaryMergeApplyRequest,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    actor, request_id = _mutation_metadata(request)
+    return _state_mutation(
+        lambda: svc.apply_merge(
+            merge.canonical_id,
+            merge.duplicate_ids,
+            merge.digest,
+            actor=actor,
+            request_id=request_id,
+        )
+    )
 
 
 @router.post("/tm", response_model=dict, status_code=201)
@@ -175,6 +246,23 @@ async def add_term(
         lambda: svc.add_term_resource(term.model_dump(), actor=actor, request_id=request_id)
     )
     return {**resource, "message": "Term added"}
+
+
+@router.post("/terms/bulk", response_model=dict)
+async def bulk_terms(
+    bulk: GlossaryBulkRequest,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    actor, request_id = _mutation_metadata(request)
+    return _state_mutation(
+        lambda: svc.bulk_terms(
+            bulk.action,
+            [term.model_dump() for term in bulk.terms],
+            actor=actor,
+            request_id=request_id,
+        )
+    )
 
 
 @router.get("/terms/{term_id}", response_model=dict)
@@ -322,13 +410,51 @@ async def reject_term(
     return {"message": "Term rejected"}
 
 
-@router.post("/import", response_model=ImportGlossaryResponse)
-async def import_glossary(
-    data: list[dict],
+@router.post("/import/preview", response_model=dict)
+async def preview_import_glossary(
     request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """Import glossary from JSON."""
+    payload = await _bounded_json(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail={"code": "object_required"})
+    items = _bounded_items(payload.get("items"))
+    policy = str(payload.get("conflict_policy") or "skip_conflicts")
+    return _validated_mutation(lambda: svc.preview_import(items, policy))
+
+
+@router.post("/import/apply", response_model=dict)
+async def apply_import_glossary(
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    payload = await _bounded_json(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail={"code": "object_required"})
+    items = _bounded_items(payload.get("items"))
+    digest = str(payload.get("digest") or "")
+    if len(digest) != 64:
+        raise HTTPException(status_code=422, detail={"code": "digest_required"})
+    policy = str(payload.get("conflict_policy") or "skip_conflicts")
+    actor, request_id = _mutation_metadata(request)
+    return _validated_mutation(
+        lambda: svc.apply_import(
+            items,
+            digest,
+            policy,
+            actor=actor,
+            request_id=request_id,
+        )
+    )
+
+
+@router.post("/import", response_model=ImportGlossaryResponse)
+async def import_glossary(
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    """Bounded legacy adapter over atomic preview/apply."""
+    data = _bounded_items(await _bounded_json(request))
     actor, request_id = _mutation_metadata(request)
     result = svc.import_glossary(data, actor=actor, request_id=request_id)
     record_audit_event(
@@ -351,10 +477,14 @@ async def export_glossary(
     request: Request,
     book_id: int | None = Query(None),
     format: str = Query("json", pattern="^(json|csv)$"),
+    scope: Literal["all", "book", "global"] | None = Query(None),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Export glossary as JSON or CSV."""
-    terms = svc.export_glossary(book_id)
+    resolved_scope = scope or ("book" if book_id is not None else "all")
+    if resolved_scope == "book" and book_id is None:
+        raise HTTPException(status_code=422, detail={"code": "book_id_required"})
+    terms = svc.export_glossary(book_id, resolved_scope)
     record_audit_event(
         event_type="export_download",
         severity="info",
@@ -370,17 +500,27 @@ async def export_glossary(
         },
     )
     if format == "csv":
-        import csv
-        import io
         output = io.StringIO()
-        if terms:
-            writer = csv.DictWriter(output, fieldnames=list(terms[0].keys()))
-            writer.writeheader()
-            writer.writerows(terms)
-        from fastapi.responses import Response
+        fieldnames = ["schema_version", "scope", "scope_book_id", *(terms[0].keys() if terms else [])]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(
+            {
+                "schema_version": 1,
+                "scope": resolved_scope,
+                "scope_book_id": book_id or 0,
+                **term,
+            }
+            for term in terms
+        )
         return Response(
             content=output.getvalue(),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=glossary.csv"},
         )
-    return {"terms": terms, "total": len(terms)}
+    return {
+        "schema_version": 1,
+        "scope": {"type": resolved_scope, "book_id": book_id or 0},
+        "terms": terms,
+        "total": len(terms),
+    }

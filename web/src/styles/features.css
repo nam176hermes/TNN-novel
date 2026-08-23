@@ -3528,6 +3528,29 @@
   gap: 6px;
 }
 
+.glossary-operation-panel {
+  margin-top: 12px;
+}
+
+.glossary-operation-panel fieldset {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.glossary-operation-panel fieldset label {
+  align-items: start;
+  display: flex;
+  gap: 8px;
+}
+
+.glossary-operation-panel textarea {
+  display: block;
+  min-height: 140px;
+  resize: vertical;
+  width: 100%;
+}
+
 .glossary-pagination {
   justify-content: flex-end;
 }
@@ -3665,18 +3688,24 @@
 
 .glossary-management-table th:nth-child(1),
 .glossary-management-table td:nth-child(1) {
-  width: 14%;
+  width: 4%;
 }
 
 .glossary-management-table th:nth-child(2),
 .glossary-management-table td:nth-child(2) {
-  width: 19%;
+  width: 14%;
 }
 
 .glossary-management-table th:nth-child(3),
-.glossary-management-table td:nth-child(3),
+.glossary-management-table td:nth-child(3) {
+  width: 18%;
+}
+
 .glossary-management-table th:nth-child(4),
-.glossary-management-table td:nth-child(4),
+.glossary-management-table td:nth-child(4) {
+  width: 8%;
+}
+
 .glossary-management-table th:nth-child(5),
 .glossary-management-table td:nth-child(5) {
   width: 7%;
@@ -3684,12 +3713,17 @@
 
 .glossary-management-table th:nth-child(6),
 .glossary-management-table td:nth-child(6) {
-  width: 13%;
+  width: 12%;
 }
 
 .glossary-management-table th:nth-child(7),
 .glossary-management-table td:nth-child(7) {
-  width: 20%;
+  width: 11%;
+}
+
+.glossary-management-table th:nth-child(8),
+.glossary-management-table td:nth-child(8) {
+  width: 26%;
 }
 
 .glossary-management-table input,
@@ -3701,6 +3735,12 @@
   font-size: 9px;
   min-height: 20px;
   padding: 1px 2px;
+}
+
+.glossary-management-table input[type="checkbox"] {
+  min-height: auto;
+  padding: 0;
+  width: auto;
 }
 
 .glossary-management-table .status-chip {
@@ -3956,13 +3996,14 @@
     justify-self: start;
   }
 
-  .glossary-management-table th:nth-child(1)::before { content: "Gốc"; }
-  .glossary-management-table td:nth-child(2)::before { content: "Bản dịch"; }
-  .glossary-management-table td:nth-child(3)::before { content: "Loại"; }
-  .glossary-management-table td:nth-child(4)::before { content: "Ưu tiên"; }
-  .glossary-management-table td:nth-child(5)::before { content: "Trạng thái"; }
-  .glossary-management-table td:nth-child(6)::before { content: "Bằng chứng"; }
-  .glossary-management-table td:nth-child(7)::before { content: "Thao tác"; }
+  .glossary-management-table td:nth-child(1)::before { content: "Chọn"; }
+  .glossary-management-table th:nth-child(2)::before { content: "Gốc"; }
+  .glossary-management-table td:nth-child(3)::before { content: "Bản dịch"; }
+  .glossary-management-table td:nth-child(4)::before { content: "Loại"; }
+  .glossary-management-table td:nth-child(5)::before { content: "Ưu tiên"; }
+  .glossary-management-table td:nth-child(6)::before { content: "Trạng thái"; }
+  .glossary-management-table td:nth-child(7)::before { content: "Bằng chứng"; }
+  .glossary-management-table td:nth-child(8)::before { content: "Thao tác"; }
 
   .glossary-management-table input,
   .glossary-management-table select {
@@ -3971,6 +4012,12 @@
     font-size: 13px;
     min-height: 44px;
     padding: 8px 10px;
+  }
+
+  .glossary-management-table input[type="checkbox"] {
+    min-height: 24px;
+    padding: 0;
+    width: 24px;
   }
 
   .glossary-management-table .status-chip {

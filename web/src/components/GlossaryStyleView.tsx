@@ -2,6 +2,12 @@ import { BookMarked, Search, ShieldCheck, Sparkles, UserRound, X } from 'lucide-
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type {
   GlossaryFacets,
+  GlossaryBulkAction,
+  GlossaryBulkTermRef,
+  GlossaryConflictPage,
+  GlossaryImportItem,
+  GlossaryImportPreview,
+  GlossaryMergePreview,
   GlossaryQuery,
   GlossaryTerm,
   GlossaryTermDetail,
@@ -33,13 +39,23 @@ export type GlossaryStyleViewProps = {
   query?: GlossaryQuery;
   total?: number;
   onApproveTerm(termId: number): void | Promise<void>;
+  onApplyImport?(items: GlossaryImportItem[], digest: string): void | Promise<void>;
+  onApplyMerge?(canonicalId: number, duplicateIds: number[], digest: string): void | Promise<void>;
+  onArchiveTerm?(termId: number): void | Promise<void>;
+  onBulkAction?(action: GlossaryBulkAction, terms: GlossaryBulkTermRef[]): void | Promise<void>;
+  onCreateTerm?(term: GlossaryImportItem): void | Promise<void>;
   onCreateBookOverride?(term: GlossaryTerm): void | Promise<void>;
+  onExport?(format: 'json' | 'csv'): void | Promise<void>;
+  onLoadConflicts?(page?: number): Promise<GlossaryConflictPage>;
   onLoadTermDetail?(termId: number, options?: { signal?: AbortSignal }): Promise<GlossaryTermDetail>;
   onLockToggle(termId: number, locked: boolean): void | Promise<void>;
   onPageChange?(page: number): void;
   onProfileChange(profileId: string): void;
+  onPreviewImport?(items: GlossaryImportItem[]): Promise<GlossaryImportPreview>;
+  onPreviewMerge?(canonicalId: number, duplicateIds: number[]): Promise<GlossaryMergePreview>;
   onQueryChange?(updates: Partial<GlossaryQuery>): void;
   onRejectTerm(termId: number): void | Promise<void>;
+  onRestoreTerm?(termId: number): void | Promise<void>;
   onSaveAndApproveTerm(termId: number, updates: GlossaryTermUpdate, locked: boolean): void | Promise<void>;
   onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<void>;
 };
@@ -47,10 +63,14 @@ export type GlossaryStyleViewProps = {
 type GlossaryRowProps = {
   term: GlossaryTerm;
   onApproveTerm(termId: number): void | Promise<void>;
+  onArchiveTerm?(termId: number): void | Promise<void>;
   onCreateBookOverride?(term: GlossaryTerm): void | Promise<void>;
   onDetail(term: GlossaryTerm, opener: HTMLElement): void;
   onLockToggle(termId: number, locked: boolean): void | Promise<void>;
   onRejectTerm(termId: number): void | Promise<void>;
+  onRestoreTerm?(termId: number): void | Promise<void>;
+  onSelect(term: GlossaryTerm, selected: boolean): void;
+  selected: boolean;
   onSaveAndApproveTerm(termId: number, updates: GlossaryTermUpdate, locked: boolean): void | Promise<void>;
   onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<void>;
 };
@@ -84,12 +104,16 @@ function statusLabel(term: GlossaryTerm): string {
 function GlossaryRow({
   term,
   onApproveTerm,
+  onArchiveTerm,
   onCreateBookOverride,
   onDetail,
   onLockToggle,
   onRejectTerm,
+  onRestoreTerm,
+  onSelect,
   onSaveAndApproveTerm,
   onUpdateTerm,
+  selected,
 }: GlossaryRowProps) {
   const [targetTerm, setTargetTerm] = useState(term.target_term);
   const [termType, setTermType] = useState(term.term_type || term.category || 'term');
@@ -110,6 +134,7 @@ function GlossaryRow({
 
   return (
     <tr>
+      <td><input aria-label={`Chọn ${term.source_term}`} checked={selected} disabled={term.archived} onChange={(event) => onSelect(term, event.target.checked)} type="checkbox" /></td>
       <th scope="row">
         <span>{term.source_term}</span>
         {term.first_seen_chapter_number ? <small className="glossary-row-context">Ch. {term.first_seen_chapter_number}</small> : null}
@@ -133,7 +158,9 @@ function GlossaryRow({
       </td>
       <td>
         <div className="dialog-actions glossary-row-actions">
-          {isPending(term) ? (
+          {term.archived ? (
+            <button aria-label={`Khôi phục ${term.source_term}`} className="secondary-action" onClick={() => void onRestoreTerm?.(term.id)} type="button">Khôi phục</button>
+          ) : isPending(term) ? (
             <>
               <button aria-label={`Duyệt ${term.source_term}`} className="primary-action" onClick={() => void onApproveTerm(term.id)} type="button">Duyệt</button>
               <button aria-label={`Từ chối ${term.source_term}`} className="danger-action" onClick={() => void onRejectTerm(term.id)} type="button">Từ chối</button>
@@ -146,6 +173,7 @@ function GlossaryRow({
             </>
           )}
           {term.inherited && onCreateBookOverride ? <button aria-label={`Tạo bản ghi riêng cho ${term.source_term}`} className="secondary-action" onClick={() => void onCreateBookOverride(term)} type="button">Tạo bản riêng</button> : null}
+          {!term.archived && onArchiveTerm ? <button aria-label={`Lưu trữ ${term.source_term}`} className="danger-action" onClick={() => void onArchiveTerm(term.id)} type="button">Lưu trữ</button> : null}
           <button aria-label={`Chi tiết ${term.source_term}`} className="secondary-action" onClick={(event) => onDetail(term, event.currentTarget)} type="button">Chi tiết</button>
         </div>
       </td>
@@ -155,14 +183,21 @@ function GlossaryRow({
 
 const literaryRuleSummary = 'Dịch theo nghĩa và khí văn; giữ nhịp thơ/đối liên; ưu tiên thành ngữ Việt cổ phong khi có.';
 const tabs = [
-  ['NEEDS_REVIEW,CONFLICT', 'Cần duyệt'], ['APPROVED', 'Đã duyệt'], ['LOCKED', 'Đã khóa'], ['REJECTED', 'Từ chối'], ['', 'Tất cả'],
+  { archived: false, label: 'Cần duyệt', status: 'NEEDS_REVIEW,CONFLICT' },
+  { archived: false, label: 'Đã duyệt', status: 'APPROVED' },
+  { archived: false, label: 'Đã khóa', status: 'LOCKED' },
+  { archived: false, label: 'Từ chối', status: 'REJECTED' },
+  { archived: false, label: 'Tất cả', status: '' },
+  { archived: true, label: 'Đã lưu trữ', status: '' },
 ] as const;
 
 export default function GlossaryStyleView({
   profiles, selectedProfileId, glossaryTerms, error = '', facets = emptyFacets,
   loadState = glossaryTerms.length ? 'ready' : 'empty', page = 1, pages = 0, perPage = 50,
   query = fallbackQuery, total = glossaryTerms.length, onApproveTerm, onCreateBookOverride,
-  onLoadTermDetail, onLockToggle, onPageChange, onProfileChange, onQueryChange, onRejectTerm,
+  onApplyImport, onApplyMerge, onArchiveTerm, onBulkAction, onCreateTerm, onExport,
+  onLoadConflicts, onLoadTermDetail, onLockToggle, onPageChange, onPreviewImport,
+  onPreviewMerge, onProfileChange, onQueryChange, onRejectTerm, onRestoreTerm,
   onSaveAndApproveTerm, onUpdateTerm,
 }: GlossaryStyleViewProps) {
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
@@ -171,6 +206,17 @@ export default function GlossaryStyleView({
   const [detail, setDetail] = useState<GlossaryTermDetail | null>(null);
   const [detailTerm, setDetailTerm] = useState<GlossaryTerm | null>(null);
   const [detailError, setDetailError] = useState('');
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [newSource, setNewSource] = useState('');
+  const [newTarget, setNewTarget] = useState('');
+  const [conflicts, setConflicts] = useState<GlossaryConflictPage | null>(null);
+  const [activeConflictId, setActiveConflictId] = useState<string | null>(null);
+  const [canonicalId, setCanonicalId] = useState<number | null>(null);
+  const [mergePreview, setMergePreview] = useState<GlossaryMergePreview | null>(null);
+  const [operationError, setOperationError] = useState('');
+  const [importText, setImportText] = useState('');
+  const [importItems, setImportItems] = useState<GlossaryImportItem[]>([]);
+  const [importPreview, setImportPreview] = useState<GlossaryImportPreview | null>(null);
   const queueHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const detailDrawerRef = useRef<HTMLElement | null>(null);
   const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -181,6 +227,7 @@ export default function GlossaryStyleView({
   const lastSearchRef = useRef(query.q);
 
   useEffect(() => setSearch(query.q), [query.q]);
+  useEffect(() => setSelectedIds(new Set()), [glossaryTerms]);
   useEffect(() => {
     if (!onQueryChange || search === lastSearchRef.current) return;
     const timer = window.setTimeout(() => {
@@ -281,6 +328,61 @@ export default function GlossaryStyleView({
   })).slice(0, 50);
   const rangeStart = total ? (page - 1) * perPage + 1 : 0;
   const rangeEnd = total ? Math.min(page * perPage, total) : 0;
+  const selectableRows = rows.filter((term) => !term.archived);
+  const selectedTerms = selectableRows.filter((term) => selectedIds.has(term.id));
+  const selectTerm = (term: GlossaryTerm, selected: boolean) => setSelectedIds((current) => {
+    const next = new Set(current);
+    if (selected) next.add(term.id); else next.delete(term.id);
+    return next;
+  });
+  const bulk = async (action: GlossaryBulkAction) => {
+    if (!onBulkAction || selectedTerms.length === 0) return;
+    await runMutation(() => onBulkAction(action, selectedTerms.map((term) => ({
+      id: term.id, expected_version: term.version ?? 0,
+    }))));
+    setSelectedIds(new Set());
+  };
+  const createTerm = async () => {
+    if (!onCreateTerm || !newSource.trim()) return;
+    await runMutation(() => onCreateTerm({
+      approved: 0,
+      book_id: query.book_id ?? 0,
+      review_status: 'NEEDS_REVIEW',
+      source_term: newSource.trim(),
+      target_term: newTarget.trim(),
+    }));
+    setNewSource(''); setNewTarget('');
+  };
+  const activeConflict = conflicts?.items.find((conflict) => conflict.id === activeConflictId) ?? null;
+  const duplicateIds = activeConflict && canonicalId !== null
+    ? activeConflict.members.filter((term) => term.id !== canonicalId).map((term) => term.id)
+    : [];
+  const loadConflicts = async (conflictPage = 1) => {
+    if (!onLoadConflicts) return;
+    setOperationError(''); setMergePreview(null); setActiveConflictId(null); setCanonicalId(null);
+    try { setConflicts(await onLoadConflicts(conflictPage)); } catch (reason) { setOperationError(String(reason)); }
+  };
+  const previewMerge = async () => {
+    if (!onPreviewMerge || canonicalId === null || duplicateIds.length === 0) return;
+    setOperationError('');
+    try { setMergePreview(await onPreviewMerge(canonicalId, duplicateIds)); } catch (reason) { setOperationError(String(reason)); }
+  };
+  const applyMerge = async () => {
+    if (!onApplyMerge || !mergePreview) return;
+    await onApplyMerge(mergePreview.canonical_id, mergePreview.duplicate_ids, mergePreview.digest);
+    setMergePreview(null); await loadConflicts();
+  };
+  const previewImport = async () => {
+    if (!onPreviewImport) return;
+    setOperationError(''); setImportPreview(null);
+    try {
+      const parsed: unknown = JSON.parse(importText);
+      if (!Array.isArray(parsed)) throw new Error('Dữ liệu nhập phải là danh sách JSON.');
+      const items = parsed as GlossaryImportItem[];
+      setImportItems(items);
+      setImportPreview(await onPreviewImport(items));
+    } catch (reason) { setOperationError(reason instanceof Error ? reason.message : 'Dữ liệu nhập không hợp lệ.'); }
+  };
 
   return (
     <section aria-labelledby="glossary-style-title" className="workflow-management-view glossary-style-view">
@@ -296,7 +398,7 @@ export default function GlossaryStyleView({
         </div>
 
         <div aria-label="Trạng thái thuật ngữ" className="glossary-review-tabs" role="tablist">
-          {tabs.map(([status, label]) => <button aria-selected={query.review_status === status} key={label} onClick={() => onQueryChange?.({ page: 1, review_status: status })} role="tab" type="button">{label}</button>)}
+          {tabs.map((tab) => <button aria-selected={Boolean(query.archived) === tab.archived && query.review_status === tab.status} key={tab.label} onClick={() => onQueryChange?.({ archived: tab.archived, page: 1, review_status: tab.status, scope: tab.archived && query.scope === 'effective' ? 'book' : query.scope })} role="tab" type="button">{tab.label}</button>)}
         </div>
 
         <div className="glossary-review-filters">
@@ -306,19 +408,93 @@ export default function GlossaryStyleView({
           <span className="status-chip status-chip-success">{rangeStart}–{rangeEnd} / {total}</span>
         </div>
 
+        {onBulkAction ? (
+          <div aria-label="Thao tác hàng loạt" className="glossary-review-filters" role="toolbar">
+            <span>{selectedTerms.length} đã chọn</span>
+            <button disabled={!selectedTerms.length} onClick={() => void bulk('approve')} type="button">Duyệt đã chọn</button>
+            <button disabled={!selectedTerms.length} onClick={() => void bulk('reject')} type="button">Từ chối đã chọn</button>
+            <button disabled={!selectedTerms.length} onClick={() => void bulk('lock')} type="button">Khóa đã chọn</button>
+            <button disabled={!selectedTerms.length} onClick={() => void bulk('archive')} type="button">Lưu trữ đã chọn</button>
+          </div>
+        ) : null}
+
+        {onCreateTerm ? (
+          <details className="glossary-operation-panel">
+            <summary>Tạo thuật ngữ</summary>
+            <div className="glossary-review-filters">
+              <label>Gốc<input aria-label="Thuật ngữ gốc mới" onChange={(event) => setNewSource(event.target.value)} value={newSource} /></label>
+              <label>Bản dịch<input aria-label="Bản dịch mới" onChange={(event) => setNewTarget(event.target.value)} value={newTarget} /></label>
+              <button disabled={!newSource.trim()} onClick={() => void createTerm()} type="button">Tạo thuật ngữ mới</button>
+            </div>
+          </details>
+        ) : null}
+
         {loadState === 'loading' ? <p className="empty-detail" role="status">Đang tải hàng chờ…</p> : null}
         {loadState === 'error' ? <p className="empty-detail" role="alert">Không thể tải hàng chờ: {error}</p> : null}
         {loadState === 'empty' ? <p className="empty-detail">Không có thuật ngữ trong hàng chờ này.</p> : null}
         {loadState === 'ready' ? (
           <div className="glossary-table-wrap">
             <table className="provider-table glossary-management-table">
-              <thead><tr><th>Gốc</th><th>Bản dịch</th><th>Loại</th><th>Ưu tiên</th><th>Trạng thái</th><th>Bằng chứng</th><th>Thao tác</th></tr></thead>
-              <tbody>{rows.map((term) => <GlossaryRow key={term.id} onApproveTerm={(id) => runMutation(() => onApproveTerm(id))} onCreateBookOverride={onCreateBookOverride ? (item) => runMutation(() => onCreateBookOverride(item)) : undefined} onDetail={openDetail} onLockToggle={(id, locked) => runMutation(() => onLockToggle(id, locked))} onRejectTerm={(id) => runMutation(() => onRejectTerm(id))} onSaveAndApproveTerm={(id, updates, locked) => runMutation(() => onSaveAndApproveTerm(id, updates, locked))} onUpdateTerm={(id, updates) => runMutation(() => onUpdateTerm(id, updates))} term={term} />)}</tbody>
+              <thead><tr><th><input aria-label="Chọn tất cả" checked={selectableRows.length > 0 && selectedTerms.length === selectableRows.length} onChange={(event) => setSelectedIds(event.target.checked ? new Set(selectableRows.map((term) => term.id)) : new Set())} type="checkbox" /></th><th>Gốc</th><th>Bản dịch</th><th>Loại</th><th>Ưu tiên</th><th>Trạng thái</th><th>Bằng chứng</th><th>Thao tác</th></tr></thead>
+              <tbody>{rows.map((term) => <GlossaryRow key={term.id} onApproveTerm={(id) => runMutation(() => onApproveTerm(id))} onArchiveTerm={onArchiveTerm ? (id) => runMutation(() => onArchiveTerm(id)) : undefined} onCreateBookOverride={onCreateBookOverride ? (item) => runMutation(() => onCreateBookOverride(item)) : undefined} onDetail={openDetail} onLockToggle={(id, locked) => runMutation(() => onLockToggle(id, locked))} onRejectTerm={(id) => runMutation(() => onRejectTerm(id))} onRestoreTerm={onRestoreTerm ? (id) => runMutation(() => onRestoreTerm(id)) : undefined} onSaveAndApproveTerm={(id, updates, locked) => runMutation(() => onSaveAndApproveTerm(id, updates, locked))} onSelect={selectTerm} onUpdateTerm={(id, updates) => runMutation(() => onUpdateTerm(id, updates))} selected={selectedIds.has(term.id)} term={term} />)}</tbody>
             </table>
           </div>
         ) : null}
         <nav aria-label="Phân trang thuật ngữ" className="glossary-pagination"><button disabled={page <= 1} onClick={() => selectPage(page - 1)} type="button">Trang trước</button><span>Trang {page} / {Math.max(pages, 1)}</span><button aria-label="Trang sau" disabled={pages === 0 || page >= pages} onClick={() => selectPage(page + 1)} type="button">Trang sau</button></nav>
       </section>
+
+      {onLoadConflicts && onPreviewMerge && onApplyMerge ? (
+        <details className="panel glossary-operation-panel">
+          <summary>Xung đột & hợp nhất</summary>
+          <button onClick={() => void loadConflicts()} type="button">Tải xung đột</button>
+          {conflicts?.items.map((conflict) => (
+            <fieldset key={conflict.id}>
+              <legend>{conflict.types.join(' · ')}</legend>
+              {conflict.members.map((term) => (
+                <label key={term.id}>
+                  <input aria-label={`Chọn canonical ${term.source_term}`} checked={activeConflictId === conflict.id && canonicalId === term.id} name="glossary-canonical" onChange={() => { setActiveConflictId(conflict.id); setCanonicalId(term.id); setMergePreview(null); }} type="radio" />
+                  {term.source_term} → {term.target_term} · {term.book_id === 0 ? 'Toàn cục' : 'Trong sách'} · v{term.version ?? 0}
+                </label>
+              ))}
+            </fieldset>
+          ))}
+          {activeConflict ? <button onClick={() => void previewMerge()} type="button">Xem trước hợp nhất</button> : null}
+          {mergePreview ? (
+            <div role="status">
+              <p>{mergePreview.evidence_count ?? 0} bằng chứng sẽ chuyển sang canonical.</p>
+              <button onClick={() => void applyMerge()} type="button">Áp dụng hợp nhất</button>
+            </div>
+          ) : null}
+          {conflicts && conflicts.pages > 1 ? (
+            <nav aria-label="Phân trang xung đột" className="glossary-pagination">
+              <button aria-label="Trang xung đột trước" disabled={conflicts.page <= 1} onClick={() => void loadConflicts(conflicts.page - 1)} type="button">Trang trước</button>
+              <span>Trang {conflicts.page} / {conflicts.pages}</span>
+              <button aria-label="Trang xung đột sau" disabled={conflicts.page >= conflicts.pages} onClick={() => void loadConflicts(conflicts.page + 1)} type="button">Trang sau</button>
+            </nav>
+          ) : null}
+          {conflicts && conflicts.items.length === 0 ? <p>Không có xung đột.</p> : null}
+        </details>
+      ) : null}
+
+      {onPreviewImport && onApplyImport && onExport ? (
+        <details className="panel glossary-operation-panel">
+          <summary>Nhập & xuất</summary>
+          <label>Dữ liệu JSON<textarea aria-label="Dữ liệu nhập JSON" onChange={(event) => { setImportText(event.target.value); setImportPreview(null); }} value={importText} /></label>
+          <div className="dialog-actions">
+            <button onClick={() => void previewImport()} type="button">Xem trước nhập</button>
+            <button onClick={() => void onExport('json')} type="button">Xuất JSON</button>
+            <button onClick={() => void onExport('csv')} type="button">Xuất CSV</button>
+          </div>
+          {importPreview ? (
+            <div role="status">
+              <p>Thêm {importPreview.summary.added} · Cập nhật {importPreview.summary.updated} · Bỏ qua {importPreview.summary.skipped}</p>
+              <button onClick={() => void onApplyImport(importItems, importPreview.digest)} type="button">Áp dụng nhập</button>
+            </div>
+          ) : null}
+        </details>
+      ) : null}
+
+      {operationError ? <p role="alert">{operationError}</p> : null}
 
       <details className="panel style-profile-reference-panel">
         <summary>Profile văn phong (phụ)</summary>

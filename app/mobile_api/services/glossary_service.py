@@ -4,7 +4,6 @@ import re
 from pathlib import Path
 
 from app.database.db import (
-    list_glossary,
     put_glossary_term,
     update_glossary_term,
     approve_glossary_term,
@@ -30,6 +29,7 @@ from app.database.db import (
 from app.database.glossary_repository import (
     GlossaryRepository,
     GlossaryStateConflict,
+    GlossaryValidationError,
     normalize_source_key,
 )
 from app.database.glossary_resolver import resolve_effective_glossary
@@ -215,6 +215,7 @@ class GlossaryService:
         mode: str | None = None,
         approved: int | None = None,
         include_weak: bool = False,
+        archived: bool = False,
     ) -> tuple[list[dict], int]:
         """Compatibility wrapper over the SQL review query."""
         result = GlossaryRepository(self.db_path).query(
@@ -226,6 +227,7 @@ class GlossaryService:
             offset=offset,
             approved=approved,
             include_weak=include_weak,
+            archived=archived,
         )
         return result["items"], result["total"]
 
@@ -244,6 +246,7 @@ class GlossaryService:
         sort: str = "review",
         approved: int | None = None,
         include_weak: bool = False,
+        archived: bool = False,
     ) -> dict:
         per_page = min(per_page, 200)
         statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
@@ -271,6 +274,7 @@ class GlossaryService:
             offset=(page - 1) * per_page,
             approved=approved,
             include_weak=include_weak,
+            archived=archived,
             effective_ids=effective_ids,
         )
         total = result["total"]
@@ -368,6 +372,18 @@ class GlossaryService:
 
     def get_term_detail(self, term_id: int) -> dict | None:
         return GlossaryRepository(self.db_path).get_detail(term_id)
+
+    def bulk_terms(
+        self,
+        action: str,
+        terms: list[dict[str, int]],
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        return GlossaryRepository(self.db_path).bulk(
+            action, terms, actor=actor, request_id=request_id
+        )
 
     def delete_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Archive a glossary term while preserving the existing API contract."""
@@ -495,6 +511,33 @@ class GlossaryService:
         """Get glossary conflicts."""
         return get_glossary_conflicts(self.db_path, book_id)
 
+    def query_conflicts(
+        self, book_id: int | None = None, page: int = 1, per_page: int = 50
+    ) -> dict:
+        return GlossaryRepository(self.db_path).query_conflicts(
+            book_id=book_id, page=page, per_page=per_page
+        )
+
+    def preview_merge(self, canonical_id: int, duplicate_ids: list[int]) -> dict:
+        return GlossaryRepository(self.db_path).preview_merge(canonical_id, duplicate_ids)
+
+    def apply_merge(
+        self,
+        canonical_id: int,
+        duplicate_ids: list[int],
+        digest: str,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        return GlossaryRepository(self.db_path).apply_merge(
+            canonical_id,
+            duplicate_ids,
+            digest,
+            actor=actor,
+            request_id=request_id,
+        )
+
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
         chapter = get_chapter_by_id(self.db_path, chapter_id)
@@ -581,57 +624,54 @@ class GlossaryService:
         actor: str = "",
         request_id: str = "",
     ) -> dict:
-        """Import glossary from JSON or CSV."""
-        added = 0
-        updated = 0
-        errors = []
+        """Bounded compatibility adapter over the atomic preview/apply flow."""
+        repository = GlossaryRepository(self.db_path)
+        try:
+            preview = repository.preview_import(data, "reject_conflicts")
+            return repository.apply_import(
+                data,
+                preview["digest"],
+                "reject_conflicts",
+                actor=actor,
+                request_id=request_id,
+            )
+        except GlossaryValidationError as exc:
+            return {
+                "added": 0,
+                "updated": 0,
+                "errors": [
+                    f"item {error['item']}: {error['code']}" for error in exc.errors
+                ],
+            }
 
-        for item_number, item in enumerate(data, start=1):
-            try:
-                # Validate required fields
-                if "source_term" not in item or "target_term" not in item:
-                    errors.append(f"item {item_number}: missing_required_fields")
-                    continue
+    def preview_import(
+        self,
+        data: list[dict],
+        conflict_policy: str = "skip_conflicts",
+    ) -> dict:
+        preview = GlossaryRepository(self.db_path).preview_import(data, conflict_policy)
+        return {key: value for key, value in preview.items() if key != "canonical_items"}
 
-                # Check if term exists
-                existing = None
-                terms = list_glossary(self.db_path, item.get("book_id", 0))
-                for t in terms:
-                    if t["source_term"] == item["source_term"] and t["book_id"] == item.get("book_id", 0):
-                        existing = t
-                        break
+    def apply_import(
+        self,
+        data: list[dict],
+        digest: str,
+        conflict_policy: str = "skip_conflicts",
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        return GlossaryRepository(self.db_path).apply_import(
+            data,
+            digest,
+            conflict_policy,
+            actor=actor,
+            request_id=request_id,
+        )
 
-                if existing:
-                    # Update existing
-                    self.update_term(
-                        existing["id"],
-                        {
-                            "target_term": item.get("target_term", existing["target_term"]),
-                            "category": item.get("category", existing.get("category", "term")),
-                            "mode": item.get("mode", existing.get("mode", "translate")),
-                            "pinyin": item.get("pinyin", existing.get("pinyin", "")),
-                            "notes_vi": item.get("notes_vi", existing.get("notes_vi", "")),
-                            "variants": item.get("variants", existing.get("variants", "")),
-                            # Keep existing approved status unless explicitly set
-                            "approved": item.get("approved", existing.get("approved", 1)),
-                        },
-                        actor=actor,
-                        request_id=request_id,
-                    )
-                    updated += 1
-                else:
-                    # Add new
-                    self.add_term(item, actor=actor, request_id=request_id)
-                    added += 1
-
-            except GlossaryStateConflict as exc:
-                errors.append(f"item {item_number}: {exc.code}")
-            except Exception:
-                errors.append(f"item {item_number}: invalid_item")
-
-        return {"added": added, "updated": updated, "errors": errors}
-
-    def export_glossary(self, book_id: int | None = None, format: str = "json") -> list[dict]:
-        """Export glossary as JSON or CSV."""
-        terms, _ = self.list_terms(book_id=book_id, limit=10000)  # Get all
-        return terms
+    def export_glossary(
+        self,
+        book_id: int | None = None,
+        scope: str = "all",
+    ) -> list[dict]:
+        return GlossaryRepository(self.db_path).export_terms(book_id, scope)

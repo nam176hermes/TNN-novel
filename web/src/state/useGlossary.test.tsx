@@ -14,6 +14,49 @@ function deferred<T>() {
 }
 
 describe('useGlossary', () => {
+  it('exposes the phase 4 mutation and preview workflow through the current book', async () => {
+    const page = {
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [{ ...fixtureGlossaryTerm, version: 3 }],
+      page: 1, pages: 1, per_page: 50, scope: 'book' as const, total: 1,
+    };
+    const client = {
+      applyGlossaryImport: vi.fn().mockResolvedValue({ added: 1, updated: 0, skipped: 0, errors: [] }),
+      applyGlossaryMerge: vi.fn().mockResolvedValue({ merged: 1 }),
+      archiveGlossaryTerm: vi.fn().mockResolvedValue(undefined),
+      bulkGlossaryTerms: vi.fn().mockResolvedValue(undefined),
+      createGlossaryTerm: vi.fn().mockResolvedValue(fixtureGlossaryTerm),
+      getGlossaryConflicts: vi.fn().mockResolvedValue({ items: [], page: 1, pages: 0, per_page: 50, total: 0 }),
+      previewGlossaryImport: vi.fn().mockResolvedValue({ digest: 'i'.repeat(64) }),
+      previewGlossaryMerge: vi.fn().mockResolvedValue({ digest: 'm'.repeat(64) }),
+      queryGlossaryTerms: vi.fn().mockResolvedValue(page),
+      restoreGlossaryTerm: vi.fn().mockResolvedValue(undefined),
+      searchTm: vi.fn(),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useGlossary(client, true, 42, '', undefined, true));
+    await waitFor(() => expect(result.current.terms.state).toBe('ready'));
+    const refs = [{ id: 7, expected_version: 3 }];
+    const items = [{ source_term: '新词', target_term: 'Từ mới' }];
+
+    await act(async () => {
+      await result.current.bulkTerms('approve', refs);
+      await result.current.archiveTerm(7);
+      await result.current.restoreTerm(7);
+      await result.current.createTerm(items[0]);
+      await result.current.loadConflicts();
+      await result.current.previewMerge(7, [8]);
+      await result.current.applyMerge(7, [8], 'm'.repeat(64));
+      await result.current.previewImport(items);
+      await result.current.applyImport(items, 'i'.repeat(64));
+    });
+
+    expect(client.bulkGlossaryTerms).toHaveBeenCalledWith('approve', refs);
+    expect(client.createGlossaryTerm).toHaveBeenCalledWith(expect.objectContaining({ book_id: 42 }));
+    expect(client.getGlossaryConflicts).toHaveBeenCalledWith(42, 1);
+    expect(client.applyGlossaryMerge).toHaveBeenCalledWith(7, [8], 'm'.repeat(64));
+    expect(client.applyGlossaryImport).toHaveBeenCalledWith(items, 'i'.repeat(64));
+  });
+
   it('requests the default queue and aborts a stale server page request', async () => {
     const first = deferred<never>();
     const page = {

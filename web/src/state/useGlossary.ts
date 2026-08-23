@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, type ApiClient, type ApiRequestOptions } from '../api/client';
 import type {
   GlossaryFacets,
+  GlossaryBulkAction,
+  GlossaryBulkTermRef,
+  GlossaryImportItem,
   GlossaryPage,
   GlossaryQuery,
   GlossaryTerm,
@@ -306,6 +309,64 @@ export function useGlossary(
     [client],
   );
 
+  const phase4Mutation = useCallback(async (call: () => Promise<unknown>) => {
+    const actionBookId = bookIdRef.current;
+    if (!enabledRef.current || actionBookId === null) return;
+    try {
+      await call();
+      if (enabledRef.current && bookIdRef.current === actionBookId) await refresh();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) onAuthError?.();
+      throw error;
+    }
+  }, [onAuthError, refresh]);
+
+  const bulkTerms = useCallback(
+    (action: GlossaryBulkAction, refs: GlossaryBulkTermRef[]) => phase4Mutation(
+      () => client.bulkGlossaryTerms(action, refs),
+    ),
+    [client, phase4Mutation],
+  );
+  const archiveTerm = useCallback(
+    (termId: number) => phase4Mutation(() => client.archiveGlossaryTerm(termId)),
+    [client, phase4Mutation],
+  );
+  const restoreTerm = useCallback(
+    (termId: number) => phase4Mutation(() => client.restoreGlossaryTerm(termId)),
+    [client, phase4Mutation],
+  );
+  const createTerm = useCallback(
+    (term: GlossaryImportItem) => phase4Mutation(() => client.createGlossaryTerm({
+      ...term,
+      book_id: term.book_id ?? bookIdRef.current ?? 0,
+    })),
+    [client, phase4Mutation],
+  );
+  const loadConflicts = useCallback(
+    (page = 1) => client.getGlossaryConflicts(bookIdRef.current ?? undefined, page),
+    [client],
+  );
+  const previewMerge = useCallback(
+    (canonicalId: number, duplicateIds: number[]) => client.previewGlossaryMerge(canonicalId, duplicateIds),
+    [client],
+  );
+  const applyMerge = useCallback(
+    (canonicalId: number, duplicateIds: number[], digest: string) => phase4Mutation(
+      () => client.applyGlossaryMerge(canonicalId, duplicateIds, digest),
+    ),
+    [client, phase4Mutation],
+  );
+  const previewImport = useCallback(
+    (items: GlossaryImportItem[]) => client.previewGlossaryImport(items),
+    [client],
+  );
+  const applyImport = useCallback(
+    (items: GlossaryImportItem[], digest: string) => phase4Mutation(
+      () => client.applyGlossaryImport(items, digest),
+    ),
+    [client, phase4Mutation],
+  );
+
   const searchTranslationMemory = useCallback(
     async (query: string) => {
       if (!enabled || !query.trim()) {
@@ -371,16 +432,25 @@ export function useGlossary(
   );
 
   return {
+    applyImport,
+    applyMerge,
     approveTerm,
+    archiveTerm,
+    bulkTerms,
+    createTerm,
     createBookOverride,
     facets: pageData.facets,
     loadTermDetail,
+    loadConflicts,
     page: pageData.page,
     pages: pageData.pages,
     pendingCount,
+    previewImport,
+    previewMerge,
     perPage: pageData.per_page,
     query,
     rejectTerm,
+    restoreTerm,
     refresh,
     relevantTerms,
     saveAndApproveTerm,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
+import re
 import sqlite3
 import unicodedata
 from datetime import datetime, timezone
@@ -48,6 +51,57 @@ class GlossaryStateConflict(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class GlossaryValidationError(Exception):
+    def __init__(self, errors: list[dict[str, Any]]) -> None:
+        self.errors = errors
+        super().__init__("validation_failed")
+
+
+IMPORT_FIELDS = {
+    "category": "term",
+    "confidence": 1.0,
+    "mode": "translate",
+    "pinyin": "",
+    "notes_vi": "",
+    "variants": "",
+    "approved": 1,
+    "priority": 0,
+    "locked": 0,
+    "genre": "",
+    "term_type": "term",
+    "alternatives": "",
+    "gender": "",
+    "first_seen_chapter_id": 0,
+    "first_seen_chapter_number": 0,
+    "review_status": "",
+    "source_context": "",
+    "occurrence_count": None,
+    "archived_at": "",
+}
+IMPORT_POLICIES = {"skip_conflicts", "reject_conflicts"}
+EXPORT_FIELDS = (
+    "id", "book_id", "source_term", "target_term", "category", "confidence", "approved",
+    "locked", "review_status", "mode", "pinyin", "notes_vi", "variants", "occurrence_count",
+    "priority", "genre", "term_type", "alternatives", "gender", "first_seen_chapter_id",
+    "first_seen_chapter_number", "source_context", "archived_at", "version",
+)
+
+
+def _stable_digest(payload: object) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _variant_keys(value: object) -> set[str]:
+    return {
+        normalize_source_key(part)
+        for part in re.split(r"[,;\n|]+", str(value or ""))
+        if normalize_source_key(part)
+    }
 
 
 def normalize_source_key(value: str) -> str:
@@ -189,6 +243,7 @@ class GlossaryRepository:
         resource = dict(row)
         resource["canonical_status"] = str(resource.get("review_status") or "CONFLICT")
         resource["version"] = int(resource.get("version") or 0)
+        resource["archived"] = bool(resource.get("archived_at"))
         resource["inherited"] = inherited
         resource["evidence_count"] = evidence_count
         return resource
@@ -208,10 +263,17 @@ class GlossaryRepository:
         return self._resource(row, evidence_count=int(row["evidence_count"] or 0))
 
     def get_detail(self, term_id: int) -> dict[str, Any] | None:
-        resource = self.get_resource(term_id)
-        if resource is None:
-            return None
         with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT g.*, (SELECT COUNT(*) FROM glossary_term_evidence e WHERE e.term_id = g.id) AS evidence_count
+                FROM glossary_terms g WHERE g.id = ?
+                """,
+                (term_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            resource = self._resource(row, evidence_count=int(row["evidence_count"] or 0))
             evidence_rows = conn.execute(
                 "SELECT * FROM glossary_term_evidence WHERE term_id = ? ORDER BY id",
                 (term_id,),
@@ -253,11 +315,14 @@ class GlossaryRepository:
         scope: str,
         approved: int | None,
         include_weak: bool,
+        archived: bool,
         effective_ids: tuple[int, ...] | None,
     ) -> tuple[str, list[Any]]:
         if scope not in QUERY_SCOPES:
             raise ValueError("invalid_scope")
-        where = ["COALESCE(g.archived_at, '') = ''"]
+        where = [
+            "COALESCE(g.archived_at, '') != ''" if archived else "COALESCE(g.archived_at, '') = ''"
+        ]
         params: list[Any] = []
         if scope == "book":
             if book_id is None:
@@ -298,7 +363,7 @@ class GlossaryRepository:
         if approved is not None:
             where.append("g.approved = ?")
             params.append(approved)
-        if not include_weak:
+        if not include_weak and not archived:
             where.extend(
                 [
                     "TRIM(g.source_term) != ''",
@@ -336,6 +401,7 @@ class GlossaryRepository:
         offset: int = 0,
         approved: int | None = None,
         include_weak: bool = False,
+        archived: bool = False,
         effective_ids: tuple[int, ...] | None = None,
     ) -> dict[str, Any]:
         order_by = QUERY_SORTS.get(sort)
@@ -351,6 +417,7 @@ class GlossaryRepository:
             scope=scope,
             approved=approved,
             include_weak=include_weak,
+            archived=archived,
             effective_ids=effective_ids,
         )
         facet_sql = cte + """
@@ -739,3 +806,555 @@ class GlossaryRepository:
             self._log(conn, "restore", before, after, self._actor(actor), request_id)
             conn.commit()
             return True
+
+    def bulk(
+        self,
+        action: str,
+        terms: list[dict[str, int]],
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        if action not in {"approve", "reject", "lock", "archive"}:
+            raise GlossaryStateConflict("invalid_action")
+        if not 1 <= len(terms) <= 200:
+            raise GlossaryStateConflict("bulk_limit_exceeded")
+        ids = [int(term["id"]) for term in terms]
+        if len(ids) != len(set(ids)):
+            raise GlossaryStateConflict("duplicate_term")
+        expected = {int(term["id"]): int(term["expected_version"]) for term in terms}
+        state_by_action = {
+            "approve": ("APPROVED", 1, 0),
+            "reject": ("REJECTED", -1, 0),
+            "lock": ("LOCKED", 1, 1),
+        }
+
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows: list[sqlite3.Row] = []
+            for term_id in ids:
+                row = self._row(conn, term_id)
+                if row is None or row["archived_at"]:
+                    raise GlossaryStateConflict("term_not_found")
+                if int(row["version"] or 0) != expected[term_id]:
+                    raise GlossaryStateConflict("stale_version")
+                if action != "archive" and not self._validate_transition(
+                    conn, row, action, row
+                ):
+                    raise GlossaryStateConflict("invalid_transition")
+                rows.append(row)
+
+            for row in rows:
+                before = dict(row)
+                if action == "archive":
+                    conn.execute(
+                        """
+                        UPDATE glossary_terms
+                        SET archived_at = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE glossary_terms
+                        SET review_status = ?, approved = ?, locked = ?,
+                            updated_at = CURRENT_TIMESTAMP, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (*state_by_action[action], row["id"]),
+                    )
+                after = dict(self._row(conn, int(row["id"])))
+                self._log(conn, action, before, after, self._actor(actor), request_id)
+            resources = [self._resource(self._row(conn, term_id)) for term_id in ids]
+            conn.commit()
+        return {"action": action, "updated": len(resources), "items": resources}
+
+    def query_conflicts(
+        self,
+        *,
+        book_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> dict[str, Any]:
+        where = ["COALESCE(g.archived_at, '') = ''", "g.review_status != 'REJECTED'"]
+        params: list[Any] = []
+        if book_id is not None:
+            where.append("g.book_id IN (0, ?)")
+            params.append(book_id)
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT g.*,
+                       (SELECT COUNT(*) FROM glossary_term_evidence e WHERE e.term_id = g.id) AS evidence_count
+                FROM glossary_terms g
+                WHERE {' AND '.join(where)}
+                ORDER BY g.book_id, g.source_key, g.id
+                """,
+                params,
+            ).fetchall()
+
+        grouped: dict[tuple[int, ...], set[str]] = {}
+        by_scope_key: dict[tuple[int, str], list[sqlite3.Row]] = {}
+        by_key: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_scope_key.setdefault((int(row["book_id"] or 0), row["source_key"]), []).append(row)
+            by_key.setdefault(row["source_key"], []).append(row)
+        for scoped_rows in by_scope_key.values():
+            if len(scoped_rows) > 1:
+                grouped.setdefault(tuple(sorted(int(row["id"]) for row in scoped_rows)), set()).add(
+                    "normalized_duplicate"
+                )
+        for keyed_rows in by_key.values():
+            scopes = {int(row["book_id"] or 0) for row in keyed_rows}
+            if 0 in scopes and any(scope != 0 for scope in scopes):
+                grouped.setdefault(tuple(sorted(int(row["id"]) for row in keyed_rows)), set()).add(
+                    "global_book"
+                )
+        for row in rows:
+            for variant_key in _variant_keys(row["variants"]):
+                matches = [candidate for candidate in by_key.get(variant_key, []) if candidate["id"] != row["id"]]
+                for match in matches:
+                    member_ids = tuple(sorted((int(row["id"]), int(match["id"]))))
+                    grouped.setdefault(member_ids, set()).add("primary_variant")
+
+        resources = {
+            int(row["id"]): self._resource(
+                row, evidence_count=int(row["evidence_count"] or 0)
+            )
+            for row in rows
+        }
+        items = [
+            {
+                "id": _stable_digest({"ids": member_ids})[:16],
+                "types": sorted(types),
+                "members": [resources[term_id] for term_id in member_ids],
+            }
+            for member_ids, types in grouped.items()
+        ]
+        items.sort(key=lambda item: (item["types"], [member["id"] for member in item["members"]]))
+        total = len(items)
+        start = (page - 1) * per_page
+        return {
+            "items": items[start:start + per_page],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": (total + per_page - 1) // per_page,
+        }
+
+    def _merge_preview(
+        self,
+        conn: sqlite3.Connection,
+        canonical_id: int,
+        duplicate_ids: list[int],
+    ) -> dict[str, Any]:
+        ids = [canonical_id, *duplicate_ids]
+        if not duplicate_ids or len(ids) > 200 or len(ids) != len(set(ids)):
+            raise GlossaryStateConflict("invalid_merge")
+        rows = [self._row(conn, term_id) for term_id in ids]
+        if any(row is None or row["archived_at"] for row in rows):
+            raise GlossaryStateConflict("term_not_found")
+        canonical = rows[0]
+        assert canonical is not None
+        canonical_variants = _variant_keys(canonical["variants"])
+        for duplicate in rows[1:]:
+            assert duplicate is not None
+            related = (
+                duplicate["source_key"] == canonical["source_key"]
+                or duplicate["source_key"] in canonical_variants
+                or canonical["source_key"] in _variant_keys(duplicate["variants"])
+            )
+            if not related:
+                raise GlossaryStateConflict("merge_candidate_mismatch")
+        versions = [{"id": int(row["id"]), "version": int(row["version"] or 0)} for row in rows if row]
+        placeholders = ",".join("?" for _ in ids)
+        evidence_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id IN ({placeholders})", ids
+            ).fetchone()[0]
+        )
+        history_count = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM glossary_history WHERE term_id IN ({placeholders})", ids
+            ).fetchone()[0]
+        )
+        occurrence_count = sum(int(row["occurrence_count"] or 0) for row in rows if row)
+        digest = _stable_digest(
+            {
+                "canonical_id": canonical_id,
+                "duplicate_ids": duplicate_ids,
+                "versions": versions,
+            }
+        )
+        return {
+            "canonical_id": canonical_id,
+            "duplicate_ids": duplicate_ids,
+            "versions": versions,
+            "digest": digest,
+            "evidence_count": evidence_count,
+            "history_count": history_count,
+            "occurrence_count": occurrence_count,
+        }
+
+    def preview_merge(self, canonical_id: int, duplicate_ids: list[int]) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            return self._merge_preview(conn, canonical_id, duplicate_ids)
+
+    def apply_merge(
+        self,
+        canonical_id: int,
+        duplicate_ids: list[int],
+        digest: str,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            preview = self._merge_preview(conn, canonical_id, duplicate_ids)
+            if not hmac.compare_digest(str(digest), preview["digest"]):
+                raise GlossaryStateConflict("preview_mismatch")
+            canonical_before = dict(self._row(conn, canonical_id))
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            conn.execute(
+                f"""
+                UPDATE glossary_term_evidence SET term_id = ?, book_id = ?
+                WHERE term_id IN ({placeholders})
+                """,
+                (canonical_id, canonical_before["book_id"], *duplicate_ids),
+            )
+            conn.execute(
+                f"UPDATE glossary_history SET term_id = ?, book_id = ? WHERE term_id IN ({placeholders})",
+                (canonical_id, canonical_before["book_id"], *duplicate_ids),
+            )
+            conn.execute(
+                """
+                UPDATE glossary_terms
+                SET occurrence_count = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                WHERE id = ?
+                """,
+                (preview["occurrence_count"], canonical_id),
+            )
+            canonical_after = dict(self._row(conn, canonical_id))
+            self._log(
+                conn, "merge", canonical_before, canonical_after, self._actor(actor), request_id
+            )
+            archived_at = datetime.now(timezone.utc).isoformat()
+            for duplicate_id in duplicate_ids:
+                before = dict(self._row(conn, duplicate_id))
+                conn.execute(
+                    """
+                    UPDATE glossary_terms
+                    SET archived_at = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (archived_at, duplicate_id),
+                )
+                after = dict(self._row(conn, duplicate_id))
+                self._log(
+                    conn, "merge_archive", before, after, self._actor(actor), request_id
+                )
+            conn.commit()
+        return {**preview, "merged": len(duplicate_ids)}
+
+    @staticmethod
+    def _canonical_import_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        canonical: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+        for item_number, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                errors.append({"item": item_number, "field": "item", "code": "invalid_type"})
+                continue
+            source = str(raw.get("source_term") or "").strip()
+            target = str(raw.get("target_term") or "").strip()
+            if not source:
+                errors.append({"item": item_number, "field": "source_term", "code": "required"})
+            if "target_term" not in raw:
+                errors.append({"item": item_number, "field": "target_term", "code": "required"})
+            if not source or "target_term" not in raw:
+                continue
+            if len(source) > 500 or len(target) > 2000:
+                errors.append({"item": item_number, "field": "item", "code": "too_long"})
+                continue
+            try:
+                book_id = int(raw.get("book_id", 0))
+                approved = int(raw.get("approved", IMPORT_FIELDS["approved"]))
+                locked = int(raw.get("locked", IMPORT_FIELDS["locked"]))
+                priority = int(raw.get("priority", IMPORT_FIELDS["priority"]))
+                confidence = float(raw.get("confidence", IMPORT_FIELDS["confidence"]))
+                first_seen_chapter_id = int(
+                    raw.get("first_seen_chapter_id", IMPORT_FIELDS["first_seen_chapter_id"])
+                )
+                first_seen_chapter_number = int(
+                    raw.get("first_seen_chapter_number", IMPORT_FIELDS["first_seen_chapter_number"])
+                )
+                occurrence_count = raw.get("occurrence_count", None)
+                occurrence_count = None if occurrence_count is None else max(0, int(occurrence_count))
+            except (TypeError, ValueError):
+                errors.append({"item": item_number, "field": "item", "code": "invalid_number"})
+                continue
+            if (
+                book_id < 0
+                or approved not in {-1, 0, 1}
+                or locked not in {0, 1}
+                or not 0 <= confidence <= 1
+                or first_seen_chapter_id < 0
+                or first_seen_chapter_number < 0
+            ):
+                errors.append({"item": item_number, "field": "item", "code": "invalid_value"})
+                continue
+            mode = str(raw.get("mode", IMPORT_FIELDS["mode"]) or "")
+            if mode not in {"", "translate", "context", "transliterate"}:
+                errors.append({"item": item_number, "field": "mode", "code": "invalid_value"})
+                continue
+            review_status = str(raw.get("review_status") or "").strip().upper()
+            if review_status and review_status not in CANONICAL_STATES:
+                errors.append({"item": item_number, "field": "review_status", "code": "invalid_value"})
+                continue
+            if review_status:
+                expected_flags = CANONICAL_STATES[review_status]
+                if (
+                    ("approved" in raw and approved != expected_flags[0])
+                    or ("locked" in raw and locked != expected_flags[1])
+                ):
+                    errors.append({"item": item_number, "field": "item", "code": "invalid_state"})
+                    continue
+            state = _requested_state(approved, locked, review_status)
+            if state[0] in {"APPROVED", "LOCKED"} and _target_is_blank(target):
+                errors.append({"item": item_number, "field": "target_term", "code": "target_required"})
+                continue
+            source_key = normalize_source_key(source)
+            identity = (book_id, source_key)
+            if identity in seen:
+                errors.append({"item": item_number, "field": "source_term", "code": "duplicate_item"})
+                continue
+            seen.add(identity)
+            item = {
+                key: raw.get(key, default)
+                for key, default in IMPORT_FIELDS.items()
+            }
+            item.update(
+                item_number=item_number,
+                book_id=book_id,
+                source_term=source,
+                source_key=source_key,
+                target_term=target,
+                approved=state[1],
+                locked=state[2],
+                review_status=state[0],
+                mode=mode,
+                priority=priority,
+                confidence=confidence,
+                first_seen_chapter_id=first_seen_chapter_id,
+                first_seen_chapter_number=first_seen_chapter_number,
+                occurrence_count=occurrence_count,
+                archived_at=str(raw.get("archived_at") or "") if raw.get("archived", bool(raw.get("archived_at"))) else "",
+            )
+            for key in (
+                "category", "pinyin", "notes_vi", "variants", "genre", "term_type",
+                "alternatives", "gender", "source_context",
+            ):
+                item[key] = str(item[key] or "")
+            canonical.append(item)
+        return canonical, errors
+
+    def _import_preview(
+        self,
+        conn: sqlite3.Connection,
+        items: list[dict[str, Any]],
+        conflict_policy: str,
+    ) -> dict[str, Any]:
+        if conflict_policy not in IMPORT_POLICIES:
+            raise GlossaryStateConflict("invalid_conflict_policy")
+        canonical, errors = self._canonical_import_items(items)
+        if errors:
+            raise GlossaryValidationError(errors)
+        actions: list[dict[str, Any]] = []
+        affected: list[dict[str, Any]] = []
+        summary = {"added": 0, "updated": 0, "skipped": 0}
+        conflict_errors: list[dict[str, Any]] = []
+        for item in canonical:
+            rows = self._source_rows(conn, item["book_id"], item["source_key"])
+            code = ""
+            current = rows[0] if len(rows) == 1 else None
+            if len(rows) > 1:
+                code = "normalized_source_collision"
+            elif current is not None:
+                current_state = _canonical_state(
+                    current["approved"], current["locked"], current["review_status"]
+                )
+                desired_state = (item["review_status"], item["approved"], item["locked"])
+                if current["locked"] == 1 and (
+                    desired_state != current_state
+                    or item["target_term"] != current["target_term"]
+                ):
+                    code = "invalid_transition"
+                elif not item["archived_at"] and desired_state[0] in {"APPROVED", "LOCKED"}:
+                    other_targets = {
+                        " ".join(unicodedata.normalize("NFKC", str(row["target_term"] or "")).split())
+                        for row in rows
+                        if int(row["id"]) != int(current["id"]) and not row["archived_at"]
+                    }
+                    other_targets.add(
+                        " ".join(unicodedata.normalize("NFKC", item["target_term"]).split())
+                    )
+                    if len(other_targets) > 1:
+                        code = "normalized_target_conflict"
+            if code:
+                if conflict_policy == "reject_conflicts":
+                    conflict_errors.append(
+                        {"item": item["item_number"], "field": "item", "code": code}
+                    )
+                else:
+                    summary["skipped"] += 1
+                    actions.append({"item": item["item_number"], "action": "skip", "code": code})
+                continue
+            if current is None:
+                summary["added"] += 1
+                affected.append(
+                    {"book_id": item["book_id"], "source_key": item["source_key"], "version": None}
+                )
+                actions.append({"item": item["item_number"], "action": "add"})
+            else:
+                summary["updated"] += 1
+                affected.append({"id": int(current["id"]), "version": int(current["version"] or 0)})
+                actions.append(
+                    {"item": item["item_number"], "action": "update", "id": int(current["id"])}
+                )
+        if conflict_errors:
+            raise GlossaryValidationError(conflict_errors)
+        digest = _stable_digest(
+            {
+                "schema_version": 1,
+                "conflict_policy": conflict_policy,
+                "items": canonical,
+                "affected": affected,
+                "actions": actions,
+            }
+        )
+        return {
+            "schema_version": 1,
+            "digest": digest,
+            "conflict_policy": conflict_policy,
+            "summary": summary,
+            "actions": actions,
+            "affected": affected,
+            "canonical_items": canonical,
+        }
+
+    def preview_import(
+        self,
+        items: list[dict[str, Any]],
+        conflict_policy: str = "skip_conflicts",
+    ) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            return self._import_preview(conn, items, conflict_policy)
+
+    def apply_import(
+        self,
+        items: list[dict[str, Any]],
+        digest: str,
+        conflict_policy: str = "skip_conflicts",
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        with get_connection(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            preview = self._import_preview(conn, items, conflict_policy)
+            if not hmac.compare_digest(str(digest), preview["digest"]):
+                raise GlossaryStateConflict("import_drift")
+            items_by_number = {
+                int(item["item_number"]): item for item in preview["canonical_items"]
+            }
+            for action in preview["actions"]:
+                if action["action"] == "skip":
+                    continue
+                item = items_by_number[int(action["item"])]
+                if action["action"] == "add":
+                    conn.execute(
+                        """
+                        INSERT INTO glossary_terms
+                            (book_id, source_term, source_key, target_term, category, confidence,
+                             approved, mode, pinyin, notes_vi, variants, occurrence_count, priority,
+                             locked, genre, term_type, alternatives, gender, first_seen_chapter_id,
+                             first_seen_chapter_number, review_status, source_context, archived_at,
+                             last_seen, updated_at, version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                        """,
+                        (
+                            item["book_id"], item["source_term"], item["source_key"], item["target_term"],
+                            item["category"], float(item["confidence"] or 0), item["approved"], item["mode"],
+                            item["pinyin"], item["notes_vi"], item["variants"],
+                            int(item["occurrence_count"] or 0), item["priority"], item["locked"], item["genre"],
+                            item["term_type"], item["alternatives"], item["gender"],
+                            int(item["first_seen_chapter_id"] or 0), int(item["first_seen_chapter_number"] or 0),
+                            item["review_status"], item["source_context"], item["archived_at"],
+                        ),
+                    )
+                    term_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    before: dict[str, Any] = {}
+                else:
+                    term_id = int(action["id"])
+                    before = dict(self._row(conn, term_id))
+                    occurrence_count = (
+                        before["occurrence_count"]
+                        if item["occurrence_count"] is None
+                        else item["occurrence_count"]
+                    )
+                    conn.execute(
+                        """
+                        UPDATE glossary_terms
+                        SET source_term = ?, source_key = ?, target_term = ?, category = ?, confidence = ?,
+                            approved = ?, mode = ?, pinyin = ?, notes_vi = ?, variants = ?,
+                            occurrence_count = ?, priority = ?, locked = ?, genre = ?, term_type = ?,
+                            alternatives = ?, gender = ?, first_seen_chapter_id = ?,
+                            first_seen_chapter_number = ?, review_status = ?, source_context = ?,
+                            archived_at = ?, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (
+                            item["source_term"], item["source_key"], item["target_term"], item["category"],
+                            float(item["confidence"] or 0), item["approved"], item["mode"], item["pinyin"],
+                            item["notes_vi"], item["variants"], occurrence_count, item["priority"], item["locked"],
+                            item["genre"], item["term_type"], item["alternatives"], item["gender"],
+                            int(item["first_seen_chapter_id"] or 0), int(item["first_seen_chapter_number"] or 0),
+                            item["review_status"], item["source_context"], item["archived_at"], term_id,
+                        ),
+                    )
+                after = dict(self._row(conn, term_id))
+                self._log(
+                    conn,
+                    "import_add" if action["action"] == "add" else "import_update",
+                    before,
+                    after,
+                    self._actor(actor),
+                    request_id,
+                )
+            conn.commit()
+        return {**preview["summary"], "errors": []}
+
+    def export_terms(self, book_id: int | None = None, scope: str = "all") -> list[dict[str, Any]]:
+        if scope not in {"all", "book", "global"}:
+            raise ValueError("invalid_scope")
+        if scope == "book" and book_id is None:
+            raise ValueError("book_id_required")
+        where = ""
+        params: tuple[Any, ...] = ()
+        if scope == "book":
+            where, params = "WHERE book_id = ?", (book_id,)
+        elif scope == "global":
+            where = "WHERE book_id = 0"
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(EXPORT_FIELDS)} FROM glossary_terms {where} ORDER BY id",
+                params,
+            ).fetchall()
+        return [
+            {**dict(row), "archived": bool(row["archived_at"])}
+            for row in rows
+        ]

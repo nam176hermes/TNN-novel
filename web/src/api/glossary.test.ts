@@ -3,6 +3,53 @@ import { fixtureGlossaryTerm } from '../test/fixtures';
 import { ApiClient } from './client';
 
 describe('glossary and TM API', () => {
+  it('drives bulk review, conflict merge, safe import, archive restore, and export contracts', async () => {
+    const preview = {
+      actions: [], affected: [], conflict_policy: 'skip_conflicts' as const,
+      digest: 'a'.repeat(64), schema_version: 1, summary: { added: 1, updated: 0, skipped: 0 },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ action: 'approve', updated: 1, items: [] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ items: [], page: 1, pages: 0, per_page: 50, total: 0 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ canonical_id: 7, duplicate_ids: [8], digest: 'b'.repeat(64) }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ canonical_id: 7, duplicate_ids: [8], merged: 1 }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => preview })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ added: 1, updated: 0, skipped: 0, errors: [] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ message: 'Term deleted' }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ message: 'Term restored' }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        blob: async () => new Blob(['{}'], { type: 'application/json' }),
+        headers: new Headers({ 'content-disposition': 'attachment; filename=glossary.json' }),
+      });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const refs = [{ id: 7, expected_version: 3 }];
+    const items = [{ book_id: 42, source_term: '筑基', target_term: 'Trúc Cơ' }];
+
+    await client.bulkGlossaryTerms('approve', refs);
+    await client.getGlossaryConflicts(42, 1);
+    const merge = await client.previewGlossaryMerge(7, [8]);
+    await client.applyGlossaryMerge(7, [8], merge.digest);
+    const imported = await client.previewGlossaryImport(items);
+    await client.applyGlossaryImport(items, imported.digest);
+    await client.archiveGlossaryTerm(7);
+    await client.restoreGlossaryTerm(7);
+    const exported = await client.downloadGlossaryExport(42, 'json');
+
+    expect(exported.filename).toBe('glossary.json');
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'http://test/api/glossary/terms/bulk', expect.objectContaining({
+      body: JSON.stringify({ action: 'approve', terms: refs }), method: 'POST',
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://test/api/glossary/conflicts?book_id=42&page=1&per_page=50', expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(5, 'http://test/api/glossary/import/preview', expect.objectContaining({
+      body: JSON.stringify({ conflict_policy: 'skip_conflicts', items }), method: 'POST',
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(8, 'http://test/api/glossary/terms/7/restore', expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(9, 'http://test/api/glossary/export?book_id=42&format=json&scope=book', expect.anything());
+  });
+
   it('queries a bounded review page with filters and an abort signal', async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn().mockResolvedValue({
@@ -37,6 +84,23 @@ describe('glossary and TM API', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'http://test/api/glossary?book_id=42&page=1&per_page=50&q=%E7%AD%91%E5%9F%BA&review_status=NEEDS_REVIEW%2CCONFLICT&scope=book&sort=review',
       expect.objectContaining({ signal: controller.signal }),
+    );
+  });
+
+  it('requests the archived review queue explicitly', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ facets: {}, items: [], page: 1, pages: 0, per_page: 50, scope: 'book', total: 0 }),
+    });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+
+    await client.queryGlossaryTerms({
+      archived: true, book_id: 42, page: 1, per_page: 50, q: '', review_status: '', scope: 'book', sort: 'review',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://test/api/glossary?book_id=42&page=1&per_page=50&archived=true&scope=book&sort=review',
+      expect.anything(),
     );
   });
 

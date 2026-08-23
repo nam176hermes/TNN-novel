@@ -202,7 +202,7 @@ async def test_glossary_import_history_keeps_authenticated_mutation_metadata(glo
 
 
 @pytest.mark.asyncio
-async def test_glossary_import_reports_later_conflict_after_committed_prefix(glossary_api_db: Path) -> None:
+async def test_glossary_legacy_import_rejects_later_conflict_without_committing_prefix(glossary_api_db: Path) -> None:
     book_id = add_book(glossary_api_db, "Book")
     locked_id = put_glossary_term(glossary_api_db, book_id, "锁定", "khóa", locked=1)
 
@@ -220,7 +220,7 @@ async def test_glossary_import_reports_later_conflict_after_committed_prefix(glo
 
     assert response.status_code == 200
     assert response.json() == {
-        "added": 1,
+        "added": 0,
         "updated": 0,
         "errors": ["item 2: invalid_transition"],
     }
@@ -233,5 +233,5 @@ async def test_glossary_import_reports_later_conflict_after_committed_prefix(glo
             "SELECT version, review_status, approved, locked FROM glossary_terms WHERE id = ?",
             (locked_id,),
         ).fetchone()
-    assert committed is not None and committed["version"] == 1
+    assert committed is None
     assert tuple(locked) == (1, "LOCKED", 1, 1)
