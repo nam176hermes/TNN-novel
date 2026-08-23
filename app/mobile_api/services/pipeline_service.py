@@ -1488,10 +1488,13 @@ def _reader_effective_dictionary_terms(
 ) -> tuple[list[Mapping[str, object]], frozenset[str]]:
     supplemental = [
         (
-            _reader_dictionary_source_keys(source),
+            source_keys,
             normalize_source_key(str(source.get("target") or "")),
+            source.get("source") != "builtin"
+            or not source_keys & effective_glossary.reserved_source_keys,
         )
         for source in supplemental_sources
+        if (source_keys := _reader_dictionary_source_keys(source))
     ]
     terms: list[Mapping[str, object]] = []
     styleguide_winning_keys: set[str] = set()
@@ -1506,7 +1509,10 @@ def _reader_effective_dictionary_terms(
             }
         )
         target_key = normalize_source_key(str(term.get("target_term") or ""))
-        if any(term_keys & source_keys and target_key == source_target for source_keys, source_target in supplemental):
+        if any(
+            survives and term_keys & source_keys and target_key == source_target
+            for source_keys, source_target, survives in supplemental
+        ):
             continue
         terms.append(term)
         styleguide_winning_keys.update(term_keys)

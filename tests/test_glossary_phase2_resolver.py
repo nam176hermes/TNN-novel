@@ -226,6 +226,48 @@ def test_reader_dictionary_includes_styleguide_only_effective_survivor(
     ] == [("glossary", "仙侠", "tiên hiệp")]
 
 
+def test_reader_dictionary_keeps_styleguide_winner_over_losing_database_variant(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    monkeypatch.setattr(
+        styleguide_config,
+        "get_locked_terms",
+        lambda: [
+            {
+                "source": "丹田",
+                "target": "đan điền",
+                "term_type": "body",
+                "priority": 80,
+                "mode": "translate",
+            }
+        ],
+    )
+    put_glossary_term(temp_db_path, 0, "旁词", "khác", variants="丹田")
+    book_id = add_book(temp_db_path, "Reader losing variant")
+    pipeline = object.__new__(PipelineService)
+    pipeline.db_path = temp_db_path
+    pipeline.data_dir = tmp_path
+
+    pack = pipeline.get_reader_dictionary_pack(book_id)
+    lookup = pipeline.lookup_reader_dictionary(book_id, query="丹田", include_online=False)
+
+    assert pack is not None
+    assert lookup is not None
+    assert [
+        (item["source"], item["term"], item["target"])
+        for item in pack["sources"]
+        if item["term"] == "丹田"
+    ] == [("glossary", "丹田", "đan điền")]
+    assert [
+        (item["source"], item["term"], item["target"])
+        for item in lookup["sources"]
+        if item["term"] == "丹田"
+    ] == [("glossary", "丹田", "đan điền")]
+
+
 @pytest.mark.parametrize("mutation_target", ["mapping", "term_row"])
 def test_effective_snapshot_rejects_nested_mutation(
     temp_db_path: Path,
