@@ -38,7 +38,7 @@ def _state_mutation(call):
 async def list_glossary(
     book_id: int | None = Query(None),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=500),
+    per_page: int = Query(50, ge=1, le=200),
     q: str = Query("", max_length=200),
     review_status: str = Query("", max_length=120),
     term_type: str | None = Query(None, max_length=40),
@@ -61,7 +61,7 @@ async def list_glossary(
     if scope in {"book", "effective"} and book_id is None:
         raise HTTPException(status_code=422, detail={"code": "book_id_required"})
 
-    legacy_call = approved is not None or include_weak is not None or per_page > 200
+    legacy_call = approved is not None or include_weak is not None
     resolved_scope = scope or ("legacy" if legacy_call else ("effective" if book_id is not None else "all"))
     return svc.query_terms(
         book_id=book_id,
@@ -171,9 +171,10 @@ async def add_term(
 ):
     """Add a new glossary term."""
     actor, request_id = _mutation_metadata(request)
-    return _state_mutation(
+    resource = _state_mutation(
         lambda: svc.add_term_resource(term.model_dump(), actor=actor, request_id=request_id)
     )
+    return {**resource, "message": "Term added"}
 
 
 @router.get("/terms/{term_id}", response_model=dict)
@@ -206,7 +207,7 @@ async def update_term(
     )
     if resource is None:
         raise HTTPException(status_code=404, detail="Term not found")
-    return resource
+    return {**resource, "message": "Term updated"}
 
 
 @router.post("/terms/{term_id}/lock", response_model=dict)

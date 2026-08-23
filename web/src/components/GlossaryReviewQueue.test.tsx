@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -11,6 +11,14 @@ import { fixtureGlossaryTerm, fixtureStyleProfile } from '../test/fixtures';
 import GlossaryStyleView from './GlossaryStyleView';
 
 afterEach(cleanup);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 const query: GlossaryQuery = {
   page: 1,
@@ -165,6 +173,89 @@ describe('GlossaryStyleView review queue', () => {
     expect(screen.getAllByText(/Trúc Cơ/).length).toBeGreaterThanOrEqual(2);
     await userEvent.click(screen.getByRole('button', { name: 'Đóng chi tiết' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('aborts obsolete detail loads and never lets stale term A overwrite term B', async () => {
+    const termA = { ...fixtureGlossaryTerm, id: 1, source_term: '甲词', target_term: 'Từ A' };
+    const termB = { ...fixtureGlossaryTerm, id: 2, source_term: '乙词', target_term: 'Từ B' };
+    const requestA = deferred<GlossaryTermDetail>();
+    const requestB = deferred<GlossaryTermDetail>();
+    const signals = new Map<number, AbortSignal | undefined>();
+    const onLoadTermDetail = vi.fn((termId: number, options?: { signal?: AbortSignal }) => {
+      signals.set(termId, options?.signal);
+      return termId === 1 ? requestA.promise : requestB.promise;
+    });
+    const { unmount } = render(
+      <GlossaryStyleView {...props({ glossaryTerms: [termA, termB], onLoadTermDetail, total: 2 })} />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Chi tiết 甲词' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Đóng chi tiết' }));
+    expect(signals.get(1)?.aborted).toBe(true);
+    await userEvent.click(screen.getByRole('button', { name: 'Chi tiết 乙词' }));
+
+    await act(async () => {
+      requestB.resolve({
+        ...termB,
+        evidence: [{ id: 2, evidence_type: 'B-only', extractor: 'test', created_at: '2026-08-23' }],
+        history: [],
+      });
+      await requestB.promise;
+    });
+    expect(await screen.findByText(/B-only/)).toBeVisible();
+
+    await act(async () => {
+      requestA.resolve({
+        ...termA,
+        evidence: [{ id: 1, evidence_type: 'A-stale', extractor: 'test', created_at: '2026-08-23' }],
+        history: [],
+      });
+      await requestA.promise;
+    });
+
+    expect(screen.getByRole('dialog', { name: 'Chi tiết 乙词' })).toBeVisible();
+    expect(screen.queryByText(/A-stale/)).not.toBeInTheDocument();
+    expect(signals.get(2)?.aborted).toBe(false);
+    unmount();
+    expect(signals.get(2)?.aborted).toBe(true);
+  });
+
+  it('focuses and contains the modal drawer, closes on Escape, and returns to its opener', async () => {
+    const user = userEvent.setup();
+    render(<GlossaryStyleView {...props()} />);
+    const opener = screen.getByRole('button', { name: 'Chi tiết 筑基' });
+
+    await user.click(opener);
+    const dialog = await screen.findByRole('dialog', { name: 'Chi tiết 筑基' });
+    const close = screen.getByRole('button', { name: 'Đóng chi tiết' });
+    await waitFor(() => expect(close).toHaveFocus());
+
+    await user.tab();
+    expect(close).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(close).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(opener).toHaveFocus();
+  });
+
+  it('restores queue focus after a mutation resolves on a reconciled final page', async () => {
+    const mutation = deferred<void>();
+    const onApproveTerm = vi.fn(() => mutation.promise);
+    const { rerender } = render(
+      <GlossaryStyleView {...props({ onApproveTerm, page: 2, pages: 2, total: 51 })} />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Duyệt 筑基' }));
+
+    rerender(<GlossaryStyleView {...props({ onApproveTerm, page: 1, pages: 1, total: 50 })} />);
+    await act(async () => {
+      mutation.resolve();
+      await mutation.promise;
+    });
+
+    expect(screen.getByText('Trang 1 / 1')).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Hàng chờ duyệt' })).toHaveFocus());
   });
 
   it('renders explicit loading, error, and empty states', () => {

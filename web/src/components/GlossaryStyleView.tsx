@@ -1,5 +1,5 @@
 import { BookMarked, Search, ShieldCheck, Sparkles, UserRound, X } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type {
   GlossaryFacets,
   GlossaryQuery,
@@ -34,7 +34,7 @@ export type GlossaryStyleViewProps = {
   total?: number;
   onApproveTerm(termId: number): void | Promise<void>;
   onCreateBookOverride?(term: GlossaryTerm): void | Promise<void>;
-  onLoadTermDetail?(termId: number): Promise<GlossaryTermDetail>;
+  onLoadTermDetail?(termId: number, options?: { signal?: AbortSignal }): Promise<GlossaryTermDetail>;
   onLockToggle(termId: number, locked: boolean): void | Promise<void>;
   onPageChange?(page: number): void;
   onProfileChange(profileId: string): void;
@@ -172,7 +172,12 @@ export default function GlossaryStyleView({
   const [detailTerm, setDetailTerm] = useState<GlossaryTerm | null>(null);
   const [detailError, setDetailError] = useState('');
   const queueHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const detailDrawerRef = useRef<HTMLElement | null>(null);
+  const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
   const detailReturnFocusRef = useRef<HTMLElement | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const detailRequestIdRef = useRef(0);
+  const detailTermIdRef = useRef<number | null>(null);
   const lastSearchRef = useRef(query.q);
 
   useEffect(() => setSearch(query.q), [query.q]);
@@ -184,18 +189,89 @@ export default function GlossaryStyleView({
     }, 250);
     return () => window.clearTimeout(timer);
   }, [onQueryChange, search]);
+  useEffect(() => {
+    if (!detailTerm) return;
+    const timer = window.setTimeout(() => detailCloseButtonRef.current?.focus(), 0);
+    return () => window.clearTimeout(timer);
+  }, [detailTerm]);
+  useEffect(() => () => {
+    detailRequestIdRef.current += 1;
+    detailAbortRef.current?.abort();
+  }, []);
 
   const focusQueue = () => window.setTimeout(() => queueHeadingRef.current?.focus(), 0);
   const runMutation = async (call: () => void | Promise<void>) => { await call(); focusQueue(); };
   const selectPage = (nextPage: number) => { onPageChange?.(nextPage); focusQueue(); };
   const openDetail = (term: GlossaryTerm, opener: HTMLElement) => {
+    detailRequestIdRef.current += 1;
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    const requestId = detailRequestIdRef.current;
+    detailAbortRef.current = controller;
+    detailTermIdRef.current = term.id;
     detailReturnFocusRef.current = opener;
     setDetailTerm(term);
     setDetail(null);
     setDetailError('');
-    if (onLoadTermDetail) void onLoadTermDetail(term.id).then(setDetail).catch((reason: unknown) => setDetailError(String(reason)));
+    if (onLoadTermDetail) {
+      void onLoadTermDetail(term.id, { signal: controller.signal })
+        .then((nextDetail) => {
+          if (
+            !controller.signal.aborted &&
+            requestId === detailRequestIdRef.current &&
+            detailTermIdRef.current === term.id
+          ) {
+            setDetail(nextDetail);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (
+            !controller.signal.aborted &&
+            requestId === detailRequestIdRef.current &&
+            detailTermIdRef.current === term.id
+          ) {
+            setDetailError(String(reason));
+          }
+        });
+    }
   };
-  const closeDetail = () => { setDetailTerm(null); setDetail(null); detailReturnFocusRef.current?.focus(); };
+  const closeDetail = () => {
+    detailRequestIdRef.current += 1;
+    detailAbortRef.current?.abort();
+    detailAbortRef.current = null;
+    detailTermIdRef.current = null;
+    setDetailTerm(null);
+    setDetail(null);
+    setDetailError('');
+    detailReturnFocusRef.current?.focus();
+  };
+  const handleDetailKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDetail();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const drawer = detailDrawerRef.current;
+    if (!drawer) return;
+    const focusable = Array.from(drawer.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ));
+    if (focusable.length === 0) {
+      event.preventDefault();
+      drawer.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !drawer.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || !drawer.contains(document.activeElement))) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   const localSearch = search.trim().toLowerCase();
   const rows = (onQueryChange ? glossaryTerms : glossaryTerms.filter((term) => {
@@ -251,8 +327,8 @@ export default function GlossaryStyleView({
       </details>
 
       {detailTerm ? (
-        <aside aria-label={`Chi tiết ${detailTerm.source_term}`} aria-modal="true" className="glossary-detail-drawer" role="dialog">
-          <header><h3>Chi tiết {detailTerm.source_term}</h3><button aria-label="Đóng chi tiết" onClick={closeDetail} type="button"><X aria-hidden="true" /></button></header>
+        <aside aria-label={`Chi tiết ${detailTerm.source_term}`} aria-modal="true" className="glossary-detail-drawer" onKeyDown={handleDetailKeyDown} ref={detailDrawerRef} role="dialog" tabIndex={-1}>
+          <header><h3>Chi tiết {detailTerm.source_term}</h3><button aria-label="Đóng chi tiết" onClick={closeDetail} ref={detailCloseButtonRef} type="button"><X aria-hidden="true" /></button></header>
           {detailError ? <p role="alert">{detailError}</p> : null}{!detail && !detailError ? <p role="status">Đang tải chi tiết…</p> : null}
           {detail ? (
             <>

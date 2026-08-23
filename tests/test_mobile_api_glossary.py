@@ -99,9 +99,12 @@ async def test_glossary_api_hides_weak_terms_and_prioritizes_reviewable_terms(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await auth_headers(client)
-        response = await client.get(f"/api/glossary?book_id={book_id}&per_page=500", headers=headers)
+        response = await client.get(
+            f"/api/glossary?book_id={book_id}&per_page=200&include_weak=0",
+            headers=headers,
+        )
         with_weak_response = await client.get(
-            f"/api/glossary?book_id={book_id}&per_page=500&include_weak=1",
+            f"/api/glossary?book_id={book_id}&per_page=200&include_weak=1",
             headers=headers,
         )
 

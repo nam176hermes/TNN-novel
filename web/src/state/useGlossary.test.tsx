@@ -62,6 +62,10 @@ describe('useGlossary', () => {
     const { result } = renderHook(() => useGlossary(client, true, 42, '他开始筑基。'));
 
     await waitFor(() => expect(result.current.terms.state).toBe('ready'));
+    expect(client.getGlossaryTerms).toHaveBeenCalledWith(
+      42,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(result.current.pendingCount).toBe(1);
     expect(result.current.relevantTerms[0].source_term).toBe('筑基');
 
@@ -160,6 +164,91 @@ describe('useGlossary', () => {
 
     expect(result.current.terms.data[0]?.source_term).toBe('结丹');
     expect(client.getGlossaryTerms).toHaveBeenCalledTimes(2);
+  });
+
+  it('resets the review queue to page one before loading a different book', async () => {
+    const queryGlossaryTerms = vi.fn(async (requestedQuery) => ({
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [{
+        ...fixtureGlossaryTerm,
+        book_id: requestedQuery.book_id,
+        source_term: requestedQuery.book_id === 42 ? '筑基' : '结丹',
+      }],
+      page: requestedQuery.page,
+      pages: requestedQuery.book_id === 42 ? 3 : 1,
+      per_page: 50,
+      scope: 'book' as const,
+      total: requestedQuery.book_id === 42 ? 101 : 1,
+    }));
+    const client = { queryGlossaryTerms, searchTm: vi.fn() } as unknown as ApiClient;
+    const { result, rerender } = renderHook(
+      ({ bookId }) => useGlossary(client, true, bookId, ''),
+      { initialProps: { bookId: 42 } },
+    );
+    await waitFor(() => expect(queryGlossaryTerms).toHaveBeenCalledTimes(1));
+
+    act(() => result.current.setQuery({ page: 3 }));
+    await waitFor(() => expect(queryGlossaryTerms).toHaveBeenCalledTimes(2));
+    expect(queryGlossaryTerms.mock.calls[1][0]).toMatchObject({ book_id: 42, page: 3 });
+
+    rerender({ bookId: 43 });
+
+    await waitFor(() => expect(result.current.terms.data[0]?.source_term).toBe('结丹'));
+    expect(queryGlossaryTerms.mock.calls[queryGlossaryTerms.mock.calls.length - 1]?.[0]).toMatchObject({
+      book_id: 43,
+      page: 1,
+    });
+    expect(result.current.query.page).toBe(1);
+  });
+
+  it('re-requests the final valid page after a mutation shrinks pagination', async () => {
+    let pageTwoLoads = 0;
+    let shrunk = false;
+    const queryGlossaryTerms = vi.fn(async (requestedQuery) => {
+      if (requestedQuery.page === 2) {
+        pageTwoLoads += 1;
+        if (pageTwoLoads > 1) {
+          shrunk = true;
+          return {
+            facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+            items: [],
+            page: 2,
+            pages: 1,
+            per_page: 50,
+            scope: 'book' as const,
+            total: 50,
+          };
+        }
+      }
+      return {
+        facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+        items: [{ ...fixtureGlossaryTerm, id: requestedQuery.page === 2 ? 51 : 1 }],
+        page: requestedQuery.page,
+        pages: shrunk ? 1 : 2,
+        per_page: 50,
+        scope: 'book' as const,
+        total: shrunk ? 50 : 51,
+      };
+    });
+    const client = {
+      approveGlossaryTerm: vi.fn().mockResolvedValue(undefined),
+      queryGlossaryTerms,
+      searchTm: vi.fn(),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useGlossary(client, true, 42, ''));
+    await waitFor(() => expect(result.current.terms.state).toBe('ready'));
+    act(() => result.current.setQuery({ page: 2 }));
+    await waitFor(() => expect(result.current.page).toBe(2));
+
+    await act(async () => result.current.approveTerm(51));
+
+    await waitFor(() => expect(result.current.page).toBe(1));
+    expect(result.current.query.page).toBe(1);
+    expect(result.current.terms.state).toBe('ready');
+    expect(queryGlossaryTerms.mock.calls[queryGlossaryTerms.mock.calls.length - 1]?.[0]).toMatchObject({
+      book_id: 42,
+      page: 1,
+    });
   });
 
   it('runs explicit review actions and refreshes the current glossary', async () => {

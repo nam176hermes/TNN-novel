@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, type ApiClient } from '../api/client';
+import { ApiError, type ApiClient, type ApiRequestOptions } from '../api/client';
 import type {
   GlossaryFacets,
   GlossaryPage,
@@ -47,6 +47,8 @@ export function useGlossary(
   const tmRequestIdRef = useRef(0);
   const bookIdRef = useRef(bookId);
   const enabledRef = useRef(enabled);
+  const effectBookIdRef = useRef(bookId);
+  const skipNextQueryRefreshRef = useRef(false);
 
   bookIdRef.current = bookId;
   enabledRef.current = enabled;
@@ -87,10 +89,18 @@ export function useGlossary(
     try {
       const requestedQuery = { ...query, book_id: requestedBookId, per_page: Math.min(query.per_page, 50) };
       let nextPage: GlossaryPage;
+      let reconciledPage: number | null = null;
       if (reviewQueue && typeof client.queryGlossaryTerms === 'function') {
         nextPage = await client.queryGlossaryTerms(requestedQuery, { signal: controller.signal });
+        if (nextPage.pages < requestedQuery.page) {
+          reconciledPage = Math.max(nextPage.pages, 1);
+          nextPage = await client.queryGlossaryTerms(
+            { ...requestedQuery, page: reconciledPage },
+            { signal: controller.signal },
+          );
+        }
       } else {
-        const items = await client.getGlossaryTerms(requestedBookId);
+        const items = await client.getGlossaryTerms(requestedBookId, { signal: controller.signal });
         nextPage = {
           facets: emptyFacets,
           items,
@@ -108,6 +118,10 @@ export function useGlossary(
         bookIdRef.current !== requestedBookId
       ) {
         return nextPage.items;
+      }
+      if (reconciledPage !== null && reconciledPage !== query.page) {
+        skipNextQueryRefreshRef.current = true;
+        setQueryState((current) => ({ ...current, page: reconciledPage }));
       }
       setTerms({
         data: nextPage.items,
@@ -288,7 +302,7 @@ export function useGlossary(
   );
 
   const loadTermDetail = useCallback(
-    (termId: number) => client.getGlossaryTermDetail(termId),
+    (termId: number, options: ApiRequestOptions = {}) => client.getGlossaryTermDetail(termId, options),
     [client],
   );
 
@@ -327,14 +341,25 @@ export function useGlossary(
   );
 
   useEffect(() => {
+    const bookChanged = effectBookIdRef.current !== bookId;
+    effectBookIdRef.current = bookId;
+    if (bookChanged && query.page !== 1) {
+      resetTerms(enabled && bookId !== null ? 'loading' : 'idle');
+      setQueryState((current) => ({ ...current, page: 1 }));
+      return;
+    }
     if (!enabled || bookId === null) {
       resetTerms('idle');
       resetTm('idle');
       return;
     }
+    if (skipNextQueryRefreshRef.current) {
+      skipNextQueryRefreshRef.current = false;
+      return;
+    }
 
     void refresh().catch(() => {});
-  }, [bookId, enabled, refresh, resetTerms, resetTm]);
+  }, [bookId, enabled, query.page, refresh, resetTerms, resetTm]);
 
   const pendingCount = useMemo(
     () => terms.data.filter((term) => term.approved === 0 || term.approved === undefined).length,

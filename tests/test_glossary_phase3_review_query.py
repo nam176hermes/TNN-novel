@@ -243,6 +243,8 @@ async def test_create_patch_and_detail_return_resources_and_reject_stale_version
         )
         assert created.status_code == 201
         created_term = created.json()
+        assert created_term["message"] == "Term added"
+        assert isinstance(created_term["id"], int)
 
         updated = await client.patch(
             f"/api/glossary/terms/{created_term['id']}",
@@ -264,6 +266,8 @@ async def test_create_patch_and_detail_return_resources_and_reject_stale_version
     assert created_term["canonical_status"] == "NEEDS_REVIEW"
     assert created_term["version"] == 1
     assert updated.status_code == 200
+    assert updated.json()["message"] == "Term updated"
+    assert updated.json()["id"] == created_term["id"]
     assert updated.json()["notes_vi"] == "checked"
     assert updated.json()["version"] == 2
     assert stale.status_code == 409
@@ -278,7 +282,7 @@ async def test_create_patch_and_detail_return_resources_and_reject_stale_version
 
 
 @pytest.mark.asyncio
-async def test_query_api_rejects_unknown_filters_and_clamps_legacy_page_size(
+async def test_query_api_rejects_unknown_filters_and_page_sizes_above_public_maximum(
     glossary_api_db: Path,
 ) -> None:
     transport = httpx.ASGITransport(app=app)
@@ -287,10 +291,9 @@ async def test_query_api_rejects_unknown_filters_and_clamps_legacy_page_size(
         bad_status = await client.get("/api/glossary?review_status=APPROVED,BOGUS", headers=headers)
         bad_sort = await client.get("/api/glossary?sort=DROP_TABLE", headers=headers)
         bad_scope = await client.get("/api/glossary?scope=book", headers=headers)
-        legacy_page = await client.get("/api/glossary?per_page=500&include_weak=1", headers=headers)
+        oversized_page = await client.get("/api/glossary?per_page=201&include_weak=1", headers=headers)
 
     assert bad_status.status_code == 422
     assert bad_sort.status_code == 422
     assert bad_scope.status_code == 422
-    assert legacy_page.status_code == 200
-    assert legacy_page.json()["per_page"] == 200
+    assert oversized_page.status_code == 422

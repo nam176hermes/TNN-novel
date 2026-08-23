@@ -1594,15 +1594,31 @@ export class ApiClient {
     return data.results;
   }
 
-  async getGlossaryTerms(bookId?: number): Promise<GlossaryTerm[]> {
-    const query = bookId === undefined ? 'per_page=500' : `book_id=${bookId}&per_page=500`;
-    const response = await this.fetcher(`${this.baseUrl}/api/glossary?${query}`, {
-      headers: this.headers(),
-    });
-    await this.assertOk(response, 'Failed to load glossary terms');
+  async getGlossaryTerms(bookId?: number, options: ApiRequestOptions = {}): Promise<GlossaryTerm[]> {
+    const items: GlossaryTerm[] = [];
+    let page = 1;
+    let pages = 1;
 
-    const data = (await response.json()) as { items: GlossaryTerm[] };
-    return data.items;
+    while (page <= pages) {
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const params = new URLSearchParams();
+      if (bookId !== undefined) params.set('book_id', String(bookId));
+      params.set('page', String(page));
+      params.set('per_page', '200');
+      params.set('include_weak', '0');
+      const response = await this.fetcher(`${this.baseUrl}/api/glossary?${params}`, {
+        headers: this.headers(),
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+      await this.assertOk(response, 'Failed to load glossary terms');
+
+      const data = (await response.json()) as { items: GlossaryTerm[]; pages?: number };
+      items.push(...data.items);
+      pages = Math.max(1, Number(data.pages) || 1);
+      page += 1;
+    }
+
+    return items;
   }
 
   async queryGlossaryTerms(query: GlossaryQuery, options: ApiRequestOptions = {}): Promise<GlossaryPage> {

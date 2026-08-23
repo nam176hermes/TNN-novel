@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { fixtureGlossaryTerm } from '../test/fixtures';
 import { ApiClient } from './client';
 
 describe('glossary and TM API', () => {
@@ -159,34 +160,74 @@ describe('glossary and TM API', () => {
     );
   });
 
-  it('loads glossary terms for a book', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        items: [
-          {
-            id: 7,
-            book_id: 1,
-            source_term: '筑基',
-            target_term: 'Trúc Cơ',
-            locked: 1,
-            genre: 'tien_hiep',
-            term_type: 'realm',
-            priority: 40,
-          },
-        ],
-        total: 1,
-      }),
-    });
+  it('loads every legacy workbench glossary page with bounded requests', async () => {
+    const pageOne = Array.from({ length: 200 }, (_, index) => ({
+      ...fixtureGlossaryTerm,
+      id: index + 1,
+      source_term: `术语-${index + 1}`,
+    }));
+    const pageTwo = Array.from({ length: 200 }, (_, index) => ({
+      ...fixtureGlossaryTerm,
+      id: index + 201,
+      source_term: `术语-${index + 201}`,
+    }));
+    const pageThree = Array.from({ length: 101 }, (_, index) => ({
+      ...fixtureGlossaryTerm,
+      id: index + 401,
+      source_term: `术语-${index + 401}`,
+    }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: pageOne, page: 1, pages: 3, per_page: 200, total: 501 }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: pageTwo, page: 2, pages: 3, per_page: 200, total: 501 }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: pageThree, page: 3, pages: 3, per_page: 200, total: 501 }),
+      });
     const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
     client.token = 'access';
 
     const terms = await client.getGlossaryTerms(1);
 
-    expect(terms[0].term_type).toBe('realm');
-    expect(fetchMock).toHaveBeenCalledWith(
-      'http://test/api/glossary?book_id=1&per_page=500',
+    expect(terms).toHaveLength(501);
+    expect(terms[200].source_term).toBe('术语-201');
+    expect(terms[500].source_term).toBe('术语-501');
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://test/api/glossary?book_id=1&page=1&per_page=200&include_weak=0',
       expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access' }) }),
     );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://test/api/glossary?book_id=1&page=3&per_page=200&include_weak=0',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access' }) }),
+    );
+  });
+
+  it('aborts legacy workbench aggregation between glossary pages', async () => {
+    const controller = new AbortController();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: [fixtureGlossaryTerm], page: 1, pages: 2, per_page: 200, total: 201 }),
+      })
+      .mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      }));
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+
+    const load = client.getGlossaryTerms(1, { signal: controller.signal });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    controller.abort();
+
+    await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock.mock.calls[1][1]).toEqual(expect.objectContaining({ signal: controller.signal }));
   });
 });
