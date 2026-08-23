@@ -357,12 +357,19 @@ export function useGlossary(
     [client, phase4Mutation],
   );
   const previewImport = useCallback(
-    (items: GlossaryImportItem[]) => client.previewGlossaryImport(items),
+    (
+      items: GlossaryImportItem[],
+      policy: 'skip_conflicts' | 'reject_conflicts' = 'skip_conflicts',
+    ) => client.previewGlossaryImport(items, policy),
     [client],
   );
   const applyImport = useCallback(
-    (items: GlossaryImportItem[], digest: string) => phase4Mutation(
-      () => client.applyGlossaryImport(items, digest),
+    (
+      items: GlossaryImportItem[],
+      digest: string,
+      policy: 'skip_conflicts' | 'reject_conflicts' = 'skip_conflicts',
+    ) => phase4Mutation(
+      () => client.applyGlossaryImport(items, digest, policy),
     ),
     [client, phase4Mutation],
   );

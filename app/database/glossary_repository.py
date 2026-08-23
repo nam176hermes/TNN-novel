@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import math
 import os
 import re
 import sqlite3
@@ -81,6 +82,8 @@ IMPORT_FIELDS = {
     "archived_at": "",
 }
 IMPORT_POLICIES = {"skip_conflicts", "reject_conflicts"}
+SQLITE_INTEGER_MIN = -(2**63)
+SQLITE_INTEGER_MAX = 2**63 - 1
 EXPORT_FIELDS = (
     "id", "book_id", "source_term", "target_term", "category", "confidence", "approved",
     "locked", "review_status", "mode", "pinyin", "notes_vi", "variants", "occurrence_count",
@@ -838,6 +841,8 @@ class GlossaryRepository:
                     raise GlossaryStateConflict("term_not_found")
                 if int(row["version"] or 0) != expected[term_id]:
                     raise GlossaryStateConflict("stale_version")
+                if action in {"approve", "lock"} and row["review_status"] == "CONFLICT":
+                    raise GlossaryStateConflict("unresolved_conflict")
                 if action != "archive" and not self._validate_transition(
                     conn, row, action, row
                 ):
@@ -878,71 +883,241 @@ class GlossaryRepository:
         page: int = 1,
         per_page: int = 50,
     ) -> dict[str, Any]:
-        where = ["COALESCE(g.archived_at, '') = ''", "g.review_status != 'REJECTED'"]
+        where = ["COALESCE(archived_at, '') = ''", "review_status != 'REJECTED'", "source_key != ''"]
         params: list[Any] = []
         if book_id is not None:
-            where.append("g.book_id IN (0, ?)")
+            where.append("book_id IN (0, ?)")
             params.append(book_id)
-        with get_connection(self.db_path) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT g.*,
-                       (SELECT COUNT(*) FROM glossary_term_evidence e WHERE e.term_id = g.id) AS evidence_count
-                FROM glossary_terms g
+        offset = (page - 1) * per_page
+        ctes = f"""
+            WITH eligible AS (
+                SELECT id, book_id, source_key, variants
+                FROM glossary_terms
                 WHERE {' AND '.join(where)}
-                ORDER BY g.book_id, g.source_key, g.id
-                """,
-                params,
-            ).fetchall()
-
-        grouped: dict[tuple[int, ...], set[str]] = {}
-        by_scope_key: dict[tuple[int, str], list[sqlite3.Row]] = {}
-        by_key: dict[str, list[sqlite3.Row]] = {}
-        for row in rows:
-            by_scope_key.setdefault((int(row["book_id"] or 0), row["source_key"]), []).append(row)
-            by_key.setdefault(row["source_key"], []).append(row)
-        for scoped_rows in by_scope_key.values():
-            if len(scoped_rows) > 1:
-                grouped.setdefault(tuple(sorted(int(row["id"]) for row in scoped_rows)), set()).add(
-                    "normalized_duplicate"
-                )
-        for keyed_rows in by_key.values():
-            scopes = {int(row["book_id"] or 0) for row in keyed_rows}
-            if 0 in scopes and any(scope != 0 for scope in scopes):
-                grouped.setdefault(tuple(sorted(int(row["id"]) for row in keyed_rows)), set()).add(
-                    "global_book"
-                )
-        for row in rows:
-            for variant_key in _variant_keys(row["variants"]):
-                matches = [candidate for candidate in by_key.get(variant_key, []) if candidate["id"] != row["id"]]
-                for match in matches:
-                    member_ids = tuple(sorted((int(row["id"]), int(match["id"]))))
-                    grouped.setdefault(member_ids, set()).add("primary_variant")
-
-        resources = {
-            int(row["id"]): self._resource(
-                row, evidence_count=int(row["evidence_count"] or 0)
+                ORDER BY id
+            ),
+            normalized AS (
+                SELECT GROUP_CONCAT(id) AS member_ids, 'normalized_duplicate' AS conflict_type
+                FROM eligible
+                GROUP BY book_id, source_key
+                HAVING COUNT(*) > 1
+            ),
+            global_book AS (
+                SELECT GROUP_CONCAT(id) AS member_ids, 'global_book' AS conflict_type
+                FROM eligible
+                GROUP BY source_key
+                HAVING MIN(book_id) = 0 AND MAX(book_id) > 0
+            ),
+            primary_variant AS (
+                SELECT printf('%d,%d', a.id, b.id) AS member_ids,
+                       'primary_variant' AS conflict_type
+                FROM eligible a
+                JOIN eligible b ON a.id < b.id
+                WHERE glossary_variant_has(a.variants, b.source_key) = 1
+                   OR glossary_variant_has(b.variants, a.source_key) = 1
+            ),
+            candidates AS (
+                SELECT * FROM normalized
+                UNION ALL SELECT * FROM global_book
+                UNION ALL SELECT * FROM primary_variant
+            ),
+            grouped AS (
+                SELECT member_ids, GROUP_CONCAT(conflict_type) AS conflict_types
+                FROM candidates
+                GROUP BY member_ids
             )
-            for row in rows
-        }
-        items = [
-            {
-                "id": _stable_digest({"ids": member_ids})[:16],
-                "types": sorted(types),
-                "members": [resources[term_id] for term_id in member_ids],
-            }
-            for member_ids, types in grouped.items()
-        ]
-        items.sort(key=lambda item: (item["types"], [member["id"] for member in item["members"]]))
-        total = len(items)
-        start = (page - 1) * per_page
+        """
+        with get_connection(self.db_path) as conn:
+            conn.create_function(
+                "glossary_variant_has",
+                2,
+                lambda variants, source_key: int(str(source_key or "") in _variant_keys(variants)),
+                deterministic=True,
+            )
+            total = int(conn.execute(f"{ctes} SELECT COUNT(*) FROM grouped", params).fetchone()[0])
+            groups = conn.execute(
+                f"""
+                {ctes}
+                SELECT member_ids, conflict_types
+                FROM grouped
+                ORDER BY conflict_types, member_ids
+                LIMIT ? OFFSET ?
+                """,
+                (*params, per_page, offset),
+            ).fetchall()
+            member_ids = sorted(
+                {
+                    int(term_id)
+                    for group in groups
+                    for term_id in str(group["member_ids"] or "").split(",")
+                    if term_id
+                }
+            )
+            resources: dict[int, dict[str, Any]] = {}
+            if member_ids:
+                placeholders = ",".join("?" for _ in member_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT g.*, COUNT(e.id) AS evidence_count
+                    FROM glossary_terms g
+                    LEFT JOIN glossary_term_evidence e ON e.term_id = g.id
+                    WHERE g.id IN ({placeholders})
+                    GROUP BY g.id
+                    ORDER BY g.id
+                    """,
+                    member_ids,
+                ).fetchall()
+                resources = {
+                    int(row["id"]): self._resource(
+                        row, evidence_count=int(row["evidence_count"] or 0)
+                    )
+                    for row in rows
+                }
+        items = []
+        for group in groups:
+            ids = tuple(int(value) for value in str(group["member_ids"]).split(","))
+            types = sorted(set(str(group["conflict_types"]).split(",")))
+            items.append(
+                {
+                    "id": _stable_digest({"ids": ids})[:16],
+                    "types": types,
+                    "members": [resources[term_id] for term_id in ids],
+                }
+            )
         return {
-            "items": items[start:start + per_page],
+            "items": items,
             "total": total,
             "page": page,
             "per_page": per_page,
             "pages": (total + per_page - 1) // per_page,
         }
+
+    def query_legacy_conflicts(
+        self,
+        *,
+        book_id: int | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        member_limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return the legacy conflict shape with bounded groups and members."""
+        where = ["approved >= 0", "COALESCE(archived_at, '') = ''"]
+        params: list[Any] = []
+        if book_id is not None:
+            where.append("book_id IN (0, ?)")
+            params.append(book_id)
+        where_sql = " AND ".join(where)
+        typed_terms = (
+            "'character','sect','realm','skill','artifact','location','title',"
+            "'cultivation','organization','place'"
+        )
+        with get_connection(self.db_path) as conn:
+            candidates = conn.execute(
+                f"""
+                WITH source_conflicts AS (
+                    SELECT 'source_conflict' AS conflict_type, source_term AS conflict_key,
+                           COUNT(DISTINCT target_term) AS conflict_count
+                    FROM glossary_terms
+                    WHERE {where_sql}
+                    GROUP BY source_term
+                    HAVING COUNT(DISTINCT target_term) > 1
+                ),
+                target_reuse AS (
+                    SELECT 'target_reuse' AS conflict_type, target_term AS conflict_key,
+                           COUNT(DISTINCT source_term) AS conflict_count
+                    FROM glossary_terms
+                    WHERE {where_sql} AND target_term != ''
+                      AND LOWER(COALESCE(term_type, category, '')) IN ({typed_terms})
+                    GROUP BY target_term
+                    HAVING COUNT(DISTINCT source_term) > 1
+                )
+                SELECT * FROM source_conflicts
+                UNION ALL SELECT * FROM target_reuse
+                ORDER BY conflict_count DESC, conflict_type, conflict_key
+                LIMIT ? OFFSET ?
+                """,
+                (*params, *params, limit, offset),
+            ).fetchall()
+            source_keys = [row["conflict_key"] for row in candidates if row["conflict_type"] == "source_conflict"]
+            target_keys = [row["conflict_key"] for row in candidates if row["conflict_type"] == "target_reuse"]
+            source_details: dict[str, list[dict[str, Any]]] = {}
+            if source_keys:
+                placeholders = ",".join("?" for _ in source_keys)
+                rows = conn.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT source_term, book_id, target_term, approved, mode,
+                               ROW_NUMBER() OVER (PARTITION BY source_term ORDER BY book_id, id) AS member_number
+                        FROM glossary_terms
+                        WHERE source_term IN ({placeholders}) AND COALESCE(archived_at, '') = ''
+                    )
+                    SELECT * FROM ranked WHERE member_number <= ?
+                    ORDER BY source_term, member_number
+                    """,
+                    (*source_keys, member_limit),
+                ).fetchall()
+                for row in rows:
+                    source_details.setdefault(str(row["source_term"]), []).append(
+                        {
+                            "book_id": row["book_id"],
+                            "target_term": row["target_term"],
+                            "approved": row["approved"],
+                            "mode": row["mode"],
+                        }
+                    )
+            target_details: dict[str, list[dict[str, Any]]] = {}
+            if target_keys:
+                placeholders = ",".join("?" for _ in target_keys)
+                rows = conn.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT target_term, book_id, source_term, approved, mode, term_type, locked,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY target_term
+                                   ORDER BY locked DESC, book_id DESC, source_term, id
+                               ) AS member_number
+                        FROM glossary_terms
+                        WHERE target_term IN ({placeholders}) AND approved >= 0
+                          AND COALESCE(archived_at, '') = ''
+                    )
+                    SELECT * FROM ranked WHERE member_number <= ?
+                    ORDER BY target_term, member_number
+                    """,
+                    (*target_keys, member_limit),
+                ).fetchall()
+                for row in rows:
+                    target_details.setdefault(str(row["target_term"]), []).append(
+                        {
+                            "book_id": row["book_id"],
+                            "source_term": row["source_term"],
+                            "approved": row["approved"],
+                            "mode": row["mode"],
+                            "term_type": row["term_type"],
+                            "locked": row["locked"],
+                        }
+                    )
+        conflicts: list[dict[str, Any]] = []
+        for row in candidates:
+            key = str(row["conflict_key"])
+            if row["conflict_type"] == "source_conflict":
+                conflicts.append(
+                    {
+                        "type": "source_conflict",
+                        "source_term": key,
+                        "targets": source_details.get(key, []),
+                        "truncated": int(row["conflict_count"]) > member_limit,
+                    }
+                )
+            else:
+                conflicts.append(
+                    {
+                        "type": "target_reuse",
+                        "target_term": key,
+                        "sources": target_details.get(key, []),
+                        "truncated": int(row["conflict_count"]) > member_limit,
+                    }
+                )
+        return conflicts
 
     def _merge_preview(
         self,
@@ -970,22 +1145,31 @@ class GlossaryRepository:
                 raise GlossaryStateConflict("merge_candidate_mismatch")
         versions = [{"id": int(row["id"]), "version": int(row["version"] or 0)} for row in rows if row]
         placeholders = ",".join("?" for _ in ids)
-        evidence_count = int(
-            conn.execute(
-                f"SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id IN ({placeholders})", ids
-            ).fetchone()[0]
-        )
-        history_count = int(
-            conn.execute(
-                f"SELECT COUNT(*) FROM glossary_history WHERE term_id IN ({placeholders})", ids
-            ).fetchone()[0]
-        )
+        evidence = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT * FROM glossary_term_evidence WHERE term_id IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+        ]
+        history = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT * FROM glossary_history WHERE term_id IN ({placeholders}) ORDER BY id",
+                ids,
+            ).fetchall()
+        ]
+        evidence_count = len(evidence)
+        history_count = len(history)
         occurrence_count = sum(int(row["occurrence_count"] or 0) for row in rows if row)
         digest = _stable_digest(
             {
                 "canonical_id": canonical_id,
                 "duplicate_ids": duplicate_ids,
                 "versions": versions,
+                "occurrence_count": occurrence_count,
+                "evidence": evidence,
+                "history": history,
             }
         )
         return {
@@ -1020,14 +1204,14 @@ class GlossaryRepository:
             placeholders = ",".join("?" for _ in duplicate_ids)
             conn.execute(
                 f"""
-                UPDATE glossary_term_evidence SET term_id = ?, book_id = ?
+                UPDATE glossary_term_evidence SET term_id = ?
                 WHERE term_id IN ({placeholders})
                 """,
-                (canonical_id, canonical_before["book_id"], *duplicate_ids),
+                (canonical_id, *duplicate_ids),
             )
             conn.execute(
-                f"UPDATE glossary_history SET term_id = ?, book_id = ? WHERE term_id IN ({placeholders})",
-                (canonical_id, canonical_before["book_id"], *duplicate_ids),
+                f"UPDATE glossary_history SET term_id = ? WHERE term_id IN ({placeholders})",
+                (canonical_id, *duplicate_ids),
             )
             conn.execute(
                 """
@@ -1079,30 +1263,59 @@ class GlossaryRepository:
             if len(source) > 500 or len(target) > 2000:
                 errors.append({"item": item_number, "field": "item", "code": "too_long"})
                 continue
-            try:
-                book_id = int(raw.get("book_id", 0))
-                approved = int(raw.get("approved", IMPORT_FIELDS["approved"]))
-                locked = int(raw.get("locked", IMPORT_FIELDS["locked"]))
-                priority = int(raw.get("priority", IMPORT_FIELDS["priority"]))
-                confidence = float(raw.get("confidence", IMPORT_FIELDS["confidence"]))
-                first_seen_chapter_id = int(
-                    raw.get("first_seen_chapter_id", IMPORT_FIELDS["first_seen_chapter_id"])
-                )
-                first_seen_chapter_number = int(
-                    raw.get("first_seen_chapter_number", IMPORT_FIELDS["first_seen_chapter_number"])
-                )
-                occurrence_count = raw.get("occurrence_count", None)
-                occurrence_count = None if occurrence_count is None else max(0, int(occurrence_count))
-            except (TypeError, ValueError):
+            integer_values: dict[str, int | None] = {}
+            invalid_number = False
+            for field, default, nullable in (
+                ("id", None, True),
+                ("version", None, True),
+                ("book_id", 0, False),
+                ("approved", IMPORT_FIELDS["approved"], False),
+                ("locked", IMPORT_FIELDS["locked"], False),
+                ("priority", IMPORT_FIELDS["priority"], False),
+                ("first_seen_chapter_id", IMPORT_FIELDS["first_seen_chapter_id"], False),
+                ("first_seen_chapter_number", IMPORT_FIELDS["first_seen_chapter_number"], False),
+                ("occurrence_count", None, True),
+            ):
+                value = raw.get(field, default)
+                if nullable and value is None:
+                    integer_values[field] = None
+                    continue
+                if isinstance(value, bool):
+                    errors.append({"item": item_number, "field": field, "code": "invalid_type"})
+                    invalid_number = True
+                    break
+                if type(value) is not int:
+                    errors.append({"item": item_number, "field": field, "code": "invalid_number"})
+                    invalid_number = True
+                    break
+                if not SQLITE_INTEGER_MIN <= value <= SQLITE_INTEGER_MAX:
+                    errors.append({"item": item_number, "field": field, "code": "out_of_range"})
+                    invalid_number = True
+                    break
+                integer_values[field] = value
+            if invalid_number:
+                continue
+            confidence_value = raw.get("confidence", IMPORT_FIELDS["confidence"])
+            if isinstance(confidence_value, bool) or type(confidence_value) not in {int, float}:
                 errors.append({"item": item_number, "field": "item", "code": "invalid_number"})
                 continue
+            confidence = float(confidence_value)
+            book_id = int(integer_values["book_id"] or 0)
+            approved = int(integer_values["approved"] or 0)
+            locked = int(integer_values["locked"] or 0)
+            priority = int(integer_values["priority"] or 0)
+            first_seen_chapter_id = int(integer_values["first_seen_chapter_id"] or 0)
+            first_seen_chapter_number = int(integer_values["first_seen_chapter_number"] or 0)
+            occurrence_count = integer_values["occurrence_count"]
             if (
                 book_id < 0
                 or approved not in {-1, 0, 1}
                 or locked not in {0, 1}
+                or not math.isfinite(confidence)
                 or not 0 <= confidence <= 1
                 or first_seen_chapter_id < 0
                 or first_seen_chapter_number < 0
+                or (occurrence_count is not None and occurrence_count < 0)
             ):
                 errors.append({"item": item_number, "field": "item", "code": "invalid_value"})
                 continue
@@ -1115,14 +1328,25 @@ class GlossaryRepository:
                 errors.append({"item": item_number, "field": "review_status", "code": "invalid_value"})
                 continue
             if review_status:
-                expected_flags = CANONICAL_STATES[review_status]
-                if (
-                    ("approved" in raw and approved != expected_flags[0])
-                    or ("locked" in raw and locked != expected_flags[1])
-                ):
+                state = (review_status, approved, locked)
+                if (approved, locked) != CANONICAL_STATES[review_status]:
                     errors.append({"item": item_number, "field": "item", "code": "invalid_state"})
                     continue
-            state = _requested_state(approved, locked, review_status)
+            else:
+                states_by_flags = {
+                    (0, 0): ("NEEDS_REVIEW", 0, 0),
+                    (1, 0): ("APPROVED", 1, 0),
+                    (-1, 0): ("REJECTED", -1, 0),
+                    (1, 1): ("LOCKED", 1, 1),
+                }
+                state = states_by_flags.get((approved, locked))
+                if state is None:
+                    errors.append({"item": item_number, "field": "item", "code": "invalid_state"})
+                    continue
+            archived_value = raw.get("archived", bool(raw.get("archived_at")))
+            if "archived" in raw and not isinstance(archived_value, bool):
+                errors.append({"item": item_number, "field": "archived", "code": "invalid_type"})
+                continue
             if state[0] in {"APPROVED", "LOCKED"} and _target_is_blank(target):
                 errors.append({"item": item_number, "field": "target_term", "code": "target_required"})
                 continue
@@ -1151,7 +1375,7 @@ class GlossaryRepository:
                 first_seen_chapter_id=first_seen_chapter_id,
                 first_seen_chapter_number=first_seen_chapter_number,
                 occurrence_count=occurrence_count,
-                archived_at=str(raw.get("archived_at") or "") if raw.get("archived", bool(raw.get("archived_at"))) else "",
+                archived_at=str(raw.get("archived_at") or "") if archived_value else "",
             )
             for key in (
                 "category", "pinyin", "notes_vi", "variants", "genre", "term_type",
@@ -1166,9 +1390,33 @@ class GlossaryRepository:
         conn: sqlite3.Connection,
         items: list[dict[str, Any]],
         conflict_policy: str,
+        legacy_partial: bool = False,
     ) -> dict[str, Any]:
         if conflict_policy not in IMPORT_POLICIES:
             raise GlossaryStateConflict("invalid_conflict_policy")
+        if legacy_partial:
+            materialized: list[dict[str, Any]] = []
+            for raw in items:
+                if not isinstance(raw, dict):
+                    materialized.append(raw)
+                    continue
+                merged: dict[str, Any] = {
+                    "approved": 0,
+                    "locked": 0,
+                    "review_status": "NEEDS_REVIEW",
+                }
+                book_value = raw.get("book_id", 0)
+                source = str(raw.get("source_term") or "").strip()
+                if type(book_value) is int and not isinstance(book_value, bool) and source:
+                    existing = self._source_rows(
+                        conn, book_value, normalize_source_key(source)
+                    )
+                    if len(existing) == 1:
+                        merged.update(dict(existing[0]))
+                        merged["archived"] = bool(existing[0]["archived_at"])
+                merged.update(raw)
+                materialized.append(merged)
+            items = materialized
         canonical, errors = self._canonical_import_items(items)
         if errors:
             raise GlossaryValidationError(errors)
@@ -1249,9 +1497,11 @@ class GlossaryRepository:
         self,
         items: list[dict[str, Any]],
         conflict_policy: str = "skip_conflicts",
+        *,
+        legacy_partial: bool = False,
     ) -> dict[str, Any]:
         with get_connection(self.db_path) as conn:
-            return self._import_preview(conn, items, conflict_policy)
+            return self._import_preview(conn, items, conflict_policy, legacy_partial)
 
     def apply_import(
         self,
@@ -1261,10 +1511,11 @@ class GlossaryRepository:
         *,
         actor: str = "",
         request_id: str = "",
+        legacy_partial: bool = False,
     ) -> dict[str, Any]:
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            preview = self._import_preview(conn, items, conflict_policy)
+            preview = self._import_preview(conn, items, conflict_policy, legacy_partial)
             if not hmac.compare_digest(str(digest), preview["digest"]):
                 raise GlossaryStateConflict("import_drift")
             items_by_number = {

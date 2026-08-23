@@ -69,6 +69,19 @@ const AUTH_DISABLED = ['1', 'true', 'yes', 'on'].includes(
 const PUBLIC_REVIEW_MODE = ['1', 'true', 'yes', 'on'].includes(
   String(import.meta.env.VITE_PUBLIC_REVIEW_MODE ?? '').trim().toLowerCase(),
 );
+
+export async function runGlossaryPhase4Mutation(
+  call: () => Promise<unknown>,
+  onError: (error: unknown, label: string) => void,
+  label: string,
+): Promise<void> {
+  try {
+    await call();
+  } catch (error) {
+    onError(error, label);
+    throw error;
+  }
+}
 const MAX_JOB_REFRESH_RETRIES = 3;
 const JOB_REFRESH_RETRY_DELAY_MS = 100;
 const emptyTranslatedBooks: AsyncState<TranslatedBookSummary[]> = { data: [], error: '', state: 'idle' };
@@ -1068,11 +1081,7 @@ function AuthenticatedApp() {
 
   async function handleGlossaryPhase4(call: () => Promise<unknown>, label: string): Promise<void> {
     setBackendError('');
-    try {
-      await call();
-    } catch (error) {
-      handleJobError(error, label);
-    }
+    return runGlossaryPhase4Mutation(call, handleJobError, label);
   }
 
   async function handleTestProvider(providerId: string): Promise<void> {
@@ -1982,8 +1991,8 @@ function AuthenticatedApp() {
               facets={glossaryState.facets}
               glossaryTerms={glossaryState.terms.data}
               loadState={glossaryState.terms.state}
-              onApplyImport={(items, digest) => handleGlossaryPhase4(
-                () => glossaryState.applyImport(items, digest), 'Glossary import failed',
+              onApplyImport={(items, digest, policy) => handleGlossaryPhase4(
+                () => glossaryState.applyImport(items, digest, policy), 'Glossary import failed',
               )}
               onApplyMerge={(canonicalId, duplicateIds, digest) => handleGlossaryPhase4(
                 () => glossaryState.applyMerge(canonicalId, duplicateIds, digest), 'Glossary merge failed',

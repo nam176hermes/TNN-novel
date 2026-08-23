@@ -40,7 +40,10 @@ def _state_mutation(call):
     try:
         return call()
     except GlossaryStateConflict as exc:
-        raise HTTPException(status_code=409, detail={"code": exc.code}) from None
+        detail = {"code": exc.code}
+        if exc.code == "normalized_source_collision":
+            detail["resolution"] = "archive_active_canonical_first"
+        raise HTTPException(status_code=409, detail=detail) from None
 
 
 def _validated_mutation(call):
@@ -61,6 +64,143 @@ async def _bounded_json(request: Request):
         return json.loads(body)
     except (TypeError, ValueError, json.JSONDecodeError):
         raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
+
+
+def _csv_import_item(row: dict[str, str], item_number: int) -> dict:
+    if None in row or any(value is None for value in row.values()):
+        raise HTTPException(status_code=422, detail={"code": "invalid_csv"})
+    if row.get("schema_version") != "1":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "validation_failed",
+                "errors": [{"item": item_number, "field": "schema_version", "code": "unsupported"}],
+            },
+        )
+    if row.get("scope") not in {"all", "book", "global"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    item = {
+        key: value
+        for key, value in row.items()
+        if key not in {"schema_version", "scope", "scope_book_id"} and value != ""
+    }
+    for field in (
+        "id", "book_id", "approved", "locked", "occurrence_count", "priority",
+        "first_seen_chapter_id", "first_seen_chapter_number", "version",
+    ):
+        if field in item:
+            try:
+                item[field] = int(item[field])
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "validation_failed",
+                        "errors": [{"item": item_number, "field": field, "code": "invalid_number"}],
+                    },
+                ) from None
+    if "confidence" in item:
+        try:
+            item["confidence"] = float(item["confidence"])
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "validation_failed",
+                    "errors": [{"item": item_number, "field": "confidence", "code": "invalid_number"}],
+                },
+            ) from None
+    if "archived" in item:
+        archived = str(item["archived"]).strip().lower()
+        if archived not in {"true", "false"}:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "validation_failed",
+                    "errors": [{"item": item_number, "field": "archived", "code": "invalid_value"}],
+                },
+            )
+        item["archived"] = archived == "true"
+    _validate_import_scope(row["scope"], row.get("scope_book_id"), [item], csv_value=True)
+    return item
+
+
+def _validate_import_scope(
+    scope_type: str,
+    scope_book_id,
+    items: list[dict],
+    *,
+    csv_value: bool = False,
+) -> None:
+    if scope_type not in {"all", "book", "global"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if scope_book_id is None or scope_book_id == "":
+        if scope_type == "book":
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+        expected_book_id = 0
+    else:
+        if isinstance(scope_book_id, bool):
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+        try:
+            expected_book_id = int(scope_book_id) if csv_value else scope_book_id
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"}) from None
+        if type(expected_book_id) is not int or not 0 <= expected_book_id <= 2**63 - 1:
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if scope_type == "all":
+        return
+    if scope_type == "global":
+        if expected_book_id != 0:
+            raise HTTPException(status_code=422, detail={"code": "scope_mismatch"})
+        expected_book_id = 0
+    for item in items:
+        item_book_id = item.get("book_id", 0) if isinstance(item, dict) else None
+        if type(item_book_id) is int and item_book_id != expected_book_id:
+            raise HTTPException(status_code=422, detail={"code": "scope_mismatch"})
+
+
+async def _bounded_import_payload(request: Request) -> tuple[dict, bool]:
+    body = await request.body()
+    if len(body) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "payload_too_large"})
+    content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type in {"text/csv", "application/csv"}:
+        try:
+            text = body.decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(text))
+            required = {"schema_version", "scope", "source_term", "target_term"}
+            if (
+                not reader.fieldnames
+                or len(reader.fieldnames) != len(set(reader.fieldnames))
+                or not required.issubset(reader.fieldnames)
+            ):
+                raise HTTPException(status_code=422, detail={"code": "invalid_csv_schema"})
+            rows = [_csv_import_item(row, index) for index, row in enumerate(reader, start=1)]
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=422, detail={"code": "invalid_csv"}) from None
+        return {"items": _bounded_items(rows)}, True
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
+    if isinstance(payload, list):
+        payload = {"items": payload}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail={"code": "object_required"})
+    if "schema_version" in payload and payload["schema_version"] != 1:
+        raise HTTPException(status_code=422, detail={"code": "unsupported_schema_version"})
+    if "scope" in payload:
+        scope = payload["scope"]
+        if not isinstance(scope, dict) or scope.get("type") not in {"all", "book", "global"}:
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if "items" not in payload and "terms" in payload:
+        payload = {**payload, "items": payload["terms"]}
+    payload["items"] = _bounded_items(payload.get("items"))
+    if "scope" in payload:
+        _validate_import_scope(
+            payload["scope"]["type"], payload["scope"].get("book_id"), payload["items"]
+        )
+    return payload, False
 
 
 def _bounded_items(value) -> list[dict]:
@@ -134,13 +274,18 @@ async def list_glossary_conflicts(
     book_id: int | None = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
+    include_legacy: bool = Query(True),
+    legacy_member_limit: int = Query(20, ge=1, le=50),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """List bounded global/book, primary/variant, and normalized conflicts."""
     result = svc.query_conflicts(book_id, page, per_page)
-    # Keep the legacy source/target-reuse collection intact while exposing the
-    # paginated merge-candidate collection additively under ``items``.
-    return {**result, "conflicts": svc.get_conflicts(book_id)}
+    legacy = (
+        svc.query_legacy_conflicts(book_id, page, per_page, legacy_member_limit)
+        if include_legacy
+        else []
+    )
+    return {**result, "conflicts": legacy, "legacy_bounded": True}
 
 
 @router.post("/conflicts/merge/preview", response_model=dict)
@@ -413,34 +558,41 @@ async def reject_term(
 @router.post("/import/preview", response_model=dict)
 async def preview_import_glossary(
     request: Request,
+    conflict_policy: str = Query(""),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    payload = await _bounded_json(request)
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=422, detail={"code": "object_required"})
-    items = _bounded_items(payload.get("items"))
-    policy = str(payload.get("conflict_policy") or "skip_conflicts")
+    payload, csv_payload = await _bounded_import_payload(request)
+    items = payload["items"]
+    policy = (
+        (conflict_policy or "skip_conflicts")
+        if csv_payload
+        else str(payload.get("conflict_policy") or "skip_conflicts")
+    )
     return _validated_mutation(lambda: svc.preview_import(items, policy))
 
 
 @router.post("/import/apply", response_model=dict)
 async def apply_import_glossary(
     request: Request,
+    digest: str = Query(""),
+    conflict_policy: str = Query(""),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    payload = await _bounded_json(request)
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=422, detail={"code": "object_required"})
-    items = _bounded_items(payload.get("items"))
-    digest = str(payload.get("digest") or "")
-    if len(digest) != 64:
+    payload, csv_payload = await _bounded_import_payload(request)
+    items = payload["items"]
+    resolved_digest = digest if csv_payload else str(payload.get("digest") or "")
+    if len(resolved_digest) != 64:
         raise HTTPException(status_code=422, detail={"code": "digest_required"})
-    policy = str(payload.get("conflict_policy") or "skip_conflicts")
+    policy = (
+        conflict_policy or "skip_conflicts"
+        if csv_payload
+        else str(payload.get("conflict_policy") or "skip_conflicts")
+    )
     actor, request_id = _mutation_metadata(request)
     return _validated_mutation(
         lambda: svc.apply_import(
             items,
-            digest,
+            resolved_digest,
             policy,
             actor=actor,
             request_id=request_id,

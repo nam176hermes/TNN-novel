@@ -113,19 +113,168 @@ describe('GlossaryStyleView', () => {
     expect(onApplyMerge).toHaveBeenCalledWith(7, [8], 'd'.repeat(64));
 
     await userEvent.click(screen.getByText('Nhập & xuất'));
-    fireEvent.change(screen.getByLabelText('Dữ liệu nhập JSON'), {
+    fireEvent.change(screen.getByLabelText('Dữ liệu nhập JSON hoặc CSV'), {
       target: { value: JSON.stringify([{ source_term: '新词', target_term: 'Từ mới' }]) },
     });
     await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
     expect(await screen.findByText('Thêm 1 · Cập nhật 0 · Bỏ qua 0')).toBeVisible();
     await userEvent.click(screen.getByRole('button', { name: 'Áp dụng nhập' }));
     expect(onApplyImport).toHaveBeenCalledWith(
-      [{ source_term: '新词', target_term: 'Từ mới' }], 'i'.repeat(64),
+      [{ source_term: '新词', target_term: 'Từ mới' }], 'i'.repeat(64), 'skip_conflicts',
     );
     await userEvent.click(screen.getByRole('button', { name: 'Xuất JSON' }));
     await userEvent.click(screen.getByRole('button', { name: 'Xuất CSV' }));
     expect(onExport).toHaveBeenNthCalledWith(1, 'json');
     expect(onExport).toHaveBeenNthCalledWith(2, 'csv');
+  });
+
+  it('accepts exported JSON envelopes and CSV with an explicit conflict policy', async () => {
+    const onPreviewImport = vi.fn().mockResolvedValue({
+      actions: [{ item: 1, action: 'add' }], affected: [], conflict_policy: 'reject_conflicts',
+      digest: 'p'.repeat(64), schema_version: 1, summary: { added: 1, updated: 0, skipped: 0 },
+    });
+    const onApplyImport = vi.fn().mockResolvedValue(undefined);
+    render(<GlossaryStyleView {...props({
+      onApplyImport,
+      onExport: vi.fn(),
+      onPreviewImport,
+    })} />);
+
+    await userEvent.click(screen.getByText('Nhập & xuất'));
+    await userEvent.selectOptions(screen.getByLabelText('Chính sách xung đột'), 'reject_conflicts');
+    const input = screen.getByLabelText('Dữ liệu nhập JSON hoặc CSV');
+    fireEvent.change(input, {
+      target: {
+        value: JSON.stringify({
+          schema_version: 1,
+          scope: { type: 'book', book_id: 42 },
+          terms: [{ source_term: '包络', target_term: 'Phong bì', book_id: 42 }],
+          total: 1,
+        }),
+      },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    expect(onPreviewImport).toHaveBeenLastCalledWith(
+      [{ source_term: '包络', target_term: 'Phong bì', book_id: 42 }],
+      'reject_conflicts',
+    );
+
+    fireEvent.change(input, {
+      target: {
+        value: [
+          'schema_version,scope,scope_book_id,source_term,target_term,book_id,approved,locked,review_status,archived',
+          '1,book,42,逗号,"Dấu, phẩy",42,0,0,NEEDS_REVIEW,false',
+        ].join('\n'),
+      },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    expect(onPreviewImport).toHaveBeenLastCalledWith(
+      [expect.objectContaining({
+        approved: 0,
+        archived: false,
+        book_id: 42,
+        locked: 0,
+        review_status: 'NEEDS_REVIEW',
+        source_term: '逗号',
+        target_term: 'Dấu, phẩy',
+      })],
+      'reject_conflicts',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Áp dụng nhập' }));
+    expect(onApplyImport).toHaveBeenCalledWith(
+      expect.any(Array), 'p'.repeat(64), 'reject_conflicts',
+    );
+
+    fireEvent.change(input, {
+      target: {
+        value: JSON.stringify([{
+          source_term: '错误', target_term: 'Sai', approved: -1, locked: 1,
+        }]),
+      },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('trạng thái canonical');
+    expect(onPreviewImport).toHaveBeenCalledTimes(2);
+
+    fireEvent.change(input, {
+      target: {
+        value: JSON.stringify({
+          schema_version: 1,
+          scope: { type: 'book', book_id: 42 },
+          terms: [{ source_term: 'scope', target_term: 'Phạm vi', book_id: 43 }],
+        }),
+      },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('không khớp');
+    expect(onPreviewImport).toHaveBeenCalledTimes(2);
+
+    fireEvent.change(input, {
+      target: {
+        value: [
+          'schema_version,scope,scope_book_id,source_term,target_term,book_id',
+          '1,global,0,scope,Phạm vi,42',
+        ].join('\n'),
+      },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('không khớp');
+    expect(onPreviewImport).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps bulk selection create inputs and previews when mutations reject', async () => {
+    const rejected = new Error('typed mutation failed');
+    const memberA = { ...fixtureGlossaryTerm, id: 7, source_term: 'Ａ B', version: 3 };
+    const memberB = { ...fixtureGlossaryTerm, id: 8, source_term: 'a b', version: 4 };
+    render(<GlossaryStyleView {...props({
+      onApplyImport: vi.fn().mockRejectedValue(rejected),
+      onApplyMerge: vi.fn().mockRejectedValue(rejected),
+      onBulkAction: vi.fn().mockRejectedValue(rejected),
+      onCreateTerm: vi.fn().mockRejectedValue(rejected),
+      onExport: vi.fn(),
+      onLoadConflicts: vi.fn().mockResolvedValue({
+        items: [{ id: 'group', members: [memberA, memberB], types: ['normalized_duplicate'] }],
+        page: 1, pages: 1, per_page: 50, total: 1,
+      }),
+      onPreviewImport: vi.fn().mockResolvedValue({
+        actions: [{ item: 1, action: 'add' }], affected: [], conflict_policy: 'skip_conflicts',
+        digest: 'i'.repeat(64), schema_version: 1, summary: { added: 1, updated: 0, skipped: 0 },
+      }),
+      onPreviewMerge: vi.fn().mockResolvedValue({
+        canonical_id: 7, duplicate_ids: [8], digest: 'm'.repeat(64), evidence_count: 1,
+      }),
+      query: {
+        book_id: 42, page: 1, per_page: 50, q: '', review_status: '', scope: 'book', sort: 'review',
+      },
+    })} />);
+
+    const selected = screen.getByRole('checkbox', { name: 'Chọn 筑基' });
+    await userEvent.click(selected);
+    await userEvent.click(screen.getByRole('button', { name: 'Duyệt đã chọn' }));
+    expect(selected).toBeChecked();
+    expect(await screen.findByRole('alert')).toHaveTextContent('typed mutation failed');
+
+    await userEvent.click(screen.getByText('Tạo thuật ngữ'));
+    await userEvent.type(screen.getByLabelText('Thuật ngữ gốc mới'), '保留');
+    await userEvent.type(screen.getByLabelText('Bản dịch mới'), 'Giữ lại');
+    await userEvent.click(screen.getByRole('button', { name: 'Tạo thuật ngữ mới' }));
+    expect(screen.getByLabelText('Thuật ngữ gốc mới')).toHaveValue('保留');
+    expect(screen.getByLabelText('Bản dịch mới')).toHaveValue('Giữ lại');
+
+    await userEvent.click(screen.getByText('Xung đột & hợp nhất'));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải xung đột' }));
+    await userEvent.click(await screen.findByRole('radio', { name: 'Chọn canonical Ａ B' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước hợp nhất' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng hợp nhất' }));
+    expect(screen.getByRole('button', { name: 'Áp dụng hợp nhất' })).toBeVisible();
+
+    await userEvent.click(screen.getByText('Nhập & xuất'));
+    fireEvent.change(screen.getByLabelText('Dữ liệu nhập JSON hoặc CSV'), {
+      target: { value: JSON.stringify([{ source_term: '保留', target_term: 'Giữ lại' }]) },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng nhập' }));
+    expect(screen.getByRole('button', { name: 'Áp dụng nhập' })).toBeVisible();
   });
 
   it('keeps style profiles in a secondary disclosure and changes the selected profile', async () => {

@@ -54,7 +54,32 @@ describe('useGlossary', () => {
     expect(client.createGlossaryTerm).toHaveBeenCalledWith(expect.objectContaining({ book_id: 42 }));
     expect(client.getGlossaryConflicts).toHaveBeenCalledWith(42, 1);
     expect(client.applyGlossaryMerge).toHaveBeenCalledWith(7, [8], 'm'.repeat(64));
-    expect(client.applyGlossaryImport).toHaveBeenCalledWith(items, 'i'.repeat(64));
+    expect(client.applyGlossaryImport).toHaveBeenCalledWith(items, 'i'.repeat(64), 'skip_conflicts');
+  });
+
+  it('propagates phase 4 mutation failures and does not refresh stale success state', async () => {
+    const failure = new ApiError('Conflict', 409, 'unresolved_conflict');
+    const page = {
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [{ ...fixtureGlossaryTerm, version: 3 }],
+      page: 1, pages: 1, per_page: 50, scope: 'book' as const, total: 1,
+    };
+    const client = {
+      bulkGlossaryTerms: vi.fn().mockRejectedValue(failure),
+      queryGlossaryTerms: vi.fn().mockResolvedValue(page),
+      searchTm: vi.fn(),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useGlossary(client, true, 42, '', undefined, true));
+    await waitFor(() => expect(result.current.terms.state).toBe('ready'));
+
+    await act(async () => {
+      await expect(
+        result.current.bulkTerms('approve', [{ id: 7, expected_version: 3 }]),
+      ).rejects.toBe(failure);
+    });
+
+    expect(client.queryGlossaryTerms).toHaveBeenCalledTimes(1);
+    expect(result.current.terms.data[0]?.version).toBe(3);
   });
 
   it('requests the default queue and aborts a stale server page request', async () => {

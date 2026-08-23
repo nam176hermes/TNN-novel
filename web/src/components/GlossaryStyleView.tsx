@@ -1,5 +1,6 @@
 import { BookMarked, Search, ShieldCheck, Sparkles, UserRound, X } from 'lucide-react';
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { ApiError } from '../api/client';
 import type {
   GlossaryFacets,
   GlossaryBulkAction,
@@ -25,6 +26,7 @@ const fallbackQuery: GlossaryQuery = {
   scope: 'book',
   sort: 'review',
 };
+type GlossaryImportPolicy = 'skip_conflicts' | 'reject_conflicts';
 
 export type GlossaryStyleViewProps = {
   profiles: StyleProfile[];
@@ -39,7 +41,7 @@ export type GlossaryStyleViewProps = {
   query?: GlossaryQuery;
   total?: number;
   onApproveTerm(termId: number): void | Promise<void>;
-  onApplyImport?(items: GlossaryImportItem[], digest: string): void | Promise<void>;
+  onApplyImport?(items: GlossaryImportItem[], digest: string, policy: GlossaryImportPolicy): void | Promise<void>;
   onApplyMerge?(canonicalId: number, duplicateIds: number[], digest: string): void | Promise<void>;
   onArchiveTerm?(termId: number): void | Promise<void>;
   onBulkAction?(action: GlossaryBulkAction, terms: GlossaryBulkTermRef[]): void | Promise<void>;
@@ -51,7 +53,7 @@ export type GlossaryStyleViewProps = {
   onLockToggle(termId: number, locked: boolean): void | Promise<void>;
   onPageChange?(page: number): void;
   onProfileChange(profileId: string): void;
-  onPreviewImport?(items: GlossaryImportItem[]): Promise<GlossaryImportPreview>;
+  onPreviewImport?(items: GlossaryImportItem[], policy: GlossaryImportPolicy): Promise<GlossaryImportPreview>;
   onPreviewMerge?(canonicalId: number, duplicateIds: number[]): Promise<GlossaryMergePreview>;
   onQueryChange?(updates: Partial<GlossaryQuery>): void;
   onRejectTerm(termId: number): void | Promise<void>;
@@ -60,19 +62,176 @@ export type GlossaryStyleViewProps = {
   onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<void>;
 };
 
+const importIntegerFields = new Set([
+  'id', 'version', 'book_id', 'approved', 'locked', 'occurrence_count', 'priority',
+  'first_seen_chapter_id', 'first_seen_chapter_number',
+]);
+
+function csvRows(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (character === '"' && text[index + 1] === '"') {
+        field += '"'; index += 1;
+      } else if (character === '"') {
+        quoted = false;
+      } else {
+        field += character;
+      }
+    } else if (character === '"') {
+      if (field) throw new Error('CSV có dấu ngoặc kép không hợp lệ.');
+      quoted = true;
+    } else if (character === ',') {
+      row.push(field); field = '';
+    } else if (character === '\n') {
+      row.push(field.replace(/\r$/, '')); rows.push(row); row = []; field = '';
+    } else {
+      field += character;
+    }
+  }
+  if (quoted) throw new Error('CSV có trường trích dẫn chưa đóng.');
+  if (field || row.length) { row.push(field.replace(/\r$/, '')); rows.push(row); }
+  return rows.filter((candidate) => candidate.some((value) => value !== ''));
+}
+
+function validateImportItems(value: unknown): GlossaryImportItem[] {
+  if (!Array.isArray(value)) throw new Error('Dữ liệu nhập phải chứa danh sách thuật ngữ.');
+  if (value.length > 5000) throw new Error('Dữ liệu nhập vượt quá 5000 thuật ngữ.');
+  return value.map((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new Error(`Dòng ${index + 1} không phải là một thuật ngữ hợp lệ.`);
+    }
+    const item = candidate as Record<string, unknown>;
+    if (typeof item.source_term !== 'string' || typeof item.target_term !== 'string') {
+      throw new Error(`Dòng ${index + 1} cần source_term và target_term dạng chuỗi.`);
+    }
+    for (const field of importIntegerFields) {
+      if (field in item && (!Number.isSafeInteger(item[field]) || typeof item[field] === 'boolean')) {
+        throw new Error(`Dòng ${index + 1}: ${field} phải là số nguyên hợp lệ.`);
+      }
+    }
+    if ('archived' in item && typeof item.archived !== 'boolean') {
+      throw new Error(`Dòng ${index + 1}: archived phải là true hoặc false.`);
+    }
+    if ('confidence' in item && (typeof item.confidence !== 'number' || !Number.isFinite(item.confidence))) {
+      throw new Error(`Dòng ${index + 1}: confidence phải là số hợp lệ.`);
+    }
+    const status = String(item.review_status ?? '').trim().toUpperCase();
+    const approved = item.approved ?? 1;
+    const locked = item.locked ?? 0;
+    const canonicalFlags: Record<string, [number, number]> = {
+      NEEDS_REVIEW: [0, 0], APPROVED: [1, 0], REJECTED: [-1, 0], LOCKED: [1, 1], CONFLICT: [0, 0],
+    };
+    const flagsAreCanonical = status
+      ? status in canonicalFlags && approved === canonicalFlags[status][0] && locked === canonicalFlags[status][1]
+      : [[0, 0], [1, 0], [-1, 0], [1, 1]].some(([expectedApproved, expectedLocked]) => (
+        approved === expectedApproved && locked === expectedLocked
+      ));
+    if (!flagsAreCanonical) {
+      throw new Error(`Dòng ${index + 1} có trạng thái canonical không hợp lệ.`);
+    }
+    return item as GlossaryImportItem;
+  });
+}
+
+function validateImportScope(scope: unknown, items: GlossaryImportItem[]): void {
+  if (!scope || typeof scope !== 'object' || !['all', 'book', 'global'].includes(String((scope as Record<string, unknown>).type))) {
+    throw new Error('Phạm vi nhập không hợp lệ.');
+  }
+  const record = scope as Record<string, unknown>;
+  const scopeType = String(record.type);
+  const scopeBookId = record.book_id ?? (scopeType === 'book' ? undefined : 0);
+  if (!Number.isSafeInteger(scopeBookId) || Number(scopeBookId) < 0) {
+    throw new Error('Mã sách trong phạm vi nhập không hợp lệ.');
+  }
+  if (scopeType === 'all') return;
+  const expectedBookId = scopeType === 'global' ? 0 : Number(scopeBookId);
+  if ((scopeType === 'global' && scopeBookId !== 0)
+      || items.some((item) => (item.book_id ?? 0) !== expectedBookId)) {
+    throw new Error('Phạm vi nhập không khớp với book_id của thuật ngữ.');
+  }
+}
+
+export function parseGlossaryImportText(text: string): GlossaryImportItem[] {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error('Dữ liệu nhập đang trống.');
+  if (new TextEncoder().encode(text).byteLength > 5 * 1024 * 1024) {
+    throw new Error('Dữ liệu nhập vượt quá 5 MB.');
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const payload = JSON.parse(trimmed) as unknown;
+    if (Array.isArray(payload)) return validateImportItems(payload);
+    if (!payload || typeof payload !== 'object') throw new Error('JSON nhập không hợp lệ.');
+    const envelope = payload as Record<string, unknown>;
+    if ('schema_version' in envelope && envelope.schema_version !== 1) {
+      throw new Error('Phiên bản schema JSON không được hỗ trợ.');
+    }
+    const items = validateImportItems(envelope.items ?? envelope.terms);
+    if ('scope' in envelope) validateImportScope(envelope.scope, items);
+    return items;
+  }
+
+  const rows = csvRows(trimmed);
+  const headers = rows[0] ?? [];
+  if (new Set(headers).size !== headers.length) throw new Error('CSV có cột trùng tên.');
+  for (const required of ['schema_version', 'scope', 'source_term', 'target_term']) {
+    if (!headers.includes(required)) throw new Error(`CSV thiếu cột ${required}.`);
+  }
+  const items = rows.slice(1).map((values, index) => {
+    if (values.length !== headers.length) throw new Error(`Dòng CSV ${index + 1} sai số lượng cột.`);
+    const record = Object.fromEntries(headers.map((header, column) => [header, values[column]]));
+    if (record.schema_version !== '1') throw new Error(`Dòng CSV ${index + 1} có schema không hỗ trợ.`);
+    if (!['all', 'book', 'global'].includes(record.scope)) throw new Error(`Dòng CSV ${index + 1} có scope không hợp lệ.`);
+    const item: Record<string, unknown> = {};
+    for (const [fieldName, rawValue] of Object.entries(record)) {
+      if (['schema_version', 'scope', 'scope_book_id'].includes(fieldName) || rawValue === '') continue;
+      if (importIntegerFields.has(fieldName)) {
+        const number = Number(rawValue);
+        if (!Number.isSafeInteger(number)) throw new Error(`Dòng CSV ${index + 1}: ${fieldName} không hợp lệ.`);
+        item[fieldName] = number;
+      } else if (fieldName === 'confidence') {
+        const number = Number(rawValue);
+        if (!Number.isFinite(number)) throw new Error(`Dòng CSV ${index + 1}: confidence không hợp lệ.`);
+        item[fieldName] = number;
+      } else if (fieldName === 'archived') {
+        if (!['true', 'false'].includes(rawValue.toLowerCase())) throw new Error(`Dòng CSV ${index + 1}: archived không hợp lệ.`);
+        item[fieldName] = rawValue.toLowerCase() === 'true';
+      } else {
+        item[fieldName] = rawValue;
+      }
+    }
+    const validated = validateImportItems([item]);
+    const scopeBookId = Number(record.scope_book_id ?? (record.scope === 'book' ? Number.NaN : 0));
+    validateImportScope({ type: record.scope, book_id: scopeBookId }, validated);
+    return validated[0];
+  });
+  return validateImportItems(items);
+}
+
+function operationErrorMessage(reason: unknown): string {
+  if (reason instanceof ApiError && reason.code === 'normalized_source_collision') {
+    return 'Không thể khôi phục vì canonical cùng thuật ngữ vẫn đang hoạt động. Hãy lưu trữ canonical trước rồi thử khôi phục lại.';
+  }
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
 type GlossaryRowProps = {
   term: GlossaryTerm;
-  onApproveTerm(termId: number): void | Promise<void>;
-  onArchiveTerm?(termId: number): void | Promise<void>;
-  onCreateBookOverride?(term: GlossaryTerm): void | Promise<void>;
+  onApproveTerm(termId: number): void | Promise<unknown>;
+  onArchiveTerm?(termId: number): void | Promise<unknown>;
+  onCreateBookOverride?(term: GlossaryTerm): void | Promise<unknown>;
   onDetail(term: GlossaryTerm, opener: HTMLElement): void;
-  onLockToggle(termId: number, locked: boolean): void | Promise<void>;
-  onRejectTerm(termId: number): void | Promise<void>;
-  onRestoreTerm?(termId: number): void | Promise<void>;
+  onLockToggle(termId: number, locked: boolean): void | Promise<unknown>;
+  onRejectTerm(termId: number): void | Promise<unknown>;
+  onRestoreTerm?(termId: number): void | Promise<unknown>;
   onSelect(term: GlossaryTerm, selected: boolean): void;
   selected: boolean;
-  onSaveAndApproveTerm(termId: number, updates: GlossaryTermUpdate, locked: boolean): void | Promise<void>;
-  onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<void>;
+  onSaveAndApproveTerm(termId: number, updates: GlossaryTermUpdate, locked: boolean): void | Promise<unknown>;
+  onUpdateTerm(termId: number, updates: GlossaryTermUpdate): void | Promise<unknown>;
 };
 
 function normalizedReviewStatus(term: GlossaryTerm): string {
@@ -217,6 +376,7 @@ export default function GlossaryStyleView({
   const [importText, setImportText] = useState('');
   const [importItems, setImportItems] = useState<GlossaryImportItem[]>([]);
   const [importPreview, setImportPreview] = useState<GlossaryImportPreview | null>(null);
+  const [importPolicy, setImportPolicy] = useState<GlossaryImportPolicy>('skip_conflicts');
   const queueHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const detailDrawerRef = useRef<HTMLElement | null>(null);
   const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -247,7 +407,17 @@ export default function GlossaryStyleView({
   }, []);
 
   const focusQueue = () => window.setTimeout(() => queueHeadingRef.current?.focus(), 0);
-  const runMutation = async (call: () => void | Promise<void>) => { await call(); focusQueue(); };
+  const runMutation = async (call: () => void | Promise<void>): Promise<boolean> => {
+    setOperationError('');
+    try {
+      await call();
+      focusQueue();
+      return true;
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+      return false;
+    }
+  };
   const selectPage = (nextPage: number) => { onPageChange?.(nextPage); focusQueue(); };
   const openDetail = (term: GlossaryTerm, opener: HTMLElement) => {
     detailRequestIdRef.current += 1;
@@ -337,21 +507,21 @@ export default function GlossaryStyleView({
   });
   const bulk = async (action: GlossaryBulkAction) => {
     if (!onBulkAction || selectedTerms.length === 0) return;
-    await runMutation(() => onBulkAction(action, selectedTerms.map((term) => ({
+    const succeeded = await runMutation(() => onBulkAction(action, selectedTerms.map((term) => ({
       id: term.id, expected_version: term.version ?? 0,
     }))));
-    setSelectedIds(new Set());
+    if (succeeded) setSelectedIds(new Set());
   };
   const createTerm = async () => {
     if (!onCreateTerm || !newSource.trim()) return;
-    await runMutation(() => onCreateTerm({
+    const succeeded = await runMutation(() => onCreateTerm({
       approved: 0,
       book_id: query.book_id ?? 0,
       review_status: 'NEEDS_REVIEW',
       source_term: newSource.trim(),
       target_term: newTarget.trim(),
     }));
-    setNewSource(''); setNewTarget('');
+    if (succeeded) { setNewSource(''); setNewTarget(''); }
   };
   const activeConflict = conflicts?.items.find((conflict) => conflict.id === activeConflictId) ?? null;
   const duplicateIds = activeConflict && canonicalId !== null
@@ -369,19 +539,32 @@ export default function GlossaryStyleView({
   };
   const applyMerge = async () => {
     if (!onApplyMerge || !mergePreview) return;
-    await onApplyMerge(mergePreview.canonical_id, mergePreview.duplicate_ids, mergePreview.digest);
-    setMergePreview(null); await loadConflicts();
+    setOperationError('');
+    try {
+      await onApplyMerge(mergePreview.canonical_id, mergePreview.duplicate_ids, mergePreview.digest);
+      setMergePreview(null); await loadConflicts();
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+    }
   };
   const previewImport = async () => {
     if (!onPreviewImport) return;
     setOperationError(''); setImportPreview(null);
     try {
-      const parsed: unknown = JSON.parse(importText);
-      if (!Array.isArray(parsed)) throw new Error('Dữ liệu nhập phải là danh sách JSON.');
-      const items = parsed as GlossaryImportItem[];
+      const items = parseGlossaryImportText(importText);
       setImportItems(items);
-      setImportPreview(await onPreviewImport(items));
+      setImportPreview(await onPreviewImport(items, importPolicy));
     } catch (reason) { setOperationError(reason instanceof Error ? reason.message : 'Dữ liệu nhập không hợp lệ.'); }
+  };
+  const applyImport = async () => {
+    if (!onApplyImport || !importPreview) return;
+    setOperationError('');
+    try {
+      await onApplyImport(importItems, importPreview.digest, importPolicy);
+      setImportPreview(null);
+    } catch (reason) {
+      setOperationError(operationErrorMessage(reason));
+    }
   };
 
   return (
@@ -479,16 +662,17 @@ export default function GlossaryStyleView({
       {onPreviewImport && onApplyImport && onExport ? (
         <details className="panel glossary-operation-panel">
           <summary>Nhập & xuất</summary>
-          <label>Dữ liệu JSON<textarea aria-label="Dữ liệu nhập JSON" onChange={(event) => { setImportText(event.target.value); setImportPreview(null); }} value={importText} /></label>
+          <label>Dữ liệu JSON hoặc CSV<textarea aria-label="Dữ liệu nhập JSON hoặc CSV" onChange={(event) => { setImportText(event.target.value); setImportPreview(null); }} value={importText} /></label>
+          <label>Chính sách xung đột<select aria-label="Chính sách xung đột" onChange={(event) => { setImportPolicy(event.target.value as GlossaryImportPolicy); setImportPreview(null); }} value={importPolicy}><option value="skip_conflicts">Bỏ qua xung đột</option><option value="reject_conflicts">Từ chối toàn bộ khi có xung đột</option></select></label>
           <div className="dialog-actions">
             <button onClick={() => void previewImport()} type="button">Xem trước nhập</button>
-            <button onClick={() => void onExport('json')} type="button">Xuất JSON</button>
-            <button onClick={() => void onExport('csv')} type="button">Xuất CSV</button>
+            <button onClick={() => void runMutation(() => onExport('json'))} type="button">Xuất JSON</button>
+            <button onClick={() => void runMutation(() => onExport('csv'))} type="button">Xuất CSV</button>
           </div>
           {importPreview ? (
             <div role="status">
               <p>Thêm {importPreview.summary.added} · Cập nhật {importPreview.summary.updated} · Bỏ qua {importPreview.summary.skipped}</p>
-              <button onClick={() => void onApplyImport(importItems, importPreview.digest)} type="button">Áp dụng nhập</button>
+              <button onClick={() => void applyImport()} type="button">Áp dụng nhập</button>
             </div>
           ) : null}
         </details>

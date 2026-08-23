@@ -518,6 +518,20 @@ class GlossaryService:
             book_id=book_id, page=page, per_page=per_page
         )
 
+    def query_legacy_conflicts(
+        self,
+        book_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+        member_limit: int = 20,
+    ) -> list[dict]:
+        return GlossaryRepository(self.db_path).query_legacy_conflicts(
+            book_id=book_id,
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            member_limit=member_limit,
+        )
+
     def preview_merge(self, canonical_id: int, duplicate_ids: list[int]) -> dict:
         return GlossaryRepository(self.db_path).preview_merge(canonical_id, duplicate_ids)
 
@@ -627,20 +641,25 @@ class GlossaryService:
         """Bounded compatibility adapter over the atomic preview/apply flow."""
         repository = GlossaryRepository(self.db_path)
         try:
-            preview = repository.preview_import(data, "reject_conflicts")
+            preview = repository.preview_import(
+                data, "reject_conflicts", legacy_partial=True
+            )
             return repository.apply_import(
                 data,
                 preview["digest"],
                 "reject_conflicts",
                 actor=actor,
                 request_id=request_id,
+                legacy_partial=True,
             )
         except GlossaryValidationError as exc:
             return {
                 "added": 0,
                 "updated": 0,
                 "errors": [
-                    f"item {error['item']}: {error['code']}" for error in exc.errors
+                    f"item {error['item']}: "
+                    f"{'invalid_transition' if error['code'] == 'invalid_state' else error['code']}"
+                    for error in exc.errors
                 ],
             }
 
