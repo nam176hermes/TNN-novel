@@ -147,6 +147,87 @@ def test_phase5_migration_coalesces_duplicate_identities_before_enforcing_unique
     assert tuple(counts) == (3, 1)
 
 
+def test_phase5_migration_coalesces_component_only_payloads_idempotently(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    provenance_book_id = add_book(temp_db_path, "Provenance")
+    term_id = put_glossary_term(temp_db_path, book_id, "玄天圣典", "", approved=0)
+    with get_connection(temp_db_path) as conn:
+        conn.execute("DROP INDEX idx_glossary_evidence_phase5_unique")
+        conn.executemany(
+            """
+            INSERT INTO glossary_term_evidence
+                (term_id, book_id, chapter_id, extractor, evidence_type, evidence_json)
+            VALUES (?, ?, 7, 'hybrid-v1', 'chapter_observation', ?)
+            """,
+            [
+                (
+                    term_id,
+                    book_id,
+                    json.dumps({
+                        "mention_count": 2,
+                        "mention_components": [{
+                            "mention_count": 2,
+                            "source_fingerprints": ["b", "a"],
+                        }],
+                    }),
+                ),
+                (
+                    term_id,
+                    provenance_book_id,
+                    json.dumps({
+                        "mention_count": 1,
+                        "mention_components": [{
+                            "mention_count": 1,
+                            "source_fingerprints": ["c"],
+                        }],
+                    }),
+                ),
+            ],
+        )
+        conn.commit()
+
+    init_db(temp_db_path)
+    with get_connection(temp_db_path) as conn:
+        first_json = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 7 AND extractor = 'hybrid-v1'",
+            (term_id,),
+        ).fetchone()[0]
+        first_counts = conn.execute(
+            "SELECT occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+    init_db(temp_db_path)
+    with get_connection(temp_db_path) as conn:
+        retry_json = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 7 AND extractor = 'hybrid-v1'",
+            (term_id,),
+        ).fetchone()[0]
+        retry_counts = conn.execute(
+            "SELECT occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+
+    assert json.loads(first_json) == {
+        "evidence_types": [],
+        "mention_components": [
+            {"mention_count": 2, "source_fingerprints": ["a", "b"]},
+            {"mention_count": 1, "source_fingerprints": ["c"]},
+        ],
+        "mention_count": 3,
+        "provenance_book_ids": [book_id, provenance_book_id],
+        "source_fingerprints": ["a", "b", "c"],
+        "title_match": False,
+    }
+    assert tuple(first_counts) == (3, 1)
+    assert retry_json == first_json
+    assert tuple(retry_counts) == tuple(first_counts)
+
+
 def test_deterministic_extraction_uses_title_repetition_suffixes_and_real_idempotent_counts(
     temp_db_path: Path,
     tmp_path: Path,
@@ -513,6 +594,92 @@ def test_phase5_evidence_remains_mergeable_without_losing_provenance(temp_db_pat
     assert json.loads(merge_relation["evidence_json"])["merged_term_id"] == duplicate_id
     assert future["updated"] == 1
     assert retry["skipped"] == 1
+
+
+def test_phase4_merge_coalesces_component_only_evidence_and_preserves_provenance(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    provenance_book_id = add_book(temp_db_path, "Provenance")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+        variants="天书",
+    )
+    duplicate_id = put_glossary_term(
+        temp_db_path, book_id, "天书", "Alias", approved=0
+    )
+    with get_connection(temp_db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO glossary_term_evidence
+                (term_id, book_id, chapter_id, extractor, evidence_type, evidence_json)
+            VALUES (?, ?, 9, 'hybrid-v1', 'chapter_observation', ?)
+            """,
+            [
+                (
+                    canonical_id,
+                    book_id,
+                    json.dumps({
+                        "mention_count": 2,
+                        "mention_components": [{
+                            "mention_count": 2,
+                            "source_fingerprints": ["canonical"],
+                        }],
+                    }),
+                ),
+                (
+                    duplicate_id,
+                    provenance_book_id,
+                    json.dumps({
+                        "mention_count": 1,
+                        "mention_components": [{
+                            "mention_count": 1,
+                            "source_fingerprints": ["variant"],
+                        }],
+                    }),
+                ),
+            ],
+        )
+        conn.commit()
+    repository = GlossaryRepository(temp_db_path)
+
+    preview = repository.preview_merge(canonical_id, [duplicate_id])
+    repository.apply_merge(canonical_id, [duplicate_id], preview["digest"])
+
+    with get_connection(temp_db_path) as conn:
+        evidence = conn.execute(
+            "SELECT book_id, evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 9 AND extractor = 'hybrid-v1'",
+            (canonical_id,),
+        ).fetchall()
+        canonical = conn.execute(
+            "SELECT occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        duplicate = conn.execute(
+            "SELECT archived_at FROM glossary_terms WHERE id = ?", (duplicate_id,)
+        ).fetchone()
+
+    assert len(evidence) == 1
+    assert evidence[0]["book_id"] == book_id
+    assert json.loads(evidence[0]["evidence_json"]) == {
+        "evidence_types": [],
+        "mention_components": [
+            {"mention_count": 2, "source_fingerprints": ["canonical"]},
+            {"mention_count": 1, "source_fingerprints": ["variant"]},
+        ],
+        "mention_count": 3,
+        "provenance_book_ids": [book_id, provenance_book_id],
+        "source_fingerprints": ["canonical", "variant"],
+        "title_match": False,
+    }
+    assert tuple(canonical) == (3, 1)
+    assert duplicate["archived_at"]
 
 
 def test_correction_harvesting_requires_and_filters_book_id(
@@ -1132,11 +1299,237 @@ def test_rejected_hybrid_source_with_deterministic_evidence_remains_observed(
     assert tuple(before)[:4] == ("Rare", "REJECTED", 2, 1)
     assert tuple(after) == tuple(before)
     assert after_hybrid is not None
-    assert json.loads(before_hybrid)["proposed_targets"] == ["Rare"]
+    before_payload = json.loads(before_hybrid)
+    assert before_payload["proposed_targets"] == ["Rare"]
     assert json.loads(after_hybrid["evidence_json"]) == {
-        **json.loads(before_hybrid),
+        **before_payload,
+        "mention_components": [{
+            **before_payload["mention_components"][0],
+            "mention_count": 2,
+        }],
         "mention_count": 2,
     }
+
+
+def test_hybrid_coalesces_canonical_inner_alias_and_disjoint_variant_before_writing(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+        variants="圣典|天书",
+        notes_vi="reviewed note",
+        alternatives="reviewed alternative",
+    )
+    service = _configure_hybrid(temp_db_path, book_id)
+    private_tail = "PRIVATE-MULTI-SURFACE-TAIL"
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章",
+        "玄天圣典现世。玄天圣典重现。天书另存。"
+        + ("甲" * MAX_HYBRID_TEXT_CHARS)
+        + private_tail,
+    )
+    all_surfaces = [
+        {"source_term": "玄天圣典", "target_term": "Must Not Replace"},
+        {"source_term": "圣典", "target_term": "Must Not Replace"},
+        {"source_term": "天书", "target_term": "Must Not Replace"},
+    ]
+    responses = [all_surfaces, all_surfaces, all_surfaces[:2]]
+    prompts: list[str] = []
+
+    def fake_provider(**kwargs):
+        prompts.append(str(kwargs["prompt"]))
+        return {
+            "text": json.dumps({"candidates": responses.pop(0)}, ensure_ascii=False),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    first = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    retry = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_retry = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        retry_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        retry_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    disappearance = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        after_disappearance = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, alternatives, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        disappearance_evidence = json.loads(
+            conn.execute(
+                "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+                "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+                (canonical_id, chapter_id),
+            ).fetchone()[0]
+        )
+
+    first_payload = json.loads(before_evidence)
+    assert first["warnings"] == []
+    assert all("occurrence_spans" not in candidate for candidate in first["candidates"])
+    assert tuple(before)[:8] == (
+        "Canonical",
+        "APPROVED",
+        1,
+        0,
+        "reviewed note",
+        "reviewed alternative",
+        3,
+        1,
+    )
+    assert first_payload["mention_count"] == 3
+    assert sorted(component["mention_count"] for component in first_payload["mention_components"]) == [1, 2]
+    assert sorted(len(component["source_fingerprints"]) for component in first_payload["mention_components"]) == [1, 2]
+    assert first_payload["source_fingerprints"] == sorted(first_payload["source_fingerprints"])
+    assert len(first_payload["source_fingerprints"]) == 3
+    assert len(first_payload["mention_components"]) <= 100
+    assert retry["created"] == 0
+    assert retry["updated"] == 0
+    assert tuple(after_retry) == tuple(before)
+    assert retry_evidence == before_evidence
+    assert retry_history == before_history
+    assert disappearance["updated"] == 1
+    assert tuple(after_disappearance)[:6] == tuple(before)[:6]
+    assert tuple(after_disappearance)[6:8] == (2, 1)
+    assert after_disappearance["version"] == before["version"] + 1
+    assert disappearance_evidence["mention_count"] == 2
+    assert len(disappearance_evidence["mention_components"]) == 1
+    assert all(private_tail not in prompt for prompt in prompts)
+
+
+def test_hybrid_coalesces_aliases_across_repeated_merges_into_one_stable_observation(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "Canonical",
+        approved=1,
+        variants="圣典|古典",
+    )
+    first_alias_id = put_glossary_term(
+        temp_db_path, book_id, "圣典", "First alias", approved=0
+    )
+    second_alias_id = put_glossary_term(
+        temp_db_path, book_id, "古典", "Second alias", approved=0
+    )
+    repository = GlossaryRepository(temp_db_path)
+    first_preview = repository.preview_merge(canonical_id, [first_alias_id])
+    repository.apply_merge(canonical_id, [first_alias_id], first_preview["digest"])
+    second_preview = repository.preview_merge(canonical_id, [second_alias_id])
+    repository.apply_merge(canonical_id, [second_alias_id], second_preview["digest"])
+    service = _configure_hybrid(temp_db_path, book_id)
+    chapter_id = _chapter(
+        temp_db_path, tmp_path, book_id, 1, "第一章", "圣典现世。古典另存。"
+    )
+    provider_response = {
+        "text": json.dumps({
+            "candidates": [
+                {"source_term": "圣典", "target_term": "Must Not Replace"},
+                {"source_term": "古典", "target_term": "Must Not Replace"},
+            ]
+        }, ensure_ascii=False),
+        "usage": {},
+    }
+    monkeypatch.setattr(
+        glossary_module,
+        "call_openai_compatible_chat",
+        lambda **_kwargs: provider_response,
+    )
+
+    service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT target_term, review_status, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    retry = service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        after = conn.execute(
+            "SELECT target_term, review_status, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+            (canonical_id, chapter_id),
+        ).fetchall()
+        history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+        archived = conn.execute(
+            "SELECT COUNT(*) FROM glossary_terms WHERE id IN (?, ?) AND archived_at != ''",
+            (first_alias_id, second_alias_id),
+        ).fetchone()[0]
+
+    assert tuple(before)[:4] == ("Canonical", "APPROVED", 2, 1)
+    assert tuple(after) == tuple(before)
+    assert len(evidence) == 1
+    assert evidence[0]["evidence_json"] == before_evidence
+    assert json.loads(before_evidence)["mention_count"] == 2
+    assert retry["updated"] == 0
+    assert history == before_history
+    assert archived == 2
 
 
 def test_hybrid_retry_and_concurrent_repository_runs_keep_one_identity_without_count_inflation(
@@ -1368,6 +1761,71 @@ def test_hybrid_nfkc_maps_combining_sequence_to_original_bounded_context(
 
     assert tuple(term)[1:] == (
         "Å神器",
+        f"众人发现{original_surface}。" + ("甲" * 27),
+        2,
+        1,
+    )
+    assert evidence["title_match"] is True
+    assert private_tail not in str(captured["prompt"])
+
+
+@pytest.mark.parametrize(
+    ("original_surface", "normalized_surface"),
+    [
+        ("가神器", "가神器"),
+        ("각神器", "각神器"),
+        ("ㄱㅏ神器", "가神器"),
+    ],
+)
+def test_hybrid_nfkc_maps_decomposed_hangul_jamo_to_original_bounded_context(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original_surface: str,
+    normalized_surface: str,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    service = _configure_hybrid(temp_db_path, book_id)
+    private_tail = "PRIVATE-HANGUL-TAIL"
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        f"第一章 {original_surface}",
+        f"众人发现{original_surface}。" + ("甲" * MAX_HYBRID_TEXT_CHARS) + private_tail,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_provider(**kwargs):
+        captured.update(kwargs)
+        return {
+            "text": json.dumps({
+                "candidates": [{"source_term": original_surface, "target_term": "Thần khí Ga"}]
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(glossary_module, "call_openai_compatible_chat", fake_provider)
+    service.extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            "SELECT id, source_term, source_context, occurrence_count, chapter_count "
+            "FROM glossary_terms WHERE book_id = ? AND source_key = ?",
+            (book_id, normalized_surface),
+        ).fetchone()
+        evidence = json.loads(
+            conn.execute(
+                "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+                "AND chapter_id = ? AND extractor = 'hybrid-v1'",
+                (term["id"], chapter_id),
+            ).fetchone()[0]
+        )
+
+    assert tuple(term)[1:] == (
+        normalized_surface,
         f"众人发现{original_surface}。" + ("甲" * 27),
         2,
         1,

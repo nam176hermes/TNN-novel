@@ -120,23 +120,186 @@ def _target_is_blank(value: object) -> bool:
     return not "".join(unicodedata.normalize("NFKC", str(value or "")).split())
 
 
+MAX_PHASE5_COMPONENTS = 100
+MAX_PHASE5_OCCURRENCE_SPANS = 250_000
+
+
+def _payload_mention_components(payload: object) -> list[tuple[int, set[str]]]:
+    if not isinstance(payload, dict):
+        return []
+    parsed: list[tuple[int, set[str]]] = []
+    raw_components = payload.get("mention_components")
+    if isinstance(raw_components, list):
+        for raw in raw_components[:MAX_PHASE5_COMPONENTS]:
+            if not isinstance(raw, dict):
+                continue
+            count = raw.get("mention_count")
+            if type(count) is not int or count < 0:
+                continue
+            fingerprints = {
+                str(value)[:128]
+                for value in (raw.get("source_fingerprints") or [])[:MAX_PHASE5_COMPONENTS]
+                if isinstance(value, str) and value
+            }
+            if fingerprints:
+                parsed.append((count, fingerprints))
+        if parsed:
+            return parsed
+    count = payload.get("mention_count", 0)
+    if type(count) is not int or count < 0:
+        count = 0
+    fingerprints = {
+        str(value)[:128]
+        for value in (payload.get("source_fingerprints") or [])[:MAX_PHASE5_COMPONENTS]
+        if isinstance(value, str) and value
+    }
+    singular = payload.get("source_fingerprint")
+    if isinstance(singular, str) and singular:
+        fingerprints.add(singular[:128])
+    if not fingerprints:
+        fingerprints.add("__legacy_observation__")
+    return [(count, fingerprints)]
+
+
+def _bounded_component_payload(
+    components: list[tuple[int, set[str]]],
+) -> list[dict[str, Any]]:
+    aggregated: dict[tuple[str, ...], int] = {}
+    for count, fingerprints in components:
+        signature = tuple(sorted(fingerprints)[:MAX_PHASE5_COMPONENTS])
+        if signature and count >= 0:
+            aggregated[signature] = aggregated.get(signature, 0) + count
+    ordered = sorted(aggregated.items())
+    if len(ordered) > MAX_PHASE5_COMPONENTS:
+        retained = ordered[:MAX_PHASE5_COMPONENTS - 1]
+        overflow = ordered[MAX_PHASE5_COMPONENTS - 1:]
+        overflow_fingerprints = tuple(sorted({value for signature, _ in overflow for value in signature}))
+        retained.append((overflow_fingerprints[:MAX_PHASE5_COMPONENTS], sum(count for _, count in overflow)))
+        ordered = retained
+    return [
+        {"mention_count": count, "source_fingerprints": list(signature)}
+        for signature, count in ordered
+    ]
+
+
+def _merge_observation_components(
+    observations: list[tuple[str, list[tuple[int, set[str]]]]],
+) -> list[tuple[int, set[str]]]:
+    nodes: list[tuple[str, int, set[str]]] = [
+        (observation_id, count, set(fingerprints))
+        for observation_id, components in observations
+        for count, fingerprints in components
+    ]
+    parents = list(range(len(nodes)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(nodes)):
+        for right in range(left + 1, len(nodes)):
+            if nodes[left][0] != nodes[right][0] and nodes[left][2] & nodes[right][2]:
+                union(left, right)
+
+    grouped: dict[int, list[tuple[str, int, set[str]]]] = {}
+    for index, node in enumerate(nodes):
+        grouped.setdefault(find(index), []).append(node)
+    merged: list[tuple[int, set[str]]] = []
+    for group in grouped.values():
+        counts_by_observation: dict[str, int] = {}
+        fingerprints: set[str] = set()
+        for observation_id, count, component_fingerprints in group:
+            counts_by_observation[observation_id] = counts_by_observation.get(observation_id, 0) + count
+            fingerprints.update(component_fingerprints)
+        merged.append((max(counts_by_observation.values(), default=0), fingerprints))
+    return merged
+
+
+def _candidate_mention_components(
+    candidates: list[dict[str, Any]],
+    *,
+    book_id: int,
+    chapter_id: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    spans: list[tuple[int, int, str]] = []
+    fallback: list[tuple[int, set[str]]] = []
+    fingerprints: set[str] = set()
+    for candidate in candidates:
+        source_key = str(candidate["_source_key"])
+        fingerprint = hashlib.sha256(
+            f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
+        ).hexdigest()
+        fingerprints.add(fingerprint)
+        raw_spans = candidate.get("occurrence_spans")
+        valid_spans: list[tuple[int, int]] = []
+        if isinstance(raw_spans, list):
+            for raw_span in raw_spans[:MAX_PHASE5_OCCURRENCE_SPANS]:
+                if (
+                    isinstance(raw_span, (list, tuple))
+                    and len(raw_span) == 2
+                    and type(raw_span[0]) is int
+                    and type(raw_span[1]) is int
+                    and 0 <= raw_span[0] < raw_span[1] <= MAX_PHASE5_OCCURRENCE_SPANS
+                ):
+                    valid_spans.append((raw_span[0], raw_span[1]))
+        if valid_spans or isinstance(raw_spans, list):
+            spans.extend((start, end, fingerprint) for start, end in valid_spans)
+        else:
+            fallback.append((max(0, int(candidate.get("mention_count") or 0)), {fingerprint}))
+
+    components: list[tuple[int, set[str]]] = list(fallback)
+    active_end = -1
+    active_fingerprints: set[str] = set()
+    for start, end, fingerprint in sorted(spans, key=lambda item: (item[0], -item[1], item[2])):
+        if start >= active_end:
+            if active_fingerprints:
+                components.append((1, active_fingerprints))
+            active_end = end
+            active_fingerprints = {fingerprint}
+        else:
+            active_end = max(active_end, end)
+            active_fingerprints.add(fingerprint)
+    if active_fingerprints:
+        components.append((1, active_fingerprints))
+    return _bounded_component_payload(components), sorted(fingerprints)[:MAX_PHASE5_COMPONENTS]
+
+
 def _phase5_evidence_payload(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
     evidence_types: set[str] = set()
-    mention_counts: list[int] = []
     provenance_book_ids: set[int] = set()
     source_fingerprints: set[str] = set()
     proposed_targets: set[str] = set()
     title_match = False
-    for row in rows:
+    observations: list[tuple[str, list[tuple[int, set[str]]]]] = []
+    has_component_payload = False
+    has_legacy_payload = False
+    for index, row in enumerate(rows):
         try:
             payload = json.loads(str(row["evidence_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        value = payload.get("mention_count")
-        if type(value) is int and value >= 0:
-            mention_counts.append(value)
+        if isinstance(payload.get("mention_components"), list):
+            has_component_payload = True
+        else:
+            has_legacy_payload = True
+        parsed_components = _payload_mention_components(payload)
+        source_fingerprints.update(
+            fingerprint
+            for _, component_fingerprints in parsed_components
+            for fingerprint in component_fingerprints
+            if not fingerprint.startswith("__legacy_")
+        )
+        observations.append((str(index), parsed_components))
         evidence_types.update(
             str(item)[:64]
             for item in payload.get("evidence_types") or []
@@ -162,62 +325,54 @@ def _phase5_evidence_payload(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[s
             if isinstance(item, str) and item
         )
         title_match = title_match or bool(payload.get("title_match"))
+    if has_legacy_payload:
+        observations = [
+            (
+                observation_id,
+                [
+                    (count, {*fingerprints, "__legacy_identity__"})
+                    for count, fingerprints in components
+                ],
+            )
+            for observation_id, components in observations
+        ]
+    merged_components = [
+        (count, fingerprints - {"__legacy_identity__"})
+        for count, fingerprints in _merge_observation_components(observations)
+    ]
+    component_payload = _bounded_component_payload(merged_components)
     result: dict[str, Any] = {
         "evidence_types": sorted(evidence_types)[:16],
-        "mention_count": max(mention_counts, default=0),
+        "mention_count": sum(int(component["mention_count"]) for component in component_payload),
         "provenance_book_ids": sorted(provenance_book_ids)[:100],
         "source_fingerprints": sorted(source_fingerprints)[:100],
         "title_match": title_match,
     }
+    if has_component_payload:
+        result["mention_components"] = component_payload
     if proposed_targets:
         result["proposed_targets"] = sorted(proposed_targets)[:10]
     return result
 
 
 def _phase5_counts_from_rows(rows: list[sqlite3.Row | dict[str, Any]]) -> tuple[int, int]:
-    observations_by_chapter: dict[int, list[tuple[int, set[str]]]] = {}
-    for row in rows:
+    observations_by_chapter: dict[int, list[tuple[str, list[tuple[int, set[str]]]]]] = {}
+    for index, row in enumerate(rows):
         try:
             payload = json.loads(str(row["evidence_json"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = {}
-        mention_count = payload.get("mention_count", 0) if isinstance(payload, dict) else 0
-        if type(mention_count) is not int or mention_count < 0:
-            mention_count = 0
-        fingerprints = {
-            str(value)[:128]
-            for value in (payload.get("source_fingerprints") or [])
-            if isinstance(value, str) and value
-        } if isinstance(payload, dict) else set()
-        singular = payload.get("source_fingerprint") if isinstance(payload, dict) else None
-        if isinstance(singular, str) and singular:
-            fingerprints.add(singular[:128])
-        if not fingerprints:
-            fingerprints.add("__legacy_observation__")
+        keys = row.keys() if hasattr(row, "keys") else ()
+        extractor = str(row["extractor"]) if "extractor" in keys else f"row:{index}"
         observations_by_chapter.setdefault(int(row["chapter_id"] or 0), []).append(
-            (mention_count, fingerprints)
+            (extractor, _payload_mention_components(payload))
         )
 
     occurrence_count = 0
     for observations in observations_by_chapter.values():
-        components: list[tuple[int, set[str]]] = []
-        for mention_count, fingerprints in observations:
-            overlapping = [
-                index
-                for index, (_, component_fingerprints) in enumerate(components)
-                if fingerprints & component_fingerprints
-            ]
-            if not overlapping:
-                components.append((mention_count, set(fingerprints)))
-                continue
-            merged_count = mention_count
-            merged_fingerprints = set(fingerprints)
-            for index in reversed(overlapping):
-                component_count, component_fingerprints = components.pop(index)
-                merged_count = max(merged_count, component_count)
-                merged_fingerprints.update(component_fingerprints)
-            components.append((merged_count, merged_fingerprints))
-        occurrence_count += sum(count for count, _ in components)
+        occurrence_count += sum(
+            count for count, _ in _merge_observation_components(observations)
+        )
     return occurrence_count, len(observations_by_chapter)
 
 
@@ -358,7 +513,7 @@ def migrate_glossary_phase1(conn: sqlite3.Connection) -> None:
     )
     migrated_evidence: dict[int, list[sqlite3.Row]] = {}
     for row in conn.execute(
-        "SELECT term_id, chapter_id, evidence_json FROM glossary_term_evidence "
+        "SELECT term_id, chapter_id, extractor, evidence_json FROM glossary_term_evidence "
         "WHERE extractor IN ('deterministic-v2', 'hybrid-v1')"
     ).fetchall():
         migrated_evidence.setdefault(int(row["term_id"]), []).append(row)
@@ -623,7 +778,7 @@ class GlossaryRepository:
     @staticmethod
     def _phase5_counts(conn: sqlite3.Connection, term_id: int) -> tuple[int, int]:
         rows = conn.execute(
-            "SELECT chapter_id, evidence_json FROM glossary_term_evidence "
+            "SELECT chapter_id, extractor, evidence_json FROM glossary_term_evidence "
             "WHERE term_id = ? AND extractor IN ('deterministic-v2', 'hybrid-v1')",
             (term_id,),
         ).fetchall()
@@ -883,6 +1038,7 @@ class GlossaryRepository:
                 ).fetchall()
             }
             observed_term_ids: set[int] = set()
+            resolved_groups: dict[tuple[str, int | str], dict[str, Any]] = {}
             for candidate in candidates:
                 source = " ".join(unicodedata.normalize("NFKC", str(candidate.get("source_term") or "")).split())
                 source_key = normalize_source_key(source)
@@ -893,7 +1049,28 @@ class GlossaryRepository:
                 if blocked:
                     skipped += 1
                     continue
-                observe_only = bool(candidate.get("observe_only")) or (
+                normalized_candidate = {
+                    **candidate,
+                    "_source": source,
+                    "_source_key": source_key,
+                }
+                group_key: tuple[str, int | str] = (
+                    ("term", int(current["id"])) if current is not None else ("source", source_key)
+                )
+                group = resolved_groups.setdefault(
+                    group_key,
+                    {"current": current, "candidates": []},
+                )
+                group["candidates"].append(normalized_candidate)
+
+            for group_key in sorted(resolved_groups, key=lambda value: (value[0], str(value[1]))):
+                group = resolved_groups[group_key]
+                grouped_candidates = sorted(
+                    group["candidates"],
+                    key=lambda item: (str(item["_source_key"]), str(item.get("target_term") or "")),
+                )
+                current = group["current"]
+                observe_only = any(bool(item.get("observe_only")) for item in grouped_candidates) or (
                     extractor == "hybrid-v1"
                     and current is not None
                     and current["review_status"] in {"APPROVED", "LOCKED", "REJECTED"}
@@ -911,21 +1088,38 @@ class GlossaryRepository:
                         skipped += 1
                         continue
 
-                mention_count = max(0, int(candidate.get("mention_count") or 0))
-                target = str(candidate.get("target_term") or "").strip()
-                term_type = str(candidate.get("term_type") or "other").strip().lower() or "other"
+                primary = grouped_candidates[0]
+                source = str(primary["_source"])
+                source_key = str(primary["_source_key"])
+                targets = sorted({
+                    str(item.get("target_term") or "").strip()[:200]
+                    for item in grouped_candidates
+                    if str(item.get("target_term") or "").strip()
+                })[:10]
+                target = targets[0] if targets else ""
+                term_type = str(primary.get("term_type") or "other").strip().lower() or "other"
+                mention_components, source_fingerprints = _candidate_mention_components(
+                    grouped_candidates,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                )
+                mention_count = sum(
+                    int(component["mention_count"]) for component in mention_components
+                )
                 evidence = {
                     "evidence_types": sorted(
-                        {str(value) for value in candidate.get("evidence_types") or [] if str(value)}
+                        {
+                            str(value)
+                            for item in grouped_candidates
+                            for value in item.get("evidence_types") or []
+                            if str(value)
+                        }
                     )[:16],
+                    "mention_components": mention_components,
                     "mention_count": mention_count,
                     "provenance_book_ids": [book_id],
-                    "source_fingerprints": [
-                        hashlib.sha256(
-                            f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
-                        ).hexdigest()
-                    ],
-                    "title_match": bool(candidate.get("title_match")),
+                    "source_fingerprints": source_fingerprints,
+                    "title_match": any(bool(item.get("title_match")) for item in grouped_candidates),
                 }
                 is_new = current is None
                 if is_new:
@@ -945,12 +1139,19 @@ class GlossaryRepository:
                             source_key,
                             target,
                             term_type,
-                            float(candidate.get("confidence") or 0.5),
+                            max(float(item.get("confidence") or 0.5) for item in grouped_candidates),
                             mention_count,
                             term_type,
                             chapter_id,
                             chapter_number,
-                            str(candidate.get("source_context") or "")[:200],
+                            next(
+                                (
+                                    str(item.get("source_context") or "")[:200]
+                                    for item in grouped_candidates
+                                    if str(item.get("source_context") or "")
+                                ),
+                                "",
+                            ),
                         ),
                     )
                     term_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -965,8 +1166,8 @@ class GlossaryRepository:
                     "WHERE term_id = ? AND chapter_id = ? AND extractor = ?",
                     (term_id, chapter_id, extractor),
                 ).fetchone()
-                if extractor == "hybrid-v1" and target and not observe_only:
-                    evidence["proposed_targets"] = [target[:200]]
+                if extractor == "hybrid-v1" and targets and not observe_only:
+                    evidence["proposed_targets"] = targets
                 elif extractor == "hybrid-v1" and observe_only and evidence_row is not None:
                     try:
                         prior_payload = json.loads(str(evidence_row["evidence_json"] or "{}"))
@@ -1006,15 +1207,19 @@ class GlossaryRepository:
                     and not observe_only
                     and status in {"NEEDS_REVIEW", "CONFLICT"}
                     and not str(current["target_term"] or "").strip()
-                    and bool(target)
+                    and bool(targets)
                 )
+                conflicting_targets = [
+                    value
+                    for value in targets
+                    if value != str(current["target_term"] or "").strip()
+                ]
                 target_conflict = (
                     extractor == "hybrid-v1"
                     and not observe_only
                     and status in {"NEEDS_REVIEW", "CONFLICT"}
                     and bool(str(current["target_term"] or "").strip())
-                    and bool(target)
-                    and str(current["target_term"]).strip() != target
+                    and bool(conflicting_targets)
                 )
                 alternatives = str(current["alternatives"] or "")
                 if target_conflict:
@@ -1023,9 +1228,16 @@ class GlossaryRepository:
                         for part in re.split(r"[,;\n|]+", alternatives)
                         if normalize_source_key(part)
                     }
-                    proposed_alternatives = f"{alternatives}|{target}" if alternatives else target
-                    if normalize_source_key(target) not in alternative_keys and len(proposed_alternatives) <= 1000:
-                        alternatives = proposed_alternatives
+                    for proposed_target in conflicting_targets:
+                        proposed_alternatives = (
+                            f"{alternatives}|{proposed_target}" if alternatives else proposed_target
+                        )
+                        if (
+                            normalize_source_key(proposed_target) not in alternative_keys
+                            and len(proposed_alternatives) <= 1000
+                        ):
+                            alternatives = proposed_alternatives
+                            alternative_keys.add(normalize_source_key(proposed_target))
                 row_changed = (
                     int(current["occurrence_count"] or 0) != occurrence_count
                     or int(current["chapter_count"] or 0) != chapter_count

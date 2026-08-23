@@ -166,19 +166,68 @@ def _context_for(text: str, term: str, radius: int = 28) -> str:
     return text[start:end].replace("\n", " ").strip()
 
 
-def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -> str:
+def _cluster_end(text: str, start: int) -> int:
+    end = start + 1
+    while end < len(text) and unicodedata.combining(text[end]):
+        end += 1
+    return end
+
+
+def _is_hangul_leading_jamo(value: str) -> bool:
+    return len(value) == 1 and 0x1100 <= ord(value) <= 0x1112
+
+
+def _is_hangul_vowel_cluster(value: str) -> bool:
+    return bool(value) and 0x1161 <= ord(value[0]) <= 0x1175 and all(
+        unicodedata.combining(character) for character in value[1:]
+    )
+
+
+def _is_hangul_trailing_cluster(value: str) -> bool:
+    return bool(value) and 0x11A8 <= ord(value[0]) <= 0x11C2 and all(
+        unicodedata.combining(character) for character in value[1:]
+    )
+
+
+def _is_hangul_lv_syllable(value: str) -> bool:
+    return len(value) == 1 and 0xAC00 <= ord(value) <= 0xD7A3 and (
+        ord(value) - 0xAC00
+    ) % 28 == 0
+
+
+def _normalized_with_original_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
     normalized_parts: list[str] = []
     original_spans: list[tuple[int, int]] = []
     cluster_start = 0
     while cluster_start < len(text):
-        cluster_end = cluster_start + 1
-        while cluster_end < len(text) and unicodedata.combining(text[cluster_end]):
-            cluster_end += 1
+        cluster_end = _cluster_end(text, cluster_start)
         normalized_cluster = unicodedata.normalize("NFKC", text[cluster_start:cluster_end])
+        if _is_hangul_leading_jamo(normalized_cluster) and cluster_end < len(text):
+            vowel_end = _cluster_end(text, cluster_end)
+            normalized_vowel = unicodedata.normalize("NFKC", text[cluster_end:vowel_end])
+            if _is_hangul_vowel_cluster(normalized_vowel):
+                cluster_end = vowel_end
+                normalized_cluster = unicodedata.normalize(
+                    "NFKC", text[cluster_start:cluster_end]
+                )
+                if _is_hangul_lv_syllable(normalized_cluster) and cluster_end < len(text):
+                    trailing_end = _cluster_end(text, cluster_end)
+                    normalized_trailing = unicodedata.normalize(
+                        "NFKC", text[cluster_end:trailing_end]
+                    )
+                    if _is_hangul_trailing_cluster(normalized_trailing):
+                        cluster_end = trailing_end
+                        normalized_cluster = unicodedata.normalize(
+                            "NFKC", text[cluster_start:cluster_end]
+                        )
         normalized_parts.append(normalized_cluster)
         original_spans.extend([(cluster_start, cluster_end)] * len(normalized_cluster))
         cluster_start = cluster_end
-    normalized_text = "".join(normalized_parts)
+    return "".join(normalized_parts), original_spans
+
+
+def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -> str:
+    normalized_text, original_spans = _normalized_with_original_spans(text)
     normalized_index = normalized_text.find(normalized_term)
     if normalized_index < 0 or not normalized_term:
         return ""
@@ -857,6 +906,10 @@ class GlossaryService:
             term_type = normalize_term_type(str(item.get("term_type") or "other"))
             if term_type not in VALID_EXTRACTED_TERM_TYPES:
                 term_type = "other"
+            occurrence_spans = [
+                [match.start(), match.start() + len(source)]
+                for match in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
+            ]
             candidates.append(
                 {
                     "source_term": source,
@@ -865,7 +918,8 @@ class GlossaryService:
                     "category": term_type,
                     "confidence": float(confidence_value),
                     "source_context": _context_for_normalized(bounded_text, source),
-                    "mention_count": len(re.findall(f"(?={re.escape(source)})", normalized_corpus)),
+                    "mention_count": len(occurrence_spans),
+                    "occurrence_spans": occurrence_spans,
                     "title_match": bool(normalized_title and source in normalized_title),
                     "evidence_types": ["provider_structured_json"],
                 }
@@ -985,7 +1039,11 @@ class GlossaryService:
                 )
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
                 candidates = [*candidates, *hybrid]
-        return {**counts, "candidates": candidates, "warnings": warnings}
+        public_candidates = [
+            {key: value for key, value in candidate.items() if key != "occurrence_spans"}
+            for candidate in candidates
+        ]
+        return {**counts, "candidates": public_candidates, "warnings": warnings}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""
