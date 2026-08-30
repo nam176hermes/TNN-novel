@@ -1,0 +1,12 @@
+# Glossary upgrade release pin. Both images were built at
+# 2026-08-30T23:22:00Z from source commit
+# 9144efc778ea18822586c7ff1df9cecbd6d85725 with one shared release ID.
+services:
+  api:
+    image: novel-pipeline-api:glossary-upgrade-20260830-r1
+    environment:
+      NOVEL_IMAGE_DIGEST: "sha256:db94007569fa29b38aa32927e0ae7ed737b8e934438c3f51a030251e6dfd7e2d"
+  import-worker:
+    image: novel-pipeline-import-worker:glossary-upgrade-20260830-r1
+    environment:
+      NOVEL_IMAGE_DIGEST: "sha256:5933105b73adde3b3e73a8b18b8d119a650bc3db33ea11b7421045b8a34ffce9"

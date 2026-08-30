@@ -1,0 +1,6 @@
+# Exact image tags running immediately before the glossary upgrade cutover.
+services:
+  api:
+    image: novel-pipeline-api:library-toc-production-20260730-r1
+  import-worker:
+    image: novel-pipeline-import-worker:library-toc-production-20260730-r1
