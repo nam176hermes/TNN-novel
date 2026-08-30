@@ -33,19 +33,22 @@ async (page) => {
     ensure(value === target, `unexpected_target:${source}:${value}`);
     return row;
   };
-  const selectTab = async (name) => {
-    const tab = page.getByRole('tab', { name, exact: true });
-    await tab.click();
+  const selectStatusFilter = async (name) => {
+    const filterGroup = page.getByRole('group', { name: 'Trạng thái thuật ngữ' });
+    const button = filterGroup.getByRole('button', { name, exact: true });
+    await button.click();
     await page.waitForFunction(
-      (label) => Array.from(document.querySelectorAll('[role="tab"]')).some(
+      (label) => Array.from(document.querySelectorAll(
+        '[role="group"][aria-label="Trạng thái thuật ngữ"] button',
+      )).some(
         (candidate) => candidate.textContent?.trim() === label
-          && candidate.getAttribute('aria-selected') === 'true',
+          && candidate.getAttribute('aria-pressed') === 'true',
       ),
       name,
     );
   };
-  const searchFor = async (search, tab, source, target = null, rangeText = '1–1 / 1') => {
-    await selectTab(tab);
+  const searchFor = async (search, statusFilter, source, target = null, rangeText = '1–1 / 1') => {
+    await selectStatusFilter(statusFilter);
     await search.fill(source);
     await exactText(rangeText);
     return target === null ? rowFor(source) : assertTarget(source, target);
@@ -119,7 +122,7 @@ async (page) => {
     ]) {
       await rowFor(source);
     }
-    await selectTab('Tất cả');
+    await selectStatusFilter('Tất cả');
     await exactText('Trang 1 / 200');
     const pageOneSources = await page.locator('tbody th[scope="row"]').allTextContents();
     ensure(pageOneSources.length === 50, `page_one_row_count:${pageOneSources.length}`);
@@ -138,7 +141,7 @@ async (page) => {
 
     // Create, edit/approve, and lock, with status-specific queue assertions.
     await search.fill('');
-    await selectTab('Cần duyệt');
+    await selectStatusFilter('Cần duyệt');
     await exactText('1–4 / 4');
     await page.getByText('Tạo thuật ngữ', { exact: true }).click();
     await page.getByRole('textbox', { name: 'Thuật ngữ gốc mới' }).fill(createdSource);
@@ -158,7 +161,7 @@ async (page) => {
 
     // Both selected rows must leave pending and become queryable as approved.
     await search.fill('');
-    await selectTab('Cần duyệt');
+    await selectStatusFilter('Cần duyệt');
     await page.getByRole('checkbox', { name: 'Chọn synthetic-source-00000' }).click();
     await page.getByRole('checkbox', { name: 'Chọn synthetic-source-00001' }).click();
     await page.getByRole('button', { name: 'Duyệt đã chọn' }).click();
