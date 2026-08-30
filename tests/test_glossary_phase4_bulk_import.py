@@ -1053,6 +1053,51 @@ async def test_conflict_query_uses_sql_pagination_and_never_calls_unbounded_lega
     assert len(response.json()["conflicts"]) <= 3
 
 
+def test_primary_variant_conflict_query_is_symmetric_and_deduplicated(
+    glossary_api_db: Path,
+) -> None:
+    from app.database.glossary_repository import GlossaryRepository
+
+    book_id = add_book(glossary_api_db, "Symmetric variants")
+    with get_connection(glossary_api_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO glossary_terms
+                (book_id, source_term, source_key, target_term, variants,
+                 approved, review_status, version)
+            VALUES (?, 'Alpha', 'alpha', 'A', 'beta', 1, 'APPROVED', 1)
+            """,
+            (book_id,),
+        )
+        alpha_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO glossary_terms
+                (book_id, source_term, source_key, target_term, variants,
+                 approved, review_status, version)
+            VALUES (?, 'Beta', 'beta', 'B', 'alpha', 1, 'APPROVED', 1)
+            """,
+            (book_id,),
+        )
+        beta_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+
+    result = GlossaryRepository(glossary_api_db).query_conflicts(
+        book_id=book_id,
+        page=1,
+        per_page=50,
+    )
+    matching = [
+        item
+        for item in result["items"]
+        if item["types"] == ["primary_variant"]
+        and {member["id"] for member in item["members"]} == {alpha_id, beta_id}
+    ]
+
+    assert len(matching) == 1
+    assert matching[0]["canonical_id"] == min(alpha_id, beta_id)
+    assert matching[0]["member_total"] == 2
+
 @pytest.mark.asyncio
 async def test_large_conflict_group_is_resolved_in_stable_mergeable_200_member_batches(
     glossary_api_db: Path,

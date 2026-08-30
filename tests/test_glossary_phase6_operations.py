@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import sqlite3
 
 import httpx
 import pytest
@@ -139,7 +140,7 @@ def test_glossary_runtime_observability_covers_required_categories_without_priva
         "glossary_queries_total",
         "glossary_state_transitions_total",
     }.issubset(_metric_names(runtime, "counters"))
-    assert {"glossary_conflicts", "glossary_effective_terms"}.issubset(
+    assert {"glossary_active_conflicts", "glossary_effective_terms"}.issubset(
         _metric_names(runtime, "gauges")
     )
     assert "glossary_query_latency_ms" in _metric_names(runtime, "latencies")
@@ -225,6 +226,134 @@ def test_operational_snapshot_adds_shared_metrics_without_changing_existing_fiel
             "value": 1.0,
         }
     ]
+
+
+def test_filtered_query_does_not_overwrite_active_conflict_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "pipeline.db"
+    init_db(db_path)
+    book_id = add_book(db_path, "Conflict inventory")
+    put_glossary_term(
+        db_path,
+        book_id,
+        "冲突库存",
+        "xung đột",
+        approved=0,
+        review_status="CONFLICT",
+    )
+    put_glossary_term(db_path, book_id, "已批准库存", "đã duyệt", approved=1)
+    observability = Observability(metrics=InMemoryMetrics(max_series=32))
+    monkeypatch.setattr(glossary_module, "default_observability", observability)
+
+    service = GlossaryService.from_db_path(db_path)
+    service.query_terms(book_id=book_id, review_status="CONFLICT", scope="book")
+    approved = service.query_terms(
+        book_id=book_id,
+        q="已批准库存",
+        review_status="APPROVED",
+        scope="book",
+    )
+
+    assert approved["total"] == 1
+    gauges = {
+        item["name"]: item["value"]
+        for item in observability.snapshot()["metrics"]["gauges"]
+    }
+    assert gauges["glossary_active_conflicts"] == 1.0
+
+
+def test_bulk_rollback_emits_no_transition_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "pipeline.db"
+    init_db(db_path)
+    book_id = add_book(db_path, "Forced rollback")
+    first_id = put_glossary_term(
+        db_path, book_id, "回滚一", "một", approved=0, review_status="NEEDS_REVIEW"
+    )
+    second_id = put_glossary_term(
+        db_path, book_id, "回滚二", "hai", approved=0, review_status="NEEDS_REVIEW"
+    )
+    with get_connection(db_path) as conn:
+        versions = {
+            int(row["id"]): int(row["version"])
+            for row in conn.execute(
+                "SELECT id, version FROM glossary_terms WHERE id IN (?, ?)",
+                (first_id, second_id),
+            )
+        }
+        conn.execute(
+            f"""
+            CREATE TRIGGER phase6_force_transition_rollback
+            BEFORE INSERT ON glossary_history
+            WHEN NEW.term_id = {second_id}
+            BEGIN
+                SELECT RAISE(ABORT, 'forced_transition_rollback');
+            END
+            """
+        )
+        conn.commit()
+
+    logger_name = "tests.glossary.phase6.rollback"
+    observability = Observability(
+        metrics=InMemoryMetrics(max_series=32),
+        events=StructuredEventLogger(logging.getLogger(logger_name)),
+    )
+    monkeypatch.setattr(repository_module, "default_observability", observability)
+
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        with pytest.raises(sqlite3.IntegrityError, match="forced_transition_rollback"):
+            repository_module.GlossaryRepository(db_path).bulk(
+                "approve",
+                [
+                    {"id": first_id, "expected_version": versions[first_id]},
+                    {"id": second_id, "expected_version": versions[second_id]},
+                ],
+                actor="phase6-test",
+            )
+
+    with get_connection(db_path) as conn:
+        states = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT review_status, approved, locked FROM glossary_terms "
+                "WHERE id IN (?, ?) ORDER BY id",
+                (first_id, second_id),
+            )
+        ]
+    assert states == [("NEEDS_REVIEW", 0, 0), ("NEEDS_REVIEW", 0, 0)]
+    assert "glossary_state_transitions_total" not in _metric_names(
+        observability.snapshot(), "counters"
+    )
+    assert '"event":"glossary_state_transition"' not in caplog.text
+
+
+def test_extraction_observe_transition_uses_a_fixed_action_label() -> None:
+    observability = Observability(metrics=InMemoryMetrics(max_series=8))
+
+    observability.record_glossary_transition(
+        action="observe",
+        before_state="NEEDS_REVIEW",
+        after_state="CONFLICT",
+        term_id=7,
+        book_id=3,
+        version=2,
+    )
+
+    transition = next(
+        item
+        for item in observability.snapshot()["metrics"]["counters"]
+        if item["name"] == "glossary_state_transitions_total"
+    )
+    assert transition["labels"] == {"operation": "observe", "state": "CONFLICT"}
 
 
 @pytest.mark.asyncio

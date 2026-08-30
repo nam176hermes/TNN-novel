@@ -62,11 +62,15 @@ describe('WorkflowShell', () => {
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Tác vụ' }));
     await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
     const moreSheet = screen.getByRole('dialog', { name: 'Thêm' });
-    await userEvent.click(within(moreSheet).getByRole('button', { name: 'Nhập chương' }));
+    await userEvent.click(within(moreSheet).getByRole('button', { name: 'Raw chưa dịch' }));
+    await userEvent.click(within(mobileNav).getByRole('button', { name: 'Thêm' }));
+    const reopenedMoreSheet = screen.getByRole('dialog', { name: 'Thêm' });
+    await userEvent.click(within(reopenedMoreSheet).getByRole('button', { name: 'Nhập chương' }));
 
     expect(onViewChange).toHaveBeenCalledWith('library');
     expect(onViewChange).toHaveBeenCalledWith('reader');
     expect(onViewChange).toHaveBeenCalledWith('jobs');
+    expect(onViewChange).toHaveBeenCalledWith('raw');
     expect(onOpenImport).toHaveBeenCalledTimes(1);
   });
 

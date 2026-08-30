@@ -799,6 +799,15 @@ class GlossaryRepository:
             "facets": facets,
         }
 
+    def count_active_conflicts(self) -> int:
+        """Return the unfiltered active conflict-row inventory."""
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM glossary_terms "
+                "WHERE review_status = 'CONFLICT' AND COALESCE(archived_at, '') = ''"
+            ).fetchone()
+        return int(row[0] or 0)
+
     @staticmethod
     def _source_rows(conn: sqlite3.Connection, book_id: int, source_key: str) -> list[sqlite3.Row]:
         return conn.execute(
@@ -876,7 +885,7 @@ class GlossaryRepository:
         after: dict[str, Any],
         actor: str,
         request_id: str,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         ensure_history_table(conn)
         def bounded_snapshot(row: dict[str, Any]) -> dict[str, Any]:
             if not row:
@@ -919,14 +928,26 @@ class GlossaryRepository:
         before_state = "ARCHIVED" if before.get("archived_at") else str(before.get("review_status") or "MISSING")
         after_state = "ARCHIVED" if after.get("archived_at") else str(after.get("review_status") or "CONFLICT")
         if not before or before_state != after_state:
-            default_observability.record_glossary_transition(
-                action=action,
-                before_state=before_state,
-                after_state=after_state,
-                term_id=int(after["id"]),
-                book_id=int(after["book_id"]),
-                version=int(after["version"]),
-            )
+            return {
+                "action": action,
+                "before_state": before_state,
+                "after_state": after_state,
+                "term_id": int(after["id"]),
+                "book_id": int(after["book_id"]),
+                "version": int(after["version"]),
+            }
+        return None
+
+    @staticmethod
+    def _commit_and_emit_transitions(
+        conn: sqlite3.Connection,
+        transitions: list[dict[str, Any] | None],
+    ) -> None:
+        """Publish only the bounded state changes made durable by this commit."""
+        conn.commit()
+        for transition in transitions:
+            if transition is not None:
+                default_observability.record_glossary_transition(**transition)
 
     @staticmethod
     def _assert_target_and_conflicts(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> None:
@@ -974,8 +995,10 @@ class GlossaryRepository:
                     (term_id,),
                 )
                 after = dict(self._row(conn, term_id))
-                self._log(conn, "observe", before, after, self._actor(actor), request_id)
-                conn.commit()
+                transition = self._log(
+                    conn, "observe", before, after, self._actor(actor), request_id
+                )
+                self._commit_and_emit_transitions(conn, [transition])
                 return term_id
             before = dict(rows[0]) if rows else {}
             if rows and rows[0]["archived_at"]:
@@ -1044,8 +1067,10 @@ class GlossaryRepository:
                 )
                 action = "update"
             after = dict(self._row(conn, term_id))
-            self._log(conn, action, before, after, self._actor(actor), request_id)
-            conn.commit()
+            transition = self._log(
+                conn, action, before, after, self._actor(actor), request_id
+            )
+            self._commit_and_emit_transitions(conn, [transition])
             return term_id
 
     def record_extraction_candidates(
@@ -1064,6 +1089,7 @@ class GlossaryRepository:
             raise ValueError("invalid_extractor")
         skipped_keys = skip_source_keys or set()
         created = updated = skipped = 0
+        transitions: list[dict[str, Any] | None] = []
         actor = f"{extractor}-extractor"
         request_id = f"chapter:{chapter_id}"
         with get_connection(self.db_path) as conn:
@@ -1291,7 +1317,7 @@ class GlossaryRepository:
                 )
                 if is_new:
                     after = dict(self._row(conn, term_id))
-                    self._log(conn, "add", {}, after, actor, request_id)
+                    transitions.append(self._log(conn, "add", {}, after, actor, request_id))
                 elif row_changed:
                     conn.execute(
                         """
@@ -1318,7 +1344,9 @@ class GlossaryRepository:
                         ),
                     )
                     after = dict(self._row(conn, term_id))
-                    self._log(conn, "observe", before, after, actor, request_id)
+                    transitions.append(
+                        self._log(conn, "observe", before, after, actor, request_id)
+                    )
                 if not is_new and evidence_changed:
                     updated += 1
                 elif not is_new and not evidence_changed:
@@ -1354,16 +1382,18 @@ class GlossaryRepository:
                         """,
                         (occurrence_count, chapter_count, term_id),
                     )
-                    self._log(
-                        conn,
-                        "observe",
-                        before,
-                        dict(self._row(conn, term_id)),
-                        actor,
-                        request_id,
+                    transitions.append(
+                        self._log(
+                            conn,
+                            "observe",
+                            before,
+                            dict(self._row(conn, term_id)),
+                            actor,
+                            request_id,
+                        )
                     )
                     updated += 1
-            conn.commit()
+            self._commit_and_emit_transitions(conn, transitions)
         return {"created": created, "updated": updated, "skipped": skipped}
 
     @staticmethod
@@ -1481,8 +1511,10 @@ class GlossaryRepository:
                 (*changes.values(), term_id),
             )
             after = dict(self._row(conn, term_id))
-            self._log(conn, "update", before, after, self._actor(actor), request_id)
-            conn.commit()
+            transition = self._log(
+                conn, "update", before, after, self._actor(actor), request_id
+            )
+            self._commit_and_emit_transitions(conn, [transition])
             return True
 
     def _transition(self, term_id: int, action: str, state: tuple[str, int, int], *, actor: str, request_id: str) -> bool:
@@ -1503,8 +1535,10 @@ class GlossaryRepository:
                 (*state, term_id),
             )
             after = dict(self._row(conn, term_id))
-            self._log(conn, action, before, after, self._actor(actor), request_id)
-            conn.commit()
+            transition = self._log(
+                conn, action, before, after, self._actor(actor), request_id
+            )
+            self._commit_and_emit_transitions(conn, [transition])
             return True
 
     def approve(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
@@ -1529,8 +1563,10 @@ class GlossaryRepository:
                 (datetime.now(timezone.utc).isoformat(), term_id),
             )
             after = dict(self._row(conn, term_id))
-            self._log(conn, "archive", before, after, self._actor(actor), request_id)
-            conn.commit()
+            transition = self._log(
+                conn, "archive", before, after, self._actor(actor), request_id
+            )
+            self._commit_and_emit_transitions(conn, [transition])
             return True
 
     def restore(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
@@ -1554,8 +1590,10 @@ class GlossaryRepository:
                 (term_id,),
             )
             after = dict(self._row(conn, term_id))
-            self._log(conn, "restore", before, after, self._actor(actor), request_id)
-            conn.commit()
+            transition = self._log(
+                conn, "restore", before, after, self._actor(actor), request_id
+            )
+            self._commit_and_emit_transitions(conn, [transition])
             return True
 
     def bulk(
@@ -1579,6 +1617,7 @@ class GlossaryRepository:
             "reject": ("REJECTED", -1, 0),
             "lock": ("LOCKED", 1, 1),
         }
+        transitions: list[dict[str, Any] | None] = []
 
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1619,9 +1658,11 @@ class GlossaryRepository:
                         (*state_by_action[action], row["id"]),
                     )
                 after = dict(self._row(conn, int(row["id"])))
-                self._log(conn, action, before, after, self._actor(actor), request_id)
+                transitions.append(
+                    self._log(conn, action, before, after, self._actor(actor), request_id)
+                )
             resources = [self._resource(self._row(conn, term_id)) for term_id in ids]
-            conn.commit()
+            self._commit_and_emit_transitions(conn, transitions)
         return {"action": action, "updated": len(resources), "items": resources}
 
     def query_conflicts(
@@ -2013,6 +2054,7 @@ class GlossaryRepository:
         actor: str = "",
         request_id: str = "",
     ) -> dict[str, Any]:
+        transitions: list[dict[str, Any] | None] = []
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             preview = self._merge_preview(conn, canonical_id, duplicate_ids)
@@ -2083,8 +2125,15 @@ class GlossaryRepository:
                 (occurrence_count, chapter_count, canonical_id),
             )
             canonical_after = dict(self._row(conn, canonical_id))
-            self._log(
-                conn, "merge", canonical_before, canonical_after, self._actor(actor), request_id
+            transitions.append(
+                self._log(
+                    conn,
+                    "merge",
+                    canonical_before,
+                    canonical_after,
+                    self._actor(actor),
+                    request_id,
+                )
             )
             archived_at = datetime.now(timezone.utc).isoformat()
             for duplicate_id in duplicate_ids:
@@ -2098,8 +2147,15 @@ class GlossaryRepository:
                     (archived_at, duplicate_id),
                 )
                 after = dict(self._row(conn, duplicate_id))
-                self._log(
-                    conn, "merge_archive", before, after, self._actor(actor), request_id
+                transitions.append(
+                    self._log(
+                        conn,
+                        "merge_archive",
+                        before,
+                        after,
+                        self._actor(actor),
+                        request_id,
+                    )
                 )
                 conn.execute(
                     """
@@ -2121,7 +2177,7 @@ class GlossaryRepository:
                         ),
                     ),
                 )
-            conn.commit()
+            self._commit_and_emit_transitions(conn, transitions)
         return {**preview, "merged": len(duplicate_ids)}
 
     @staticmethod
@@ -2394,6 +2450,7 @@ class GlossaryRepository:
         request_id: str = "",
         legacy_partial: bool = False,
     ) -> dict[str, Any]:
+        transitions: list[dict[str, Any] | None] = []
         with get_connection(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             preview = self._import_preview(conn, items, conflict_policy, legacy_partial)
@@ -2459,15 +2516,17 @@ class GlossaryRepository:
                         ),
                     )
                 after = dict(self._row(conn, term_id))
-                self._log(
-                    conn,
-                    "import_add" if action["action"] == "add" else "import_update",
-                    before,
-                    after,
-                    self._actor(actor),
-                    request_id,
+                transitions.append(
+                    self._log(
+                        conn,
+                        "import_add" if action["action"] == "add" else "import_update",
+                        before,
+                        after,
+                        self._actor(actor),
+                        request_id,
+                    )
                 )
-            conn.commit()
+            self._commit_and_emit_transitions(conn, transitions)
         return {**preview["summary"], "errors": []}
 
     def export_terms(self, book_id: int | None = None, scope: str = "all") -> list[dict[str, Any]]:

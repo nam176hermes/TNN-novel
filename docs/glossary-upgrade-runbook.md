@@ -123,8 +123,11 @@ Enable hybrid mode for one low-risk book at a time from **Trích xuất thuật 
 Choose only an already-configured provider, save the per-book setting, and
 re-extract one chapter. Review candidates before approving them. Watch the
 authenticated operations snapshot for extraction outcomes, provider failure
-codes, query latency, conflict counts, effective-term counts/fingerprints, state
-transitions, and QA violation counts.
+codes, query latency, active-conflict inventory, effective-term counts, state
+transitions, and QA violation counts. Correlate those metrics with the
+structured operational event logs, which carry the non-reversible glossary
+fingerprint identifiers; fingerprint identifiers are not metric-snapshot
+fields.
 
 Expand only when provider failures, conflicts, latency, and QA remain within the
 operator's recorded thresholds. Provider credentials and paid calls are an

@@ -81,6 +81,7 @@ _GLOSSARY_ACTIONS = {
     "merge",
     "merge_archive",
     "needs_review",
+    "observe",
     "reject",
     "restore",
     "unlock",
@@ -555,11 +556,14 @@ class Observability:
         elapsed_ms: int | float,
         result_count: int,
         conflict_count: int,
+        active_conflict_count: int,
     ) -> None:
         labels = {"operation": "queue"}
         self.metrics.increment("glossary_queries_total", labels=labels)
         self.metrics.observe_latency_ms("glossary_query_latency_ms", elapsed_ms, labels=labels)
-        self.metrics.set_gauge("glossary_conflicts", max(0, int(conflict_count)))
+        self.metrics.set_gauge(
+            "glossary_active_conflicts", max(0, int(active_conflict_count))
+        )
         self.events.emit(
             "glossary_query",
             operation="queue",

@@ -471,7 +471,8 @@ class GlossaryService:
         archived: bool = False,
     ) -> tuple[list[dict], int]:
         """Compatibility wrapper over the SQL review query."""
-        result = GlossaryRepository(self.db_path).query(
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
             book_id=book_id,
             q=search or "",
             mode=mode,
@@ -515,7 +516,8 @@ class GlossaryService:
                     }
                 )
             )
-        result = GlossaryRepository(self.db_path).query(
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
             book_id=book_id,
             q=q,
             review_statuses=statuses,
@@ -542,6 +544,7 @@ class GlossaryService:
             elapsed_ms=(time.perf_counter() - started) * 1000,
             result_count=len(result["items"]),
             conflict_count=int(result["facets"]["review_status"].get("CONFLICT", 0)),
+            active_conflict_count=repository.count_active_conflicts(),
         )
         return result
 
