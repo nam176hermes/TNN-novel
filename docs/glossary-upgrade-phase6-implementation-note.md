@@ -16,8 +16,8 @@ The review fix closes every reported Important and Minor finding:
 - a filtered queue query cannot overwrite the unfiltered active-conflict
   inventory gauge;
 - extraction observation uses the fixed `observe` action label;
-- the symmetric primary/variant conflict result is regression-tested for one
-  canonical, de-duplicated pair;
+- primary/variant conflict matching is regression-tested in both ID directions
+  and reciprocal matches are de-duplicated;
 - the runbook distinguishes metric snapshots from structured fingerprint
   events;
 - one committed command now builds and serves the final app, creates two fresh
@@ -30,6 +30,76 @@ The review fix closes every reported Important and Minor finding:
 All verification used synthetic, Linux-native `/tmp` data. No operator
 database, production service, deployment, remote Git state, or live/paid
 provider was read or changed.
+
+## Exact cumulative Task 7 tracked-file inventory
+
+The following is the exact path set returned for the final Task 7 round-2 tree
+by:
+
+```bash
+git diff --name-only 1a83b693c57247ef1e54d9938440d2092066aa76..HEAD
+```
+
+```text
+app/database/glossary_repository.py
+app/database/glossary_resolver.py
+app/mobile_api/services/glossary_service.py
+app/mobile_api/services/operational_metrics_service.py
+app/mobile_api/services/qa_service.py
+app/observability.py
+docs/glossary-upgrade-phase6-implementation-note.md
+docs/glossary-upgrade-runbook.md
+scripts/certify_glossary_phase6_browser.sh
+scripts/glossary_phase6_browser_journey.js
+scripts/prepare_glossary_phase6_fixture.py
+tests/test_glossary_phase4_bulk_import.py
+tests/test_glossary_phase6_browser_orchestrator.py
+tests/test_glossary_phase6_operations.py
+web/src/components/GlossaryStyleView.test.tsx
+web/src/components/GlossaryStyleView.tsx
+web/src/components/WorkflowShell.test.tsx
+web/src/components/WorkflowShell.tsx
+```
+
+Thirteen of those paths were already in the original implementation through
+`9146bfe`. The review fixes added these five paths to the cumulative set:
+`scripts/certify_glossary_phase6_browser.sh`,
+`tests/test_glossary_phase4_bulk_import.py`,
+`tests/test_glossary_phase6_browser_orchestrator.py`,
+`web/src/components/WorkflowShell.test.tsx`, and
+`web/src/components/WorkflowShell.tsx`. Review fixes also strengthened several
+of the original thirteen paths; the canonical list above is the authoritative
+complete Task 7 set.
+
+## Review fix round 2 — conflict-direction regression
+
+Round 2 changes only this note and
+`tests/test_glossary_phase4_bulk_import.py`; production, frontend, browser,
+dependency, lockfile, and configuration files are unchanged. The conflict
+regression now uses three disjoint pairs:
+
+1. a lower-ID term whose variants contain the higher-ID primary;
+2. a higher-ID term whose variants contain the lower-ID primary;
+3. a reciprocal pair in which each term names the other as a variant.
+
+It requires exactly three unique `primary_variant` groups, the literal three
+member pairs, the lower member ID as canonical, and two members per group.
+Mutation checks prove the test catches all requested regressions:
+
+- current production before mutation: exit `0`, `1 passed, 1 warning in
+  1.82s`;
+- temporary `variant.id < term.id` restriction: exit `1`, expected three
+  groups but received two; `1 failed, 1 warning in 1.83s`;
+- temporary `variant.id > term.id` restriction: exit `1`, expected three
+  groups but received two; `1 failed, 1 warning in 1.80s`;
+- temporary removal of `SELECT DISTINCT`: exit `1`, expected three groups but
+  received four; `1 failed, 1 warning in 1.71s`;
+- production restored byte-for-byte: exit `0`, `1 passed, 1 warning in
+  1.64s`.
+
+No production fix was needed. The affected Phase 4/6 and orchestrator-contract
+suite exited `0` with `31 passed, 49 warnings in 30.73s`. `scripts/lint.sh`
+and `git diff --check` also exited `0`.
 
 ## Implementation boundaries
 

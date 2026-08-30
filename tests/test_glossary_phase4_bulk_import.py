@@ -1060,26 +1060,25 @@ def test_primary_variant_conflict_query_is_symmetric_and_deduplicated(
 
     book_id = add_book(glossary_api_db, "Symmetric variants")
     with get_connection(glossary_api_db) as conn:
-        conn.execute(
-            """
-            INSERT INTO glossary_terms
-                (book_id, source_term, source_key, target_term, variants,
-                 approved, review_status, version)
-            VALUES (?, 'Alpha', 'alpha', 'A', 'beta', 1, 'APPROVED', 1)
-            """,
-            (book_id,),
-        )
-        alpha_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-        conn.execute(
-            """
-            INSERT INTO glossary_terms
-                (book_id, source_term, source_key, target_term, variants,
-                 approved, review_status, version)
-            VALUES (?, 'Beta', 'beta', 'B', 'alpha', 1, 'APPROVED', 1)
-            """,
-            (book_id,),
-        )
-        beta_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        term_ids: dict[str, int] = {}
+        for source_key, variants in (
+            ("lower-owns", "higher-primary"),
+            ("higher-primary", ""),
+            ("lower-primary", ""),
+            ("higher-owns", "lower-primary"),
+            ("reciprocal-lower", "reciprocal-higher"),
+            ("reciprocal-higher", "reciprocal-lower"),
+        ):
+            cursor = conn.execute(
+                """
+                INSERT INTO glossary_terms
+                    (book_id, source_term, source_key, target_term, variants,
+                     approved, review_status, version)
+                VALUES (?, ?, ?, ?, ?, 1, 'APPROVED', 1)
+                """,
+                (book_id, source_key, source_key, f"target-{source_key}", variants),
+            )
+            term_ids[source_key] = int(cursor.lastrowid)
         conn.commit()
 
     result = GlossaryRepository(glossary_api_db).query_conflicts(
@@ -1087,16 +1086,30 @@ def test_primary_variant_conflict_query_is_symmetric_and_deduplicated(
         page=1,
         per_page=50,
     )
-    matching = [
+    primary_variant_groups = [
         item
         for item in result["items"]
         if item["types"] == ["primary_variant"]
-        and {member["id"] for member in item["members"]} == {alpha_id, beta_id}
+    ]
+    expected_pairs = {
+        frozenset((term_ids["lower-owns"], term_ids["higher-primary"])),
+        frozenset((term_ids["lower-primary"], term_ids["higher-owns"])),
+        frozenset((term_ids["reciprocal-lower"], term_ids["reciprocal-higher"])),
+    }
+    actual_pairs = [
+        frozenset(member["id"] for member in item["members"])
+        for item in primary_variant_groups
     ]
 
-    assert len(matching) == 1
-    assert matching[0]["canonical_id"] == min(alpha_id, beta_id)
-    assert matching[0]["member_total"] == 2
+    assert len(primary_variant_groups) == 3
+    assert set(actual_pairs) == expected_pairs
+    assert len(actual_pairs) == len(set(actual_pairs))
+    assert all(
+        item["canonical_id"] == min(member["id"] for member in item["members"])
+        and item["member_total"] == 2
+        for item in primary_variant_groups
+    )
+
 
 @pytest.mark.asyncio
 async def test_large_conflict_group_is_resolved_in_stable_mergeable_200_member_batches(
