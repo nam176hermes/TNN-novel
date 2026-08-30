@@ -23,7 +23,7 @@ from app.database.db import (
 from app.mobile_api.services.job_service import JobService, JobTracker
 from app.mobile_api.services.glossary_service import GlossaryService
 from app.mobile_api.services.pipeline_service import PipelineService
-from app.mobile_api.services.qa_service import QAService
+from app.mobile_api.services.qa_service import QAService, build_deterministic_chapter_qa_report
 from app.translation import styleguide_config
 from app.translation.cache import get_cached_translation, set_cached_translation
 
@@ -226,6 +226,136 @@ def test_reader_dictionary_includes_styleguide_only_effective_survivor(
     ] == [("glossary", "仙侠", "tiên hiệp")]
 
 
+def test_selected_genre_filters_styleguide_across_runtime_consumers_and_cache_identity(
+    temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    init_db(temp_db_path)
+    monkeypatch.setattr(
+        styleguide_config,
+        "get_locked_terms",
+        lambda: [
+            {
+                "source": "仙道专词",
+                "target": "tiên đạo",
+                "genre": "tien_hiep",
+                "term_type": "concept",
+                "priority": 90,
+                "mode": "translate",
+            },
+            {
+                "source": "武林专词",
+                "target": "võ lâm",
+                "genre": "kiem_hiep",
+                "term_type": "concept",
+                "priority": 90,
+                "mode": "translate",
+            },
+            {
+                "source": "中性专词",
+                "target": "trung tính",
+                "genre": "",
+                "term_type": "concept",
+                "priority": 80,
+                "mode": "translate",
+            },
+        ],
+    )
+    book_id = add_book(temp_db_path, "Genre isolation")
+
+    tien_hiep = db_mod.resolve_effective_glossary(
+        temp_db_path, book_id, style_profile_id="tien_hiep"
+    )
+    kiem_hiep = db_mod.resolve_effective_glossary(
+        temp_db_path, book_id, style_profile_id="kiem_hiep"
+    )
+
+    assert set(tien_hiep.translate_mapping) == {"仙道专词", "中性专词"}
+    assert {term["source_term"] for term in tien_hiep.prompt_terms} == {
+        "仙道专词",
+        "中性专词",
+    }
+    assert {term["source_term"] for term in tien_hiep.dictionary_terms} == {
+        "仙道专词",
+        "中性专词",
+    }
+    assert set(kiem_hiep.translate_mapping) == {"武林专词", "中性专词"}
+    assert {term["source_term"] for term in kiem_hiep.prompt_terms} == {
+        "武林专词",
+        "中性专词",
+    }
+    assert {term["source_term"] for term in kiem_hiep.dictionary_terms} == {
+        "武林专词",
+        "中性专词",
+    }
+
+    source = "仙道专词 武林专词 中性专词"
+    tien_report = build_deterministic_chapter_qa_report(
+        book_id=book_id,
+        chapter_id=1,
+        source_text=source,
+        translated_text="tiên đạo và trung tính",
+        glossary_terms=list(tien_hiep.locked_terms),
+    )
+    kiem_report = build_deterministic_chapter_qa_report(
+        book_id=book_id,
+        chapter_id=1,
+        source_text=source,
+        translated_text="võ lâm và trung tính",
+        glossary_terms=list(kiem_hiep.locked_terms),
+    )
+    assert tien_report["glossary_violations"] == []
+    assert kiem_report["glossary_violations"] == []
+
+    pipeline = object.__new__(PipelineService)
+    pipeline.db_path = temp_db_path
+    pipeline.data_dir = tmp_path
+    with get_connection(temp_db_path) as conn:
+        conn.execute("UPDATE style_profiles SET is_default = (id = 'tien_hiep')")
+        conn.commit()
+    tien_pack = pipeline.get_reader_dictionary_pack(book_id)
+    with get_connection(temp_db_path) as conn:
+        conn.execute("UPDATE style_profiles SET is_default = (id = 'kiem_hiep')")
+        conn.commit()
+    kiem_pack = pipeline.get_reader_dictionary_pack(book_id)
+    assert {
+        source["term"]
+        for source in tien_pack["sources"]
+        if source["source"] == "glossary" and source["term"].endswith("专词")
+    } == {"仙道专词", "中性专词"}
+    assert {
+        source["term"]
+        for source in kiem_pack["sources"]
+        if source["source"] == "glossary" and source["term"].endswith("专词")
+    } == {"武林专词", "中性专词"}
+
+    assert tien_hiep.fingerprint != kiem_hiep.fingerprint
+    set_cached_translation(
+        temp_db_path,
+        "原文",
+        "zh",
+        "vi",
+        "model",
+        "cached for tien hiep",
+        glossary_fingerprint=tien_hiep.fingerprint,
+    )
+    assert get_cached_translation(
+        temp_db_path,
+        "原文",
+        "zh",
+        "vi",
+        "model",
+        glossary_fingerprint=tien_hiep.fingerprint,
+    ) == "cached for tien hiep"
+    assert get_cached_translation(
+        temp_db_path,
+        "原文",
+        "zh",
+        "vi",
+        "model",
+        glossary_fingerprint=kiem_hiep.fingerprint,
+    ) is None
 def test_reader_dictionary_keeps_styleguide_winner_over_losing_database_variant(
     temp_db_path: Path,
     tmp_path: Path,

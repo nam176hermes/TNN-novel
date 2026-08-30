@@ -130,7 +130,7 @@ async def test_bulk_review_rejects_every_write_on_blank_stale_missing_and_locked
         )
 
     assert blank.status_code == 409 and blank.json()["detail"]["code"] == "target_required"
-    assert missing.status_code == 409 and missing.json()["detail"]["code"] == "term_not_found"
+    assert missing.status_code == 404 and missing.json()["detail"]["code"] == "not_found"
     assert locked.status_code == 409 and locked.json()["detail"]["code"] == "locked_term"
     assert stale.status_code == 409 and stale.json()["detail"]["code"] == "stale_version"
     assert unresolved.status_code == 409
@@ -478,6 +478,7 @@ async def test_import_limits_legacy_atomic_adapter_and_json_csv_round_trip_metad
 
     round_trip_db = tmp_path / "round-trip.sqlite"
     init_db(round_trip_db)
+    assert add_book(round_trip_db, "Round trip target") == book_id
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: round_trip_db)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await _auth_headers(client)
@@ -769,6 +770,7 @@ async def test_exported_json_envelope_and_csv_are_direct_preview_and_apply_input
 
     json_db = tmp_path / "json-direct.sqlite"
     init_db(json_db)
+    assert add_book(json_db, "JSON direct target") == book_id
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: json_db)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await _auth_headers(client)
@@ -783,6 +785,7 @@ async def test_exported_json_envelope_and_csv_are_direct_preview_and_apply_input
 
     csv_db = tmp_path / "csv-direct.sqlite"
     init_db(csv_db)
+    assert add_book(csv_db, "CSV direct target") == book_id
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: csv_db)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await _auth_headers(client)
@@ -886,6 +889,7 @@ async def test_endpoint_exports_round_trip_blank_targets_and_empty_scopes_withou
 
     destination = tmp_path / "blank-target-round-trip.sqlite"
     init_db(destination)
+    assert add_book(destination, "Blank target destination") == book_id
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: destination)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         headers = await _auth_headers(client)

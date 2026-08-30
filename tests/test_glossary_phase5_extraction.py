@@ -886,10 +886,26 @@ def test_reextract_reconciles_stale_evidence_and_zeroes_real_counts(
             "WHERE term_id = ? AND chapter_id = ? AND extractor = 'deterministic-v2'",
             (term["id"], chapter_id),
         ).fetchone()[0]
+        reconciliation = conn.execute(
+            "SELECT before_json, after_json FROM glossary_history "
+            "WHERE term_id = ? AND action = 'observe' ORDER BY id DESC LIMIT 1",
+            (term["id"],),
+        ).fetchone()
 
     assert result["created"] == 0
     assert tuple(term)[1:] == (0, 0)
     assert evidence_count == 0
+    before = json.loads(reconciliation["before_json"])
+    after = json.loads(reconciliation["after_json"])
+    assert before["occurrence_count"] == 2
+    assert before["chapter_count"] == 1
+    assert before["evidence_count"] == 1
+    assert after["occurrence_count"] == 0
+    assert after["chapter_count"] == 0
+    assert after["evidence_count"] == 0
+    serialized = reconciliation["before_json"] + reconciliation["after_json"]
+    assert "玄天圣典" not in serialized
+    assert "弟子静坐" not in serialized
 
 
 @pytest.mark.parametrize(

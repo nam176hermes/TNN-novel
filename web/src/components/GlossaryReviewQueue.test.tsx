@@ -101,7 +101,10 @@ describe('GlossaryStyleView review queue', () => {
     const onQueryChange = vi.fn();
     render(<GlossaryStyleView {...props({ onQueryChange })} />);
 
-    expect(screen.getByRole('tab', { name: 'Cần duyệt' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('tablist', { name: 'Trạng thái thuật ngữ' })).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Trạng thái thuật ngữ' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Cần duyệt' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Đã duyệt' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByText('1–1 / 1')).toBeVisible();
 
     fireEvent.change(screen.getByRole('searchbox', { name: 'Tìm thuật ngữ' }), { target: { value: 'linh thạch' } });

@@ -452,12 +452,100 @@ def _record_extraction(
 class GlossaryService:
     def __init__(self):
         self.db_path = get_db_path()
+        self._access_bound = False
+        self._access_user_id = ""
+        self._access_username = ""
+        self._access_admin_username = ""
 
     @classmethod
     def from_db_path(cls, db_path) -> "GlossaryService":
         service = object.__new__(cls)
         service.db_path = Path(db_path)
+        service._access_bound = False
+        service._access_user_id = ""
+        service._access_username = ""
+        service._access_admin_username = ""
         return service
+
+    def for_user(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        admin_username: str,
+    ) -> "GlossaryService":
+        """Bind API-only access context while leaving background services unbound."""
+        self._access_bound = True
+        self._access_user_id = str(user_id or "").strip()
+        self._access_username = str(username or "").strip()
+        self._access_admin_username = str(admin_username or "").strip()
+        return self
+
+    @property
+    def _is_access_admin(self) -> bool:
+        return bool(
+            self._access_bound
+            and self._access_admin_username
+            and self._access_username == self._access_admin_username
+        )
+
+    def _deny_access(self) -> None:
+        raise GlossaryAccessError()
+
+    def authorize_book(self, book_id: int) -> None:
+        if not self._access_bound:
+            return
+        if not GlossaryRepository(self.db_path).owned_book_exists(
+            int(book_id), self._access_user_id
+        ):
+            self._deny_access()
+
+    def _authorize_admin(self) -> None:
+        if self._access_bound and not self._is_access_admin:
+            self._deny_access()
+
+    def _authorize_query_scope(self, book_id: int | None, scope: str) -> None:
+        if not self._access_bound:
+            return
+        if scope in {"all", "global"} or book_id is None:
+            self._authorize_admin()
+            return
+        self.authorize_book(int(book_id))
+
+    def _authorize_term_ids(self, term_ids: list[int] | tuple[int, ...]) -> None:
+        if not self._access_bound:
+            return
+        unique_ids = tuple(dict.fromkeys(int(term_id) for term_id in term_ids))
+        resolved = GlossaryRepository(self.db_path).term_book_ids(unique_ids)
+        if len(resolved) != len(unique_ids):
+            self._deny_access()
+        for term_id in unique_ids:
+            book_id = resolved[term_id]
+            if book_id == 0:
+                self._authorize_admin()
+            else:
+                self.authorize_book(book_id)
+
+    def _authorize_import(
+        self,
+        canonical_items: list[dict],
+        scope: dict | list[dict] | None = None,
+    ) -> None:
+        if not self._access_bound:
+            return
+        scopes = scope if isinstance(scope, list) else [scope] if isinstance(scope, dict) else []
+        for item_scope in scopes:
+            scope_type = str(item_scope.get("type") or "")
+            if scope_type in {"all", "global"}:
+                self._authorize_admin()
+            elif scope_type == "book":
+                self.authorize_book(int(item_scope.get("book_id") or 0))
+        for item in canonical_items:
+            book_id = int(item.get("book_id") or 0)
+            if book_id == 0:
+                self._authorize_admin()
+            else:
+                self.authorize_book(book_id)
 
     def list_terms(
         self,
@@ -471,6 +559,7 @@ class GlossaryService:
         archived: bool = False,
     ) -> tuple[list[dict], int]:
         """Compatibility wrapper over the SQL review query."""
+        self._authorize_query_scope(book_id, "legacy")
         repository = GlossaryRepository(self.db_path)
         result = repository.query(
             book_id=book_id,
@@ -502,6 +591,7 @@ class GlossaryService:
         include_weak: bool = False,
         archived: bool = False,
     ) -> dict:
+        self._authorize_query_scope(book_id, scope)
         started = time.perf_counter()
         per_page = min(per_page, 200)
         statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
@@ -550,11 +640,25 @@ class GlossaryService:
 
     def search_terms(self, query: str, book_id: int | None = None, limit: int = 20) -> list[dict]:
         """Search glossary terms."""
-        terms, _ = self.list_terms(book_id=book_id, limit=1000, search=query)
+        self._authorize_query_scope(book_id, "legacy")
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
+            book_id=book_id,
+            q=query,
+            scope="legacy",
+            limit=1000,
+            offset=0,
+        )
+        terms = result["items"]
         return terms[:limit]
 
     def add_term(self, term_data: dict, *, actor: str = "", request_id: str = "") -> int:
         """Add a new glossary term."""
+        book_id = int(term_data.get("book_id", 0) or 0)
+        if book_id == 0:
+            self._authorize_admin()
+        else:
+            self.authorize_book(book_id)
         term_type = normalize_term_type(term_data.get("term_type") or term_data.get("category", "term"))
         return put_glossary_term(
             db_path=self.db_path,
@@ -597,6 +701,7 @@ class GlossaryService:
         request_id: str = "",
     ) -> bool:
         """Update a glossary term."""
+        self._authorize_term_ids([term_id])
         return update_glossary_term(
             db_path=self.db_path,
             term_id=term_id,
@@ -633,6 +738,7 @@ class GlossaryService:
         return GlossaryRepository(self.db_path).get_resource(term_id)
 
     def get_term_detail(self, term_id: int) -> dict | None:
+        self._authorize_term_ids([term_id])
         return GlossaryRepository(self.db_path).get_detail(term_id)
 
     def bulk_terms(
@@ -643,27 +749,33 @@ class GlossaryService:
         actor: str = "",
         request_id: str = "",
     ) -> dict:
+        self._authorize_term_ids([int(term["id"]) for term in terms])
         return GlossaryRepository(self.db_path).bulk(
             action, terms, actor=actor, request_id=request_id
         )
 
     def delete_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Archive a glossary term while preserving the existing API contract."""
+        self._authorize_term_ids([term_id])
         return GlossaryRepository(self.db_path).archive(term_id, actor=actor, request_id=request_id)
 
     def restore_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
+        self._authorize_term_ids([term_id])
         return GlossaryRepository(self.db_path).restore(term_id, actor=actor, request_id=request_id)
 
     def approve_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Approve a pending glossary term."""
+        self._authorize_term_ids([term_id])
         return approve_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
     def reject_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Reject/delete a pending glossary term."""
+        self._authorize_term_ids([term_id])
         return reject_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
     def set_term_mode(self, term_id: int, mode: str) -> bool:
         """Set the mode of a glossary term."""
+        self._authorize_term_ids([term_id])
         return set_glossary_term_mode(self.db_path, term_id, mode)
 
     def set_term_locked(
@@ -675,6 +787,7 @@ class GlossaryService:
         request_id: str = "",
     ) -> bool:
         """Lock or unlock a glossary term."""
+        self._authorize_term_ids([term_id])
         return set_glossary_term_locked(
             self.db_path,
             term_id,
@@ -776,6 +889,7 @@ class GlossaryService:
     def query_conflicts(
         self, book_id: int | None = None, page: int = 1, per_page: int = 50
     ) -> dict:
+        self._authorize_query_scope(book_id, "legacy")
         return GlossaryRepository(self.db_path).query_conflicts(
             book_id=book_id, page=page, per_page=per_page
         )
@@ -787,6 +901,7 @@ class GlossaryService:
         per_page: int = 50,
         member_limit: int = 20,
     ) -> list[dict]:
+        self._authorize_query_scope(book_id, "legacy")
         return GlossaryRepository(self.db_path).query_legacy_conflicts(
             book_id=book_id,
             limit=per_page,
@@ -795,6 +910,7 @@ class GlossaryService:
         )
 
     def preview_merge(self, canonical_id: int, duplicate_ids: list[int]) -> dict:
+        self._authorize_term_ids([canonical_id, *duplicate_ids])
         return GlossaryRepository(self.db_path).preview_merge(canonical_id, duplicate_ids)
 
     def apply_merge(
@@ -806,6 +922,7 @@ class GlossaryService:
         actor: str = "",
         request_id: str = "",
     ) -> dict:
+        self._authorize_term_ids([canonical_id, *duplicate_ids])
         return GlossaryRepository(self.db_path).apply_merge(
             canonical_id,
             duplicate_ids,
@@ -815,6 +932,7 @@ class GlossaryService:
         )
 
     def get_extraction_settings(self, book_id: int) -> dict:
+        self.authorize_book(book_id)
         if get_book_by_id(self.db_path, book_id) is None:
             raise ValueError("book_not_found")
         with get_connection(self.db_path) as conn:
@@ -830,6 +948,7 @@ class GlossaryService:
         }
 
     def update_extraction_settings(self, book_id: int, *, mode: str, provider_id: str = "") -> dict:
+        self.authorize_book(book_id)
         if get_book_by_id(self.db_path, book_id) is None:
             raise ValueError("book_not_found")
         if mode not in {"deterministic", "hybrid"}:
@@ -1020,6 +1139,7 @@ class GlossaryService:
 
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
+        self.authorize_book(book_id)
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or int(chapter.get("book_id") or 0) != int(book_id):
             raise ValueError("Chapter not found")
@@ -1138,6 +1258,7 @@ class GlossaryService:
             preview = repository.preview_import(
                 data, "reject_conflicts", legacy_partial=True
             )
+            self._authorize_import(preview["canonical_items"])
             return repository.apply_import(
                 data,
                 preview["digest"],
@@ -1161,8 +1282,11 @@ class GlossaryService:
         self,
         data: list[dict],
         conflict_policy: str = "skip_conflicts",
+        *,
+        scope: dict | list[dict] | None = None,
     ) -> dict:
         preview = GlossaryRepository(self.db_path).preview_import(data, conflict_policy)
+        self._authorize_import(preview["canonical_items"], scope)
         return {key: value for key, value in preview.items() if key != "canonical_items"}
 
     def apply_import(
@@ -1171,9 +1295,12 @@ class GlossaryService:
         digest: str,
         conflict_policy: str = "skip_conflicts",
         *,
+        scope: dict | list[dict] | None = None,
         actor: str = "",
         request_id: str = "",
     ) -> dict:
+        preview = GlossaryRepository(self.db_path).preview_import(data, conflict_policy)
+        self._authorize_import(preview["canonical_items"], scope)
         return GlossaryRepository(self.db_path).apply_import(
             data,
             digest,
@@ -1187,4 +1314,9 @@ class GlossaryService:
         book_id: int | None = None,
         scope: str = "all",
     ) -> list[dict]:
+        self._authorize_query_scope(book_id, scope)
         return GlossaryRepository(self.db_path).export_terms(book_id, scope)
+
+
+class GlossaryAccessError(LookupError):
+    """Hide both nonexistent and unauthorized glossary resources."""

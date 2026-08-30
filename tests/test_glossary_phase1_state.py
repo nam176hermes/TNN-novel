@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.database.db import (
+    add_book,
     approve_glossary_term,
     auto_approve_glossary,
     delete_glossary_term,
@@ -498,23 +499,43 @@ def test_history_failure_rolls_back_term_mutation(temp_db_path: Path) -> None:
     assert after == before
 
 
-def test_history_snapshots_exclude_unbounded_content_fields(temp_db_path: Path) -> None:
+def test_history_snapshots_capture_bounded_metadata_and_private_content_digests(
+    temp_db_path: Path,
+) -> None:
     init_db(temp_db_path)
     secret = "private-context-" + "x" * 5000
+    book_id = add_book(temp_db_path, "Private audit", owner_user_id="audit-owner")
     term_id = put_glossary_term(
         temp_db_path,
-        12,
+        book_id,
         "隐私",
         "riêng tư",
+        category="concept",
+        confidence=0.75,
+        mode="context",
         notes_vi=secret,
+        variants=secret + "-variants",
         alternatives=secret,
         source_context=secret,
+        priority=7,
+        term_type="concept",
+        genre="tien_hiep",
+        gender="neutral",
     )
-    update_glossary_term(temp_db_path, term_id, notes_vi=secret + "-updated")
+    update_glossary_term(
+        temp_db_path,
+        term_id,
+        category="title",
+        mode="translate",
+        priority=11,
+        term_type="title",
+        gender="unknown",
+    )
 
     with get_connection(temp_db_path) as conn:
         rows = conn.execute(
-            "SELECT before_json, after_json FROM glossary_history WHERE term_id = ? ORDER BY id",
+            "SELECT source_term, target_term, before_json, after_json "
+            "FROM glossary_history WHERE term_id = ? ORDER BY id",
             (term_id,),
         ).fetchall()
 
@@ -522,9 +543,57 @@ def test_history_snapshots_exclude_unbounded_content_fields(temp_db_path: Path) 
     for row in rows:
         assert secret not in row["before_json"]
         assert secret not in row["after_json"]
-        assert len(row["before_json"]) < 1024
-        assert len(row["after_json"]) < 1024
-        assert "source_context" not in json.loads(row["after_json"])
+        assert len(row["before_json"]) < 4096
+        assert len(row["after_json"]) < 4096
+        assert row["source_term"] == "隐私"
+        assert row["target_term"] == "riêng tư"
+
+    before = json.loads(rows[-1]["before_json"])
+    after = json.loads(rows[-1]["after_json"])
+    assert before["category"] == "concept"
+    assert after["category"] == "title"
+    assert before["confidence"] == 0.75
+    assert after["confidence"] == 0.75
+    assert before["mode"] == "context"
+    assert after["mode"] == "translate"
+    assert before["priority"] == 7
+    assert after["priority"] == 11
+    assert before["term_type"] == "concept"
+    assert after["term_type"] == "title"
+    assert before["gender"] == "neutral"
+    assert after["gender"] == "unknown"
+    assert after["scope"] == "book"
+    assert after["owner_user_id"] == "audit-owner"
+    assert after["book_id"] == book_id
+    assert after["evidence_count"] == 0
+    assert after["status"] == "APPROVED"
+    assert after["archived"] is False
+    assert after["approved"] == 1
+    assert after["locked"] == 0
+    assert after["version"] == before["version"] + 1
+    assert after["created_at"]
+    assert after["updated_at"]
+    assert after["last_seen"]
+
+    for field in (
+        "source_term",
+        "target_term",
+        "variants",
+        "notes_vi",
+        "source_context",
+        "alternatives",
+    ):
+        descriptor = after["content"][field]
+        assert descriptor["present"] is True
+        assert descriptor["length"] > 0
+        assert len(descriptor["sha256"]) == 64
+        assert descriptor["sha256"] not in {
+            "隐私",
+            "riêng tư",
+            secret,
+            secret + "-variants",
+        }
+        assert after["content"][field] == before["content"][field]
 
 
 def test_archive_hides_old_readers_restore_api_recovers_and_locked_tuple_stays_compatible(
@@ -532,9 +601,12 @@ def test_archive_hides_old_readers_restore_api_recovers_and_locked_tuple_stays_c
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
-    term_id = put_glossary_term(temp_db_path, 13, "灵根", "linh căn", approved=1, locked=1)
-    assert load_glossary(temp_db_path, 13)["灵根"] == "linh căn"
-    locked = next(row for row in load_locked_glossary_terms(temp_db_path, 13) if row["id"] == term_id)
+    book_id = add_book(temp_db_path, "Archive API")
+    term_id = put_glossary_term(temp_db_path, book_id, "灵根", "linh căn", approved=1, locked=1)
+    assert load_glossary(temp_db_path, book_id)["灵根"] == "linh căn"
+    locked = next(
+        row for row in load_locked_glossary_terms(temp_db_path, book_id) if row["id"] == term_id
+    )
     assert (locked["review_status"], locked["approved"], locked["locked"]) == ("LOCKED", 1, 1)
 
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: temp_db_path)
@@ -574,7 +646,7 @@ def test_archive_hides_old_readers_restore_api_recovers_and_locked_tuple_stays_c
     assert tuple(row) == ("", "LOCKED", 1, 1)
     assert [entry["request_id"] for entry in history] == ["req-archive-restore", "req-archive-restore"]
     assert all(entry["actor"] == mobile_settings.admin_username for entry in history)
-    assert list_glossary(temp_db_path, 13)
+    assert list_glossary(temp_db_path, book_id)
 
 
 def test_api_update_history_carries_actor_and_request_id(
@@ -582,7 +654,8 @@ def test_api_update_history_carries_actor_and_request_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     init_db(temp_db_path)
-    term_id = put_glossary_term(temp_db_path, 14, "元婴", "Nguyên Anh", approved=0)
+    book_id = add_book(temp_db_path, "Update history API")
+    term_id = put_glossary_term(temp_db_path, book_id, "元婴", "Nguyên Anh", approved=0)
     monkeypatch.setattr("app.mobile_api.services.glossary_service.get_db_path", lambda: temp_db_path)
 
     async def exercise_api() -> httpx.Response:

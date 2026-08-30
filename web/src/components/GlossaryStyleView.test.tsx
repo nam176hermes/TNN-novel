@@ -14,6 +14,12 @@ const alternateProfile: StyleProfile = {
   label: 'Kiếm hiệp',
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => { resolve = next; });
+  return { promise, resolve };
+}
+
 function props(overrides: Record<string, unknown> = {}) {
   return {
     glossaryTerms: [fixtureGlossaryTerm],
@@ -146,6 +152,12 @@ describe('GlossaryStyleView', () => {
       })]);
     expect(parseGlossaryImportText([header.join(','), emptyMetadataRow.join(',')].join('\n')))
       .toEqual([]);
+
+    const blankBookScopeRow = ['1', 'book', '', ...Array(header.length - 3).fill('')];
+    expect(() => parseGlossaryImportText([
+      header.join(','),
+      blankBookScopeRow.join(','),
+    ].join('\n'))).toThrow('Mã sách trong phạm vi nhập không hợp lệ');
   });
 
   it('selects versioned rows for bulk review and exposes create archive and restore actions', async () => {
@@ -244,6 +256,81 @@ describe('GlossaryStyleView', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Xuất CSV' }));
     expect(onExport).toHaveBeenNthCalledWith(1, 'json');
     expect(onExport).toHaveBeenNthCalledWith(2, 'csv');
+  });
+
+  it('does not restore a deferred merge preview after selection or book context changes', async () => {
+    const pendingPreview = deferred<{
+      canonical_id: number; duplicate_ids: number[]; digest: string; evidence_count: number;
+    }>();
+    const memberA = { ...fixtureGlossaryTerm, id: 7, source_term: 'Ａ B', version: 3 };
+    const memberB = { ...fixtureGlossaryTerm, id: 8, source_term: 'a b', version: 4 };
+    const onLoadConflicts = vi.fn().mockResolvedValue({
+      items: [{ id: 'group', members: [memberA, memberB], types: ['normalized_duplicate'] }],
+      page: 1, pages: 1, per_page: 50, total: 1,
+    });
+    const onPreviewMerge = vi.fn().mockReturnValue(pendingPreview.promise);
+    const onApplyMerge = vi.fn().mockResolvedValue(undefined);
+    const shared = { onApplyMerge, onLoadConflicts, onPreviewMerge };
+    const { rerender } = render(<GlossaryStyleView {...props({ ...shared, bookId: 1 })} />);
+
+    await userEvent.click(screen.getByText('Xung đột & hợp nhất'));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải xung đột' }));
+    await userEvent.click(await screen.findByRole('radio', { name: 'Chọn canonical Ａ B' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước hợp nhất' }));
+    await userEvent.click(screen.getByRole('radio', { name: 'Chọn canonical a b' }));
+    rerender(<GlossaryStyleView {...props({ ...shared, bookId: 2 })} />);
+
+    await act(async () => pendingPreview.resolve({
+      canonical_id: 7,
+      duplicate_ids: [8],
+      digest: 's'.repeat(64),
+      evidence_count: 1,
+    }));
+
+    expect(screen.queryByRole('button', { name: 'Áp dụng hợp nhất' })).not.toBeInTheDocument();
+    expect(onApplyMerge).not.toHaveBeenCalled();
+  });
+
+  it('does not restore or apply an import preview after text book or revision changes', async () => {
+    const pendingPreview = deferred<{
+      actions: { item: number; action: 'add' }[];
+      affected: never[];
+      conflict_policy: 'skip_conflicts';
+      digest: string;
+      schema_version: number;
+      summary: { added: number; updated: number; skipped: number };
+    }>();
+    const onPreviewImport = vi.fn().mockReturnValue(pendingPreview.promise);
+    const onApplyImport = vi.fn().mockResolvedValue(undefined);
+    const shared = { onApplyImport, onExport: vi.fn(), onPreviewImport };
+    const { rerender } = render(<GlossaryStyleView {...props({ ...shared, bookId: 1 })} />);
+
+    await userEvent.click(screen.getByText('Nhập & xuất'));
+    const input = screen.getByLabelText('Dữ liệu nhập JSON hoặc CSV');
+    fireEvent.change(input, {
+      target: { value: JSON.stringify([{ source_term: '旧词', target_term: 'Cũ' }]) },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    fireEvent.change(input, {
+      target: { value: JSON.stringify([{ source_term: '新词', target_term: 'Mới' }]) },
+    });
+    rerender(<GlossaryStyleView {...props({
+      ...shared,
+      bookId: 2,
+      glossaryTerms: [{ ...fixtureGlossaryTerm, version: (fixtureGlossaryTerm.version ?? 0) + 1 }],
+    })} />);
+
+    await act(async () => pendingPreview.resolve({
+      actions: [{ item: 1, action: 'add' }],
+      affected: [],
+      conflict_policy: 'skip_conflicts',
+      digest: 'i'.repeat(64),
+      schema_version: 1,
+      summary: { added: 1, updated: 0, skipped: 0 },
+    }));
+
+    expect(screen.queryByRole('button', { name: 'Áp dụng nhập' })).not.toBeInTheDocument();
+    expect(onApplyImport).not.toHaveBeenCalled();
   });
 
   it('labels a partial conflict batch and reloads the remainder for repeated merge resolution', async () => {

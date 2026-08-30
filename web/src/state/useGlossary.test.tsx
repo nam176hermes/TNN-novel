@@ -234,6 +234,78 @@ describe('useGlossary', () => {
     expect(client.getGlossaryTerms).toHaveBeenCalledTimes(2);
   });
 
+  it('does not let a deferred mutation abort or repaint a newer query', async () => {
+    const mutation = deferred<void>();
+    const newestQuery = deferred<{
+      facets: { locked: {}; mode: {}; review_status: {}; scope: {}; term_type: {} };
+      items: typeof fixtureGlossaryTerm[];
+      page: number;
+      pages: number;
+      per_page: number;
+      scope: 'global';
+      total: number;
+    }>();
+    const initialPage = {
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [fixtureGlossaryTerm],
+      page: 1,
+      pages: 2,
+      per_page: 50,
+      scope: 'book' as const,
+      total: 51,
+    };
+    const staleMutationRefresh = {
+      ...initialPage,
+      items: [{ ...fixtureGlossaryTerm, source_term: '旧查询重绘' }],
+    };
+    const queryGlossaryTerms = vi
+      .fn()
+      .mockResolvedValueOnce(initialPage)
+      .mockReturnValueOnce(newestQuery.promise)
+      .mockResolvedValue(staleMutationRefresh);
+    const client = {
+      bulkGlossaryTerms: vi.fn().mockReturnValue(mutation.promise),
+      queryGlossaryTerms,
+      searchTm: vi.fn(),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useGlossary(client, true, 42, '', undefined, true));
+    await waitFor(() => expect(result.current.terms.state).toBe('ready'));
+
+    let mutationPromise!: Promise<void>;
+    act(() => {
+      mutationPromise = result.current.bulkTerms('approve', [{ id: 7, expected_version: 1 }]);
+    });
+    act(() => {
+      result.current.setQuery({ q: 'new filter', scope: 'global', page: 2 });
+    });
+    await waitFor(() => expect(queryGlossaryTerms).toHaveBeenCalledTimes(2));
+    const newestSignal = queryGlossaryTerms.mock.calls[1][1].signal as AbortSignal;
+
+    mutation.resolve();
+    await act(async () => {
+      await mutationPromise;
+    });
+
+    expect(newestSignal.aborted).toBe(false);
+    expect(queryGlossaryTerms).toHaveBeenCalledTimes(2);
+    newestQuery.resolve({
+      facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },
+      items: [{ ...fixtureGlossaryTerm, id: 88, source_term: '新查询结果' }],
+      page: 2,
+      pages: 2,
+      per_page: 50,
+      scope: 'global',
+      total: 51,
+    });
+    await waitFor(() => expect(result.current.terms.data[0]?.source_term).toBe('新查询结果'));
+    expect(queryGlossaryTerms.mock.calls[1][0]).toMatchObject({
+      book_id: 42,
+      page: 2,
+      q: 'new filter',
+      scope: 'global',
+    });
+  });
+
   it('resets the review queue to page one before loading a different book', async () => {
     const queryGlossaryTerms = vi.fn(async (requestedQuery) => ({
       facets: { locked: {}, mode: {}, review_status: {}, scope: {}, term_type: {} },

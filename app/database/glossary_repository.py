@@ -586,6 +586,30 @@ class GlossaryRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
 
+    def owned_book_exists(self, book_id: int, owner_user_id: str) -> bool:
+        """Return only the ownership predicate needed by API authorization."""
+        if int(book_id) <= 0 or not str(owner_user_id or "").strip():
+            return False
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM books WHERE id = ? AND owner_user_id = ? LIMIT 1",
+                (int(book_id), str(owner_user_id).strip()),
+            ).fetchone()
+        return row is not None
+
+    def term_book_ids(self, term_ids: list[int] | tuple[int, ...]) -> dict[int, int]:
+        """Resolve all term participants without filtering archived records."""
+        resolved_ids = tuple(dict.fromkeys(int(term_id) for term_id in term_ids))
+        if not resolved_ids:
+            return {}
+        placeholders = ",".join("?" for _ in resolved_ids)
+        with get_connection(self.db_path) as conn:
+            rows = conn.execute(
+                f"SELECT id, book_id FROM glossary_terms WHERE id IN ({placeholders})",
+                resolved_ids,
+            ).fetchall()
+        return {int(row["id"]): int(row["book_id"] or 0) for row in rows}
+
     @staticmethod
     def _actor(actor: str) -> str:
         return actor or os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
@@ -887,18 +911,81 @@ class GlossaryRepository:
         request_id: str,
     ) -> dict[str, Any] | None:
         ensure_history_table(conn)
+
         def bounded_snapshot(row: dict[str, Any]) -> dict[str, Any]:
             if not row:
                 return {}
+            book_id = int(row.get("book_id") or 0)
+            owner = (
+                conn.execute(
+                    "SELECT owner_user_id FROM books WHERE id = ?",
+                    (book_id,),
+                ).fetchone()
+                if book_id > 0
+                else None
+            )
+            evidence_count = row.get("_evidence_count")
+            if evidence_count is None:
+                evidence_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                        (int(row["id"]),),
+                    ).fetchone()[0]
+                )
+
+            content: dict[str, dict[str, Any]] = {}
+            for field in (
+                "source_term",
+                "target_term",
+                "variants",
+                "notes_vi",
+                "source_context",
+                "alternatives",
+            ):
+                value = str(row.get(field) or "")
+                digest = hashlib.sha256(
+                    b"novel-tnn:glossary-history:v1\0"
+                    + field.encode("utf-8")
+                    + b"\0"
+                    + value.encode("utf-8")
+                ).hexdigest()
+                content[field] = {
+                    "present": bool(value),
+                    "length": len(value),
+                    "sha256": digest,
+                }
+
+            review_status = str(row.get("review_status") or "CONFLICT")
             return {
                 "id": row["id"],
-                "book_id": row["book_id"],
-                "review_status": row["review_status"],
-                "approved": row["approved"],
-                "locked": row["locked"],
-                "version": row["version"],
-                "archived": bool(row["archived_at"]),
-                "target_present": not _target_is_blank(row["target_term"]),
+                "book_id": book_id,
+                "scope": "global" if book_id == 0 else "book",
+                "owner_user_id": str(owner["owner_user_id"] or "") if owner else "",
+                "type": str(row.get("term_type") or "term"),
+                "category": str(row.get("category") or ""),
+                "term_type": str(row.get("term_type") or ""),
+                "genre": str(row.get("genre") or ""),
+                "gender": str(row.get("gender") or ""),
+                "mode": str(row.get("mode") or ""),
+                "priority": int(row.get("priority") or 0),
+                "confidence": float(row.get("confidence") or 0),
+                "occurrence_count": int(row.get("occurrence_count") or 0),
+                "chapter_count": int(row.get("chapter_count") or 0),
+                "first_seen_chapter_id": int(row.get("first_seen_chapter_id") or 0),
+                "first_seen_chapter_number": int(row.get("first_seen_chapter_number") or 0),
+                "evidence_count": int(evidence_count),
+                "created_at": str(row.get("created_at") or ""),
+                "updated_at": str(row.get("updated_at") or ""),
+                "last_seen": str(row.get("last_seen") or ""),
+                "archived_at": str(row.get("archived_at") or ""),
+                "review_status": review_status,
+                "status": "ARCHIVED" if row.get("archived_at") else review_status,
+                "approved": int(row.get("approved") or 0),
+                "locked": int(row.get("locked") or 0),
+                "version": int(row.get("version") or 0),
+                "archived": bool(row.get("archived_at")),
+                "target_present": not _target_is_blank(row.get("target_term")),
+                "content": content,
             }
 
         conn.execute(
@@ -1231,6 +1318,13 @@ class GlossaryRepository:
                     term_id = int(current["id"])
                 observed_term_ids.add(term_id)
 
+                evidence_count_before = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                        (term_id,),
+                    ).fetchone()[0]
+                )
+
                 evidence_row = conn.execute(
                     "SELECT id, evidence_json FROM glossary_term_evidence "
                     "WHERE term_id = ? AND chapter_id = ? AND extractor = ?",
@@ -1271,6 +1365,7 @@ class GlossaryRepository:
                 occurrence_count, chapter_count = self._phase5_counts(conn, term_id)
 
                 before = dict(current)
+                before["_evidence_count"] = evidence_count_before
                 status = str(current["review_status"])
                 retain_blank_proposal = (
                     extractor == "hybrid-v1"
@@ -1354,6 +1449,15 @@ class GlossaryRepository:
 
             stale_term_ids = prior_term_ids - observed_term_ids
             if stale_term_ids:
+                evidence_counts_before = {
+                    term_id: int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                            (term_id,),
+                        ).fetchone()[0]
+                    )
+                    for term_id in stale_term_ids
+                }
                 placeholders = ",".join("?" for _ in stale_term_ids)
                 conn.execute(
                     f"""
@@ -1373,6 +1477,7 @@ class GlossaryRepository:
                     ):
                         continue
                     before = dict(current)
+                    before["_evidence_count"] = evidence_counts_before[term_id]
                     conn.execute(
                         """
                         UPDATE glossary_terms
@@ -2064,6 +2169,16 @@ class GlossaryRepository:
             placeholders = ",".join("?" for _ in duplicate_ids)
             all_ids = [canonical_id, *duplicate_ids]
             all_placeholders = ",".join("?" for _ in all_ids)
+            evidence_counts_before = {
+                term_id: int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                        (term_id,),
+                    ).fetchone()[0]
+                )
+                for term_id in all_ids
+            }
+            canonical_before["_evidence_count"] = evidence_counts_before[canonical_id]
             phase5_rows = conn.execute(
                 f"""
                 SELECT * FROM glossary_term_evidence
@@ -2124,20 +2239,10 @@ class GlossaryRepository:
                 """,
                 (occurrence_count, chapter_count, canonical_id),
             )
-            canonical_after = dict(self._row(conn, canonical_id))
-            transitions.append(
-                self._log(
-                    conn,
-                    "merge",
-                    canonical_before,
-                    canonical_after,
-                    self._actor(actor),
-                    request_id,
-                )
-            )
             archived_at = datetime.now(timezone.utc).isoformat()
             for duplicate_id in duplicate_ids:
                 before = dict(self._row(conn, duplicate_id))
+                before["_evidence_count"] = evidence_counts_before[duplicate_id]
                 conn.execute(
                     """
                     UPDATE glossary_terms
@@ -2177,6 +2282,16 @@ class GlossaryRepository:
                         ),
                     ),
                 )
+            transitions.append(
+                self._log(
+                    conn,
+                    "merge",
+                    canonical_before,
+                    dict(self._row(conn, canonical_id)),
+                    self._actor(actor),
+                    request_id,
+                )
+            )
             self._commit_and_emit_transitions(conn, transitions)
         return {**preview, "merged": len(duplicate_ids)}
 

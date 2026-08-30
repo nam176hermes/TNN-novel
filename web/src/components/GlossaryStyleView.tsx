@@ -175,6 +175,10 @@ function validateImportScope(scope: unknown, items: GlossaryImportItem[]): void 
   }
 }
 
+function importPreviewBinding(context: string, items: GlossaryImportItem[]): string {
+  return JSON.stringify({ context, items });
+}
+
 export function parseGlossaryImportText(text: string): GlossaryImportItem[] {
   const trimmed = text.trim();
   if (!trimmed) throw new Error('Dữ liệu nhập đang trống.');
@@ -205,7 +209,11 @@ export function parseGlossaryImportText(text: string): GlossaryImportItem[] {
     const record = Object.fromEntries(headers.map((header, column) => [header, values[column]]));
     if (record.schema_version !== '1') throw new Error(`Dòng CSV ${index + 1} có schema không hỗ trợ.`);
     if (!['all', 'book', 'global'].includes(record.scope)) throw new Error(`Dòng CSV ${index + 1} có scope không hợp lệ.`);
-    const scopeBookId = Number(record.scope_book_id ?? (record.scope === 'book' ? Number.NaN : 0));
+    const rawScopeBookId = record.scope_book_id;
+    if (record.scope === 'book' && (rawScopeBookId === undefined || rawScopeBookId.trim() === '')) {
+      throw new Error('Mã sách trong phạm vi nhập không hợp lệ.');
+    }
+    const scopeBookId = Number(rawScopeBookId ?? 0);
     if (
       canonicalCsvItemFields.every((fieldName) => headers.includes(fieldName))
       && canonicalCsvItemFields.every((fieldName) => record[fieldName] === '')
@@ -423,8 +431,17 @@ export default function GlossaryStyleView({
   const extractionRequestIdRef = useRef(0);
   const extractionBookIdRef = useRef(bookId);
   const extractionLoaderRef = useRef(onLoadExtractionSettings);
+  const bookContextRef = useRef(bookId);
+  const conflictRequestIdRef = useRef(0);
+  const mergePreviewRequestIdRef = useRef(0);
+  const mergeContextRef = useRef('');
+  const acceptedMergeBindingRef = useRef<string | null>(null);
+  const importPreviewRequestIdRef = useRef(0);
+  const importContextRef = useRef('');
+  const acceptedImportBindingRef = useRef<string | null>(null);
   extractionBookIdRef.current = bookId;
   extractionLoaderRef.current = onLoadExtractionSettings;
+  bookContextRef.current = bookId;
 
   const loadExtractionSettings = useCallback(async (targetBookId: number) => {
     const loader = extractionLoaderRef.current;
@@ -598,41 +615,156 @@ export default function GlossaryStyleView({
   const duplicateIds = activeConflict && canonicalId !== null
     ? activeConflict.members.filter((term) => term.id !== canonicalId).map((term) => term.id)
     : [];
+  const glossaryRevision = JSON.stringify(
+    glossaryTerms
+      .map((term) => [
+        term.id,
+        term.book_id,
+        term.version ?? 0,
+        term.review_status ?? '',
+        Boolean(term.archived),
+      ])
+      .sort((left, right) => Number(left[0]) - Number(right[0])),
+  );
+  const mergeContext = JSON.stringify({
+    bookId: bookId ?? null,
+    canonicalId,
+    conflictId: activeConflictId,
+    duplicateIds: [...duplicateIds].sort((left, right) => left - right),
+    participants: (activeConflict?.members ?? [])
+      .map((term) => [term.id, term.book_id, term.version ?? 0])
+      .sort((left, right) => Number(left[0]) - Number(right[0])),
+    glossaryRevision,
+  });
+  const importContext = JSON.stringify({
+    bookId: bookId ?? null,
+    glossaryRevision,
+    policy: importPolicy,
+    text: importText,
+  });
+  mergeContextRef.current = mergeContext;
+  importContextRef.current = importContext;
+
+  useEffect(() => {
+    conflictRequestIdRef.current += 1;
+    setConflicts(null);
+    setActiveConflictId(null);
+    setCanonicalId(null);
+  }, [bookId]);
+  useEffect(() => {
+    mergePreviewRequestIdRef.current += 1;
+    importPreviewRequestIdRef.current += 1;
+    acceptedMergeBindingRef.current = null;
+    acceptedImportBindingRef.current = null;
+    setMergePreview(null);
+    setImportPreview(null);
+  }, [bookId, glossaryRevision]);
+
+  const invalidateMergePreview = () => {
+    mergePreviewRequestIdRef.current += 1;
+    acceptedMergeBindingRef.current = null;
+    setMergePreview(null);
+  };
+  const invalidateImportPreview = () => {
+    importPreviewRequestIdRef.current += 1;
+    acceptedImportBindingRef.current = null;
+    setImportPreview(null);
+  };
   const loadConflicts = async (conflictPage = 1) => {
     if (!onLoadConflicts) return;
-    setOperationError(''); setMergePreview(null); setActiveConflictId(null); setCanonicalId(null);
-    try { setConflicts(await onLoadConflicts(conflictPage)); } catch (reason) { setOperationError(String(reason)); }
+    const targetBookId = bookId;
+    const requestId = ++conflictRequestIdRef.current;
+    setOperationError(''); invalidateMergePreview(); setActiveConflictId(null); setCanonicalId(null);
+    try {
+      const nextConflicts = await onLoadConflicts(conflictPage);
+      if (
+        requestId !== conflictRequestIdRef.current
+        || bookContextRef.current !== targetBookId
+      ) return;
+      setConflicts(nextConflicts);
+    } catch (reason) {
+      if (requestId === conflictRequestIdRef.current && bookContextRef.current === targetBookId) {
+        setOperationError(String(reason));
+      }
+    }
   };
   const previewMerge = async () => {
     if (!onPreviewMerge || canonicalId === null || duplicateIds.length === 0) return;
+    const binding = mergeContextRef.current;
+    const requestId = ++mergePreviewRequestIdRef.current;
+    acceptedMergeBindingRef.current = null;
+    setMergePreview(null);
     setOperationError('');
-    try { setMergePreview(await onPreviewMerge(canonicalId, duplicateIds)); } catch (reason) { setOperationError(String(reason)); }
+    try {
+      const nextPreview = await onPreviewMerge(canonicalId, duplicateIds);
+      if (
+        requestId !== mergePreviewRequestIdRef.current
+        || mergeContextRef.current !== binding
+      ) return;
+      acceptedMergeBindingRef.current = binding;
+      setMergePreview(nextPreview);
+    } catch (reason) {
+      if (requestId === mergePreviewRequestIdRef.current && mergeContextRef.current === binding) {
+        setOperationError(String(reason));
+      }
+    }
   };
   const applyMerge = async () => {
     if (!onApplyMerge || !mergePreview) return;
+    if (acceptedMergeBindingRef.current !== mergeContextRef.current) {
+      invalidateMergePreview();
+      setOperationError('Bản xem trước hợp nhất đã hết hạn. Hãy xem trước lại.');
+      return;
+    }
+    const acceptedPreview = mergePreview;
     setOperationError('');
     try {
-      await onApplyMerge(mergePreview.canonical_id, mergePreview.duplicate_ids, mergePreview.digest);
-      setMergePreview(null); await loadConflicts();
+      await onApplyMerge(
+        acceptedPreview.canonical_id,
+        acceptedPreview.duplicate_ids,
+        acceptedPreview.digest,
+      );
+      invalidateMergePreview(); await loadConflicts();
     } catch (reason) {
       setOperationError(operationErrorMessage(reason));
     }
   };
   const previewImport = async () => {
     if (!onPreviewImport) return;
+    const context = importContextRef.current;
+    const requestId = ++importPreviewRequestIdRef.current;
+    acceptedImportBindingRef.current = null;
     setOperationError(''); setImportPreview(null);
     try {
       const items = parseGlossaryImportText(importText);
+      const binding = importPreviewBinding(context, items);
       setImportItems(items);
-      setImportPreview(await onPreviewImport(items, importPolicy));
-    } catch (reason) { setOperationError(reason instanceof Error ? reason.message : 'Dữ liệu nhập không hợp lệ.'); }
+      const nextPreview = await onPreviewImport(items, importPolicy);
+      if (
+        requestId !== importPreviewRequestIdRef.current
+        || importContextRef.current !== context
+      ) return;
+      acceptedImportBindingRef.current = binding;
+      setImportPreview(nextPreview);
+    } catch (reason) {
+      if (requestId === importPreviewRequestIdRef.current && importContextRef.current === context) {
+        setOperationError(reason instanceof Error ? reason.message : 'Dữ liệu nhập không hợp lệ.');
+      }
+    }
   };
   const applyImport = async () => {
     if (!onApplyImport || !importPreview) return;
+    const currentBinding = importPreviewBinding(importContextRef.current, importItems);
+    if (acceptedImportBindingRef.current !== currentBinding) {
+      invalidateImportPreview();
+      setOperationError('Bản xem trước nhập đã hết hạn. Hãy xem trước lại.');
+      return;
+    }
+    const acceptedPreview = importPreview;
     setOperationError('');
     try {
-      await onApplyImport(importItems, importPreview.digest, importPolicy);
-      setImportPreview(null);
+      await onApplyImport(importItems, acceptedPreview.digest, importPolicy);
+      invalidateImportPreview();
     } catch (reason) {
       setOperationError(operationErrorMessage(reason));
     }
@@ -640,6 +772,15 @@ export default function GlossaryStyleView({
   const configuredProviders = providers.filter((provider) => (
     provider.enabled === 1 && (!provider.api_key_env || provider.api_key_set)
   ));
+  const currentMergePreview = (
+    mergePreview && acceptedMergeBindingRef.current === mergeContext ? mergePreview : null
+  );
+  const currentImportPreview = (
+    importPreview
+    && acceptedImportBindingRef.current === importPreviewBinding(importContext, importItems)
+      ? importPreview
+      : null
+  );
   const saveExtractionSettings = async () => {
     if (!bookId || !onSaveExtractionSettings || !extractionLoaded) return;
     const targetBookId = bookId;
@@ -688,8 +829,8 @@ export default function GlossaryStyleView({
           <label className="glossary-search"><Search aria-hidden="true" size={14} /><span className="sr-only">Tìm thuật ngữ</span><input aria-label="Tìm thuật ngữ" onChange={(event) => setSearch(event.target.value)} placeholder="Tìm thuật ngữ..." type="search" value={search} /></label>
         </div>
 
-        <div aria-label="Trạng thái thuật ngữ" className="glossary-review-tabs" role="tablist">
-          {tabs.map((tab) => <button aria-selected={Boolean(query.archived) === tab.archived && query.review_status === tab.status} key={tab.label} onClick={() => onQueryChange?.({ archived: tab.archived, page: 1, review_status: tab.status, scope: tab.archived && query.scope === 'effective' ? 'book' : query.scope })} role="tab" type="button">{tab.label}</button>)}
+        <div aria-label="Trạng thái thuật ngữ" className="glossary-review-tabs" role="group">
+          {tabs.map((tab) => <button aria-pressed={Boolean(query.archived) === tab.archived && query.review_status === tab.status} key={tab.label} onClick={() => onQueryChange?.({ archived: tab.archived, page: 1, review_status: tab.status, scope: tab.archived && query.scope === 'effective' ? 'book' : query.scope })} type="button">{tab.label}</button>)}
         </div>
 
         <div className="glossary-review-filters">
@@ -746,16 +887,16 @@ export default function GlossaryStyleView({
               ) : null}
               {conflict.members.map((term) => (
                 <label key={term.id}>
-                  <input aria-label={`Chọn canonical ${term.source_term}`} checked={activeConflictId === conflict.id && canonicalId === term.id} name="glossary-canonical" onChange={() => { setActiveConflictId(conflict.id); setCanonicalId(term.id); setMergePreview(null); }} type="radio" />
+                  <input aria-label={`Chọn canonical ${term.source_term}`} checked={activeConflictId === conflict.id && canonicalId === term.id} name="glossary-canonical" onChange={() => { invalidateMergePreview(); setActiveConflictId(conflict.id); setCanonicalId(term.id); }} type="radio" />
                   {term.source_term} → {term.target_term} · {term.book_id === 0 ? 'Toàn cục' : 'Trong sách'} · v{term.version ?? 0}{term.id === conflict.canonical_id ? ' · canonical mặc định' : ''}
                 </label>
               ))}
             </fieldset>
           ))}
           {activeConflict ? <button onClick={() => void previewMerge()} type="button">Xem trước hợp nhất</button> : null}
-          {mergePreview ? (
+          {currentMergePreview ? (
             <div role="status">
-              <p>{mergePreview.evidence_count ?? 0} bằng chứng sẽ chuyển sang canonical.</p>
+              <p>{currentMergePreview.evidence_count ?? 0} bằng chứng sẽ chuyển sang canonical.</p>
               <button onClick={() => void applyMerge()} type="button">Áp dụng hợp nhất</button>
             </div>
           ) : null}
@@ -773,16 +914,16 @@ export default function GlossaryStyleView({
       {onPreviewImport && onApplyImport && onExport ? (
         <details className="panel glossary-operation-panel">
           <summary>Nhập & xuất</summary>
-          <label>Dữ liệu JSON hoặc CSV<textarea aria-label="Dữ liệu nhập JSON hoặc CSV" onChange={(event) => { setImportText(event.target.value); setImportPreview(null); }} value={importText} /></label>
-          <label>Chính sách xung đột<select aria-label="Chính sách xung đột" onChange={(event) => { setImportPolicy(event.target.value as GlossaryImportPolicy); setImportPreview(null); }} value={importPolicy}><option value="skip_conflicts">Bỏ qua xung đột</option><option value="reject_conflicts">Từ chối toàn bộ khi có xung đột</option></select></label>
+          <label>Dữ liệu JSON hoặc CSV<textarea aria-label="Dữ liệu nhập JSON hoặc CSV" onChange={(event) => { invalidateImportPreview(); setImportText(event.target.value); }} value={importText} /></label>
+          <label>Chính sách xung đột<select aria-label="Chính sách xung đột" onChange={(event) => { invalidateImportPreview(); setImportPolicy(event.target.value as GlossaryImportPolicy); }} value={importPolicy}><option value="skip_conflicts">Bỏ qua xung đột</option><option value="reject_conflicts">Từ chối toàn bộ khi có xung đột</option></select></label>
           <div className="dialog-actions">
             <button onClick={() => void previewImport()} type="button">Xem trước nhập</button>
             <button onClick={() => void runMutation(() => onExport('json'))} type="button">Xuất JSON</button>
             <button onClick={() => void runMutation(() => onExport('csv'))} type="button">Xuất CSV</button>
           </div>
-          {importPreview ? (
+          {currentImportPreview ? (
             <div role="status">
-              <p>Thêm {importPreview.summary.added} · Cập nhật {importPreview.summary.updated} · Bỏ qua {importPreview.summary.skipped}</p>
+              <p>Thêm {currentImportPreview.summary.added} · Cập nhật {currentImportPreview.summary.updated} · Bỏ qua {currentImportPreview.summary.skipped}</p>
               <button onClick={() => void applyImport()} type="button">Áp dụng nhập</button>
             </div>
           ) : null}

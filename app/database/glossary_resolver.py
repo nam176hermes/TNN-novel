@@ -150,7 +150,7 @@ def resolve_effective_glossary(
         if int(row.get("book_id") or 0) == int(book_id) and int(book_id) != 0
     }
     candidates: list[dict] = []
-    for row in [*rows, *_styleguide_rows(None)]:
+    for row in [*rows, *_styleguide_rows(genre)]:
         scope = int(row.get("book_id") or 0)
         source_key = str(row.get("source_key") or normalize_source_key(row["source_term"]))
         if scope == 0 and not row.get("styleguide") and source_key in book_primary_keys:

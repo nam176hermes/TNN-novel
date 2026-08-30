@@ -52,9 +52,38 @@ export function useGlossary(
   const enabledRef = useRef(enabled);
   const effectBookIdRef = useRef(bookId);
   const skipNextQueryRefreshRef = useRef(false);
+  const latestRefreshRef = useRef<() => Promise<GlossaryTerm[]>>(async () => []);
+  const queryGenerationRef = useRef(0);
+  const latestQueryTokenRef = useRef('');
+  const mutationContextRef = useRef({ bookId, enabled, generation: 0, token: '' });
 
   bookIdRef.current = bookId;
   enabledRef.current = enabled;
+  const queryToken = JSON.stringify({
+    archived: query.archived ?? false,
+    bookId,
+    enabled,
+    locked: query.locked ?? null,
+    mode: query.mode ?? '',
+    page: query.page,
+    perPage: query.per_page,
+    q: query.q,
+    reviewQueue,
+    reviewStatus: query.review_status,
+    scope: query.scope,
+    sort: query.sort,
+    termType: query.term_type ?? '',
+  });
+  if (latestQueryTokenRef.current !== queryToken) {
+    latestQueryTokenRef.current = queryToken;
+    queryGenerationRef.current += 1;
+  }
+  mutationContextRef.current = {
+    bookId,
+    enabled,
+    generation: queryGenerationRef.current,
+    token: queryToken,
+  };
 
   const resetTerms = useCallback(
     (state: LoadState = 'idle') => {
@@ -156,6 +185,25 @@ export function useGlossary(
       throw error;
     }
   }, [bookId, client, enabled, onAuthError, query, resetTerms, resetTm, reviewQueue]);
+  latestRefreshRef.current = refresh;
+
+  const captureMutationContext = useCallback(() => ({ ...mutationContextRef.current }), []);
+  const refreshAfterMutation = useCallback(
+    async (started: ReturnType<typeof captureMutationContext>) => {
+      const latest = mutationContextRef.current;
+      if (
+        !latest.enabled
+        || latest.bookId === null
+        || latest.bookId !== started.bookId
+        || latest.generation !== started.generation
+        || latest.token !== started.token
+      ) {
+        return;
+      }
+      await latestRefreshRef.current();
+    },
+    [captureMutationContext],
+  );
 
   const setQuery = useCallback((updates: Partial<GlossaryQuery>) => {
     setQueryState((current) => ({
@@ -168,8 +216,8 @@ export function useGlossary(
 
   const updateTerm = useCallback(
     async (termId: number, updates: GlossaryTermUpdate) => {
-      const actionBookId = bookIdRef.current;
-      if (!enabledRef.current || actionBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
 
       try {
         const version = terms.data.find((term) => term.id === termId)?.version;
@@ -177,9 +225,7 @@ export function useGlossary(
           ...updates,
           ...(version === undefined ? {} : { expected_version: version }),
         });
-        if (enabledRef.current && bookIdRef.current === actionBookId) {
-          await refresh();
-        }
+        await refreshAfterMutation(actionContext);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           onAuthError?.();
@@ -187,13 +233,13 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh, terms.data],
+    [captureMutationContext, client, onAuthError, refreshAfterMutation, terms.data],
   );
 
   const toggleLock = useCallback(
     async (termId: number, locked: boolean) => {
-      const actionBookId = bookIdRef.current;
-      if (!enabledRef.current || actionBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
 
       try {
         if (locked) {
@@ -201,9 +247,7 @@ export function useGlossary(
         } else {
           await client.unlockGlossaryTerm(termId);
         }
-        if (enabledRef.current && bookIdRef.current === actionBookId) {
-          await refresh();
-        }
+        await refreshAfterMutation(actionContext);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           onAuthError?.();
@@ -211,19 +255,17 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh],
+    [captureMutationContext, client, onAuthError, refreshAfterMutation],
   );
 
   const approveTerm = useCallback(
     async (termId: number) => {
-      const actionBookId = bookIdRef.current;
-      if (!enabledRef.current || actionBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
 
       try {
         await client.approveGlossaryTerm(termId);
-        if (enabledRef.current && bookIdRef.current === actionBookId) {
-          await refresh();
-        }
+        await refreshAfterMutation(actionContext);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           onAuthError?.();
@@ -231,19 +273,17 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh],
+    [captureMutationContext, client, onAuthError, refreshAfterMutation],
   );
 
   const rejectTerm = useCallback(
     async (termId: number) => {
-      const actionBookId = bookIdRef.current;
-      if (!enabledRef.current || actionBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
 
       try {
         await client.rejectGlossaryTerm(termId);
-        if (enabledRef.current && bookIdRef.current === actionBookId) {
-          await refresh();
-        }
+        await refreshAfterMutation(actionContext);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           onAuthError?.();
@@ -251,13 +291,13 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh],
+    [captureMutationContext, client, onAuthError, refreshAfterMutation],
   );
 
   const saveAndApproveTerm = useCallback(
     async (termId: number, updates: GlossaryTermUpdate, locked: boolean) => {
-      const actionBookId = bookIdRef.current;
-      if (!enabledRef.current || actionBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
 
       try {
         const version = terms.data.find((term) => term.id === termId)?.version;
@@ -267,9 +307,7 @@ export function useGlossary(
           locked: locked ? 1 : 0,
           ...(version === undefined ? {} : { expected_version: version }),
         });
-        if (enabledRef.current && bookIdRef.current === actionBookId) {
-          await refresh();
-        }
+        await refreshAfterMutation(actionContext);
       } catch (error) {
         if (error instanceof ApiError && error.status === 401) {
           onAuthError?.();
@@ -277,16 +315,16 @@ export function useGlossary(
         throw error;
       }
     },
-    [client, onAuthError, refresh, terms.data],
+    [captureMutationContext, client, onAuthError, refreshAfterMutation, terms.data],
   );
 
   const createBookOverride = useCallback(
     async (term: GlossaryTerm) => {
-      const currentBookId = bookIdRef.current;
-      if (!enabledRef.current || currentBookId === null) return;
+      const actionContext = captureMutationContext();
+      if (!actionContext.enabled || actionContext.bookId === null) return;
       await client.createGlossaryTerm({
         approved: 0,
-        book_id: currentBookId,
+        book_id: actionContext.bookId,
         category: term.category,
         genre: term.genre,
         locked: 0,
@@ -299,9 +337,9 @@ export function useGlossary(
         term_type: term.term_type,
         variants: term.variants,
       });
-      await refresh();
+      await refreshAfterMutation(actionContext);
     },
-    [client, refresh],
+    [captureMutationContext, client, refreshAfterMutation],
   );
 
   const loadTermDetail = useCallback(
@@ -310,16 +348,16 @@ export function useGlossary(
   );
 
   const phase4Mutation = useCallback(async (call: () => Promise<unknown>) => {
-    const actionBookId = bookIdRef.current;
-    if (!enabledRef.current || actionBookId === null) return;
+    const actionContext = captureMutationContext();
+    if (!actionContext.enabled || actionContext.bookId === null) return;
     try {
       await call();
-      if (enabledRef.current && bookIdRef.current === actionBookId) await refresh();
+      await refreshAfterMutation(actionContext);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) onAuthError?.();
       throw error;
     }
-  }, [onAuthError, refresh]);
+  }, [captureMutationContext, onAuthError, refreshAfterMutation]);
 
   const bulkTerms = useCallback(
     (action: GlossaryBulkAction, refs: GlossaryBulkTermRef[]) => phase4Mutation(

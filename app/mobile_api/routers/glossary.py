@@ -14,6 +14,8 @@ from app.database.glossary_repository import (
     GlossaryValidationError,
 )
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.auth import get_current_user
+from app.mobile_api.config import mobile_settings
 from app.mobile_api.schemas import (
     GlossaryBulkRequest,
     GlossaryMergeApplyRequest,
@@ -23,15 +25,30 @@ from app.mobile_api.schemas import (
     ImportGlossaryResponse,
     TranslationMemoryEntryCreate,
 )
-from app.mobile_api.services.glossary_service import GlossaryService
+from app.mobile_api.services.glossary_service import GlossaryAccessError, GlossaryService
 
 router = APIRouter(prefix="/api/glossary", tags=["glossary"])
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 5_000
 
 
-def get_glossary_service():
-    return GlossaryService()
+def get_glossary_service(current_user: dict = Depends(get_current_user)):
+    return GlossaryService().for_user(
+        user_id=str(current_user.get("user_id") or ""),
+        username=str(current_user.get("username") or ""),
+        admin_username=mobile_settings.admin_username,
+    )
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "not_found"})
+
+
+def _authorized(call):
+    try:
+        return call()
+    except GlossaryAccessError:
+        raise _not_found() from None
 
 
 def _mutation_metadata(request: Request) -> tuple[str, str]:
@@ -43,6 +60,8 @@ def _mutation_metadata(request: Request) -> tuple[str, str]:
 def _state_mutation(call):
     try:
         return call()
+    except GlossaryAccessError:
+        raise _not_found() from None
     except GlossaryStateConflict as exc:
         detail = {"code": exc.code}
         if exc.code == "normalized_source_collision":
@@ -192,15 +211,25 @@ async def _bounded_import_payload(request: Request) -> tuple[dict, bool]:
                 or not required.issubset(reader.fieldnames)
             ):
                 raise HTTPException(status_code=422, detail={"code": "invalid_csv_schema"})
+            source_rows = list(reader)
             parsed_rows = [
-                _csv_import_item(row, index) for index, row in enumerate(reader, start=1)
+                _csv_import_item(row, index) for index, row in enumerate(source_rows, start=1)
             ]
             if len(parsed_rows) > MAX_IMPORT_ROWS:
                 raise HTTPException(status_code=422, detail={"code": "row_limit_exceeded"})
             rows = [row for row in parsed_rows if row is not None]
         except UnicodeDecodeError:
             raise HTTPException(status_code=422, detail={"code": "invalid_csv"}) from None
-        return {"items": _bounded_items(rows)}, True
+        return {
+            "items": _bounded_items(rows),
+            "authorization_scopes": [
+                {
+                    "type": row.get("scope"),
+                    "book_id": int(row.get("scope_book_id") or 0),
+                }
+                for row in source_rows
+            ],
+        }, True
     try:
         payload = json.loads(body)
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -263,7 +292,7 @@ async def list_glossary(
 
     legacy_call = approved is not None or include_weak is not None
     resolved_scope = scope or ("legacy" if legacy_call else ("effective" if book_id is not None else "all"))
-    return svc.query_terms(
+    return _authorized(lambda: svc.query_terms(
         book_id=book_id,
         page=page,
         per_page=per_page,
@@ -277,7 +306,7 @@ async def list_glossary(
         approved=approved,
         include_weak=bool(include_weak),
         archived=archived,
-    )
+    ))
 
 
 @router.get("/search")
@@ -287,7 +316,7 @@ async def search_glossary(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Search glossary terms."""
-    results = svc.search_terms(q, book_id)
+    results = _authorized(lambda: svc.search_terms(q, book_id))
     return {"results": results, "total": len(results)}
 
 
@@ -301,9 +330,9 @@ async def list_glossary_conflicts(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """List bounded global/book, primary/variant, and normalized conflicts."""
-    result = svc.query_conflicts(book_id, page, per_page)
+    result = _authorized(lambda: svc.query_conflicts(book_id, page, per_page))
     legacy = (
-        svc.query_legacy_conflicts(book_id, page, per_page, legacy_member_limit)
+        _authorized(lambda: svc.query_legacy_conflicts(book_id, page, per_page, legacy_member_limit))
         if include_legacy
         else []
     )
@@ -437,7 +466,7 @@ async def get_term_detail(
     term_id: int,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    resource = svc.get_term_detail(term_id)
+    resource = _authorized(lambda: svc.get_term_detail(term_id))
     if resource is None:
         raise HTTPException(status_code=404, detail="Term not found")
     return resource
@@ -590,7 +619,13 @@ async def preview_import_glossary(
         if csv_payload
         else str(payload.get("conflict_policy") or "skip_conflicts")
     )
-    return _validated_mutation(lambda: svc.preview_import(items, policy))
+    return _validated_mutation(
+        lambda: svc.preview_import(
+            items,
+            policy,
+            scope=payload.get("scope") or payload.get("authorization_scopes"),
+        )
+    )
 
 
 @router.post("/import/apply", response_model=dict)
@@ -616,6 +651,7 @@ async def apply_import_glossary(
             items,
             resolved_digest,
             policy,
+            scope=payload.get("scope") or payload.get("authorization_scopes"),
             actor=actor,
             request_id=request_id,
         )
@@ -630,7 +666,9 @@ async def import_glossary(
     """Bounded legacy adapter over atomic preview/apply."""
     data = _bounded_items(await _bounded_json(request))
     actor, request_id = _mutation_metadata(request)
-    result = svc.import_glossary(data, actor=actor, request_id=request_id)
+    result = _authorized(
+        lambda: svc.import_glossary(data, actor=actor, request_id=request_id)
+    )
     record_audit_event(
         event_type="import_complete",
         severity="info",
@@ -658,7 +696,7 @@ async def export_glossary(
     resolved_scope = scope or ("book" if book_id is not None else "all")
     if resolved_scope == "book" and book_id is None:
         raise HTTPException(status_code=422, detail={"code": "book_id_required"})
-    terms = svc.export_glossary(book_id, resolved_scope)
+    terms = _authorized(lambda: svc.export_glossary(book_id, resolved_scope))
     record_audit_event(
         event_type="export_download",
         severity="info",

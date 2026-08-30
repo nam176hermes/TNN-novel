@@ -6,7 +6,6 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from app.database.db import get_book_by_id
 from app.mobile_api.auth import get_current_user
 from app.mobile_api.audit import record_audit_event
 from app.mobile_api.schemas import (
@@ -26,7 +25,7 @@ from app.mobile_api.schemas import (
     UserResponse,
 )
 from app.mobile_api.services.pipeline_service import PipelineService
-from app.mobile_api.services.glossary_service import GlossaryService
+from app.mobile_api.services.glossary_service import GlossaryAccessError, GlossaryService
 from app.mobile_api.upload_limits import read_upload_bytes_limited
 from app.storage.artifact_paths import ArtifactPathError, ResolutionStatus
 
@@ -79,10 +78,14 @@ def _glossary_settings_error(exc: ValueError) -> HTTPException:
 
 
 def _owned_glossary_service(book_id: int, current_user: dict) -> GlossaryService:
-    service = GlossaryService()
-    book = get_book_by_id(service.db_path, book_id)
-    owner_user_id = str(current_user.get("user_id") or current_user.get("username") or "").strip()
-    if book is None or not owner_user_id or str(book.get("owner_user_id") or "") != owner_user_id:
+    service = GlossaryService().for_user(
+        user_id=str(current_user.get("user_id") or ""),
+        username=str(current_user.get("username") or ""),
+        admin_username="",
+    )
+    try:
+        service.authorize_book(book_id)
+    except GlossaryAccessError:
         raise HTTPException(status_code=404, detail={"code": "book_not_found"})
     return service
 

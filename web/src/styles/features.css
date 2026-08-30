@@ -3517,7 +3517,7 @@
   margin-top: 10px;
 }
 
-.glossary-review-tabs button[aria-selected="true"] {
+.glossary-review-tabs button[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--accent-strong);
 }
@@ -3997,7 +3997,7 @@
   }
 
   .glossary-management-table td:nth-child(1)::before { content: "Chọn"; }
-  .glossary-management-table th:nth-child(2)::before { content: "Gốc"; }
+  .glossary-management-table td:nth-child(2)::before { content: "Gốc"; }
   .glossary-management-table td:nth-child(3)::before { content: "Bản dịch"; }
   .glossary-management-table td:nth-child(4)::before { content: "Loại"; }
   .glossary-management-table td:nth-child(5)::before { content: "Ưu tiên"; }
