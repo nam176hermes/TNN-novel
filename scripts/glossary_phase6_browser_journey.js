@@ -178,10 +178,10 @@ async (page) => {
 
     // Merge leaves the canonical active, archives the duplicate, and removes the group.
     const clearedQueueResponse = page.waitForResponse((response) => {
-      const url = new URL(response.url());
-      return url.pathname === '/api/glossary'
-        && !url.searchParams.has('q')
-        && url.searchParams.get('review_status') === 'APPROVED'
+      const responseUrl = response.url();
+      return responseUrl.includes('/api/glossary?')
+        && !/[?&]q=/.test(responseUrl)
+        && responseUrl.includes('review_status=APPROVED')
         && response.status() === 200;
     });
     await search.fill('');
