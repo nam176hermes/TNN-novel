@@ -3,250 +3,242 @@
 ## Scope and result
 
 Phase 6 adds privacy-bounded glossary observability to the existing in-process
-stack, exposes that shared snapshot through the existing authenticated
-operations response, adds cumulative 10,000-row integration coverage and a
-real Chromium operator journey, and documents the staged migration and
-rollback procedure.
+stack, exposes it through the existing authenticated operations response, and
+provides cumulative 10,000-row backend, frontend, and real-browser
+certification. The original Phase 6 implementation ended at `9146bfe`; the
+review-fix production commit is
+`8ee219564bbf6f6dc02a46c35bc745d67e303974` on
+`codex/glossary-phase6-ops-e2e`.
 
-The production implementation was committed as `0b3cac1` on
-`codex/glossary-phase6-ops-e2e`, based on
-`1a83b693c57247ef1e54d9938440d2092066aa76`. Verification used only isolated,
-synthetic data on the Linux-native `/tmp` filesystem. No operator database,
-production deployment, remote Git state, or live/paid provider was touched.
+The review fix closes every reported Important and Minor finding:
 
-## Changed files
+- transition telemetry is emitted only after the containing SQLite commit;
+- a filtered queue query cannot overwrite the unfiltered active-conflict
+  inventory gauge;
+- extraction observation uses the fixed `observe` action label;
+- the symmetric primary/variant conflict result is regression-tested for one
+  canonical, de-duplicated pair;
+- the runbook distinguishes metric snapshots from structured fingerprint
+  events;
+- one committed command now builds and serves the final app, creates two fresh
+  10,000-row fixtures, logs into fresh Chromium sessions, runs the full journey
+  independently at desktop and mobile widths, and cleans up its temporary
+  servers, sessions, and databases;
+- the mobile **Thêm** menu exposes **Raw chưa dịch**, so the same chapter-first
+  journey is keyboard- and touch-reachable on mobile.
 
-- `app/observability.py` adds bounded glossary query, transition, extraction,
-  provider-failure, resolution/fingerprint, and QA recording methods to the
-  existing `Observability`, `InMemoryMetrics`, and `StructuredEventLogger`
-  stack. Metric labels are fixed allow-listed dimensions.
-- `app/database/glossary_repository.py` records state transitions at the shared
-  history boundary, preserves explicit save-and-approve semantics, and avoids
-  the quadratic all-pairs primary/variant conflict scan by joining only rows
-  that actually contain variants.
-- `app/database/glossary_resolver.py` records effective-term counts and the
-  existing non-reversible SHA-256 glossary fingerprint.
-- `app/mobile_api/services/glossary_service.py` records query latency, result
-  and conflict counts, extraction outcomes, and sanitized provider failure
-  codes at shared service boundaries.
-- `app/mobile_api/services/qa_service.py` records glossary QA run and violation
-  counts without emitting source or translation text.
-- `app/mobile_api/services/operational_metrics_service.py` adds the shared
-  observability snapshot to the existing authenticated operations payload
-  while retaining every prior top-level field.
-- `web/src/components/GlossaryStyleView.tsx` keeps create actions scoped to the
-  selected book when the query omits its redundant `book_id` field.
-- `web/src/components/GlossaryStyleView.test.tsx` adds cumulative stateful UI
-  coverage for the operator workflow and the selected-book create contract.
-- `tests/test_glossary_phase6_operations.py` covers all required telemetry
-  categories, sentinel privacy boundaries, additive operations exposure, and
-  the complete 10,000-row authenticated API journey.
-- `scripts/prepare_glossary_phase6_fixture.py` reuses the Phase 0 fixture helper
-  to create exactly 10,000 glossary rows plus deterministic queue, conflict,
-  book, and chapter data in an empty caller-supplied directory.
-- `scripts/glossary_phase6_browser_journey.js` is a CLI-first Playwright driver
-  for queue, search, pagination, create/edit, approve/lock, bulk approve,
-  conflict preview/apply, import preview/apply, export, archive/restore,
-  re-extraction, responsive overflow, and keyboard activation.
-- `docs/glossary-upgrade-runbook.md` gives the backup, copied-database audit,
-  additive API/schema rollout, legacy-client smoke, UI rollout, conflict
-  cleanup, per-book hybrid enablement, and application-only rollback sequence.
-- `docs/glossary-upgrade-phase6-implementation-note.md` records this evidence.
+All verification used synthetic, Linux-native `/tmp` data. No operator
+database, production service, deployment, remote Git state, or live/paid
+provider was read or changed.
 
-## Privacy and operational contract
+## Implementation boundaries
 
-The shared snapshot now contains these glossary series:
+The implementation continues to reuse
+`app.observability.default_observability`, `InMemoryMetrics`, and
+`StructuredEventLogger`; it adds no telemetry dependency or parallel stack.
+Instrumentation remains at shared repository, query/extraction service,
+resolver, QA, and operations-response boundaries.
 
-- counters: queries, state transitions, extractions, provider failures,
-  resolutions, QA runs, and QA violations;
-- gauges: current query-scope conflict count and effective term count;
-- latency: bounded query-latency samples with count, p50, and p95;
-- structured events: query, state transition, extraction, resolution, and QA.
+`GlossaryRepository._log` still writes the bounded history record inside the
+caller transaction, but now returns an allow-listed numeric/state transition
+payload. `_commit_and_emit_transitions` commits first and publishes those
+payloads only after SQLite reports success. Standalone create/update/state and
+archive/restore paths use the same helper. Extraction, bulk update, conflict
+merge, and import collect their already-bounded transition payloads and emit
+them after the single transaction commit. A forced SQLite trigger failure on
+the second bulk history insert proves that rolled-back rows produce neither a
+transition counter nor a structured transition event.
 
-Events contain only controlled action/state/mode/extractor/error codes,
-durations, counts, numeric IDs/versions, and the existing 64-character
-non-reversible fingerprint. They do not accept source terms, target terms,
-variants, notes, title/body/context/prompt content, provider credentials, or
-filesystem paths. The privacy test injects private chapter-body, title,
-translation, provider-secret, and path sentinels and proves none enter logs,
-metric labels/snapshots, the operations snapshot, or operational persistence;
-chapter/provider/path sentinels also do not enter glossary evidence or history.
+Queue telemetry now exposes `glossary_active_conflicts`, calculated from all
+unarchived `CONFLICT` rows independently of the current queue search/status
+filter. The filtered conflict count remains in the bounded `glossary_query`
+event. Existing authenticated operations response fields remain unchanged.
 
-The runbook makes two data rules unconditional: create no normalized unique
-index until a fresh copied-database audit reports exactly zero normalized
-same-book collision groups, and never purge archived glossary rows. Rollback
-disables hybrid extraction and the new UI/application artifact while leaving
-the additive schema readable; it does not run a destructive down migration.
+Structured events contain only controlled action/state/mode/extractor/error
+codes, durations, counts, numeric IDs/versions, and existing non-reversible
+fingerprint identifiers. Source/target terms, variants, notes, title/body,
+context/prompt content, provider credentials, and filesystem paths remain
+excluded. Fingerprint identifiers are available in structured event logs, not
+as fields in the operations metric snapshot.
 
-## TDD evidence
+The operator runbook keeps these rules unconditional:
 
-The first telemetry/API test run was a genuine RED:
+1. Do not create a normalized unique index until a fresh copied-database audit
+   reports zero same-book normalized collision groups.
+2. Never purge archived glossary rows.
+3. Roll back the application/UI and disable hybrid extraction without a
+   destructive schema down-migration.
 
-```text
-NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q -s \
-  tests/test_glossary_phase6_operations.py
-exit 1: 2 failed in 0.99s
+## Review-fix TDD ledger
+
+The first combined regression run was:
+
+```bash
+NOVEL_PIPELINE_IGNORE_DOTENV=1 TMPDIR=/tmp TMP=/tmp TEMP=/tmp \
+  .venv/bin/python -m pytest -q -s \
+  tests/test_glossary_phase6_operations.py::test_filtered_query_does_not_overwrite_active_conflict_inventory \
+  tests/test_glossary_phase6_operations.py::test_bulk_rollback_emits_no_transition_telemetry \
+  tests/test_glossary_phase6_operations.py::test_extraction_observe_transition_uses_a_fixed_action_label \
+  tests/test_glossary_phase6_browser_orchestrator.py \
+  tests/test_glossary_phase4_bulk_import.py::test_primary_variant_conflict_query_is_symmetric_and_deduplicated
 ```
 
-It failed because the glossary metric/event categories and `observability`
-operations field did not exist. After the focused implementation, the same two
-tests exited `0`: `2 passed in 0.86s`.
+It exited `1`: `5 failed, 1 warning in 2.25s`. The production gaps were the
+missing active-inventory gauge, one leaked rolled-back transition, the
+`unknown` extraction action, and the absent orchestrator. The first variant
+fixture also used a non-canonical serialization and was corrected before using
+that regression as evidence; with canonical delimiter storage, the existing
+query already returned the expected symmetric pair. The focused non-browser
+GREEN then exited `0`: `4 passed, 1 warning in 2.09s`. The orchestrator contract
+test separately passed `1 passed in 0.03s`.
 
-The real browser then exposed two cumulative contracts that were locked with
-focused RED tests before their production fixes:
+The first real orchestrator run failed before Chromium because the legacy
+`ops.py wait-health` helper expects `status=ok`, while the current readiness
+endpoint correctly returned HTTP 200 with
+`ready_with_degraded_capabilities`. The orchestrator now performs a bounded,
+stdlib-only semantic readiness check accepting `ready` and
+`ready_with_degraded_capabilities`; it does not treat HTTP 2xx alone as ready.
 
-```text
-npm --prefix web test -- src/components/GlossaryStyleView.test.tsx \
-  -t 'cumulative 10k operator workflow'
-exit 1: expected create book_id 42, received 0; 1 failed, 10 skipped
+The first complete desktop journey then exposed that newly extracted blank-
+target candidates are intentionally omitted from the default
+`include_weak=false` review query. The certification therefore proves their
+durable post-state by parsing a second browser download after re-extraction:
+the total changes from `10002` to `10007`, and all five exact extracted rows
+have `NEEDS_REVIEW` plus chapter IDs/numbers of `1`.
 
-NOVEL_PIPELINE_IGNORE_DOTENV=1 .venv/bin/python -m pytest -q -s \
-  tests/test_glossary_phase6_operations.py -k ten_thousand
-exit 1: save-and-approve PATCH expected 200, received 409;
-1 failed, 2 deselected, 4 warnings in 2.59s
+The first full mobile run exposed a genuine navigation RED:
+
+```bash
+npm --prefix web test -- src/components/WorkflowShell.test.tsx \
+  -t 'keeps mobile workflow navigation wired'
 ```
 
-Focused GREEN results were `1 passed, 10 skipped` in `3.26s` for the frontend
-contract and `1 passed, 2 deselected, 4 warnings` in `3.66s` for the API
-contract. A cumulative Phase 0-6 run then caught an over-broad unlock action
-classification (`1 failed, 142 passed, 81 warnings in 103.15s`). The action was
-narrowed so `locked=0` remains an unlock unless the same request explicitly
-asks for approval. The exact regression plus the 10,000-row API journey passed
-`2 passed, 4 warnings in 4.20s`; the cumulative rerun passed `143 passed, 81
-warnings in 108.84s`.
+It exited `1` because the mobile **Thêm** dialog had no accessible
+**Raw chưa dịch** button. The minimal route action made the same command exit
+`0`: `1 passed, 5 skipped`.
 
-The original conflict query also revealed a production-scale blocker: the
-all-pairs primary/variant scan did not return after 91 seconds on 10,000 rows.
-Restricting that join to rows with a non-empty variants payload preserved the
-same conflict pairs and reduced the focused 10,000-row journey to `3.67s` (`1
-passed, 2 deselected, 4 warnings`).
+## Focused and cumulative GREEN evidence
 
-## Focused and cumulative validation
+All commands ran from the Phase 6 worktree before the production commit.
 
-All commands ran from the Phase 6 worktree.
+- Phase 4 + Phase 6 + orchestrator contract:
+  `31 passed, 49 warnings in 30.97s`, exit `0`.
+- Affected frontend API/state/view/shell suite: `4` files and `36` tests
+  passed in `5.35s`, exit `0`.
+- `scripts/lint.sh`, shell syntax, JavaScript syntax, and `git diff --check`:
+  exit `0`.
+- Cumulative Phase 0–6, QA, service, and API suite: `148 passed, 81 warnings
+  in 101.49s`, exit `0`.
+- Pre-commit self-contained browser certification: exit `0`, with two fresh
+  10,000-row fixtures and complete desktop/mobile receipts.
 
-- `NOVEL_PIPELINE_IGNORE_DOTENV=1 TMPDIR=/tmp TMP=/tmp TEMP=/tmp
-  scripts/lint.sh` — initial exit `1` for one unused test-local `db_path`;
-  after removing it, exit `0` with TypeScript typecheck green. The final rerun
-  after the action fix also exited `0` in `14.5s`.
-- `NOVEL_PIPELINE_IGNORE_DOTENV=1 NOVEL_PIPELINE_TEST_TMPDIR=/tmp
-  TMPDIR=/tmp TMP=/tmp TEMP=/tmp .venv/bin/python -m pytest -q -s
-  tests/test_glossary_phase0_baseline.py tests/test_glossary_phase1_state.py
-  tests/test_glossary_phase2_resolver.py
-  tests/test_glossary_phase3_review_query.py
-  tests/test_glossary_phase4_bulk_import.py
-  tests/test_glossary_phase5_extraction.py
-  tests/test_glossary_phase6_operations.py tests/test_glossary_qa_phase4.py
-  tests/test_glossary_service_logic.py tests/test_mobile_api_glossary.py` —
-  exit `0`; `143 passed, 81 warnings in 108.84s`.
-- `npm --prefix web test -- src/api/glossary.test.ts
-  src/components/GlossaryReviewQueue.test.tsx
-  src/components/GlossaryStyleView.test.tsx
-  src/state/useGlossary.test.tsx` — exit `0`; `4` files and `37` tests passed
-  in `5.22s`.
-- `node --check scripts/glossary_phase6_browser_journey.js` and Python compile
-  checks for the fixture/test files — exit `0`.
+## Canonical gates after production commit
 
-## Canonical post-commit gates
+Production SHA under test:
+`8ee219564bbf6f6dc02a46c35bc745d67e303974`.
 
-The first literal canonical invocation,
-`NOVEL_PIPELINE_IGNORE_DOTENV=1 scripts/verify.sh`, exited `1` at the
-environment preflight before tests. The isolated worktree lacked the ignored
-local-development prerequisites `.env`, `data/pipeline.db`, `data/`, and
-`data/logs`; this was a worktree setup failure, not a source/test failure.
+The isolated worktree had no local development `.env` or `data` tree. For the
+canonical gate only, `.env` was an ignored credential-free comment and `data`
+was an ignored symlink to a freshly initialized
+`/tmp/novel-tnn-phase6-fix-verify-46vxOf/data`. No operator file was copied.
+Both entries and the temporary tree were removed after verification.
 
-For the retry, `.env` was an ignored, credential-free marker and `data` was an
-ignored symlink to a newly initialized disposable directory under `/tmp`; no
-operator data or credentials were copied or read. The exact same literal
-command then exited `0`:
+The literal canonical command:
 
-- compile, shell syntax, environment, lint/typecheck: pass;
-- backend: `1450 passed, 469 warnings in 490.69s`;
-- dependency consistency: pass;
-- frontend: `87` files and `799` tests passed in `31.12s`;
-- frontend build: `1858` modules transformed, built in `736ms`.
+```bash
+NOVEL_PIPELINE_IGNORE_DOTENV=1 scripts/verify.sh
+```
 
-The separately required `git diff --check && npm --prefix web run build`
-exited `0`; the explicit build transformed `1858` modules and completed in
-`717ms`. A subsequent ignored browser-only build with
-`VITE_API_BASE_URL=http://127.0.0.1:17860` also exited `0` (`1858` modules,
-`733ms`); this merely directed the local SPA at the isolated loopback server.
-
-## Final Chromium evidence
-
-The final run used commit `0b3cac1`, real headless Chromium, and a newly created
-`/tmp/novel-tnn-phase6-final-browser-iIrqhQ/data` fixture. Fixture preparation
 exited `0` with:
 
-```json
-{"book_id": 1, "chapter_id": 1, "rows": 10000}
+- Python compile, shell syntax, environment, lint/typecheck: pass;
+- backend: `1455 passed, 469 warnings in 493.91s`;
+- Python dependency consistency: pass;
+- frontend: `87` files and `799` tests passed in `34.48s`;
+- frontend build: `1858` modules transformed, built in `900ms`.
+
+The separately required command also exited `0`:
+
+```bash
+git diff --check && npm --prefix web run build
 ```
 
-The Playwright skill wrapper could not execute on this Linux host because its
-checked-in launcher has CRLF (`/usr/bin/env: 'bash\r': No such file or
-directory`, exit `127`). Directly invoking the same CLI package initially
-inherited a Windows temporary path and returned `ENOTSUP`; setting
-`TMPDIR=/tmp TMP=/tmp TEMP=/tmp` resolved that host-only issue. No wrapper,
-dependency, lockfile, or global configuration was modified.
+The explicit build transformed `1858` modules and completed in `748ms`.
 
-The final CLI command ran from `output/playwright/final/` so every artifact is
-contained below the ignored `output/playwright/` tree:
+## Reproducible Chromium certification
+
+The entire setup/build/start/open/login/journey/cleanup sequence is one
+committed command:
+
+```bash
+NOVEL_PIPELINE_IGNORE_DOTENV=1 TMPDIR=/tmp TMP=/tmp TEMP=/tmp \
+  scripts/certify_glossary_phase6_browser.sh
+```
+
+The script:
+
+1. selects a loopback-only ephemeral port and builds the final SPA for it;
+2. creates an empty Linux-native temporary root;
+3. prepares a fresh exact 10,000-row fixture for desktop;
+4. starts `python -m app.mobile_api` with final static serving, synthetic local
+   credentials, authentication enabled, and every external provider key empty;
+5. waits for semantic readiness, opens a fresh direct CLI Chromium session,
+   resizes to `1440x900`, logs in, and runs the complete driver;
+6. closes the session and server;
+7. repeats steps 3–6 with an independent fixture at `390x844`;
+8. removes both fixture trees through its exit trap while retaining only
+   ignored receipts under `output/playwright/`.
+
+The final post-commit invocation exited `0` and printed:
 
 ```text
-TMPDIR=/tmp TMP=/tmp TEMP=/tmp \
-npx --yes --package @playwright/cli playwright-cli \
-  --session phase6-final run-code \
-  --filename /home/thenam176/Novel-TNN/.worktrees/glossary-phase6-ops-e2e/scripts/glossary_phase6_browser_journey.js
-exit 0 in 13.9s
+PHASE6_BROWSER_CERTIFICATION_OK fixtures=2 rows_each=10000 \
+viewports=desktop:1440x900,mobile:390x844 \
+artifacts=.../output/playwright/phase6-certification-20260830T203548Z-742410
 ```
 
-The structured receipt was:
+Each viewport independently asserted:
 
-```json
-{
-  "datasetRows": 10000,
-  "desktop": {"height": 900, "noHorizontalOverflow": true, "width": 1440},
-  "download": "glossary.json",
-  "extractionStatus": "5 thuật ngữ mới · 0 cập nhật · 0 cảnh báo",
-  "httpFailures": [],
-  "keyboard": {
-    "activated": true,
-    "focusVisible": true,
-    "tag": "SUMMARY",
-    "text": "Profile văn phong (phụ)"
-  },
-  "mobile": {
-    "bodyScrollWidth": 390,
-    "innerWidth": 390,
-    "noHorizontalOverflow": true,
-    "rootScrollWidth": 390
-  }
-}
-```
+- initial pending queue rows `1–4 / 4`;
+- all-list page 1 and page 2 each containing 50 distinct rows;
+- search result `synthetic-source-09999 → synthetic-target-09999`;
+- created row and initial target, edited target, approved queue, then locked
+  queue;
+- both bulk-selected rows absent from pending and present with approved state;
+- merge preview, no remaining conflict group, active canonical row, and
+  archived duplicate row;
+- import preview and the applied imported row/target;
+- suggested filename `glossary.json`, parsed JSON schema/scope/total, locked
+  created content, imported content, archived merge duplicate, and fixture
+  tail;
+- archive intermediate state and restored final locked state;
+- exact re-extraction status and a parsed post-extraction export containing all
+  five exact new rows (`10007` total);
+- visible keyboard focus on the profile `SUMMARY` and successful Enter
+  activation;
+- no post-auth HTTP response at or above 400;
+- no horizontal page overflow before or after the journey.
 
-This receipt follows the complete journey: default four-row queue, all-terms
-page 1 and page 2, search for row 10,000, create, edit plus approve, lock, bulk
-approve, conflict preview/apply, import preview/apply, JSON export,
-archive/restore, and deterministic chapter re-extraction. Keyboard-only `Tab`
-reached a visible-focus `SUMMARY`, and `Enter` opened it. Separate viewport
-receipts confirmed desktop root/inner widths `1440/1440` and mobile
-body/root/inner widths `390/390/390`.
+Desktop receipt: export total `10002`, `httpFailures=[]`, initial/final
+body/root/inner widths `1440/1440/1440`, keyboard activation `true`.
 
-Artifacts:
+Mobile receipt: export total `10002`, `httpFailures=[]`, initial/final
+body/root/inner widths `390/390/390`, keyboard activation `true`.
 
-- `output/playwright/final/.playwright-cli/glossary.json`
-- `output/playwright/final/.playwright-cli/page-2026-08-30T19-44-44-328Z.png`
-  (390 x 844 mobile)
-- `output/playwright/final/.playwright-cli/page-2026-08-30T19-44-51-786Z.png`
-  (1440 x 900 desktop)
+Final ignored artifacts include:
 
-The browser console contains one expected pre-authentication
-`POST /api/auth/refresh` `401` while the login screen establishes that no prior
-session exists. The post-authentication journey installed its own response
-listener and completed with `httpFailures: []`. Chromium ran headless, so this
-is functional/responsive/accessibility smoke evidence rather than a manual
-visual-design sign-off. Artifacts are local and ignored, not release assets.
+- `output/playwright/phase6-certification-20260830T203548Z-742410/desktop/phase6-desktop-final.png`;
+- `output/playwright/phase6-certification-20260830T203548Z-742410/mobile/phase6-mobile-final.png`;
+- each viewport's `fixture.json`, `journey.log`, `server.log`, CLI snapshot,
+  console receipt, and final parsed download.
 
-Independent review was intentionally not dispatched in this implementation
-task. The task-level instruction prohibited subagents/reviewers, so the final
-Critical/Important review gate remains for the parent integration workflow.
+The only server `4xx` before each journey listener is the expected fresh-session
+`POST /api/auth/refresh` `401`; the driver attaches its HTTP failure listener
+after successful login and reports no failures. Chromium is headless, so this
+is functional, responsive, and accessibility smoke evidence rather than a
+manual visual-design sign-off.
+
+No dependency, lockfile, CI/global configuration, operator database, provider,
+deployment, push, or main-branch merge was involved. Independent review was
+not dispatched because this fix assignment explicitly prohibited subagents and
+reviewers.
