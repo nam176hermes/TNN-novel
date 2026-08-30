@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 from app.database.connection import get_connection
 from app.database.glossary_repository import normalize_source_key
+from app.observability import default_observability
 from app.translation import styleguide_config
 
 
@@ -266,7 +267,7 @@ def resolve_effective_glossary(
             or term.get("genre") == genre
         )
     )
-    return EffectiveGlossary(
+    resolved = EffectiveGlossary(
         book_id=book_id,
         fingerprint=fingerprint,
         style_profile=_deep_freeze(profile) if profile is not None else None,
@@ -288,3 +289,9 @@ def resolve_effective_glossary(
         dictionary_terms=tuple(_deep_freeze(term) for term in dictionary_terms),
         reserved_source_keys=frozenset(database_source_keys),
     )
+    default_observability.record_glossary_resolution(
+        book_id=book_id,
+        effective_term_count=len(dictionary_terms),
+        fingerprint_id=fingerprint,
+    )
+    return resolved

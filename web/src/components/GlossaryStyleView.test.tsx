@@ -471,4 +471,168 @@ describe('GlossaryStyleView', () => {
       term_type: 'realm',
     }, false);
   });
+
+  it('keeps the cumulative 10k operator workflow wired through one stateful view', async () => {
+    const active = { ...fixtureGlossaryTerm, locked: 0, version: 3 };
+    const archived = {
+      ...fixtureGlossaryTerm,
+      archived: true,
+      archived_at: '2026-08-30T00:00:00Z',
+      id: 8,
+      locked: 0,
+      source_term: '归档术语',
+      target_term: 'Thuật ngữ lưu trữ',
+      version: 4,
+    };
+    const duplicate = {
+      ...active,
+      id: 9,
+      source_term: '築基',
+      target_term: 'Trúc Cơ khác',
+      version: 2,
+    };
+    const approved = {
+      ...active,
+      approved: 1,
+      id: 10,
+      review_status: 'APPROVED' as const,
+      source_term: '编辑锁定',
+      target_term: 'Sửa và khóa',
+      version: 6,
+    };
+    const onApplyImport = vi.fn().mockResolvedValue(undefined);
+    const onApplyMerge = vi.fn().mockResolvedValue(undefined);
+    const onApproveTerm = vi.fn().mockResolvedValue(undefined);
+    const onArchiveTerm = vi.fn().mockResolvedValue(undefined);
+    const onBulkAction = vi.fn().mockResolvedValue(undefined);
+    const onCreateTerm = vi.fn().mockResolvedValue(undefined);
+    const onExport = vi.fn().mockResolvedValue(undefined);
+    const onLoadConflicts = vi.fn().mockResolvedValue({
+      items: [{
+        canonical_id: active.id,
+        id: 'phase6-conflict',
+        member_total: 2,
+        members: [active, duplicate],
+        members_truncated: false,
+        types: ['primary_variant'],
+      }],
+      page: 1, pages: 1, per_page: 50, total: 1,
+    });
+    const onLockToggle = vi.fn().mockResolvedValue(undefined);
+    const onPageChange = vi.fn();
+    const onPreviewImport = vi.fn().mockResolvedValue({
+      actions: [{ item: 1, action: 'add' }], affected: [], conflict_policy: 'skip_conflicts',
+      digest: 'i'.repeat(64), schema_version: 1, summary: { added: 1, updated: 0, skipped: 0 },
+    });
+    const onPreviewMerge = vi.fn().mockResolvedValue({
+      canonical_id: active.id,
+      duplicate_ids: [duplicate.id],
+      digest: 'm'.repeat(64),
+      evidence_count: 0,
+    });
+    const onQueryChange = vi.fn();
+    const onReextractChapter = vi.fn().mockResolvedValue({
+      created: 1, updated: 0, skipped: 0, warnings: [],
+    });
+    const onRestoreTerm = vi.fn().mockResolvedValue(undefined);
+    const onSaveAndApproveTerm = vi.fn().mockResolvedValue(undefined);
+    const onUpdateTerm = vi.fn().mockResolvedValue(undefined);
+    render(<GlossaryStyleView {...props({
+      bookId: 42,
+      chapterId: 4201,
+      glossaryTerms: [active, approved, archived],
+      onApplyImport,
+      onApplyMerge,
+      onApproveTerm,
+      onArchiveTerm,
+      onBulkAction,
+      onCreateTerm,
+      onExport,
+      onLoadConflicts,
+      onLoadExtractionSettings: vi.fn().mockResolvedValue({
+        book_id: 42, max_candidates_per_chapter: 100, mode: 'deterministic', provider_id: '',
+      }),
+      onLockToggle,
+      onPageChange,
+      onPreviewImport,
+      onPreviewMerge,
+      onQueryChange,
+      onReextractChapter,
+      onRestoreTerm,
+      onSaveAndApproveTerm,
+      onSaveExtractionSettings: vi.fn(),
+      onUpdateTerm,
+      page: 1,
+      pages: 200,
+      perPage: 50,
+      query: {
+        page: 1, per_page: 50, q: '', review_status: 'NEEDS_REVIEW,CONFLICT',
+        scope: 'book', sort: 'review',
+      },
+      total: 10_000,
+    })} />);
+
+    await userEvent.type(screen.getByLabelText('Tìm thuật ngữ'), 'synthetic-source-09999');
+    await waitFor(() => expect(onQueryChange).toHaveBeenCalledWith({
+      page: 1, q: 'synthetic-source-09999',
+    }));
+    await userEvent.click(screen.getByRole('button', { name: 'Trang sau' }));
+    expect(onPageChange).toHaveBeenCalledWith(2);
+
+    await userEvent.click(screen.getByText('Tạo thuật ngữ'));
+    await userEvent.type(screen.getByLabelText('Thuật ngữ gốc mới'), 'phase6-created');
+    await userEvent.type(screen.getByLabelText('Bản dịch mới'), 'Đã tạo');
+    await userEvent.click(screen.getByRole('button', { name: 'Tạo thuật ngữ mới' }));
+    expect(onCreateTerm).toHaveBeenCalledWith(expect.objectContaining({
+      book_id: 42, source_term: 'phase6-created', target_term: 'Đã tạo',
+    }));
+
+    await userEvent.clear(screen.getByLabelText('Bản dịch cho 编辑锁定'));
+    await userEvent.type(screen.getByLabelText('Bản dịch cho 编辑锁定'), 'Đã sửa');
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu thay đổi 编辑锁定' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Duyệt 筑基' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Khóa thuật ngữ 编辑锁定' }));
+    expect(onUpdateTerm).toHaveBeenCalledWith(approved.id, expect.objectContaining({
+      target_term: 'Đã sửa',
+    }));
+    expect(onApproveTerm).toHaveBeenCalledWith(active.id);
+    expect(onLockToggle).toHaveBeenCalledWith(approved.id, true);
+
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Chọn 筑基' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Duyệt đã chọn' }));
+    expect(onBulkAction).toHaveBeenCalledWith('approve', [{ id: active.id, expected_version: 3 }]);
+
+    await userEvent.click(screen.getByText('Xung đột & hợp nhất'));
+    await userEvent.click(screen.getByRole('button', { name: 'Tải xung đột' }));
+    await userEvent.click(await screen.findByRole('radio', { name: 'Chọn canonical 筑基' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước hợp nhất' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng hợp nhất' }));
+    expect(onApplyMerge).toHaveBeenCalledWith(active.id, [duplicate.id], 'm'.repeat(64));
+
+    await userEvent.click(screen.getByText('Nhập & xuất'));
+    fireEvent.change(screen.getByLabelText('Dữ liệu nhập JSON hoặc CSV'), {
+      target: { value: JSON.stringify([{ source_term: 'phase6-imported', target_term: 'Đã nhập' }]) },
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Xem trước nhập' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Áp dụng nhập' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Xuất JSON' }));
+    expect(onApplyImport).toHaveBeenCalledWith(
+      [{ source_term: 'phase6-imported', target_term: 'Đã nhập' }],
+      'i'.repeat(64),
+      'skip_conflicts',
+    );
+    expect(onExport).toHaveBeenCalledWith('json');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Lưu trữ 筑基' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Khôi phục 归档术语' }));
+    expect(onArchiveTerm).toHaveBeenCalledWith(active.id);
+    expect(onRestoreTerm).toHaveBeenCalledWith(archived.id);
+
+    await userEvent.click(screen.getByText('Trích xuất thuật ngữ'));
+    await waitFor(() => expect(screen.getByRole('button', {
+      name: 'Trích xuất lại chương',
+    })).toBeEnabled());
+    await userEvent.click(screen.getByRole('button', { name: 'Trích xuất lại chương' }));
+    expect(onReextractChapter).toHaveBeenCalledWith(42, 4201);
+  });
 });

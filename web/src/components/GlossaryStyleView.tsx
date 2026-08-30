@@ -587,7 +587,7 @@ export default function GlossaryStyleView({
     if (!onCreateTerm || !newSource.trim()) return;
     const succeeded = await runMutation(() => onCreateTerm({
       approved: 0,
-      book_id: query.book_id ?? 0,
+      book_id: query.book_id ?? bookId ?? 0,
       review_status: 'NEEDS_REVIEW',
       source_term: newSource.trim(),
       target_term: newTarget.trim(),

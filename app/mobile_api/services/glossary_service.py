@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import os
 import re
+import time
 import unicodedata
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from app.database.glossary_repository import (
 )
 from app.database.glossary_resolver import resolve_effective_glossary
 from app.mobile_api.dependencies import get_db_path
+from app.observability import default_observability
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
 from app.translation.ollama_client import call_openai_compatible_chat
@@ -419,6 +421,34 @@ def _sort_glossary_for_review(terms: list[dict]) -> list[dict]:
     )
 
 
+def _record_extraction(
+    book_id: int,
+    chapter_id: int,
+    result: dict,
+    *,
+    extractor: str = DETERMINISTIC_EXTRACTOR,
+    error_code: str = "",
+) -> dict:
+    warnings = result.get("warnings") or []
+    resolved_error = error_code or next(
+        (str(item.get("code") or "") for item in warnings if isinstance(item, dict)),
+        "",
+    )
+    default_observability.record_glossary_extraction(
+        extractor=extractor,
+        status="warning" if warnings else "skipped" if resolved_error else "success",
+        created=int(result.get("created") or 0),
+        updated=int(result.get("updated") or 0),
+        skipped=int(result.get("skipped") or 0),
+        candidate_count=len(result.get("candidates") or []),
+        warning_count=len(warnings),
+        error_code=resolved_error,
+        book_id=book_id,
+        chapter_id=chapter_id,
+    )
+    return result
+
+
 class GlossaryService:
     def __init__(self):
         self.db_path = get_db_path()
@@ -471,6 +501,7 @@ class GlossaryService:
         include_weak: bool = False,
         archived: bool = False,
     ) -> dict:
+        started = time.perf_counter()
         per_page = min(per_page, 200)
         statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
         effective_ids = None
@@ -506,6 +537,11 @@ class GlossaryService:
             per_page=per_page,
             pages=(total + per_page - 1) // per_page,
             scope="all" if scope == "legacy" else scope,
+        )
+        default_observability.record_glossary_query(
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            result_count=len(result["items"]),
+            conflict_count=int(result["facets"]["review_status"].get("CONFLICT", 0)),
         )
         return result
 
@@ -1000,7 +1036,12 @@ class GlossaryService:
             if resolved_raw_path is not None:
                 raw_text = resolved_raw_path.read_text(encoding="utf-8", errors="replace")
         if resolved_raw_path is None:
-            return {"created": 0, "updated": 0, "skipped": 0, "candidates": [], "warnings": []}
+            return _record_extraction(
+                book_id,
+                chapter_id,
+                {"created": 0, "updated": 0, "skipped": 0, "candidates": [], "warnings": []},
+                error_code="artifact_unavailable",
+            )
         if not raw_text:
             chapter_number = int(chapter.get("chapter_number") or 0)
             repository = GlossaryRepository(self.db_path)
@@ -1012,7 +1053,8 @@ class GlossaryService:
                 candidates=[],
                 occurrence_corpus="",
             )
-            if self.get_extraction_settings(book_id)["mode"] == "hybrid":
+            extraction_mode = self.get_extraction_settings(book_id)["mode"]
+            if extraction_mode == "hybrid":
                 hybrid_counts = repository.record_extraction_candidates(
                     book_id=book_id,
                     chapter_id=chapter_id,
@@ -1022,7 +1064,12 @@ class GlossaryService:
                     occurrence_corpus="",
                 )
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
-            return {**counts, "candidates": [], "warnings": []}
+            return _record_extraction(
+                book_id,
+                chapter_id,
+                {**counts, "candidates": [], "warnings": []},
+                extractor=HYBRID_EXTRACTOR if extraction_mode == "hybrid" else DETERMINISTIC_EXTRACTOR,
+            )
 
         raw_chapter_title = str(chapter.get("title") or "")
         chapter_title = _clean_chapter_title(raw_chapter_title)
@@ -1059,7 +1106,16 @@ class GlossaryService:
                 )
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
                 candidates = [*candidates, *hybrid]
-        return {**counts, "candidates": candidates, "warnings": warnings}
+        return _record_extraction(
+            book_id,
+            chapter_id,
+            {**counts, "candidates": candidates, "warnings": warnings},
+            extractor=(
+                HYBRID_EXTRACTOR
+                if extraction_settings["mode"] == "hybrid"
+                else DETERMINISTIC_EXTRACTOR
+            ),
+        )
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""

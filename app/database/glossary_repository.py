@@ -15,6 +15,7 @@ from typing import Any
 
 from app.database.connection import get_connection
 from app.database.glossary_history import ensure_history_table
+from app.observability import default_observability
 
 
 CANONICAL_STATES = {
@@ -915,6 +916,17 @@ class GlossaryRepository:
                 after["version"],
             ),
         )
+        before_state = "ARCHIVED" if before.get("archived_at") else str(before.get("review_status") or "MISSING")
+        after_state = "ARCHIVED" if after.get("archived_at") else str(after.get("review_status") or "CONFLICT")
+        if not before or before_state != after_state:
+            default_observability.record_glossary_transition(
+                action=action,
+                before_state=before_state,
+                after_state=after_state,
+                term_id=int(after["id"]),
+                book_id=int(after["book_id"]),
+                version=int(after["version"]),
+            )
 
     @staticmethod
     def _assert_target_and_conflicts(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> None:
@@ -1440,8 +1452,12 @@ class GlossaryRepository:
             state = self._requested_update_state(current, changes)
             merged.update(review_status=state[0], approved=state[1], locked=state[2])
             if state_change:
-                if "locked" in changes:
-                    action = "lock" if int(changes["locked"] or 0) else "unlock"
+                if "locked" in changes and not int(changes["locked"] or 0):
+                    explicit_approval = (
+                        ("approved" in changes and int(changes["approved"]) == 1)
+                        or str(changes.get("review_status") or "").strip().upper() == "APPROVED"
+                    )
+                    action = "approve" if current["locked"] != 1 and explicit_approval else "unlock"
                 else:
                     action = {
                         "APPROVED": "unlock" if current["locked"] == 1 else "approve",
@@ -1649,17 +1665,27 @@ class GlossaryRepository:
                 GROUP BY source_key
                 HAVING MIN(book_id) = 0 AND MAX(book_id) > 0
             ),
+            variant_terms AS (
+                SELECT id, variants
+                FROM eligible
+                WHERE TRIM(COALESCE(variants, '')) NOT IN ('', '[]')
+            ),
+            variant_matches AS (
+                SELECT DISTINCT
+                       CASE WHEN variant.id < term.id THEN variant.id ELSE term.id END AS canonical_id,
+                       CASE WHEN variant.id < term.id THEN term.id ELSE variant.id END AS secondary_id
+                FROM variant_terms variant
+                JOIN eligible term ON term.id != variant.id
+                WHERE glossary_variant_has(variant.variants, term.source_key) = 1
+            ),
             primary_variant AS (
                 SELECT 'primary_variant' AS conflict_type,
                        -2 AS group_book_id,
-                       printf('%d:%d', a.id, b.id) AS source_key,
-                       a.id AS canonical_id,
-                       b.id AS secondary_id,
+                       printf('%d:%d', canonical_id, secondary_id) AS source_key,
+                       canonical_id,
+                       secondary_id,
                        2 AS member_total
-                FROM eligible a
-                JOIN eligible b ON a.id < b.id
-                WHERE glossary_variant_has(a.variants, b.source_key) = 1
-                   OR glossary_variant_has(b.variants, a.source_key) = 1
+                FROM variant_matches
             ),
             candidates AS (
                 SELECT * FROM normalized

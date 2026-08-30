@@ -13,6 +13,7 @@ from typing import Any
 
 from app.config import settings
 from app.mobile_api.config import mobile_settings
+from app.observability import default_observability
 from app.runtime_identity import get_runtime_identity
 from app.runtime_status import inspect_worker_runtime
 from app.services.tts.availability import inspect_tts_capability
@@ -212,6 +213,7 @@ class OperationalMetricsService:
             },
             "tts": tts,
             "container": {"restart_count": _optional_non_negative_int("NOVEL_CONTAINER_RESTART_COUNT")},
+            "observability": default_observability.snapshot(),
         }
         snapshot["alerts"] = evaluate_operational_alerts(snapshot)
         self._cached = (monotonic_now, snapshot)

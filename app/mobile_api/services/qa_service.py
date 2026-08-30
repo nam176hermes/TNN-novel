@@ -11,6 +11,7 @@ from app.database.db import (
     save_qa_report,
 )
 from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
+from app.observability import default_observability
 
 
 class ChapterContentReader(Protocol):
@@ -140,6 +141,12 @@ def build_deterministic_chapter_qa_report(
     else:
         overall_status = "PASS"
     quality_score = {"PASS": 9.0, "WARNING": 6.5, "FAIL": 3.0}[overall_status]
+    default_observability.record_glossary_qa(
+        book_id=book_id,
+        chapter_id=chapter_id,
+        violation_count=len(glossary_violations),
+        status=overall_status.lower(),
+    )
 
     suggested_fixes = [
         {
