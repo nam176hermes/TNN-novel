@@ -105,9 +105,10 @@ def test_init_db_seeds_style_profiles_and_glossary_metadata(temp_db_path: Path) 
     global_glossary = load_glossary(temp_db_path, 0)
     locked_terms = load_locked_glossary_terms(temp_db_path, 0)
     locked_by_source = {term["source_term"]: term for term in locked_terms}
-    assert global_glossary["宿主"] == "ký chủ"
-    assert global_glossary["积分"] == "điểm tích lũy"
-    assert global_glossary["江湖"] == "giang hồ"
+    assert global_glossary["仙侠"] == "tiên hiệp"
+    assert "宿主" not in global_glossary
+    assert "积分" not in global_glossary
+    assert "江湖" not in global_glossary
     assert locked_by_source["灵气"]["target_term"] == "linh khí"
     assert locked_by_source["灵气"]["genre"] == "tien_hiep"
 

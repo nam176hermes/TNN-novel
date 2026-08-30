@@ -450,6 +450,11 @@ def _record_extraction(
 
 
 class GlossaryService:
+    _access_bound = False
+    _access_user_id = ""
+    _access_username = ""
+    _access_admin_username = ""
+
     def __init__(self):
         self.db_path = get_db_path()
         self._access_bound = False
