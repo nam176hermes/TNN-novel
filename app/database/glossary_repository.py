@@ -1014,7 +1014,7 @@ class GlossaryRepository:
         )
         before_state = "ARCHIVED" if before.get("archived_at") else str(before.get("review_status") or "MISSING")
         after_state = "ARCHIVED" if after.get("archived_at") else str(after.get("review_status") or "CONFLICT")
-        if not before or before_state != after_state:
+        if action == "observe" or not before or before_state != after_state:
             return {
                 "action": action,
                 "before_state": before_state,
@@ -1471,9 +1471,16 @@ class GlossaryRepository:
                     if current is None:
                         continue
                     occurrence_count, chapter_count = self._phase5_counts(conn, term_id)
+                    evidence_count_after = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                            (term_id,),
+                        ).fetchone()[0]
+                    )
                     if (
                         int(current["occurrence_count"] or 0) == occurrence_count
                         and int(current["chapter_count"] or 0) == chapter_count
+                        and evidence_counts_before[term_id] == evidence_count_after
                     ):
                         continue
                     before = dict(current)

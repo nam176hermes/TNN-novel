@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -20,7 +21,9 @@ from app.mobile_api.config import mobile_settings
 from app.mobile_api.main import app
 from app.mobile_api.services import glossary_service as glossary_module
 from app.mobile_api.services.glossary_service import GlossaryService
+from app.database import glossary_repository as repository_module
 from app.database.glossary_repository import GlossaryRepository
+from app.observability import InMemoryMetrics, Observability, StructuredEventLogger
 from app.translation.self_improve import add_correction, harvest_corrections
 
 
@@ -906,6 +909,162 @@ def test_reextract_reconciles_stale_evidence_and_zeroes_real_counts(
     serialized = reconciliation["before_json"] + reconciliation["after_json"]
     assert "玄天圣典" not in serialized
     assert "弟子静坐" not in serialized
+
+
+def test_stale_overlapping_extractor_evidence_records_count_only_reconciliation_once(
+    temp_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    term_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "玄天圣典",
+        "PRIVATE-OVERLAP-TARGET-SENTINEL",
+        approved=1,
+        locked=1,
+        notes_vi="PRIVATE-OVERLAP-NOTE-SENTINEL",
+        variants="PRIVATE-OVERLAP-VARIANT-SENTINEL",
+    )
+    repository = GlossaryRepository(temp_db_path)
+    candidate = {
+        "source_term": "玄天圣典",
+        "mention_count": 1,
+        "evidence_types": ["repeated_ngram"],
+    }
+    repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=7,
+        chapter_number=7,
+        extractor="deterministic-v2",
+        candidates=[candidate],
+        occurrence_corpus="玄天圣典",
+    )
+    repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=7,
+        chapter_number=7,
+        extractor="hybrid-v1",
+        candidates=[{**candidate, "target_term": "ignored reviewed proposal"}],
+        occurrence_corpus="玄天圣典",
+    )
+
+    with get_connection(temp_db_path) as conn:
+        before = conn.execute(
+            "SELECT version, occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        before_history_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+                (term_id,),
+            ).fetchone()[0]
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+            (term_id,),
+        ).fetchone()[0] == 2
+        assert tuple(before)[1:] == (1, 1)
+
+    logger_name = "tests.glossary.stale-overlap"
+    observability = Observability(
+        metrics=InMemoryMetrics(max_series=16),
+        events=StructuredEventLogger(logging.getLogger(logger_name)),
+    )
+    monkeypatch.setattr(repository_module, "default_observability", observability)
+
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        first = repository.record_extraction_candidates(
+            book_id=book_id,
+            chapter_id=7,
+            chapter_number=7,
+            extractor="hybrid-v1",
+            candidates=[],
+            occurrence_corpus="玄天圣典",
+        )
+        retry = repository.record_extraction_candidates(
+            book_id=book_id,
+            chapter_id=7,
+            chapter_number=7,
+            extractor="hybrid-v1",
+            candidates=[],
+            occurrence_corpus="玄天圣典",
+        )
+
+    with get_connection(temp_db_path) as conn:
+        after = conn.execute(
+            "SELECT target_term, review_status, approved, locked, notes_vi, variants, "
+            "occurrence_count, chapter_count, version FROM glossary_terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
+        after_evidence_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM glossary_term_evidence WHERE term_id = ?",
+                (term_id,),
+            ).fetchone()[0]
+        )
+        after_history_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+                (term_id,),
+            ).fetchone()[0]
+        )
+        reconciliation = conn.execute(
+            "SELECT action, before_json, after_json, version FROM glossary_history "
+            "WHERE term_id = ? ORDER BY id DESC LIMIT 1",
+            (term_id,),
+        ).fetchone()
+
+    transition_count = sum(
+        float(item["value"])
+        for item in observability.snapshot()["metrics"]["counters"]
+        if item["name"] == "glossary_state_transitions_total"
+        and item["labels"] == {"operation": "observe", "state": "LOCKED"}
+    )
+    assert {
+        "first_updated": first["updated"],
+        "retry_updated": retry["updated"],
+        "version_delta": int(after["version"]) - int(before["version"]),
+        "history_delta": after_history_count - before_history_count,
+        "evidence_count": after_evidence_count,
+        "transition_count": transition_count,
+        "transition_log_count": caplog.text.count('"event":"glossary_state_transition"'),
+    } == {
+        "first_updated": 1,
+        "retry_updated": 0,
+        "version_delta": 1,
+        "history_delta": 1,
+        "evidence_count": 1,
+        "transition_count": 1.0,
+        "transition_log_count": 1,
+    }
+    assert tuple(after)[:8] == (
+        "PRIVATE-OVERLAP-TARGET-SENTINEL",
+        "LOCKED",
+        1,
+        1,
+        "PRIVATE-OVERLAP-NOTE-SENTINEL",
+        "PRIVATE-OVERLAP-VARIANT-SENTINEL",
+        1,
+        1,
+    )
+    assert reconciliation["action"] == "observe"
+    assert int(reconciliation["version"]) == int(before["version"]) + 1
+    before_snapshot = json.loads(reconciliation["before_json"])
+    after_snapshot = json.loads(reconciliation["after_json"])
+    assert (before_snapshot["occurrence_count"], before_snapshot["chapter_count"]) == (1, 1)
+    assert (after_snapshot["occurrence_count"], after_snapshot["chapter_count"]) == (1, 1)
+    assert (before_snapshot["evidence_count"], after_snapshot["evidence_count"]) == (2, 1)
+    private_snapshots = reconciliation["before_json"] + reconciliation["after_json"] + caplog.text
+    for sentinel in (
+        "PRIVATE-OVERLAP-TARGET-SENTINEL",
+        "PRIVATE-OVERLAP-NOTE-SENTINEL",
+        "PRIVATE-OVERLAP-VARIANT-SENTINEL",
+        "玄天圣典",
+    ):
+        assert sentinel not in private_snapshots
 
 
 @pytest.mark.parametrize(
