@@ -300,6 +300,21 @@ def test_deterministic_extraction_uses_title_repetition_suffixes_and_real_idempo
     assert evidence_count == 2
 
 
+def test_deterministic_producer_counts_late_unique_surface_without_span_payload() -> None:
+    candidates = glossary_module.extract_candidate_terms_from_text(
+        ("x" * 250_001) + "玄天圣典。玄天圣典",
+        "第一章 玄天圣典",
+    )
+
+    repeated = next(
+        candidate for candidate in candidates if candidate["source_term"] == "玄天圣典"
+    )
+    assert repeated["mention_count"] == 3
+    assert repeated["title_match"] is True
+    assert "occurrence_spans" not in repeated
+    assert all("occurrence_spans" not in candidate for candidate in candidates)
+
+
 def test_deterministic_coalesces_nested_aliases_across_title_and_body_stably(
     temp_db_path: Path,
     tmp_path: Path,
@@ -414,6 +429,156 @@ def test_deterministic_coalesces_nested_aliases_across_title_and_body_stably(
     assert tuple(after_disappearance)[6:8] == (4, 1)
     assert after_disappearance["version"] == before["version"] + 1
     assert disappearance_payload["mention_count"] == 4
+
+
+def test_deterministic_normal_producer_unions_nested_occurrences_beyond_old_cap(
+    temp_db_path: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "派金華林丹",
+        "Canonical",
+        approved=1,
+        variants="金華林",
+    )
+    compatibility_surface = "派金華林丹"
+    raw_text = (compatibility_surface * 250_000) + "派金華林丹"
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章",
+        raw_text,
+    )
+
+    result = _service(temp_db_path).extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        before_term = conn.execute(
+            "SELECT * FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        before_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        before_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    retry = _service(temp_db_path).extract_chapter_terms(book_id, chapter_id)
+
+    with get_connection(temp_db_path) as conn:
+        after_term = conn.execute(
+            "SELECT * FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        after_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (canonical_id, chapter_id),
+        ).fetchone()[0]
+        after_history = conn.execute(
+            "SELECT COUNT(*) FROM glossary_history WHERE term_id = ?",
+            (canonical_id,),
+        ).fetchone()[0]
+        history_json = "".join(
+            str(value or "")
+            for row in conn.execute(
+                "SELECT before_json, after_json FROM glossary_history WHERE term_id = ?",
+                (canonical_id,),
+            ).fetchall()
+            for value in row
+        )
+
+    candidate_counts = {
+        candidate["source_term"]: candidate["mention_count"]
+        for candidate in result["candidates"]
+        if candidate["source_term"] in {"派金華林丹", "金華林"}
+    }
+    assert candidate_counts == {"派金華林丹": 250_001, "金華林": 250_001}
+    assert (before_term["occurrence_count"], before_term["chapter_count"]) == (250_001, 1)
+    assert json.loads(before_evidence)["mention_count"] == 250_001
+    assert retry["updated"] == 0
+    assert tuple(after_term) == tuple(before_term)
+    assert after_evidence == before_evidence
+    assert after_history == before_history
+    assert all("occurrence_spans" not in candidate for candidate in result["candidates"])
+    public_json = json.dumps(result, ensure_ascii=False)
+    for private_value in ("occurrence_corpus", "occurrence_spans"):
+        assert private_value not in before_evidence
+        assert private_value not in history_json
+        assert private_value not in public_json
+        assert private_value not in caplog.text
+    assert raw_text not in before_evidence
+    assert raw_text not in history_json
+    assert raw_text not in public_json
+    assert raw_text not in caplog.text
+    assert compatibility_surface not in before_evidence
+    assert compatibility_surface not in history_json
+    assert compatibility_surface not in caplog.text
+    assert "派金華林丹" not in before_evidence
+    assert "金華林" not in before_evidence
+
+
+def test_repository_streaming_union_keeps_nested_and_touching_interval_semantics(
+    temp_db_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    canonical_id = put_glossary_term(
+        temp_db_path,
+        book_id,
+        "甲乙",
+        "Canonical",
+        approved=1,
+        variants="乙|丙丁",
+    )
+    repository = GlossaryRepository(temp_db_path)
+
+    repository.record_extraction_candidates(
+        book_id=book_id,
+        chapter_id=7,
+        chapter_number=7,
+        extractor="deterministic-v2",
+        candidates=[
+            {"source_term": "甲乙", "mention_count": 2},
+            {"source_term": "乙", "mention_count": 2},
+            {"source_term": "丙丁", "mention_count": 1},
+        ],
+        occurrence_corpus="甲乙丙丁。甲乙",
+    )
+
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            "SELECT occurrence_count, chapter_count FROM glossary_terms WHERE id = ?",
+            (canonical_id,),
+        ).fetchone()
+        evidence_json = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence WHERE term_id = ? "
+            "AND chapter_id = 7 AND extractor = 'deterministic-v2'",
+            (canonical_id,),
+        ).fetchone()[0]
+
+    payload = json.loads(evidence_json)
+    assert tuple(term) == (3, 1)
+    assert payload["mention_count"] == 3
+    assert sorted(
+        component["mention_count"] for component in payload["mention_components"]
+    ) == [1, 2]
+    assert sorted(
+        len(component["source_fingerprints"])
+        for component in payload["mention_components"]
+    ) == [1, 2]
+    assert all(surface not in evidence_json for surface in ("甲乙", "乙", "丙丁"))
 
 
 @pytest.mark.parametrize(
@@ -539,8 +704,10 @@ def test_deterministic_persists_late_safe_occurrence_coordinates(
     assert tuple(term) == (1, 1)
 
 
+@pytest.mark.parametrize("occurrence_count", [249_999, 250_000, 250_001])
 def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_count(
     temp_db_path: Path,
+    occurrence_count: int,
 ) -> None:
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Book")
@@ -552,12 +719,10 @@ def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_coun
         approved=1,
     )
     repository = GlossaryRepository(temp_db_path)
+    occurrence_corpus = "洪荒圣典。" * occurrence_count
     candidate = {
         "source_term": "洪荒圣典",
-        "mention_count": 250_001,
-        "occurrence_spans": [
-            [index * 2, index * 2 + 1] for index in range(250_001)
-        ],
+        "mention_count": occurrence_count,
         "evidence_types": ["repeated_ngram"],
     }
 
@@ -567,6 +732,7 @@ def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_coun
         chapter_number=99,
         extractor="deterministic-v2",
         candidates=[candidate],
+        occurrence_corpus=occurrence_corpus,
     )
     with get_connection(temp_db_path) as conn:
         before = conn.execute(
@@ -588,6 +754,7 @@ def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_coun
         chapter_number=99,
         extractor="deterministic-v2",
         candidates=[candidate],
+        occurrence_corpus=occurrence_corpus,
     )
     with get_connection(temp_db_path) as conn:
         after = conn.execute(
@@ -604,10 +771,10 @@ def test_deterministic_span_cardinality_overflow_preserves_truthful_bounded_coun
         ).fetchone()[0]
 
     payload = json.loads(before_evidence)
-    assert tuple(before)[:2] == (250_001, 1)
-    assert payload["mention_count"] == 250_001
+    assert tuple(before)[:2] == (occurrence_count, 1)
+    assert payload["mention_count"] == occurrence_count
     assert len(payload["mention_components"]) == 1
-    assert payload["mention_components"][0]["mention_count"] == 250_001
+    assert payload["mention_components"][0]["mention_count"] == occurrence_count
     assert "occurrence_spans" not in before_evidence
     assert "洪荒圣典" not in before_evidence
     assert retry["updated"] == 0
@@ -862,6 +1029,7 @@ def test_phase5_evidence_remains_mergeable_without_losing_provenance(temp_db_pat
             "mention_count": 3,
             "evidence_types": ["repeated_ngram"],
         }],
+        occurrence_corpus="圣典。圣典。圣典",
     )
     retry = repository.record_extraction_candidates(
         book_id=book_id,
@@ -873,6 +1041,7 @@ def test_phase5_evidence_remains_mergeable_without_losing_provenance(temp_db_pat
             "mention_count": 3,
             "evidence_types": ["repeated_ngram"],
         }],
+        occurrence_corpus="圣典。圣典。圣典",
     )
 
     with get_connection(temp_db_path) as conn:
@@ -1585,6 +1754,7 @@ def test_rejected_hybrid_source_with_deterministic_evidence_remains_observed(
             "mention_count": 2,
             "evidence_types": ["repeated_token"],
         }],
+        occurrence_corpus="罕词出现，罕词再次出现。",
     )
     with get_connection(temp_db_path) as conn:
         before = conn.execute(
@@ -1883,6 +2053,7 @@ def test_hybrid_retry_and_concurrent_repository_runs_keep_one_identity_without_c
                 chapter_number=99,
                 extractor="deterministic-v2",
                 candidates=concurrent_candidate,
+                occurrence_corpus="并发圣典。并发圣典",
             ),
             range(8),
         ))

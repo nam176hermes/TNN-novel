@@ -306,11 +306,6 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
         )
         if not _valid_candidate_source(source):
             return
-        occurrence_spans = [
-            [match.start(), match.start() + len(source)]
-            for match in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
-        ]
-        mentions = len(occurrence_spans)
         item = by_source.get(source)
         if item is None:
             item = {
@@ -320,16 +315,13 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
                 "category": term_type,
                 "confidence": confidence,
                 "source_context": _context_for_normalized(text, source),
-                "mention_count": mentions,
-                "occurrence_spans": occurrence_spans,
+                "mention_count": 0,
                 "title_match": bool(normalized_title and source in normalized_title),
                 "evidence_types": [evidence_type],
             }
             by_source[source] = item
             return
         item["confidence"] = max(float(item["confidence"]), confidence)
-        item["mention_count"] = mentions
-        item["occurrence_spans"] = occurrence_spans
         item["title_match"] = bool(
             item["title_match"] or (normalized_title and source in normalized_title)
         )
@@ -363,6 +355,11 @@ def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> lis
             continue
         maximal.append((source, count))
         observe(source, _candidate_term_type(source), "repeated_ngram", min(0.8, 0.5 + count * 0.05))
+
+    for source, item in by_source.items():
+        item["mention_count"] = sum(
+            1 for _ in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
+        )
 
     return sorted(
         by_source.values(),
@@ -838,18 +835,18 @@ class GlossaryService:
         chapter_title: str,
         raw_text: str,
         provider_id: str,
-    ) -> tuple[list[dict] | None, list[dict]]:
+    ) -> tuple[list[dict] | None, list[dict], str]:
         warnings: list[dict] = []
         provider = next(
             (item for item in list_model_providers(self.db_path) if item["id"] == provider_id),
             None,
         )
         if provider is None or int(provider.get("enabled") or 0) != 1:
-            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}], ""
         api_key_env = str(provider.get("api_key_env") or "").strip()
         api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
         if api_key_env and not api_key:
-            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}], ""
 
         bounded_title = _clean_chapter_title(chapter_title)[:200]
         bounded_text = raw_text[:MAX_HYBRID_TEXT_CHARS]
@@ -872,7 +869,7 @@ class GlossaryService:
                 response_format={"type": "json_object"},
             )
         except requests.RequestException:
-            return None, [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}], ""
 
         try:
             payload = json.loads(str(response.get("text") or ""))
@@ -880,7 +877,7 @@ class GlossaryService:
             if not isinstance(payload, dict) or not isinstance(raw_candidates, list):
                 raise ValueError("invalid_candidates")
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None, [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}]
+            return None, [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}], ""
 
         if len(raw_candidates) > MAX_HYBRID_CANDIDATES:
             raw_candidates = raw_candidates[:MAX_HYBRID_CANDIDATES]
@@ -922,10 +919,6 @@ class GlossaryService:
             term_type = normalize_term_type(str(item.get("term_type") or "other"))
             if term_type not in VALID_EXTRACTED_TERM_TYPES:
                 term_type = "other"
-            occurrence_spans = [
-                [match.start(), match.start() + len(source)]
-                for match in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
-            ]
             candidates.append(
                 {
                     "source_term": source,
@@ -934,8 +927,12 @@ class GlossaryService:
                     "category": term_type,
                     "confidence": float(confidence_value),
                     "source_context": _context_for_normalized(bounded_text, source),
-                    "mention_count": len(occurrence_spans),
-                    "occurrence_spans": occurrence_spans,
+                    "mention_count": sum(
+                        1
+                        for _ in re.finditer(
+                            f"(?={re.escape(source)})", normalized_corpus
+                        )
+                    ),
                     "title_match": bool(normalized_title and source in normalized_title),
                     "evidence_types": ["provider_structured_json"],
                 }
@@ -980,7 +977,7 @@ class GlossaryService:
                 retained.append({**candidate, "observe_only": True})
             elif source_key not in evidenced_keys:
                 retained.append(candidate)
-        return retained, warnings
+        return retained, warnings, normalized_corpus
 
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
@@ -1013,6 +1010,7 @@ class GlossaryService:
                 chapter_number=chapter_number,
                 extractor=DETERMINISTIC_EXTRACTOR,
                 candidates=[],
+                occurrence_corpus="",
             )
             if self.get_extraction_settings(book_id)["mode"] == "hybrid":
                 hybrid_counts = repository.record_extraction_candidates(
@@ -1021,11 +1019,14 @@ class GlossaryService:
                     chapter_number=chapter_number,
                     extractor=HYBRID_EXTRACTOR,
                     candidates=[],
+                    occurrence_corpus="",
                 )
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
             return {**counts, "candidates": [], "warnings": []}
 
-        candidates = extract_candidate_terms_from_text(raw_text, str(chapter.get("title") or ""))
+        chapter_title = _clean_chapter_title(str(chapter.get("title") or ""))
+        candidates = extract_candidate_terms_from_text(raw_text, chapter_title)
+        _, deterministic_corpus = _normalized_extraction_corpus(chapter_title, raw_text)
         chapter_number = int(chapter.get("chapter_number") or 0)
         repository = GlossaryRepository(self.db_path)
         counts = repository.record_extraction_candidates(
@@ -1034,11 +1035,12 @@ class GlossaryService:
             chapter_number=chapter_number,
             extractor=DETERMINISTIC_EXTRACTOR,
             candidates=candidates,
+            occurrence_corpus=deterministic_corpus,
         )
         warnings: list[dict] = []
         extraction_settings = self.get_extraction_settings(book_id)
         if extraction_settings["mode"] == "hybrid":
-            hybrid, warnings = self._hybrid_candidates(
+            hybrid, warnings, hybrid_corpus = self._hybrid_candidates(
                 book_id=book_id,
                 chapter_id=chapter_id,
                 chapter_title=str(chapter.get("title") or ""),
@@ -1052,14 +1054,11 @@ class GlossaryService:
                     chapter_number=chapter_number,
                     extractor=HYBRID_EXTRACTOR,
                     candidates=hybrid,
+                    occurrence_corpus=hybrid_corpus,
                 )
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
                 candidates = [*candidates, *hybrid]
-        public_candidates = [
-            {key: value for key, value in candidate.items() if key != "occurrence_spans"}
-            for candidate in candidates
-        ]
-        return {**counts, "candidates": public_candidates, "warnings": warnings}
+        return {**counts, "candidates": candidates, "warnings": warnings}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""

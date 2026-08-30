@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import heapq
 import hmac
 import math
 import os
@@ -121,8 +122,6 @@ def _target_is_blank(value: object) -> bool:
 
 
 MAX_PHASE5_COMPONENTS = 100
-MAX_PHASE5_OCCURRENCE_SPANS = 250_000
-MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 
 
 def _payload_mention_components(payload: object) -> list[tuple[int, set[str]]]:
@@ -229,57 +228,78 @@ def _candidate_mention_components(
     *,
     book_id: int,
     chapter_id: int,
+    occurrence_corpus: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    spans: list[tuple[int, int, str]] = []
-    fallback: list[tuple[int, set[str]]] = []
-    fingerprints: set[str] = set()
-    remaining_span_capacity = MAX_PHASE5_OCCURRENCE_SPANS
+    surfaces: dict[str, str] = {}
     for candidate in candidates:
+        source = str(candidate["_source"])
         source_key = str(candidate["_source_key"])
         fingerprint = hashlib.sha256(
             f"{book_id}:{chapter_id}:{source_key}".encode("utf-8")
         ).hexdigest()
-        fingerprints.add(fingerprint)
-        raw_spans = candidate.get("occurrence_spans")
-        valid_spans: list[tuple[int, int]] = []
-        if isinstance(raw_spans, list):
-            bounded_spans = raw_spans[:remaining_span_capacity]
-            remaining_span_capacity -= len(bounded_spans)
-            for raw_span in bounded_spans:
-                if (
-                    isinstance(raw_span, (list, tuple))
-                    and len(raw_span) == 2
-                    and type(raw_span[0]) is int
-                    and type(raw_span[1]) is int
-                    and 0 <= raw_span[0] < raw_span[1] <= MAX_SQLITE_INTEGER
-                ):
-                    valid_spans.append((raw_span[0], raw_span[1]))
-        if isinstance(raw_spans, list):
-            spans.extend((start, end, fingerprint) for start, end in valid_spans)
-            overflow_count = max(
-                0,
-                int(candidate.get("mention_count") or 0) - len(valid_spans),
-            )
-            if overflow_count:
-                fallback.append((overflow_count, {fingerprint}))
-        else:
-            fallback.append((max(0, int(candidate.get("mention_count") or 0)), {fingerprint}))
+        surfaces.setdefault(source, fingerprint)
 
-    components: list[tuple[int, set[str]]] = list(fallback)
+    retained: dict[tuple[str, ...], int] = {}
+    overflow_count = 0
+    overflow_fingerprints: set[str] = set()
+
+    def add_overflow(signature: tuple[str, ...], count: int) -> None:
+        nonlocal overflow_count, overflow_fingerprints
+        overflow_count += count
+        overflow_fingerprints = set(
+            sorted(overflow_fingerprints | set(signature))[:MAX_PHASE5_COMPONENTS]
+        )
+
+    def add_component(fingerprints: set[str]) -> None:
+        signature = tuple(sorted(fingerprints)[:MAX_PHASE5_COMPONENTS])
+        if signature in retained:
+            retained[signature] += 1
+            return
+        retained_limit = MAX_PHASE5_COMPONENTS - 1
+        if len(retained) < retained_limit:
+            retained[signature] = 1
+            return
+        largest = max(retained)
+        if signature < largest:
+            add_overflow(largest, retained.pop(largest))
+            retained[signature] = 1
+        else:
+            add_overflow(signature, 1)
+
+    def matches(source: str, fingerprint: str):
+        for match in re.finditer(f"(?={re.escape(source)})", occurrence_corpus):
+            yield match.start(), match.start() + len(source), fingerprint
+
     active_end = -1
     active_fingerprints: set[str] = set()
-    for start, end, fingerprint in sorted(spans, key=lambda item: (item[0], -item[1], item[2])):
+    merged_matches = heapq.merge(
+        *(matches(source, fingerprint) for source, fingerprint in surfaces.items()),
+        key=lambda item: (item[0], -item[1], item[2]),
+    )
+    for start, end, fingerprint in merged_matches:
         if start >= active_end:
             if active_fingerprints:
-                components.append((1, active_fingerprints))
+                add_component(active_fingerprints)
             active_end = end
             active_fingerprints = {fingerprint}
         else:
             active_end = max(active_end, end)
-            active_fingerprints.add(fingerprint)
+            active_fingerprints = set(
+                sorted(active_fingerprints | {fingerprint})[:MAX_PHASE5_COMPONENTS]
+            )
     if active_fingerprints:
-        components.append((1, active_fingerprints))
-    return _bounded_component_payload(components), sorted(fingerprints)[:MAX_PHASE5_COMPONENTS]
+        add_component(active_fingerprints)
+
+    components = [
+        {"mention_count": count, "source_fingerprints": list(signature)}
+        for signature, count in sorted(retained.items())
+    ]
+    if overflow_count:
+        components.append({
+            "mention_count": overflow_count,
+            "source_fingerprints": sorted(overflow_fingerprints),
+        })
+    return components, sorted(set(surfaces.values()))[:MAX_PHASE5_COMPONENTS]
 
 
 def _phase5_evidence_payload(rows: list[sqlite3.Row | dict[str, Any]]) -> dict[str, Any]:
@@ -1024,6 +1044,7 @@ class GlossaryRepository:
         chapter_number: int,
         extractor: str,
         candidates: list[dict[str, Any]],
+        occurrence_corpus: str,
         skip_source_keys: set[str] | None = None,
     ) -> dict[str, int]:
         """Persist bounded extraction evidence without inflating retry counts."""
@@ -1112,6 +1133,7 @@ class GlossaryRepository:
                     grouped_candidates,
                     book_id=book_id,
                     chapter_id=chapter_id,
+                    occurrence_corpus=occurrence_corpus,
                 )
                 mention_count = sum(
                     int(component["mention_count"]) for component in mention_components
