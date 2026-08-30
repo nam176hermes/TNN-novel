@@ -177,14 +177,25 @@ async (page) => {
     }
 
     // Merge leaves the canonical active, archives the duplicate, and removes the group.
+    const clearedQueueResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === '/api/glossary'
+        && !url.searchParams.has('q')
+        && url.searchParams.get('review_status') === 'APPROVED'
+        && response.status() === 200;
+    });
     await search.fill('');
+    await clearedQueueResponse;
+    await page.getByText('Đang tải hàng chờ…', { exact: true }).waitFor({ state: 'hidden' });
     await page.getByText('Xung đột & hợp nhất', { exact: true }).click();
     await page.getByRole('button', { name: 'Tải xung đột' }).click();
     await page.getByRole('radio', { name: 'Chọn canonical Ｐｈａｓｅ６ Conflict' }).click();
     await page.getByRole('button', { name: 'Xem trước hợp nhất' }).click();
     const mergeStatus = page.getByRole('status').filter({ hasText: /bằng chứng sẽ chuyển/ });
     await mergeStatus.waitFor({ state: 'visible' });
-    await page.getByRole('button', { name: 'Áp dụng hợp nhất' }).click();
+    const applyMerge = page.getByRole('button', { name: 'Áp dụng hợp nhất' });
+    await applyMerge.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+    await applyMerge.click();
     await exactText('Không có xung đột.');
     const canonicalRow = await searchFor(search, 'Cần duyệt', 'Ｐｈａｓｅ６ Conflict', 'Canonical');
     await canonicalRow.getByText('Xung đột', { exact: true }).waitFor({ state: 'visible' });
