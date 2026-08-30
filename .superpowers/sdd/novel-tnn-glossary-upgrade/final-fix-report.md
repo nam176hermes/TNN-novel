@@ -7,10 +7,11 @@ Date: 2026-08-30
 - Worktree: `/home/thenam176/Novel-TNN/.worktrees/glossary-final-fixes`
 - Branch: `codex/glossary-final-fixes`
 - Authorized base: `d9a93a19ac6ddf1b1e65062cab2635b5b68794d2`
-- Final production/browser-driver SHA under certification: `b4a94dcc974737f63b704e43712a3b90f39a2850`
+- Browser-certified production/driver SHA: `b4a94dcc974737f63b704e43712a3b90f39a2850`
+- Final continuation production/test SHA under canonical verification: `9d3b6c1f6250300b68f022d1d9b93c7520342c6a`
 - No dependency, schema, CI, deployment, remote Git, operator database, or live/provider mutation was performed.
 
-This was the single authorized final-fix wave. It closes C1, I1, I2, I3, I4, and all three minor findings without changing the public API schema or the unbound background/service behavior.
+This was the single authorized final-fix wave. It closes C1, I1, I2, I3, I4, all three minor findings, and the final evidence-count-only stale-reconciliation continuation without changing the public API schema or the unbound background/service behavior.
 
 ## Implemented fixes
 
@@ -31,6 +32,8 @@ This was the single authorized final-fix wave. It closes C1, I1, I2, I3, I4, and
 - Content-bearing fields (`source_term`, `target_term`, `variants`, `notes_vi`, `source_context`, and `alternatives`) are represented in snapshots only by per-field domain-separated SHA-256, length, and presence metadata.
 - Legacy `glossary_history.source_term` and `target_term` columns remain unchanged for compatibility; raw free-form content is not duplicated into JSON snapshots.
 - Extraction reconciliation captures evidence counts before evidence deletion/update, and merge history captures exact pre/post evidence counts after evidence movement and alias creation.
+- Stale extraction reconciliation now compares evidence count as well as aggregate occurrence/chapter counts. Removing one overlapping extractor therefore records the bounded `2 -> 1` evidence transition, increments the term version once, and emits one committed `observe` transition even when aggregate counts remain unchanged.
+- A retry after that stale evidence is gone is idempotent: it does not add history, increment version, or emit another transition, and reviewed term metadata remains unchanged.
 
 ### I2: selected styleguide genre
 
@@ -72,6 +75,7 @@ Backend commands below used `NOVEL_PIPELINE_IGNORE_DOTENV=1` and isolated `/tmp`
 | I3 | `GlossaryStyleView.test.tsx` with two deferred preview tests -> 2 failed, 11 passed; stale merge/import responses restored apply controls after selection/text/book/revision changes. | Component file -> 13 passed. |
 | I4 | `useGlossary.test.tsx` with deferred mutation followed by search/scope/page change -> 1 failed, 10 passed; the newest request's `AbortSignal` was aborted. | Hook file -> 11 passed; newest signal remained live, no third stale query ran, and the newest rows won. |
 | Minors | ReviewQueue + StyleView parser + PWA CSS tests -> 8 failed, 18 passed. Three root assertions were red; the incorrect tab-role test left fake timers active and caused five same-file cascades. | The same three files -> 26 passed. |
+| Stale overlapping evidence continuation | Real SQLite deterministic + hybrid overlap test -> 1 failed: evidence deleted `2 -> 1`, but `updated`, version delta, history delta, telemetry counter, and transition log were all `0`. | Same test -> 1 passed; occurrence/chapter stayed `1/1`, evidence history recorded `2 -> 1`, version/history/committed telemetry changed exactly once, retry stayed idempotent, and private sentinels remained absent. |
 
 The first cumulative glossary backend run was `129 passed, 6 failed`. All six failures were expected contract/fixture drift: two API tests used nonexistent book IDs, three import round trips omitted destination books, and one bulk test expected the old distinguishable `409 term_not_found`. After creating owned destination books and adopting the required indistinguishable `404`, the seven focused regressions passed and the cumulative glossary selection completed as `135 passed, 87 warnings`.
 
@@ -102,9 +106,31 @@ On committed production SHA `6abf0f4fc80743e63f0d13b58ebe13db09bd2da0`, the lite
 - Frontend: `87` files, `802` tests in `31.49s`.
 - Frontend production build: `1858` modules, built in `1.30s`.
 
-The later production-tree changes only corrected the tracked browser certification driver. A final canonical rerun is performed after this report commit so the returned handoff can cite the final HEAD directly.
+The later production-tree changes only corrected the tracked browser certification driver. The promised final canonical rerun then completed on report SHA `2a4676789b5786f3d835a3852dcdb98fde0091ba` with exit `0`:
 
-`git diff --check` passed before each production commit and before the report.
+- Python compile, shell syntax, environment, lint/typecheck, and dependency consistency: pass.
+- Backend: `1460 passed, 477 warnings in 474.43s`.
+- Frontend: `87` files, `802` tests in `30.99s`.
+- Frontend production build: `1858` modules, built in `989ms`.
+
+### Evidence-count-only continuation
+
+The continuation began from clean SHA `2a4676789b5786f3d835a3852dcdb98fde0091ba`. A real SQLite regression established two overlapping observations for one locked term in the same chapter, one from `deterministic-v2` and one from `hybrid-v1`. Clearing only the stale hybrid observation kept occurrence/chapter counts at `1/1` while evidence count fell from `2` to `1`. Before the fix, the test failed with `updated=0`, version/history deltas `0`, and no observe telemetry counter or event.
+
+The shared stale guard now includes the post-delete evidence count, and centralized `observe` history transitions are published only after the transaction commits. Focused extraction/history/rollback/telemetry coverage passed as `7 passed, 1 warning`. The affected database, Phase 1/2/4/5/6, and final owner-authorization selection passed as `164 passed, 67 warnings in 101.88s`. `scripts/lint.sh` exited `0`.
+
+On committed continuation production/test SHA `9d3b6c1f6250300b68f022d1d9b93c7520342c6a`, the literal canonical command exited `0`:
+
+- Python compile: pass.
+- Shell syntax: pass.
+- Environment: pass using only disposable ignored prerequisites.
+- Lint and frontend typecheck: pass.
+- Backend: `1461 passed, 477 warnings in 482.70s`.
+- Python dependency consistency: pass.
+- Frontend: `87` files, `802` tests in `30.85s`.
+- Frontend production build: `1858` modules, built in `2.21s`.
+
+`git diff --check` passed before each production commit and before each report commit.
 
 ## Browser certification
 
@@ -126,6 +152,7 @@ Final certification on `b4a94dcc974737f63b704e43712a3b90f39a2850` exited `0`:
 - Both reported `httpFailures: []`.
 - Desktop initial/final width was `1440/1440`; mobile was `390/390`; both reported no horizontal overflow.
 - Keyboard focus was visible on the expected `SUMMARY`, and Enter activated it in both viewports.
+- No browser rerun was required for the evidence-count-only continuation because it changed no API, UI, CSS, browser driver, or browser-visible contract.
 
 ## Changed files
 
