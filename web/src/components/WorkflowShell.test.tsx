@@ -74,6 +74,7 @@ describe('WorkflowShell', () => {
     expect(onViewChange).toHaveBeenCalledWith('library');
     expect(onViewChange).toHaveBeenCalledWith('reader');
     expect(onViewChange).toHaveBeenCalledWith('jobs');
+    expect(onViewChange).toHaveBeenCalledWith('raw');
     expect(onOpenImport).toHaveBeenCalledTimes(1);
   });
 

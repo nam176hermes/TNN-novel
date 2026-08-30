@@ -56,7 +56,7 @@ def extract_term_changes(pipe_out: str, user_fix: str) -> List[Tuple[str, str]]:
 
 def harvest_corrections(
     db_path: Path,
-    book_id: int = 0,
+    book_id: int,
     days: int = 7,
     min_occurrences: int = 2,
 ) -> List[dict]:
@@ -70,8 +70,8 @@ def harvest_corrections(
         rows = conn.execute(
             """SELECT source_chunk, pipe_out, user_fix, correction_type
             FROM user_corrections
-            WHERE created_at >= datetime('now', ?)""",
-            (f"-{days} days",),
+            WHERE book_id = ? AND created_at >= datetime('now', ?)""",
+            (book_id, f"-{days} days"),
         ).fetchall()
     finally:
         conn.close()

@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import App from './App';
+import App, { runGlossaryPhase4Mutation } from './App';
 import { putCachedChapterAsync } from './state/readerCache';
 import { clearReaderPrivateData } from './state/readerPrivateData';
 import { saveReaderResume } from './state/readerResume';
@@ -11,6 +11,17 @@ import { fixtureBook, fixtureChapter, fixtureUsage } from './test/fixtures';
 describe('App', () => {
   beforeEach(() => {
     clearToken();
+  });
+
+  it('shows phase 4 errors and propagates rejected promises to the owning component', async () => {
+    const failure = new Error('typed phase 4 failure');
+    const handleError = vi.fn();
+
+    await expect(
+      runGlossaryPhase4Mutation(() => Promise.reject(failure), handleError, 'Glossary bulk update failed'),
+    ).rejects.toBe(failure);
+
+    expect(handleError).toHaveBeenCalledWith(failure, 'Glossary bulk update failed');
   });
 
   afterEach(() => {

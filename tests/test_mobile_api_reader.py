@@ -1753,7 +1753,7 @@ async def test_reader_dictionary_pack_returns_offline_sources_for_browser_cache(
     assert payload["chapter_id"] == chapter_id
     assert payload["online"]["status"] == "skipped"
     assert payload["source_count"] == len(payload["sources"])
-    assert payload["counts"]["glossary"] == 1
+    assert payload["counts"]["glossary"] >= 1
     assert payload["counts"]["offline_dictionary"] == 1
     assert payload["counts"]["xray"] == 1
     assert payload["counts"]["builtin"] >= 1

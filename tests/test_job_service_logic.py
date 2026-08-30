@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,9 @@ from app.ingestion.source_policies import SourcePolicy
 from app.mobile_api.services import job_service as job_service_module
 from app.mobile_api.routers import jobs as jobs_router
 from app.mobile_api.services.job_service import JobService, JobTracker
+from app.mobile_api.services.glossary_service import GlossaryService
 from app.mobile_api.services.pipeline_service import PipelineService
+from app.mobile_api.services.qa_service import QAService
 from app.services.tts.availability import TTSUnavailableError
 
 
@@ -1152,6 +1155,74 @@ async def test_translate_worker_passes_style_profile_id_to_pipeline(temp_db_path
     assert attempts[0]["model"] == "deepseek-live"
     assert attempts[0]["status"] == "success"
     assert attempts[0]["error"] == ""
+
+
+@pytest.mark.asyncio
+async def test_successful_translation_records_bounded_sanitized_glossary_warnings(
+    temp_db_path,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
+    translated_path = tmp_path / "translated.txt"
+
+    class SavingPipeline:
+        db_path = temp_db_path
+
+        def get_chapter(self, target_chapter_id: int) -> dict:
+            return {"id": target_chapter_id, "book_id": book_id}
+
+        def translate_chapter(self, **_kwargs) -> str:
+            translated_path.write_text("Bản dịch đã lưu.", encoding="utf-8")
+            update_chapter_paths(
+                temp_db_path,
+                chapter_id,
+                translated_text_path=translated_path,
+                status="translated",
+            )
+            return "Bản dịch đã lưu."
+
+    warnings = [
+        {"code": "provider_unavailable", "message": "Hybrid glossary extraction was skipped."}
+        for _ in range(12)
+    ] + [{"code": "unknown", "message": "provider-secret /private/prompt"}]
+    monkeypatch.setattr(
+        GlossaryService,
+        "extract_chapter_terms",
+        lambda *args, **kwargs: {"created": 0, "updated": 0, "warnings": warnings},
+    )
+    monkeypatch.setattr(
+        QAService,
+        "run_deterministic_qa",
+        lambda *args, **kwargs: {"overall_status": "PASS", "issues": []},
+    )
+    service = JobService(SavingPipeline())  # type: ignore[arg-type]
+
+    job_id = service.start_translate_job(
+        chapter_ids=[chapter_id],
+        provider_id="fake",
+        model="fake-model",
+    )
+    await service.tracker._tasks[job_id]
+
+    status = service.get_job_status(job_id)
+    logs = get_job_logs(temp_db_path, job_id=job_id)
+    qa_completed = next(log for log in logs if log["event_type"] == "qa_completed")
+    details = qa_completed["details"]
+    assert status is not None
+    assert status["status"] == "completed"
+    assert translated_path.read_text(encoding="utf-8") == "Bản dịch đã lưu."
+    assert details["glossary_warning_count"] == 13
+    assert details["glossary_warnings_truncated"] is True
+    assert len(details["glossary_warning_codes"].split(",")) == 10
+    assert details["glossary_warning_codes"].split(",")[0] == "provider_unavailable"
+    assert details["glossary_warning_messages"].split(" | ")[0] == (
+        "Hybrid glossary extraction was skipped."
+    )
+    assert "provider-secret" not in json.dumps(details)
+    assert "/private/prompt" not in json.dumps(details)
 
 
 @pytest.mark.asyncio

@@ -198,6 +198,48 @@ def test_post_commit_followup_failure_returns_warning_without_rolling_back(
     assert all(warning["type"] == "post_import_qa_warning" for warning in result["warnings"])
 
 
+def test_post_commit_provider_warning_is_returned_without_rolling_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "pipeline.db"
+    db_mod.init_db(db_path)
+    service = _pipeline(db_path, tmp_path)
+    monkeypatch.setattr(
+        GlossaryService,
+        "extract_chapter_terms",
+        lambda *args, **kwargs: {
+            "created": 0,
+            "updated": 0,
+            "warnings": [
+                {
+                    "code": "provider_unavailable",
+                    "message": "Hybrid glossary extraction was skipped.",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(QAService, "run_deterministic_qa", lambda *args, **kwargs: {"status": "PASS"})
+
+    result = service.import_reviewed_text_plan(
+        title="Provider Warning",
+        chapters=_chapters(1),
+        content_kind="raw",
+        duplicate_strategy="error",
+    )
+
+    assert result["imported_chapters"] == 1
+    assert len(db_mod.list_chapters(db_path, result["book_id"])) == 1
+    assert result["warnings"] == [
+        {
+            "type": "glossary_extraction_warning",
+            "message": "Hybrid glossary extraction was skipped.",
+            "chapter_number": 1,
+            "reason": "provider_unavailable",
+        }
+    ]
+
+
 def test_reviewed_import_rejects_stale_overwrite_after_server_revalidation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

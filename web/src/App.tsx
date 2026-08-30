@@ -69,6 +69,19 @@ const AUTH_DISABLED = ['1', 'true', 'yes', 'on'].includes(
 const PUBLIC_REVIEW_MODE = ['1', 'true', 'yes', 'on'].includes(
   String(import.meta.env.VITE_PUBLIC_REVIEW_MODE ?? '').trim().toLowerCase(),
 );
+
+export async function runGlossaryPhase4Mutation(
+  call: () => Promise<unknown>,
+  onError: (error: unknown, label: string) => void,
+  label: string,
+): Promise<void> {
+  try {
+    await call();
+  } catch (error) {
+    onError(error, label);
+    throw error;
+  }
+}
 const MAX_JOB_REFRESH_RETRIES = 3;
 const JOB_REFRESH_RETRY_DELAY_MS = 100;
 const emptyTranslatedBooks: AsyncState<TranslatedBookSummary[]> = { data: [], error: '', state: 'idle' };
@@ -328,6 +341,7 @@ function AuthenticatedApp() {
     assistBookId,
     chapterText.sourceText,
     expireSession,
+    activeView === 'glossary',
   );
   const loadTranslatedBooks = useCallback(async (): Promise<TranslatedBookSummary[]> => {
     if (!session.isAuthenticated) {
@@ -1114,6 +1128,11 @@ function AuthenticatedApp() {
     } catch (error) {
       handleJobError(error, 'Glossary review failed');
     }
+  }
+
+  async function handleGlossaryPhase4(call: () => Promise<unknown>, label: string): Promise<void> {
+    setBackendError('');
+    return runGlossaryPhase4Mutation(call, handleJobError, label);
   }
 
   async function handleTestProvider(providerId: string): Promise<void> {
@@ -2025,15 +2044,64 @@ function AuthenticatedApp() {
           <>
             {statusMessages}
             <GlossaryStyleView
+              bookId={assistBookId ?? undefined}
+              chapterId={selectedChapter?.book_id === assistBookId ? selectedChapter.id : undefined}
+              error={glossaryState.terms.error}
+              facets={glossaryState.facets}
               glossaryTerms={glossaryState.terms.data}
+              loadState={glossaryState.terms.state}
+              onApplyImport={(items, digest, policy) => handleGlossaryPhase4(
+                () => glossaryState.applyImport(items, digest, policy), 'Glossary import failed',
+              )}
+              onApplyMerge={(canonicalId, duplicateIds, digest) => handleGlossaryPhase4(
+                () => glossaryState.applyMerge(canonicalId, duplicateIds, digest), 'Glossary merge failed',
+              )}
               onApproveTerm={handleGlossaryApprove}
+              onArchiveTerm={(termId) => handleGlossaryPhase4(
+                () => glossaryState.archiveTerm(termId), 'Glossary archive failed',
+              )}
+              onBulkAction={(action, terms) => handleGlossaryPhase4(
+                () => glossaryState.bulkTerms(action, terms), 'Glossary bulk update failed',
+              )}
+              onCreateTerm={(term) => handleGlossaryPhase4(
+                () => glossaryState.createTerm(term), 'Glossary create failed',
+              )}
+              onCreateBookOverride={glossaryState.createBookOverride}
+              onExport={(format) => handleGlossaryPhase4(async () => {
+                const download = await session.client.downloadGlossaryExport(assistBookId ?? undefined, format);
+                triggerBrowserDownload(download.blob, download.filename);
+              }, 'Glossary export failed')}
+              onLoadConflicts={glossaryState.loadConflicts}
+              onLoadExtractionSettings={(bookId) => session.client.getBookGlossarySettings(bookId)}
+              onLoadTermDetail={glossaryState.loadTermDetail}
               onLockToggle={handleGlossaryLockToggle}
+              onPageChange={(page) => glossaryState.setQuery({ page })}
               onProfileChange={handleStyleProfileChange}
+              onPreviewImport={glossaryState.previewImport}
+              onPreviewMerge={glossaryState.previewMerge}
+              onQueryChange={glossaryState.setQuery}
               onRejectTerm={handleGlossaryReject}
+              onReextractChapter={async (bookId, chapterId) => {
+                const result = await session.client.reextractChapterGlossary(bookId, chapterId);
+                await glossaryState.refresh();
+                return result;
+              }}
+              onRestoreTerm={(termId) => handleGlossaryPhase4(
+                () => glossaryState.restoreTerm(termId), 'Glossary restore failed',
+              )}
               onSaveAndApproveTerm={handleGlossarySaveAndApprove}
+              onSaveExtractionSettings={(bookId, settings) => (
+                session.client.updateBookGlossarySettings(bookId, settings)
+              )}
               onUpdateTerm={handleGlossaryTermUpdate}
+              page={glossaryState.page}
+              pages={glossaryState.pages}
+              perPage={glossaryState.perPage}
               profiles={styleState.profiles.data}
+              providers={providersState.providers.data}
+              query={glossaryState.query}
               selectedProfileId={styleState.selectedStyleProfileId}
+              total={glossaryState.total}
             />
           </>
         );

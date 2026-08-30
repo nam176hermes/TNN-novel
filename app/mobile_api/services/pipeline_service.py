@@ -36,9 +36,6 @@ from app.database.db import (
     get_provider_defaults,
     get_reader_dictionary_cache,
     get_reader_ai_cache,
-    load_glossary,
-    load_glossary_names,
-    list_glossary,
     list_chapters,
     list_model_providers,
     list_reader_annotations,
@@ -58,6 +55,8 @@ from app.database.db import (
     upsert_reader_ai_cache,
     upsert_reader_dictionary_cache,
 )
+from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
+from app.database.glossary_repository import normalize_source_key
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
 from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
 from app.mobile_api.services.content_file_service import ContentFileService
@@ -1458,9 +1457,76 @@ def fetch_online_dictionary_lookup(query: str, *, timeout: float = ONLINE_DICTIO
     return results
 
 
-def _reader_dictionary_builtin_results(query: str) -> list[dict]:
+def _reader_dictionary_builtin_is_shadowed(
+    entry: Mapping[str, object],
+    reserved_source_keys: frozenset[str],
+) -> bool:
+    surfaces = [entry.get("term"), *(entry.get("variants") or [])]
+    return any(
+        normalize_source_key(str(surface or "")) in reserved_source_keys
+        for surface in surfaces
+        if str(surface or "").strip()
+    )
+
+
+def _reader_dictionary_source_keys(source: Mapping[str, object]) -> frozenset[str]:
+    variants = source.get("variants") or []
+    if isinstance(variants, str):
+        variant_values = _dictionary_split_variants(variants)
+    else:
+        variant_values = [str(item) for item in variants]
+    return frozenset(
+        key
+        for surface in [source.get("term"), *variant_values]
+        if (key := normalize_source_key(str(surface or "")))
+    )
+
+
+def _reader_effective_dictionary_terms(
+    effective_glossary: EffectiveGlossary,
+    supplemental_sources: list[dict],
+) -> tuple[list[Mapping[str, object]], frozenset[str]]:
+    supplemental = [
+        (
+            source_keys,
+            normalize_source_key(str(source.get("target") or "")),
+            source.get("source") != "builtin"
+            or not source_keys & effective_glossary.reserved_source_keys,
+        )
+        for source in supplemental_sources
+        if (source_keys := _reader_dictionary_source_keys(source))
+    ]
+    terms: list[Mapping[str, object]] = []
+    styleguide_winning_keys: set[str] = set()
+    for term in effective_glossary.dictionary_terms:
+        if not term.get("styleguide"):
+            terms.append(term)
+            continue
+        term_keys = _reader_dictionary_source_keys(
+            {
+                "term": term.get("source_term"),
+                "variants": term.get("variants"),
+            }
+        )
+        target_key = normalize_source_key(str(term.get("target_term") or ""))
+        if any(
+            survives and term_keys & source_keys and target_key == source_target
+            for source_keys, source_target, survives in supplemental
+        ):
+            continue
+        terms.append(term)
+        styleguide_winning_keys.update(term_keys)
+    return terms, frozenset(styleguide_winning_keys)
+
+
+def _reader_dictionary_builtin_results(
+    query: str,
+    reserved_source_keys: frozenset[str] = frozenset(),
+) -> list[dict]:
     results: list[dict] = []
     for entry in READER_BUILTIN_DICTIONARY:
+        if _reader_dictionary_builtin_is_shadowed(entry, reserved_source_keys):
+            continue
         variants = [str(item) for item in entry.get("variants", []) if str(item).strip()]
         if not _dictionary_query_matches(
             query,
@@ -1487,8 +1553,14 @@ def _reader_dictionary_builtin_entry(entry: dict[str, object]) -> dict:
     }
 
 
-def _reader_dictionary_builtin_pack_results() -> list[dict]:
-    return [_reader_dictionary_builtin_entry(entry) for entry in READER_BUILTIN_DICTIONARY]
+def _reader_dictionary_builtin_pack_results(
+    reserved_source_keys: frozenset[str] = frozenset(),
+) -> list[dict]:
+    return [
+        _reader_dictionary_builtin_entry(entry)
+        for entry in READER_BUILTIN_DICTIONARY
+        if not _reader_dictionary_builtin_is_shadowed(entry, reserved_source_keys)
+    ]
 
 
 def _reader_dictionary_file_entry(row: dict, provider: str) -> dict | None:
@@ -2684,7 +2756,10 @@ class PipelineService:
         if cached:
             return cached
 
-        fallback_terms = _matching_reader_terms(load_glossary(self.db_path, book_id), selected_text)
+        fallback_terms = _matching_reader_terms(
+            resolve_effective_glossary(self.db_path, book_id).prompt_mapping,
+            selected_text,
+        )
         provider_options = self._reader_ai_provider_options()
         raw_payload: dict = {}
         if provider_options:
@@ -2743,10 +2818,7 @@ class PipelineService:
             list_chapters(self.db_path, book_id),
             key=lambda item: int(item.get("chapter_number") or 0),
         )
-        glossary = {
-            **load_glossary(self.db_path, book_id),
-            **load_glossary_names(self.db_path, book_id),
-        }
+        glossary = resolve_effective_glossary(self.db_path, book_id).prompt_mapping
         candidates: dict[str, dict] = {}
         chapter_payloads: list[tuple[dict, list[str]]] = []
 
@@ -3895,12 +3967,20 @@ class PipelineService:
                 return None
             current_chapter_number = int(chapter.get("chapter_number") or 0)
 
+        effective_glossary = resolve_effective_glossary(self.db_path, book_id)
+        raw_builtin_sources = _reader_dictionary_builtin_pack_results()
+        file_sources = _reader_dictionary_file_pack_results(self.data_dir)
+        dictionary_terms, styleguide_winning_keys = _reader_effective_dictionary_terms(
+            effective_glossary,
+            [*raw_builtin_sources, *file_sources],
+        )
         glossary_sources = [
             _reader_dictionary_glossary_result(term)
-            for term in list_glossary(self.db_path, book_id)
+            for term in dictionary_terms
         ]
-        builtin_sources = _reader_dictionary_builtin_pack_results()
-        file_sources = _reader_dictionary_file_pack_results(self.data_dir)
+        builtin_sources = _reader_dictionary_builtin_pack_results(
+            effective_glossary.reserved_source_keys | styleguide_winning_keys
+        )
 
         self._ensure_reader_xray_auto_extracted(book_id)
         xray_sources = [
@@ -3952,7 +4032,13 @@ class PipelineService:
             current_chapter_number = int(chapter.get("chapter_number") or 0)
 
         offline_sources: list[dict] = []
-        glossary_terms = list_glossary(self.db_path, book_id)
+        effective_glossary = resolve_effective_glossary(self.db_path, book_id)
+        raw_builtin_sources = _reader_dictionary_builtin_results(normalized_query)
+        file_sources = _reader_dictionary_file_results(self.data_dir, normalized_query)
+        glossary_terms, styleguide_winning_keys = _reader_effective_dictionary_terms(
+            effective_glossary,
+            [*raw_builtin_sources, *file_sources],
+        )
         for term in glossary_terms:
             variants = _dictionary_split_variants(term.get("variants"))
             if _dictionary_query_matches(
@@ -3964,8 +4050,13 @@ class PipelineService:
             ):
                 offline_sources.append(_reader_dictionary_glossary_result(term))
 
-        offline_sources.extend(_reader_dictionary_builtin_results(normalized_query))
-        offline_sources.extend(_reader_dictionary_file_results(self.data_dir, normalized_query))
+        offline_sources.extend(
+            _reader_dictionary_builtin_results(
+                normalized_query,
+                effective_glossary.reserved_source_keys | styleguide_winning_keys,
+            )
+        )
+        offline_sources.extend(file_sources)
 
         self._ensure_reader_xray_auto_extracted(book_id)
         entities = list_reader_xray_entities(
@@ -4173,6 +4264,7 @@ class PipelineService:
         style_profile_id: str | None = None,
         chunk_size: int | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        effective_glossary: EffectiveGlossary | None = None,
     ) -> str:
         book = get_book_by_id(self.db_path, book_id)
         if not book:
@@ -4197,6 +4289,7 @@ class PipelineService:
             style_profile_id=style_profile_id,
             chunk_size=chunk_size,
             cancel_check=cancel_check,
+            effective_glossary=effective_glossary,
         )
         self.update_chapter_translation(chapter_id, translated)
         return translated
@@ -4212,6 +4305,7 @@ class PipelineService:
         chunk_size: int | None = None,
         stage_callback: Callable[[dict], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        effective_glossary: EffectiveGlossary | None = None,
     ) -> dict:
         preset = get_translation_preset(preset_id)
         effective_chunk_size = chunk_size if chunk_size is not None else preset.chunk_size
@@ -4266,6 +4360,7 @@ class PipelineService:
                 style_profile_id=style_profile_id,
                 chunk_size=effective_chunk_size,
                 cancel_check=cancel_check,
+                effective_glossary=effective_glossary,
             )
         except Exception as exc:
             notify_stage("translate", "failed", translate_options, stage_started_at, str(exc))
@@ -5150,7 +5245,18 @@ class PipelineService:
                 from app.mobile_api.services.glossary_service import GlossaryService
                 from app.mobile_api.services.qa_service import QAService
 
-                GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
+                extraction = GlossaryService.from_db_path(self.db_path).extract_chapter_terms(
+                    book_id, chapter_id_for_followup
+                )
+                for warning in extraction.get("warnings") or []:
+                    warnings.append(
+                        {
+                            "type": "glossary_extraction_warning",
+                            "message": str(warning.get("message") or "Glossary extraction was skipped."),
+                            "chapter_number": int(item["chapter_number"]),
+                            "reason": str(warning.get("code") or "extraction_warning"),
+                        }
+                    )
                 if item.get("translated_final_path"):
                     QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
             except Exception:

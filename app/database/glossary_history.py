@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS glossary_history (
     old_mode TEXT DEFAULT '',
     new_mode TEXT DEFAULT '',
     user TEXT DEFAULT '',
+    term_id INTEGER,
+    before_json TEXT NOT NULL DEFAULT '{}',
+    after_json TEXT NOT NULL DEFAULT '{}',
+    actor TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_glossary_history_source ON glossary_history(source_term);
@@ -36,9 +42,44 @@ CREATE INDEX IF NOT EXISTS idx_glossary_history_ts ON glossary_history(timestamp
 
 
 def ensure_history_table(conn: sqlite3.Connection) -> None:
-    """Create glossary_history table if not exists."""
-    conn.executescript(GLOSSARY_HISTORY_SCHEMA)
-    conn.commit()
+    """Create or extend history without committing the caller's transaction."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS glossary_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER DEFAULT 0,
+            source_term TEXT NOT NULL,
+            target_term TEXT DEFAULT '',
+            action TEXT NOT NULL,
+            old_target TEXT DEFAULT '',
+            old_mode TEXT DEFAULT '',
+            new_mode TEXT DEFAULT '',
+            user TEXT DEFAULT '',
+            term_id INTEGER,
+            before_json TEXT NOT NULL DEFAULT '{}',
+            after_json TEXT NOT NULL DEFAULT '{}',
+            actor TEXT NOT NULL DEFAULT '',
+            request_id TEXT NOT NULL DEFAULT '',
+            version INTEGER NOT NULL DEFAULT 0,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(glossary_history)")}
+    for definition in (
+        "term_id INTEGER",
+        "before_json TEXT NOT NULL DEFAULT '{}'",
+        "after_json TEXT NOT NULL DEFAULT '{}'",
+        "actor TEXT NOT NULL DEFAULT ''",
+        "request_id TEXT NOT NULL DEFAULT ''",
+        "version INTEGER NOT NULL DEFAULT 0",
+    ):
+        if definition.split()[0] not in columns:
+            conn.execute(f"ALTER TABLE glossary_history ADD COLUMN {definition}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_history_source ON glossary_history(source_term)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_history_book ON glossary_history(book_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_history_ts ON glossary_history(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_history_term ON glossary_history(term_id, id)")
 
 
 def log_glossary_change(

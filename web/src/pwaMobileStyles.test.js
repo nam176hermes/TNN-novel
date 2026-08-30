@@ -32,6 +32,10 @@ describe('mobile PWA prompt styles', () => {
     expect(styles).toContain('.providers-management-table thead,');
     expect(styles).toContain('.glossary-management-table thead,');
     expect(styles).toContain('.providers-management-table th:nth-child(1)::before { content: "Provider"; }');
+    expect(styles).toContain('.glossary-management-table td:nth-child(1)::before { content: "Chọn"; }');
+    expect(styles).toContain('.glossary-management-table td:nth-child(2)::before { content: "Gốc"; }');
+    expect(styles).not.toContain('.glossary-management-table th:nth-child(2)::before { content: "Gốc"; }');
+    expect(styles).toContain('.glossary-management-table td:nth-child(7)::before { content: "Bằng chứng"; }');
     expect(styles).toContain('.glossary-management-table td:nth-child(8)::before { content: "Thao tác"; }');
     expect(styles).toContain('.provider-key-form input,\n  .provider-key-form button,\n  .provider-row-test {\n    min-height: 44px;');
   });

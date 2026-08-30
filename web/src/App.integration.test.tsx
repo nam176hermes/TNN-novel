@@ -42,10 +42,10 @@ function defaultAssistAutoLoadResponse(target: string) {
     };
   }
 
-  if (/\/api\/glossary\?book_id=\d+&per_page=500$/.test(target)) {
+  if (/\/api\/glossary\?book_id=\d+&page=1&per_page=200&include_weak=0$/.test(target)) {
     return {
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => ({ items: [], page: 1, pages: 0, per_page: 200, total: 0 }),
     };
   }
 
@@ -1344,10 +1344,24 @@ describe('App live data wiring', () => {
         };
       }
 
-      if (target.endsWith('/api/glossary?book_id=42&per_page=500')) {
+      if (target.endsWith('/api/glossary?book_id=42&page=1&per_page=200&include_weak=0')) {
         return {
           ok: true,
-          json: async () => ({ items: [fixtureGlossaryTerm] }),
+          json: async () => ({ items: [fixtureGlossaryTerm], page: 1, pages: 1, per_page: 200, total: 1 }),
+        };
+      }
+      if (target.endsWith('/api/glossary?book_id=42&page=1&per_page=50&review_status=NEEDS_REVIEW%2CCONFLICT&scope=book&sort=review')) {
+        return {
+          ok: true,
+          json: async () => ({
+            facets: { locked: { '1': 1 }, mode: {}, review_status: { NEEDS_REVIEW: 1 }, scope: { book: 1 }, term_type: { realm: 1 } },
+            items: [fixtureGlossaryTerm],
+            page: 1,
+            pages: 1,
+            per_page: 50,
+            scope: 'book',
+            total: 1,
+          }),
         };
       }
 

@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import settings
-from app.database.db import get_connection
+from app.database.db import (
+    approve_glossary_term as _approve_glossary_term,
+    delete_glossary_term as _archive_glossary_term,
+    get_connection,
+    get_glossary_pending as _get_glossary_pending,
+    put_glossary_term,
+)
 
 
 def get_pending_chapters(db_path: Path, book_id: Optional[int] = None, limit: int = 15) -> list[dict]:
@@ -130,45 +136,32 @@ def add_pending_glossary_term(
     confidence: float = 0.5,
 ) -> None:
     """Add a pending glossary term for user review."""
-    with get_connection(db_path) as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO glossary_terms (book_id, source_term, target_term, category, confidence, approved)
-               VALUES (?, ?, ?, ?, ?, 0)""",
-            (book_id, source, target, category, confidence),
-        )
-        conn.commit()
+    put_glossary_term(
+        db_path,
+        book_id,
+        source,
+        target,
+        category=category,
+        confidence=confidence,
+        approved=0,
+        review_status="NEEDS_REVIEW",
+        preserve_existing=True,
+    )
 
 
 def get_pending_glossary(db_path: Path, book_id: int = 0) -> list[dict]:
     """Get pending glossary terms awaiting approval."""
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """SELECT * FROM glossary_terms
-               WHERE approved = 0 AND book_id IN (0, ?)
-               ORDER BY created_at DESC""",
-            (book_id,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    return _get_glossary_pending(db_path, book_id, limit=10_000)
 
 
 def approve_glossary_term(db_path: Path, term_id: int) -> None:
     """Approve a pending glossary term."""
-    with get_connection(db_path) as conn:
-        conn.execute(
-            "UPDATE glossary_terms SET approved = 1 WHERE id = ?",
-            (term_id,),
-        )
-        conn.commit()
+    _approve_glossary_term(db_path, term_id)
 
 
 def reject_glossary_term(db_path: Path, term_id: int) -> None:
-    """Reject/remove a pending glossary term."""
-    with get_connection(db_path) as conn:
-        conn.execute(
-            "DELETE FROM glossary_terms WHERE id = ?",
-            (term_id,),
-        )
-        conn.commit()
+    """Archive a pending glossary term while preserving audit history."""
+    _archive_glossary_term(db_path, term_id)
 
 
 def generate_daily_report(db_path: Path, book_id: Optional[int] = None) -> dict:

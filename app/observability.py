@@ -56,6 +56,7 @@ _ALLOWED_METRIC_LABELS = {
     "adapter_version",
     "fetch_method",
     "error_code",
+    "extractor",
     "operation",
     "status",
     "stage",
@@ -68,6 +69,45 @@ _RELEVANT_CIRCUIT_ERRORS = {
     "rate_limited",
     "source_unavailable",
     "browser_crash",
+}
+_GLOSSARY_ACTIONS = {
+    "add",
+    "approve",
+    "archive",
+    "conflict",
+    "import_add",
+    "import_update",
+    "lock",
+    "merge",
+    "merge_archive",
+    "needs_review",
+    "observe",
+    "reject",
+    "restore",
+    "unlock",
+    "update",
+}
+_GLOSSARY_STATES = {
+    "APPROVED",
+    "ARCHIVED",
+    "CONFLICT",
+    "LOCKED",
+    "MISSING",
+    "NEEDS_REVIEW",
+    "REJECTED",
+}
+_GLOSSARY_EXTRACTORS = {"deterministic-v2", "hybrid-v1"}
+_GLOSSARY_EXTRACTION_ERRORS = {
+    "",
+    "artifact_unavailable",
+    "provider_malformed_response",
+    "provider_not_configured",
+    "provider_unavailable",
+}
+_GLOSSARY_PROVIDER_FAILURES = {
+    "provider_malformed_response",
+    "provider_not_configured",
+    "provider_unavailable",
 }
 
 
@@ -509,6 +549,131 @@ class Observability:
     def set_workload(self, *, active_jobs: int, queue_depth: int) -> None:
         self.metrics.set_gauge("active_jobs", active_jobs)
         self.metrics.set_gauge("queue_depth", queue_depth)
+
+    def record_glossary_query(
+        self,
+        *,
+        elapsed_ms: int | float,
+        result_count: int,
+        conflict_count: int,
+        active_conflict_count: int,
+    ) -> None:
+        labels = {"operation": "queue"}
+        self.metrics.increment("glossary_queries_total", labels=labels)
+        self.metrics.observe_latency_ms("glossary_query_latency_ms", elapsed_ms, labels=labels)
+        self.metrics.set_gauge(
+            "glossary_active_conflicts", max(0, int(active_conflict_count))
+        )
+        self.events.emit(
+            "glossary_query",
+            operation="queue",
+            elapsed_ms=max(0, int(elapsed_ms)),
+            result_count=max(0, int(result_count)),
+            conflict_count=max(0, int(conflict_count)),
+        )
+
+    def record_glossary_transition(
+        self,
+        *,
+        action: str,
+        before_state: str,
+        after_state: str,
+        term_id: int,
+        book_id: int,
+        version: int,
+    ) -> None:
+        safe_action = action if action in _GLOSSARY_ACTIONS else "unknown"
+        safe_before = before_state if before_state in _GLOSSARY_STATES else "MISSING"
+        safe_after = after_state if after_state in _GLOSSARY_STATES else "CONFLICT"
+        labels = {"operation": safe_action, "state": safe_after}
+        self.metrics.increment("glossary_state_transitions_total", labels=labels)
+        self.events.emit(
+            "glossary_state_transition",
+            operation=safe_action,
+            before_state=safe_before,
+            state=safe_after,
+            term_id=max(0, int(term_id)),
+            book_id=max(0, int(book_id)),
+            version=max(0, int(version)),
+            conflict_count=int(safe_after == "CONFLICT"),
+        )
+
+    def record_glossary_extraction(
+        self,
+        *,
+        extractor: str,
+        status: str,
+        created: int,
+        updated: int,
+        skipped: int,
+        candidate_count: int,
+        warning_count: int,
+        error_code: str,
+        book_id: int,
+        chapter_id: int,
+    ) -> None:
+        safe_extractor = extractor if extractor in _GLOSSARY_EXTRACTORS else "deterministic-v2"
+        safe_status = status if status in {"success", "warning", "skipped"} else "warning"
+        safe_error = error_code if error_code in _GLOSSARY_EXTRACTION_ERRORS else ""
+        labels = {"extractor": safe_extractor, "status": safe_status}
+        self.metrics.increment("glossary_extractions_total", labels=labels)
+        if safe_error in _GLOSSARY_PROVIDER_FAILURES:
+            self.metrics.increment(
+                "glossary_provider_failures_total",
+                labels={"extractor": safe_extractor, "error_code": safe_error},
+            )
+        self.events.emit(
+            "glossary_extraction",
+            extractor=safe_extractor,
+            status=safe_status,
+            error_code=safe_error,
+            created=max(0, int(created)),
+            updated=max(0, int(updated)),
+            skipped=max(0, int(skipped)),
+            candidate_count=max(0, int(candidate_count)),
+            warning_count=max(0, int(warning_count)),
+            book_id=max(0, int(book_id)),
+            chapter_id=max(0, int(chapter_id)),
+        )
+
+    def record_glossary_resolution(
+        self,
+        *,
+        book_id: int,
+        effective_term_count: int,
+        fingerprint_id: str,
+    ) -> None:
+        fingerprint = str(fingerprint_id or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            fingerprint = "invalid"
+        self.metrics.increment("glossary_resolutions_total", labels={"operation": "resolve"})
+        self.metrics.set_gauge("glossary_effective_terms", max(0, int(effective_term_count)))
+        self.events.emit(
+            "glossary_resolution",
+            book_id=max(0, int(book_id)),
+            effective_term_count=max(0, int(effective_term_count)),
+            fingerprint_id=fingerprint,
+        )
+
+    def record_glossary_qa(
+        self,
+        *,
+        book_id: int,
+        chapter_id: int,
+        violation_count: int,
+        status: str,
+    ) -> None:
+        safe_status = status if status in {"pass", "warning", "fail"} else "warning"
+        count = max(0, int(violation_count))
+        self.metrics.increment("glossary_qa_runs_total", labels={"status": safe_status})
+        self.metrics.increment("glossary_qa_violations_total", count, labels={"status": safe_status})
+        self.events.emit(
+            "glossary_qa",
+            book_id=max(0, int(book_id)),
+            chapter_id=max(0, int(chapter_id)),
+            violation_count=count,
+            status=safe_status,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         return {"metrics": self.metrics.snapshot(), "circuits": self.circuit_breaker.snapshot()}

@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from collections import Counter
+import json
+import os
 import re
+import time
+import unicodedata
 from pathlib import Path
 
+import requests
+
 from app.database.db import (
-    list_glossary,
     put_glossary_term,
     update_glossary_term,
     approve_glossary_term,
     reject_glossary_term,
-    delete_glossary_term,
     set_glossary_term_mode,
     set_glossary_term_locked,
     glossary_stats,
@@ -26,11 +31,22 @@ from app.database.db import (
     search_fuzzy_tm,
     clear_fuzzy_tm,
     get_chapter_by_id,
+    get_book_by_id,
     get_connection,
+    list_model_providers,
 )
+from app.database.glossary_repository import (
+    GlossaryRepository,
+    GlossaryStateConflict,
+    GlossaryValidationError,
+    normalize_source_key,
+)
+from app.database.glossary_resolver import resolve_effective_glossary
 from app.mobile_api.dependencies import get_db_path
+from app.observability import default_observability
 from app.config import settings
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError, require_artifact_file
+from app.translation.ollama_client import call_openai_compatible_chat
 
 
 PRIORITY_TERM_TYPE_WEIGHTS = {
@@ -61,6 +77,61 @@ COMMON_SOURCE_TERMS = {
     "一个",
     "一下",
     "自己",
+    "什么",
+    "怎么",
+    "他们",
+    "我们",
+    "你们",
+}
+
+COMMON_TERM_BOUNDARIES = set("的了是在有不也都就这那其而与及又将把被着过")
+DETERMINISTIC_EXTRACTOR = "deterministic-v2"
+HYBRID_EXTRACTOR = "hybrid-v1"
+MAX_HYBRID_TEXT_CHARS = 12_000
+MAX_HYBRID_CANDIDATES = 100
+HYBRID_WARNING_MESSAGE = "Hybrid glossary extraction was skipped."
+VALID_EXTRACTED_TERM_TYPES = {
+    "artifact", "character", "concept", "cultivation", "idiom", "location", "organization",
+    "other", "place", "realm", "sect", "skill", "technique", "term", "title",
+}
+SUFFIX_TERM_TYPES = {
+    "剑诀": "skill",
+    "神通": "skill",
+    "道君": "title",
+    "真人": "title",
+    "宗": "sect",
+    "门": "sect",
+    "派": "sect",
+    "阁": "sect",
+    "宫": "sect",
+    "殿": "sect",
+    "教": "sect",
+    "族": "sect",
+    "境": "realm",
+    "期": "realm",
+    "层": "realm",
+    "阶": "realm",
+    "功": "skill",
+    "法": "skill",
+    "术": "skill",
+    "诀": "skill",
+    "典": "skill",
+    "丹": "artifact",
+    "剑": "artifact",
+    "珠": "artifact",
+    "符": "artifact",
+    "炉": "artifact",
+    "鼎": "artifact",
+    "印": "artifact",
+    "幡": "artifact",
+    "山": "place",
+    "城": "place",
+    "谷": "place",
+    "峰": "place",
+    "岛": "place",
+    "洲": "place",
+    "界": "place",
+    "域": "place",
 }
 
 TERM_TYPE_ALIASES = {
@@ -97,6 +168,84 @@ def _context_for(text: str, term: str, radius: int = 28) -> str:
     return text[start:end].replace("\n", " ").strip()
 
 
+def _cluster_end(text: str, start: int) -> int:
+    end = start + 1
+    while end < len(text) and unicodedata.combining(text[end]):
+        end += 1
+    return end
+
+
+def _is_hangul_leading_jamo(value: str) -> bool:
+    return len(value) == 1 and 0x1100 <= ord(value) <= 0x1112
+
+
+def _is_hangul_vowel_cluster(value: str) -> bool:
+    return bool(value) and 0x1161 <= ord(value[0]) <= 0x1175 and all(
+        unicodedata.combining(character) for character in value[1:]
+    )
+
+
+def _is_hangul_trailing_cluster(value: str) -> bool:
+    return bool(value) and 0x11A8 <= ord(value[0]) <= 0x11C2 and all(
+        unicodedata.combining(character) for character in value[1:]
+    )
+
+
+def _is_hangul_lv_syllable(value: str) -> bool:
+    return len(value) == 1 and 0xAC00 <= ord(value) <= 0xD7A3 and (
+        ord(value) - 0xAC00
+    ) % 28 == 0
+
+
+def _normalized_with_original_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    normalized_parts: list[str] = []
+    original_spans: list[tuple[int, int]] = []
+    cluster_start = 0
+    while cluster_start < len(text):
+        cluster_end = _cluster_end(text, cluster_start)
+        normalized_cluster = unicodedata.normalize("NFKC", text[cluster_start:cluster_end])
+        if _is_hangul_leading_jamo(normalized_cluster) and cluster_end < len(text):
+            vowel_end = _cluster_end(text, cluster_end)
+            normalized_vowel = unicodedata.normalize("NFKC", text[cluster_end:vowel_end])
+            if _is_hangul_vowel_cluster(normalized_vowel):
+                cluster_end = vowel_end
+                normalized_cluster = unicodedata.normalize(
+                    "NFKC", text[cluster_start:cluster_end]
+                )
+                if _is_hangul_lv_syllable(normalized_cluster) and cluster_end < len(text):
+                    trailing_end = _cluster_end(text, cluster_end)
+                    normalized_trailing = unicodedata.normalize(
+                        "NFKC", text[cluster_end:trailing_end]
+                    )
+                    if _is_hangul_trailing_cluster(normalized_trailing):
+                        cluster_end = trailing_end
+                        normalized_cluster = unicodedata.normalize(
+                            "NFKC", text[cluster_start:cluster_end]
+                        )
+        normalized_parts.append(normalized_cluster)
+        original_spans.extend([(cluster_start, cluster_end)] * len(normalized_cluster))
+        cluster_start = cluster_end
+    return "".join(normalized_parts), original_spans
+
+
+def _context_for_normalized(text: str, normalized_term: str, radius: int = 28) -> str:
+    normalized_text, original_spans = _normalized_with_original_spans(text)
+    normalized_index = normalized_text.find(normalized_term)
+    if normalized_index < 0 or not normalized_term:
+        return ""
+    original_start = original_spans[normalized_index][0]
+    original_end = original_spans[normalized_index + len(normalized_term) - 1][1]
+    return text[
+        max(0, original_start - radius):min(len(text), original_end + radius)
+    ].replace("\n", " ").strip()
+
+
+def _normalized_extraction_corpus(title: str, text: str) -> tuple[str, str]:
+    normalized_title = unicodedata.normalize("NFKC", title)
+    normalized_text = unicodedata.normalize("NFKC", text)
+    return normalized_title, f"{normalized_title}\n{normalized_text}"
+
+
 def _normalize_candidate_source(source: str, term_type: str) -> str:
     source = source.strip("，。！？、：；（）()[]【】《》“”\"' \n\t")
     for marker in ("来到", "进入", "取出", "拿出", "走入", "回到", "前往", "拜入"):
@@ -108,40 +257,121 @@ def _normalize_candidate_source(source: str, term_type: str) -> str:
     return source
 
 
-def extract_candidate_terms_from_text(text: str) -> list[dict]:
+def _candidate_term_type(source: str, fallback: str = "term") -> str:
+    for suffix, term_type in SUFFIX_TERM_TYPES.items():
+        if source.endswith(suffix):
+            return term_type
+    return fallback
+
+
+def _valid_candidate_source(source: str) -> bool:
+    return (
+        2 <= len(source) <= 32
+        and source not in COMMON_SOURCE_TERMS
+        and source[0] not in COMMON_TERM_BOUNDARIES
+        and source[-1] not in COMMON_TERM_BOUNDARIES
+        and bool(re.fullmatch(r"[\u3400-\u9fff]+", source))
+    )
+
+
+def _clean_chapter_title(title: str) -> str:
+    return re.sub(
+        r"^\s*第[〇零一二三四五六七八九十百千万两\d]+章\s*[:：\-—]?\s*",
+        "",
+        str(title or ""),
+    ).strip()
+
+
+def extract_candidate_terms_from_text(text: str, chapter_title: str = "") -> list[dict]:
     """Lightweight Chinese webnovel term extraction.
 
     It is intentionally conservative and review-first: candidates are never
     auto-approved and are safe to run after import or translation jobs.
     """
     text = text or ""
-    patterns: list[tuple[str, str]] = [
+    title = _clean_chapter_title(chapter_title)
+    normalized_title, normalized_corpus = _normalized_extraction_corpus(title, text)
+    patterns: list[tuple[str, str] | tuple[str, str, str]] = [
         (rf"[{COMMON_CHINESE_SURNAMES}][\u4e00-\u9fff]{{1,2}}", "character"),
-        (r"[\u4e00-\u9fff]{2,8}(?:宗|门|派|阁|宫|殿|教|族)", "sect"),
-        (r"[\u4e00-\u9fff]{1,6}(?:境|期|层|阶)", "realm"),
-        (r"[\u4e00-\u9fff]{1,8}(?:功|法|术|诀|剑诀|神通)", "skill"),
-        (r"[\u4e00-\u9fff]{1,8}(?:丹|剑|珠|符|炉|鼎|印|幡)", "artifact"),
-        (r"[\u4e00-\u9fff]{2,8}(?:山|城|谷|峰|岛|洲|界|域)", "place"),
+        (r"[\u4e00-\u9fff]{1,8}(?:宗|门|派|阁|宫|殿|教|族)", "sect", "suffix"),
+        (r"[\u4e00-\u9fff]{1,6}(?:境|期|层|阶)", "realm", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:剑诀|神通|功|法|术|诀|典)", "skill", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:丹|剑|珠|符|炉|鼎|印|幡)", "artifact", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:山|城|谷|峰|岛|洲|界|域)", "place", "suffix"),
+        (r"[\u4e00-\u9fff]{1,8}(?:道君|真人)", "title", "suffix"),
     ]
-    seen: set[str] = set()
-    candidates: list[dict] = []
-    for pattern, term_type in patterns:
+    by_source: dict[str, dict] = {}
+
+    def observe(source: str, term_type: str, evidence_type: str, confidence: float) -> None:
+        source = unicodedata.normalize(
+            "NFKC", _normalize_candidate_source(source, term_type)
+        )
+        if not _valid_candidate_source(source):
+            return
+        item = by_source.get(source)
+        if item is None:
+            item = {
+                "source_term": source,
+                "target_term": "",
+                "term_type": term_type,
+                "category": term_type,
+                "confidence": confidence,
+                "source_context": _context_for_normalized(text, source),
+                "mention_count": 0,
+                "title_match": bool(normalized_title and source in normalized_title),
+                "evidence_types": [evidence_type],
+            }
+            by_source[source] = item
+            return
+        item["confidence"] = max(float(item["confidence"]), confidence)
+        item["title_match"] = bool(
+            item["title_match"] or (normalized_title and source in normalized_title)
+        )
+        if evidence_type not in item["evidence_types"]:
+            item["evidence_types"].append(evidence_type)
+
+    for pattern, term_type, *evidence in patterns:
         for match in re.finditer(pattern, text):
-            source = _normalize_candidate_source(match.group(0), term_type)
-            if len(source) < 2 or source in COMMON_SOURCE_TERMS or source in seen:
-                continue
-            seen.add(source)
-            candidates.append(
-                {
-                    "source_term": source,
-                    "target_term": "",
-                    "term_type": term_type,
-                    "category": term_type,
-                    "confidence": 0.55 if term_type == "character" else 0.65,
-                    "source_context": _context_for(text, source),
-                }
+            observe(
+                match.group(0),
+                term_type,
+                evidence[0] if evidence else "name_pattern",
+                0.55 if term_type == "character" else 0.65,
             )
-    return candidates
+
+    for source in re.findall(r"[\u3400-\u9fff]{2,32}", title):
+        observe(source, _candidate_term_type(source, "title"), "chapter_title", 0.75)
+
+    ngram_counts: Counter[str] = Counter()
+    for run in re.findall(r"[\u3400-\u9fff]+", text):
+        for size in range(2, min(6, len(run)) + 1):
+            ngram_counts.update(run[index:index + size] for index in range(len(run) - size + 1))
+    repeated = [
+        (source, count)
+        for source, count in ngram_counts.items()
+        if count >= 2 and _valid_candidate_source(source)
+    ]
+    maximal: list[tuple[str, int]] = []
+    for source, count in sorted(repeated, key=lambda item: (-len(item[0]), -item[1], item[0])):
+        if any(source in longer and longer_count >= count for longer, longer_count in maximal):
+            continue
+        maximal.append((source, count))
+        observe(source, _candidate_term_type(source), "repeated_ngram", min(0.8, 0.5 + count * 0.05))
+
+    for source, item in by_source.items():
+        item["mention_count"] = sum(
+            1 for _ in re.finditer(f"(?={re.escape(source)})", normalized_corpus)
+        )
+
+    return sorted(
+        by_source.values(),
+        key=lambda item: (
+            -int(bool(item["title_match"])),
+            -int(item["mention_count"]),
+            -len(str(item["source_term"])),
+            str(item["source_term"]),
+        ),
+    )
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -191,15 +421,136 @@ def _sort_glossary_for_review(terms: list[dict]) -> list[dict]:
     )
 
 
+def _record_extraction(
+    book_id: int,
+    chapter_id: int,
+    result: dict,
+    *,
+    extractor: str = DETERMINISTIC_EXTRACTOR,
+    error_code: str = "",
+) -> dict:
+    warnings = result.get("warnings") or []
+    resolved_error = error_code or next(
+        (str(item.get("code") or "") for item in warnings if isinstance(item, dict)),
+        "",
+    )
+    default_observability.record_glossary_extraction(
+        extractor=extractor,
+        status="warning" if warnings else "skipped" if resolved_error else "success",
+        created=int(result.get("created") or 0),
+        updated=int(result.get("updated") or 0),
+        skipped=int(result.get("skipped") or 0),
+        candidate_count=len(result.get("candidates") or []),
+        warning_count=len(warnings),
+        error_code=resolved_error,
+        book_id=book_id,
+        chapter_id=chapter_id,
+    )
+    return result
+
+
 class GlossaryService:
+    _access_bound = False
+    _access_user_id = ""
+    _access_username = ""
+    _access_admin_username = ""
+
     def __init__(self):
         self.db_path = get_db_path()
+        self._access_bound = False
+        self._access_user_id = ""
+        self._access_username = ""
+        self._access_admin_username = ""
 
     @classmethod
     def from_db_path(cls, db_path) -> "GlossaryService":
         service = object.__new__(cls)
         service.db_path = Path(db_path)
+        service._access_bound = False
+        service._access_user_id = ""
+        service._access_username = ""
+        service._access_admin_username = ""
         return service
+
+    def for_user(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        admin_username: str,
+    ) -> "GlossaryService":
+        """Bind API-only access context while leaving background services unbound."""
+        self._access_bound = True
+        self._access_user_id = str(user_id or "").strip()
+        self._access_username = str(username or "").strip()
+        self._access_admin_username = str(admin_username or "").strip()
+        return self
+
+    @property
+    def _is_access_admin(self) -> bool:
+        return bool(
+            self._access_bound
+            and self._access_admin_username
+            and self._access_username == self._access_admin_username
+        )
+
+    def _deny_access(self) -> None:
+        raise GlossaryAccessError()
+
+    def authorize_book(self, book_id: int) -> None:
+        if not self._access_bound:
+            return
+        if not GlossaryRepository(self.db_path).owned_book_exists(
+            int(book_id), self._access_user_id
+        ):
+            self._deny_access()
+
+    def _authorize_admin(self) -> None:
+        if self._access_bound and not self._is_access_admin:
+            self._deny_access()
+
+    def _authorize_query_scope(self, book_id: int | None, scope: str) -> None:
+        if not self._access_bound:
+            return
+        if scope in {"all", "global"} or book_id is None:
+            self._authorize_admin()
+            return
+        self.authorize_book(int(book_id))
+
+    def _authorize_term_ids(self, term_ids: list[int] | tuple[int, ...]) -> None:
+        if not self._access_bound:
+            return
+        unique_ids = tuple(dict.fromkeys(int(term_id) for term_id in term_ids))
+        resolved = GlossaryRepository(self.db_path).term_book_ids(unique_ids)
+        if len(resolved) != len(unique_ids):
+            self._deny_access()
+        for term_id in unique_ids:
+            book_id = resolved[term_id]
+            if book_id == 0:
+                self._authorize_admin()
+            else:
+                self.authorize_book(book_id)
+
+    def _authorize_import(
+        self,
+        canonical_items: list[dict],
+        scope: dict | list[dict] | None = None,
+    ) -> None:
+        if not self._access_bound:
+            return
+        scopes = scope if isinstance(scope, list) else [scope] if isinstance(scope, dict) else []
+        for item_scope in scopes:
+            scope_type = str(item_scope.get("type") or "")
+            if scope_type in {"all", "global"}:
+                self._authorize_admin()
+            elif scope_type == "book":
+                self.authorize_book(int(item_scope.get("book_id") or 0))
+        for item in canonical_items:
+            book_id = int(item.get("book_id") or 0)
+            if book_id == 0:
+                self._authorize_admin()
+            else:
+                self.authorize_book(book_id)
 
     def list_terms(
         self,
@@ -210,42 +561,111 @@ class GlossaryService:
         mode: str | None = None,
         approved: int | None = None,
         include_weak: bool = False,
+        archived: bool = False,
     ) -> tuple[list[dict], int]:
-        """List glossary terms with pagination and filtering."""
-        # For simplicity, we'll load all and filter (in production, add SQL WHERE clauses)
-        all_terms = list_glossary(self.db_path, book_id)
+        """Compatibility wrapper over the SQL review query."""
+        self._authorize_query_scope(book_id, "legacy")
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
+            book_id=book_id,
+            q=search or "",
+            mode=mode,
+            scope="legacy",
+            limit=limit,
+            offset=offset,
+            approved=approved,
+            include_weak=include_weak,
+            archived=archived,
+        )
+        return result["items"], result["total"]
 
-        # Apply filters
-        filtered = all_terms
-        if search:
-            search_lower = search.lower()
-            filtered = [
-                t for t in filtered
-                if search_lower in t["source_term"].lower()
-                or search_lower in t["target_term"].lower()
-            ]
-        if mode is not None:
-            filtered = [t for t in filtered if t.get("mode") == mode]
-        if approved is not None:
-            filtered = [t for t in filtered if t.get("approved") == approved]
-        if not include_weak:
-            filtered = [t for t in filtered if not _is_weak_term(t)]
-        filtered = _sort_glossary_for_review(filtered)
-
-        total = len(filtered)
-        # Apply pagination
-        paginated = filtered[offset:offset + limit]
-        return paginated, total
+    def query_terms(
+        self,
+        *,
+        book_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+        q: str = "",
+        review_status: str = "",
+        term_type: str | None = None,
+        mode: str | None = None,
+        locked: bool | None = None,
+        scope: str = "all",
+        sort: str = "review",
+        approved: int | None = None,
+        include_weak: bool = False,
+        archived: bool = False,
+    ) -> dict:
+        self._authorize_query_scope(book_id, scope)
+        started = time.perf_counter()
+        per_page = min(per_page, 200)
+        statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
+        effective_ids = None
+        if scope == "effective":
+            effective_ids = tuple(
+                sorted(
+                    {
+                        int(term["id"])
+                        for term in resolve_effective_glossary(self.db_path, int(book_id or 0)).dictionary_terms
+                        if int(term["id"]) > 0
+                    }
+                )
+            )
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
+            book_id=book_id,
+            q=q,
+            review_statuses=statuses,
+            term_type=term_type,
+            mode=mode,
+            locked=locked,
+            scope=scope,
+            sort=sort,
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            approved=approved,
+            include_weak=include_weak,
+            archived=archived,
+            effective_ids=effective_ids,
+        )
+        total = result["total"]
+        result.update(
+            page=page,
+            per_page=per_page,
+            pages=(total + per_page - 1) // per_page,
+            scope="all" if scope == "legacy" else scope,
+        )
+        default_observability.record_glossary_query(
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            result_count=len(result["items"]),
+            conflict_count=int(result["facets"]["review_status"].get("CONFLICT", 0)),
+            active_conflict_count=repository.count_active_conflicts(),
+        )
+        return result
 
     def search_terms(self, query: str, book_id: int | None = None, limit: int = 20) -> list[dict]:
         """Search glossary terms."""
-        terms, _ = self.list_terms(book_id=book_id, limit=1000, search=query)
+        self._authorize_query_scope(book_id, "legacy")
+        repository = GlossaryRepository(self.db_path)
+        result = repository.query(
+            book_id=book_id,
+            q=query,
+            scope="legacy",
+            limit=1000,
+            offset=0,
+        )
+        terms = result["items"]
         return terms[:limit]
 
-    def add_term(self, term_data: dict) -> int:
+    def add_term(self, term_data: dict, *, actor: str = "", request_id: str = "") -> int:
         """Add a new glossary term."""
+        book_id = int(term_data.get("book_id", 0) or 0)
+        if book_id == 0:
+            self._authorize_admin()
+        else:
+            self.authorize_book(book_id)
         term_type = normalize_term_type(term_data.get("term_type") or term_data.get("category", "term"))
-        put_glossary_term(
+        return put_glossary_term(
             db_path=self.db_path,
             book_id=term_data.get("book_id", 0),
             source=term_data["source_term"],
@@ -266,26 +686,27 @@ class GlossaryService:
             first_seen_chapter_number=term_data.get("first_seen_chapter_number", 0),
             review_status=term_data.get("review_status", ""),
             source_context=term_data.get("source_context", ""),
+            actor=actor,
+            request_id=request_id,
         )
-        # Return the ID of the inserted/updated term (simplified)
-        terms = list_glossary(self.db_path, term_data.get("book_id", 0))
-        for t in reversed(terms):  # Get most recent
-            if t["source_term"] == term_data["source_term"] and t["target_term"] == term_data["target_term"]:
-                return t["id"]
-        return 0
 
-    def update_term(self, term_id: int, updates: dict) -> bool:
+    def add_term_resource(self, term_data: dict, *, actor: str = "", request_id: str = "") -> dict:
+        term_id = self.add_term(term_data, actor=actor, request_id=request_id)
+        resource = GlossaryRepository(self.db_path).get_resource(term_id)
+        if resource is None:
+            raise GlossaryStateConflict("term_not_created")
+        return resource
+
+    def update_term(
+        self,
+        term_id: int,
+        updates: dict,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> bool:
         """Update a glossary term."""
-        # Get current term
-        terms = list_glossary(self.db_path)
-        current = None
-        for t in terms:
-            if t["id"] == term_id:
-                current = t
-                break
-        if not current:
-            return False
-
+        self._authorize_term_ids([term_id])
         return update_glossary_term(
             db_path=self.db_path,
             term_id=term_id,
@@ -304,27 +725,81 @@ class GlossaryService:
             gender=updates.get("gender"),
             review_status=updates.get("review_status"),
             source_context=updates.get("source_context"),
+            expected_version=updates.get("expected_version"),
+            actor=actor,
+            request_id=request_id,
         )
 
-    def delete_term(self, term_id: int) -> bool:
-        """Hard-delete a glossary term for explicit destructive actions."""
-        return delete_glossary_term(self.db_path, term_id)
+    def update_term_resource(
+        self,
+        term_id: int,
+        updates: dict,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict | None:
+        if not self.update_term(term_id, updates, actor=actor, request_id=request_id):
+            return None
+        return GlossaryRepository(self.db_path).get_resource(term_id)
 
-    def approve_term(self, term_id: int) -> bool:
+    def get_term_detail(self, term_id: int) -> dict | None:
+        self._authorize_term_ids([term_id])
+        return GlossaryRepository(self.db_path).get_detail(term_id)
+
+    def bulk_terms(
+        self,
+        action: str,
+        terms: list[dict[str, int]],
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        self._authorize_term_ids([int(term["id"]) for term in terms])
+        return GlossaryRepository(self.db_path).bulk(
+            action, terms, actor=actor, request_id=request_id
+        )
+
+    def delete_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
+        """Archive a glossary term while preserving the existing API contract."""
+        self._authorize_term_ids([term_id])
+        return GlossaryRepository(self.db_path).archive(term_id, actor=actor, request_id=request_id)
+
+    def restore_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
+        self._authorize_term_ids([term_id])
+        return GlossaryRepository(self.db_path).restore(term_id, actor=actor, request_id=request_id)
+
+    def approve_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Approve a pending glossary term."""
-        return approve_glossary_term(self.db_path, term_id)
+        self._authorize_term_ids([term_id])
+        return approve_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
-    def reject_term(self, term_id: int) -> bool:
+    def reject_term(self, term_id: int, *, actor: str = "", request_id: str = "") -> bool:
         """Reject/delete a pending glossary term."""
-        return reject_glossary_term(self.db_path, term_id)
+        self._authorize_term_ids([term_id])
+        return reject_glossary_term(self.db_path, term_id, actor=actor, request_id=request_id)
 
     def set_term_mode(self, term_id: int, mode: str) -> bool:
         """Set the mode of a glossary term."""
+        self._authorize_term_ids([term_id])
         return set_glossary_term_mode(self.db_path, term_id, mode)
 
-    def set_term_locked(self, term_id: int, locked: bool) -> bool:
+    def set_term_locked(
+        self,
+        term_id: int,
+        locked: bool,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> bool:
         """Lock or unlock a glossary term."""
-        return set_glossary_term_locked(self.db_path, term_id, locked)
+        self._authorize_term_ids([term_id])
+        return set_glossary_term_locked(
+            self.db_path,
+            term_id,
+            locked,
+            actor=actor,
+            request_id=request_id,
+        )
 
     def get_stats(self, book_id: int | None = None) -> dict:
         """Get glossary statistics."""
@@ -416,13 +891,266 @@ class GlossaryService:
         """Get glossary conflicts."""
         return get_glossary_conflicts(self.db_path, book_id)
 
+    def query_conflicts(
+        self, book_id: int | None = None, page: int = 1, per_page: int = 50
+    ) -> dict:
+        self._authorize_query_scope(book_id, "legacy")
+        return GlossaryRepository(self.db_path).query_conflicts(
+            book_id=book_id, page=page, per_page=per_page
+        )
+
+    def query_legacy_conflicts(
+        self,
+        book_id: int | None = None,
+        page: int = 1,
+        per_page: int = 50,
+        member_limit: int = 20,
+    ) -> list[dict]:
+        self._authorize_query_scope(book_id, "legacy")
+        return GlossaryRepository(self.db_path).query_legacy_conflicts(
+            book_id=book_id,
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            member_limit=member_limit,
+        )
+
+    def preview_merge(self, canonical_id: int, duplicate_ids: list[int]) -> dict:
+        self._authorize_term_ids([canonical_id, *duplicate_ids])
+        return GlossaryRepository(self.db_path).preview_merge(canonical_id, duplicate_ids)
+
+    def apply_merge(
+        self,
+        canonical_id: int,
+        duplicate_ids: list[int],
+        digest: str,
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        self._authorize_term_ids([canonical_id, *duplicate_ids])
+        return GlossaryRepository(self.db_path).apply_merge(
+            canonical_id,
+            duplicate_ids,
+            digest,
+            actor=actor,
+            request_id=request_id,
+        )
+
+    def get_extraction_settings(self, book_id: int) -> dict:
+        self.authorize_book(book_id)
+        if get_book_by_id(self.db_path, book_id) is None:
+            raise ValueError("book_not_found")
+        with get_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT extraction_mode, provider_id FROM book_glossary_settings WHERE book_id = ?",
+                (book_id,),
+            ).fetchone()
+        return {
+            "book_id": book_id,
+            "mode": str(row["extraction_mode"]) if row else "deterministic",
+            "provider_id": str(row["provider_id"] or "") if row else "",
+            "max_candidates_per_chapter": MAX_HYBRID_CANDIDATES,
+        }
+
+    def update_extraction_settings(self, book_id: int, *, mode: str, provider_id: str = "") -> dict:
+        self.authorize_book(book_id)
+        if get_book_by_id(self.db_path, book_id) is None:
+            raise ValueError("book_not_found")
+        if mode not in {"deterministic", "hybrid"}:
+            raise ValueError("invalid_extraction_mode")
+        resolved_provider_id = str(provider_id or "").strip() if mode == "hybrid" else ""
+        if mode == "hybrid":
+            provider = next(
+                (item for item in list_model_providers(self.db_path) if item["id"] == resolved_provider_id),
+                None,
+            )
+            if (
+                provider is None
+                or int(provider.get("enabled") or 0) != 1
+                or not str(provider.get("base_url") or "").strip()
+                or not str(provider.get("model") or "").strip()
+                or (
+                    bool(str(provider.get("api_key_env") or "").strip())
+                    and not bool(provider.get("api_key_set"))
+                )
+            ):
+                raise ValueError("provider_not_configured")
+        with get_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO book_glossary_settings (book_id, extraction_mode, provider_id, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    extraction_mode = excluded.extraction_mode,
+                    provider_id = excluded.provider_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (book_id, mode, resolved_provider_id),
+            )
+            conn.commit()
+        return self.get_extraction_settings(book_id)
+
+    def _hybrid_candidates(
+        self,
+        *,
+        book_id: int,
+        chapter_id: int,
+        chapter_title: str,
+        raw_text: str,
+        provider_id: str,
+    ) -> tuple[list[dict] | None, list[dict], str]:
+        warnings: list[dict] = []
+        provider = next(
+            (item for item in list_model_providers(self.db_path) if item["id"] == provider_id),
+            None,
+        )
+        if provider is None or int(provider.get("enabled") or 0) != 1:
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}], ""
+        api_key_env = str(provider.get("api_key_env") or "").strip()
+        api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+        if api_key_env and not api_key:
+            return None, [{"code": "provider_not_configured", "message": HYBRID_WARNING_MESSAGE}], ""
+
+        bounded_title = _clean_chapter_title(chapter_title)[:200]
+        bounded_text = raw_text[:MAX_HYBRID_TEXT_CHARS]
+        prompt = (
+            "Extract glossary candidates from this Chinese web-novel chapter. "
+            "Return one JSON object with a candidates array. Each item may contain only "
+            "source_term, target_term, term_type, and confidence. Do not return more than 100 items. "
+            "Candidates are review suggestions, never approvals.\n"
+            f"TITLE:\n{bounded_title}\nCHAPTER:\n{bounded_text}"
+        )
+        try:
+            response = call_openai_compatible_chat(
+                prompt=prompt,
+                base_url=str(provider["base_url"]),
+                model=str(provider["model"]),
+                api_key=api_key,
+                temperature=0.0,
+                timeout=min(60, max(1, int(provider.get("timeout_seconds") or 60))),
+                max_retries=0,
+                response_format={"type": "json_object"},
+            )
+        except requests.RequestException:
+            return None, [{"code": "provider_unavailable", "message": HYBRID_WARNING_MESSAGE}], ""
+
+        try:
+            payload = json.loads(str(response.get("text") or ""))
+            raw_candidates = payload["candidates"]
+            if not isinstance(payload, dict) or not isinstance(raw_candidates, list):
+                raise ValueError("invalid_candidates")
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None, [{"code": "provider_malformed_response", "message": HYBRID_WARNING_MESSAGE}], ""
+
+        if len(raw_candidates) > MAX_HYBRID_CANDIDATES:
+            raw_candidates = raw_candidates[:MAX_HYBRID_CANDIDATES]
+            warnings.append(
+                {"code": "provider_output_truncated", "message": "Hybrid output was limited to 100 candidates."}
+            )
+        normalized_title, normalized_corpus = _normalized_extraction_corpus(
+            bounded_title, bounded_text
+        )
+        candidates: list[dict] = []
+        seen: set[str] = set()
+        invalid_count = duplicate_count = 0
+        for item in raw_candidates:
+            if not isinstance(item, dict) or not isinstance(item.get("source_term"), str):
+                invalid_count += 1
+                continue
+            source = " ".join(
+                unicodedata.normalize("NFKC", str(item["source_term"])).split()
+            )
+            source_key = normalize_source_key(source)
+            target_value = item.get("target_term", "")
+            confidence_value = item.get("confidence", 0.5)
+            if (
+                not source_key
+                or len(source) > 64
+                or source not in normalized_corpus
+                or not isinstance(target_value, str)
+                or len(target_value) > 200
+                or isinstance(confidence_value, bool)
+                or not isinstance(confidence_value, int | float)
+                or not 0 <= float(confidence_value) <= 1
+            ):
+                invalid_count += 1
+                continue
+            if source_key in seen:
+                duplicate_count += 1
+                continue
+            seen.add(source_key)
+            term_type = normalize_term_type(str(item.get("term_type") or "other"))
+            if term_type not in VALID_EXTRACTED_TERM_TYPES:
+                term_type = "other"
+            candidates.append(
+                {
+                    "source_term": source,
+                    "target_term": target_value.strip(),
+                    "term_type": term_type,
+                    "category": term_type,
+                    "confidence": float(confidence_value),
+                    "source_context": _context_for_normalized(bounded_text, source),
+                    "mention_count": sum(
+                        1
+                        for _ in re.finditer(
+                            f"(?={re.escape(source)})", normalized_corpus
+                        )
+                    ),
+                    "title_match": bool(normalized_title and source in normalized_title),
+                    "evidence_types": ["provider_structured_json"],
+                }
+            )
+        if duplicate_count:
+            warnings.append(
+                {"code": "provider_duplicates_ignored", "message": "Duplicate hybrid candidates were ignored."}
+            )
+        if invalid_count:
+            warnings.append(
+                {"code": "provider_items_ignored", "message": "Invalid hybrid candidates were ignored."}
+            )
+
+        effective_keys = set(resolve_effective_glossary(self.db_path, book_id).reserved_source_keys)
+        with get_connection(self.db_path) as conn:
+            reviewed_keys = {
+                str(row["source_key"])
+                for row in conn.execute(
+                    "SELECT source_key FROM glossary_terms WHERE book_id = ? "
+                    "AND review_status IN ('APPROVED', 'LOCKED', 'REJECTED') "
+                    "AND COALESCE(archived_at, '') = ''",
+                    (book_id,),
+                ).fetchall()
+            }
+            evidenced_keys = {
+                str(row["source_key"])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT g.source_key
+                    FROM glossary_term_evidence e
+                    JOIN glossary_terms g ON g.id = e.term_id
+                    WHERE g.book_id = ? AND e.chapter_id = ?
+                      AND e.extractor != ?
+                    """,
+                    (book_id, chapter_id, HYBRID_EXTRACTOR),
+                ).fetchall()
+            }
+        retained: list[dict] = []
+        for candidate in candidates:
+            source_key = normalize_source_key(candidate["source_term"])
+            if source_key in effective_keys | reviewed_keys:
+                retained.append({**candidate, "observe_only": True})
+            elif source_key not in evidenced_keys:
+                retained.append(candidate)
+        return retained, warnings, normalized_corpus
+
     def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
+        self.authorize_book(book_id)
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or int(chapter.get("book_id") or 0) != int(book_id):
             raise ValueError("Chapter not found")
         raw_path = str(chapter.get("raw_text_path") or "").strip()
         raw_text = ""
+        resolved_raw_path: Path | None = None
         if raw_path:
             try:
                 resolved_raw_path = require_artifact_file(
@@ -435,115 +1163,165 @@ class GlossaryService:
                 resolved_raw_path = None
             if resolved_raw_path is not None:
                 raw_text = resolved_raw_path.read_text(encoding="utf-8", errors="replace")
+        if resolved_raw_path is None:
+            return _record_extraction(
+                book_id,
+                chapter_id,
+                {"created": 0, "updated": 0, "skipped": 0, "candidates": [], "warnings": []},
+                error_code="artifact_unavailable",
+            )
         if not raw_text:
-            return {"created": 0, "updated": 0, "skipped": 0, "candidates": []}
-
-        candidates = extract_candidate_terms_from_text(raw_text)
-        created = 0
-        updated = 0
-        skipped = 0
-        chapter_number = int(chapter.get("chapter_number") or 0)
-        with get_connection(self.db_path) as conn:
-            for candidate in candidates:
-                source = str(candidate["source_term"])
-                existing = conn.execute(
-                    "SELECT id, review_status FROM glossary_terms WHERE book_id = ? AND source_term = ?",
-                    (book_id, source),
-                ).fetchone()
-                if existing and str(existing["review_status"] or "").upper() in {"APPROVED", "LOCKED", "REJECTED"}:
-                    skipped += 1
-                    continue
-                if existing:
-                    conn.execute(
-                        """
-                        UPDATE glossary_terms
-                        SET occurrence_count = occurrence_count + 1,
-                            last_seen = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP,
-                            source_context = COALESCE(NULLIF(?, ''), source_context),
-                            review_status = CASE
-                                WHEN review_status IS NULL OR review_status = '' THEN 'NEEDS_REVIEW'
-                                ELSE review_status
-                            END
-                        WHERE id = ?
-                        """,
-                        (candidate.get("source_context") or "", existing["id"]),
-                    )
-                    updated += 1
-                    continue
-                conn.execute(
-                    """
-                    INSERT INTO glossary_terms
-                    (book_id, source_term, target_term, category, confidence, approved, mode,
-                     term_type, first_seen_chapter_id, first_seen_chapter_number,
-                     review_status, source_context, occurrence_count, last_seen, updated_at)
-                    VALUES (?, ?, '', ?, ?, 0, 'translate', ?, ?, ?, 'NEEDS_REVIEW', ?, 1,
-                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        book_id,
-                        source,
-                        candidate.get("category") or candidate.get("term_type") or "other",
-                        float(candidate.get("confidence") or 0.5),
-                        normalize_term_type(candidate.get("term_type")),
-                        chapter_id,
-                        chapter_number,
-                        candidate.get("source_context") or "",
-                    ),
+            chapter_number = int(chapter.get("chapter_number") or 0)
+            repository = GlossaryRepository(self.db_path)
+            counts = repository.record_extraction_candidates(
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_number=chapter_number,
+                extractor=DETERMINISTIC_EXTRACTOR,
+                candidates=[],
+                occurrence_corpus="",
+            )
+            extraction_mode = self.get_extraction_settings(book_id)["mode"]
+            if extraction_mode == "hybrid":
+                hybrid_counts = repository.record_extraction_candidates(
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    chapter_number=chapter_number,
+                    extractor=HYBRID_EXTRACTOR,
+                    candidates=[],
+                    occurrence_corpus="",
                 )
-                created += 1
-            conn.commit()
-        return {"created": created, "updated": updated, "skipped": skipped, "candidates": candidates}
+                counts = {key: counts[key] + hybrid_counts[key] for key in counts}
+            return _record_extraction(
+                book_id,
+                chapter_id,
+                {**counts, "candidates": [], "warnings": []},
+                extractor=HYBRID_EXTRACTOR if extraction_mode == "hybrid" else DETERMINISTIC_EXTRACTOR,
+            )
+
+        raw_chapter_title = str(chapter.get("title") or "")
+        chapter_title = _clean_chapter_title(raw_chapter_title)
+        candidates = extract_candidate_terms_from_text(raw_text, raw_chapter_title)
+        _, deterministic_corpus = _normalized_extraction_corpus(chapter_title, raw_text)
+        chapter_number = int(chapter.get("chapter_number") or 0)
+        repository = GlossaryRepository(self.db_path)
+        counts = repository.record_extraction_candidates(
+            book_id=book_id,
+            chapter_id=chapter_id,
+            chapter_number=chapter_number,
+            extractor=DETERMINISTIC_EXTRACTOR,
+            candidates=candidates,
+            occurrence_corpus=deterministic_corpus,
+        )
+        warnings: list[dict] = []
+        extraction_settings = self.get_extraction_settings(book_id)
+        if extraction_settings["mode"] == "hybrid":
+            hybrid, warnings, hybrid_corpus = self._hybrid_candidates(
+                book_id=book_id,
+                chapter_id=chapter_id,
+                chapter_title=str(chapter.get("title") or ""),
+                raw_text=raw_text,
+                provider_id=str(extraction_settings["provider_id"]),
+            )
+            if hybrid is not None:
+                hybrid_counts = repository.record_extraction_candidates(
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    chapter_number=chapter_number,
+                    extractor=HYBRID_EXTRACTOR,
+                    candidates=hybrid,
+                    occurrence_corpus=hybrid_corpus,
+                )
+                counts = {key: counts[key] + hybrid_counts[key] for key in counts}
+                candidates = [*candidates, *hybrid]
+        return _record_extraction(
+            book_id,
+            chapter_id,
+            {**counts, "candidates": candidates, "warnings": warnings},
+            extractor=(
+                HYBRID_EXTRACTOR
+                if extraction_settings["mode"] == "hybrid"
+                else DETERMINISTIC_EXTRACTOR
+            ),
+        )
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:
         """Get chapters with low glossary coverage."""
         return get_low_coverage_chapters(self.db_path, book_id, threshold)
 
-    def import_glossary(self, data: list[dict], format: str = "json") -> dict:
-        """Import glossary from JSON or CSV."""
-        added = 0
-        updated = 0
-        errors = []
+    def import_glossary(
+        self,
+        data: list[dict],
+        format: str = "json",
+        *,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        """Bounded compatibility adapter over the atomic preview/apply flow."""
+        repository = GlossaryRepository(self.db_path)
+        try:
+            preview = repository.preview_import(
+                data, "reject_conflicts", legacy_partial=True
+            )
+            self._authorize_import(preview["canonical_items"])
+            return repository.apply_import(
+                data,
+                preview["digest"],
+                "reject_conflicts",
+                actor=actor,
+                request_id=request_id,
+                legacy_partial=True,
+            )
+        except GlossaryValidationError as exc:
+            return {
+                "added": 0,
+                "updated": 0,
+                "errors": [
+                    f"item {error['item']}: "
+                    f"{'invalid_transition' if error['code'] == 'invalid_state' else error['code']}"
+                    for error in exc.errors
+                ],
+            }
 
-        for item in data:
-            try:
-                # Validate required fields
-                if "source_term" not in item or "target_term" not in item:
-                    errors.append(f"Missing source_term or target_term in item: {item}")
-                    continue
+    def preview_import(
+        self,
+        data: list[dict],
+        conflict_policy: str = "skip_conflicts",
+        *,
+        scope: dict | list[dict] | None = None,
+    ) -> dict:
+        preview = GlossaryRepository(self.db_path).preview_import(data, conflict_policy)
+        self._authorize_import(preview["canonical_items"], scope)
+        return {key: value for key, value in preview.items() if key != "canonical_items"}
 
-                # Check if term exists
-                existing = None
-                terms = list_glossary(self.db_path, item.get("book_id", 0))
-                for t in terms:
-                    if t["source_term"] == item["source_term"] and t["book_id"] == item.get("book_id", 0):
-                        existing = t
-                        break
+    def apply_import(
+        self,
+        data: list[dict],
+        digest: str,
+        conflict_policy: str = "skip_conflicts",
+        *,
+        scope: dict | list[dict] | None = None,
+        actor: str = "",
+        request_id: str = "",
+    ) -> dict:
+        preview = GlossaryRepository(self.db_path).preview_import(data, conflict_policy)
+        self._authorize_import(preview["canonical_items"], scope)
+        return GlossaryRepository(self.db_path).apply_import(
+            data,
+            digest,
+            conflict_policy,
+            actor=actor,
+            request_id=request_id,
+        )
 
-                if existing:
-                    # Update existing
-                    self.update_term(existing["id"], {
-                        "target_term": item.get("target_term", existing["target_term"]),
-                        "category": item.get("category", existing.get("category", "term")),
-                        "mode": item.get("mode", existing.get("mode", "translate")),
-                        "pinyin": item.get("pinyin", existing.get("pinyin", "")),
-                        "notes_vi": item.get("notes_vi", existing.get("notes_vi", "")),
-                        "variants": item.get("variants", existing.get("variants", "")),
-                        # Keep existing approved status unless explicitly set
-                        "approved": item.get("approved", existing.get("approved", 1)),
-                    })
-                    updated += 1
-                else:
-                    # Add new
-                    self.add_term(item)
-                    added += 1
+    def export_glossary(
+        self,
+        book_id: int | None = None,
+        scope: str = "all",
+    ) -> list[dict]:
+        self._authorize_query_scope(book_id, scope)
+        return GlossaryRepository(self.db_path).export_terms(book_id, scope)
 
-            except Exception as exc:
-                errors.append(f"Failed to process item {item}: {exc}")
 
-        return {"added": added, "updated": updated, "errors": errors}
-
-    def export_glossary(self, book_id: int | None = None, format: str = "json") -> list[dict]:
-        """Export glossary as JSON or CSV."""
-        terms, _ = self.list_terms(book_id=book_id, limit=10000)  # Get all
-        return terms
+class GlossaryAccessError(LookupError):
+    """Hide both nonexistent and unauthorized glossary resources."""

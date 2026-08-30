@@ -15,17 +15,13 @@ from rich.errors import LiveError
 from app.config import settings
 from app.database.db import (
     add_fuzzy_tm_entry,
-    get_default_style_profile,
     get_fuzzy_tm_match,
     get_last_summary,
-    get_style_profile,
     list_model_providers,
-    load_glossary,
-    load_locked_glossary_terms,
-    load_glossary_names,
     put_glossary_term,
     record_provider_usage,
 )
+from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
 from app.translation.pre_translator import (
     build_lexicon_from_glossary,
     get_protected_spans,
@@ -37,7 +33,7 @@ from app.translation.template_rules import TemplateEngine
 
 console = Console()
 logger = logging.getLogger(__name__)
-TRANSLATION_CACHE_PROMPT_VERSION = "p6-styleguide-config-v1"
+TRANSLATION_CACHE_PROMPT_VERSION = "p7-effective-glossary-v1"
 RETRYABLE_PROVIDER_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
@@ -111,6 +107,7 @@ def call_openai_compatible_chat(
     temperature: float = 0.3,
     timeout: int = 180,
     max_retries: int = 2,
+    response_format: dict | None = None,
 ) -> dict:
     """Call an OpenAI-compatible chat completions endpoint."""
     stripped_api_key = api_key.strip()
@@ -118,15 +115,18 @@ def call_openai_compatible_chat(
 
     for attempt in range(max(0, max_retries) + 1):
         try:
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "stream": False,
+            }
+            if response_format is not None:
+                payload["response_format"] = response_format
             response = requests.post(
                 url,
                 headers={"Authorization": f"Bearer {stripped_api_key}"} if stripped_api_key else {},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "stream": False,
-                },
+                json=payload,
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -938,6 +938,7 @@ def translate_chapter(
     chapter_id: Optional[int] = None,
     style_profile_id: Optional[str] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    effective_glossary: EffectiveGlossary | None = None,
 ) -> str:
     """Translate chapter using Ollama with glossary, chunking, and cache.
 
@@ -959,18 +960,16 @@ def translate_chapter(
     from app.translation.cache import get_cached_translation, set_cached_translation
     book = get_book_by_title(db_path, book_title)
     book_id = book["id"] if book else 0
-    glossary = load_glossary(db_path, book_id)
-    name_map = load_glossary_names(db_path, book_id)
-    style_profile = (
-        get_style_profile(db_path, style_profile_id)
-        if style_profile_id
-        else get_default_style_profile(db_path)
-    )
-    locked_glossary = load_locked_glossary_terms(
+    snapshot = effective_glossary or resolve_effective_glossary(
         db_path,
         book_id,
-        genre=style_profile["id"] if style_profile else None,
+        style_profile_id=style_profile_id,
     )
+    glossary = dict(snapshot.translate_mapping)
+    prompt_glossary = snapshot.prompt_mapping
+    name_map = snapshot.name_mapping
+    style_profile = snapshot.style_profile
+    locked_glossary = list(snapshot.locked_terms)
     previous_summary = get_last_summary(db_path, book_id) or ""
 
     chunks = _split_into_chunks(text, max_chars=chunk_size)
@@ -1017,7 +1016,14 @@ def translate_chapter(
 
             # Exact cache hit on processed chunk
             if use_cache:
-                cached = get_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model))
+                cached = get_cached_translation(
+                    db_path,
+                    processed_chunk,
+                    "zh",
+                    "vi",
+                    _cache_model_key(model),
+                    glossary_fingerprint=snapshot.fingerprint,
+                )
                 if cached is not None:
                     translated_chunks.append(cached)
                     console.print(f"  [dim]Chunk {i}/{len(chunks)} cache hit[/dim]")
@@ -1040,7 +1046,7 @@ def translate_chapter(
                 chunk=processed_chunk,  # Use processed chunk with glossary markers
                 book_title=book_title,
                 chapter_title=chapter_title,
-                glossary=glossary,
+                glossary=prompt_glossary,
                 previous_summary=previous_summary,
                 name_map=name_map,
                 previous_chunk_suffix=prev_suffix,
@@ -1080,13 +1086,20 @@ def translate_chapter(
 
                 # Store in both exact cache and fuzzy TM
                 if use_cache:
-                    set_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model), translation_part)
+                    set_cached_translation(
+                        db_path,
+                        processed_chunk,
+                        "zh",
+                        "vi",
+                        _cache_model_key(model),
+                        translation_part,
+                        glossary_fingerprint=snapshot.fingerprint,
+                    )
                 add_fuzzy_tm_entry(db_path, processed_chunk, translation_part, score=85)
 
                 new_terms = _extract_new_terms(raw_output)
                 for src, tgt in new_terms:
                     pending_new_terms.append((src, tgt))
-                    glossary[src] = tgt
 
                 console.print(f"  [dim]Chunk {i}/{len(chunks)} done[/dim]")
                 if translation_part:
@@ -1135,12 +1148,19 @@ def translate_chapter(
                         translated_chunks.append(translation_part)
                         # Store retry result in caches too
                         if use_cache:
-                            set_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model), translation_part)
+                            set_cached_translation(
+                                db_path,
+                                processed_chunk,
+                                "zh",
+                                "vi",
+                                _cache_model_key(model),
+                                translation_part,
+                                glossary_fingerprint=snapshot.fingerprint,
+                            )
                         add_fuzzy_tm_entry(db_path, processed_chunk, translation_part, score=85)
                         new_terms = _extract_new_terms(raw_output)
                         for src, tgt in new_terms:
                             pending_new_terms.append((src, tgt))
-                            glossary[src] = tgt
                         if translation_part:
                             paras = [p.strip() for p in translation_part.split("\n\n") if p.strip()]
                             if paras:

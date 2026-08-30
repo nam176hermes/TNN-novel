@@ -1309,6 +1309,81 @@ export type GlossaryTerm = {
   source_context?: string;
   created_at?: string;
   updated_at?: string;
+  version?: number;
+  canonical_status?: string;
+  inherited?: boolean;
+  evidence_count?: number;
+  archived?: boolean;
+  archived_at?: string;
+};
+
+export type GlossaryScope = 'all' | 'book' | 'global' | 'effective';
+
+export type GlossarySort =
+  | 'review'
+  | 'source_asc'
+  | 'source_desc'
+  | 'updated_desc'
+  | 'updated_asc'
+  | 'priority_desc'
+  | 'evidence_desc';
+
+export type GlossaryQuery = {
+  book_id?: number;
+  page: number;
+  per_page: number;
+  q: string;
+  review_status: string;
+  term_type?: string;
+  mode?: string;
+  locked?: boolean;
+  scope: GlossaryScope;
+  sort: GlossarySort;
+  archived?: boolean;
+};
+
+export type GlossaryFacets = {
+  review_status: Record<string, number>;
+  term_type: Record<string, number>;
+  mode: Record<string, number>;
+  locked: Record<string, number>;
+  scope: Record<string, number>;
+};
+
+export type GlossaryPage = {
+  items: GlossaryTerm[];
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+  scope: GlossaryScope;
+  facets: GlossaryFacets;
+};
+
+export type GlossaryEvidence = {
+  id: number;
+  evidence_type: string;
+  extractor: string;
+  created_at: string;
+  chapter_id?: number;
+  evidence?: Record<string, unknown>;
+};
+
+export type GlossaryHistory = {
+  id: number;
+  action: string;
+  actor: string;
+  request_id: string;
+  version: number;
+  created_at?: string;
+  timestamp?: string;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+};
+
+export type GlossaryTermDetail = GlossaryTerm & {
+  evidence: GlossaryEvidence[];
+  history: GlossaryHistory[];
 };
 
 export type GlossaryTermUpdate = Partial<
@@ -1331,6 +1406,71 @@ export type GlossaryTermUpdate = Partial<
     | 'source_context'
   >
 >;
+
+export type GlossaryVersionedUpdate = GlossaryTermUpdate & { expected_version?: number };
+
+export type GlossaryBulkAction = 'approve' | 'reject' | 'lock' | 'archive';
+
+export type GlossaryBulkTermRef = { id: number; expected_version: number };
+
+export type GlossaryConflictGroup = {
+  id: string;
+  types: Array<'global_book' | 'normalized_duplicate' | 'primary_variant'>;
+  canonical_id: number;
+  member_total: number;
+  members_truncated: boolean;
+  members: GlossaryTerm[];
+};
+
+export type GlossaryConflictPage = {
+  items: GlossaryConflictGroup[];
+  total: number;
+  page: number;
+  per_page: number;
+  pages: number;
+};
+
+export type GlossaryMergePreview = {
+  canonical_id: number;
+  duplicate_ids: number[];
+  digest: string;
+  evidence_count?: number;
+  history_count?: number;
+  occurrence_count?: number;
+  merged?: number;
+};
+
+export type GlossaryImportItem = Partial<GlossaryTerm> & Pick<GlossaryTerm, 'source_term' | 'target_term'>;
+
+export type GlossaryImportPreview = {
+  schema_version: number;
+  digest: string;
+  conflict_policy: 'skip_conflicts' | 'reject_conflicts';
+  summary: { added: number; updated: number; skipped: number };
+  actions: Array<{ item: number; action: 'add' | 'update' | 'skip'; code?: string; id?: number }>;
+  affected: Array<Record<string, unknown>>;
+};
+
+export type GlossaryImportResult = {
+  added: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+};
+
+export type BookGlossarySettings = {
+  book_id: number;
+  mode: 'deterministic' | 'hybrid';
+  provider_id: string;
+  max_candidates_per_chapter: 100;
+};
+
+export type GlossaryExtractionResult = {
+  created: number;
+  updated: number;
+  skipped: number;
+  warnings: Array<{ code: string; message: string }>;
+};
 
 export type Book = {
   id: number;

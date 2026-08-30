@@ -1,49 +1,312 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+import csv
+import io
+import json
+from typing import Literal
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
+
+from app.database.glossary_repository import (
+    EXPORT_FIELDS,
+    GlossaryStateConflict,
+    GlossaryValidationError,
+)
 from app.mobile_api.audit import record_audit_event
+from app.mobile_api.auth import get_current_user
+from app.mobile_api.config import mobile_settings
 from app.mobile_api.schemas import (
+    GlossaryBulkRequest,
+    GlossaryMergeApplyRequest,
+    GlossaryMergePreviewRequest,
     GlossaryTermCreate,
     GlossaryTermUpdate,
     ImportGlossaryResponse,
     TranslationMemoryEntryCreate,
 )
-from app.mobile_api.services.glossary_service import GlossaryService
+from app.mobile_api.services.glossary_service import GlossaryAccessError, GlossaryService
 
 router = APIRouter(prefix="/api/glossary", tags=["glossary"])
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_ROWS = 5_000
 
 
-def get_glossary_service():
-    return GlossaryService()
+def get_glossary_service(current_user: dict = Depends(get_current_user)):
+    return GlossaryService().for_user(
+        user_id=str(current_user.get("user_id") or ""),
+        username=str(current_user.get("username") or ""),
+        admin_username=mobile_settings.admin_username,
+    )
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "not_found"})
+
+
+def _authorized(call):
+    try:
+        return call()
+    except GlossaryAccessError:
+        raise _not_found() from None
+
+
+def _mutation_metadata(request: Request) -> tuple[str, str]:
+    user = getattr(request.state, "user", {})
+    request_id = request.headers.get("X-Request-ID", "") or request.headers.get("X-Correlation-ID", "")
+    return str(user.get("username") or ""), request_id
+
+
+def _state_mutation(call):
+    try:
+        return call()
+    except GlossaryAccessError:
+        raise _not_found() from None
+    except GlossaryStateConflict as exc:
+        detail = {"code": exc.code}
+        if exc.code == "normalized_source_collision":
+            detail["resolution"] = "archive_active_canonical_first"
+        raise HTTPException(status_code=409, detail=detail) from None
+
+
+def _validated_mutation(call):
+    try:
+        return _state_mutation(call)
+    except GlossaryValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "validation_failed", "errors": exc.errors},
+        ) from None
+
+
+async def _bounded_json(request: Request):
+    body = await request.body()
+    if len(body) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "payload_too_large"})
+    try:
+        return json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
+
+
+def _csv_import_item(row: dict[str, str], item_number: int) -> dict | None:
+    if None in row or any(value is None for value in row.values()):
+        raise HTTPException(status_code=422, detail={"code": "invalid_csv"})
+    if row.get("schema_version") != "1":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "validation_failed",
+                "errors": [{"item": item_number, "field": "schema_version", "code": "unsupported"}],
+            },
+        )
+    if row.get("scope") not in {"all", "book", "global"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    item_fields = [key for key in row if key not in {"schema_version", "scope", "scope_book_id"}]
+    if (
+        set(EXPORT_FIELDS).issubset(row)
+        and "archived" in row
+        and all(row[key] == "" for key in item_fields)
+    ):
+        _validate_import_scope(
+            row["scope"], row.get("scope_book_id"), [], csv_value=True
+        )
+        return None
+    item = {
+        key: value
+        for key, value in row.items()
+        if key not in {"schema_version", "scope", "scope_book_id"}
+    }
+    for field in (
+        "id", "book_id", "approved", "locked", "occurrence_count", "priority",
+        "first_seen_chapter_id", "first_seen_chapter_number", "version",
+    ):
+        if field in item:
+            if field == "occurrence_count" and item[field] == "":
+                item.pop(field)
+                continue
+            try:
+                item[field] = int(item[field])
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "validation_failed",
+                        "errors": [{"item": item_number, "field": field, "code": "invalid_number"}],
+                    },
+                ) from None
+    if "confidence" in item:
+        try:
+            item["confidence"] = float(item["confidence"])
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "validation_failed",
+                    "errors": [{"item": item_number, "field": "confidence", "code": "invalid_number"}],
+                },
+            ) from None
+    if "archived" in item:
+        archived = str(item["archived"]).strip().lower()
+        if archived not in {"true", "false"}:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "validation_failed",
+                    "errors": [{"item": item_number, "field": "archived", "code": "invalid_value"}],
+                },
+            )
+        item["archived"] = archived == "true"
+    _validate_import_scope(row["scope"], row.get("scope_book_id"), [item], csv_value=True)
+    return item
+
+
+def _validate_import_scope(
+    scope_type: str,
+    scope_book_id,
+    items: list[dict],
+    *,
+    csv_value: bool = False,
+) -> None:
+    if scope_type not in {"all", "book", "global"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if scope_book_id is None or scope_book_id == "":
+        if scope_type == "book":
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+        expected_book_id = 0
+    else:
+        if isinstance(scope_book_id, bool):
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+        try:
+            expected_book_id = int(scope_book_id) if csv_value else scope_book_id
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"}) from None
+        if type(expected_book_id) is not int or not 0 <= expected_book_id <= 2**63 - 1:
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if scope_type == "all":
+        return
+    if scope_type == "global":
+        if expected_book_id != 0:
+            raise HTTPException(status_code=422, detail={"code": "scope_mismatch"})
+        expected_book_id = 0
+    for item in items:
+        item_book_id = item.get("book_id", 0) if isinstance(item, dict) else None
+        if type(item_book_id) is int and item_book_id != expected_book_id:
+            raise HTTPException(status_code=422, detail={"code": "scope_mismatch"})
+
+
+async def _bounded_import_payload(request: Request) -> tuple[dict, bool]:
+    body = await request.body()
+    if len(body) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "payload_too_large"})
+    content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type in {"text/csv", "application/csv"}:
+        try:
+            text = body.decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(text))
+            required = {"schema_version", "scope", "source_term", "target_term"}
+            if (
+                not reader.fieldnames
+                or len(reader.fieldnames) != len(set(reader.fieldnames))
+                or not required.issubset(reader.fieldnames)
+            ):
+                raise HTTPException(status_code=422, detail={"code": "invalid_csv_schema"})
+            source_rows = list(reader)
+            parsed_rows = [
+                _csv_import_item(row, index) for index, row in enumerate(source_rows, start=1)
+            ]
+            if len(parsed_rows) > MAX_IMPORT_ROWS:
+                raise HTTPException(status_code=422, detail={"code": "row_limit_exceeded"})
+            rows = [row for row in parsed_rows if row is not None]
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=422, detail={"code": "invalid_csv"}) from None
+        return {
+            "items": _bounded_items(rows),
+            "authorization_scopes": [
+                {
+                    "type": row.get("scope"),
+                    "book_id": int(row.get("scope_book_id") or 0),
+                }
+                for row in source_rows
+            ],
+        }, True
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_json"}) from None
+    if isinstance(payload, list):
+        payload = {"items": payload}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail={"code": "object_required"})
+    if "schema_version" in payload and payload["schema_version"] != 1:
+        raise HTTPException(status_code=422, detail={"code": "unsupported_schema_version"})
+    if "scope" in payload:
+        scope = payload["scope"]
+        if not isinstance(scope, dict) or scope.get("type") not in {"all", "book", "global"}:
+            raise HTTPException(status_code=422, detail={"code": "invalid_scope"})
+    if "items" not in payload and "terms" in payload:
+        payload = {**payload, "items": payload["terms"]}
+    payload["items"] = _bounded_items(payload.get("items"))
+    if "scope" in payload:
+        _validate_import_scope(
+            payload["scope"]["type"], payload["scope"].get("book_id"), payload["items"]
+        )
+    return payload, False
+
+
+def _bounded_items(value) -> list[dict]:
+    if not isinstance(value, list):
+        raise HTTPException(status_code=422, detail={"code": "items_required"})
+    if len(value) > MAX_IMPORT_ROWS:
+        raise HTTPException(status_code=422, detail={"code": "row_limit_exceeded"})
+    return value
 
 
 @router.get("")
 async def list_glossary(
     book_id: int | None = Query(None),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=500),
+    per_page: int = Query(50, ge=1, le=200),
+    q: str = Query("", max_length=200),
+    review_status: str = Query("", max_length=120),
+    term_type: str | None = Query(None, max_length=40),
     mode: str | None = Query(None),
+    locked: bool | None = Query(None),
+    scope: Literal["all", "book", "global", "effective"] | None = Query(None),
+    sort: Literal[
+        "review", "source_asc", "source_desc", "updated_desc", "updated_asc", "priority_desc", "evidence_desc"
+    ] = Query("review"),
     approved: int | None = Query(None),
-    include_weak: bool = Query(False),
+    include_weak: bool | None = Query(None),
+    archived: bool = Query(False),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """List glossary terms with pagination and filtering."""
-    offset = (page - 1) * per_page
-    items, total = svc.list_terms(
+    """List a bounded glossary review page using SQL filters and facets."""
+    statuses = tuple(part.strip().upper() for part in review_status.split(",") if part.strip())
+    if any(status not in {"NEEDS_REVIEW", "APPROVED", "REJECTED", "LOCKED", "CONFLICT"} for status in statuses):
+        raise HTTPException(status_code=422, detail={"code": "invalid_review_status"})
+    if mode is not None and mode not in {"", "translate", "context", "transliterate"}:
+        raise HTTPException(status_code=422, detail={"code": "invalid_mode"})
+    if scope in {"book", "effective"} and book_id is None:
+        raise HTTPException(status_code=422, detail={"code": "book_id_required"})
+
+    legacy_call = approved is not None or include_weak is not None
+    resolved_scope = scope or ("legacy" if legacy_call else ("effective" if book_id is not None else "all"))
+    return _authorized(lambda: svc.query_terms(
         book_id=book_id,
-        limit=per_page,
-        offset=offset,
+        page=page,
+        per_page=per_page,
+        q=q,
+        review_status=review_status,
+        term_type=term_type,
         mode=mode,
+        locked=locked,
+        scope=resolved_scope,
+        sort=sort,
         approved=approved,
-        include_weak=include_weak,
-    )
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-    }
+        include_weak=bool(include_weak),
+        archived=archived,
+    ))
 
 
 @router.get("/search")
@@ -53,18 +316,55 @@ async def search_glossary(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Search glossary terms."""
-    results = svc.search_terms(q, book_id)
+    results = _authorized(lambda: svc.search_terms(q, book_id))
     return {"results": results, "total": len(results)}
 
 
 @router.get("/conflicts")
 async def list_glossary_conflicts(
     book_id: int | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    include_legacy: bool = Query(True),
+    legacy_member_limit: int = Query(20, ge=1, le=50),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """List glossary conflicts and target reuse warnings."""
-    conflicts = svc.get_conflicts(book_id)
-    return {"conflicts": conflicts, "total": len(conflicts)}
+    """List bounded global/book, primary/variant, and normalized conflicts."""
+    result = _authorized(lambda: svc.query_conflicts(book_id, page, per_page))
+    legacy = (
+        _authorized(lambda: svc.query_legacy_conflicts(book_id, page, per_page, legacy_member_limit))
+        if include_legacy
+        else []
+    )
+    return {**result, "conflicts": legacy, "legacy_bounded": True}
+
+
+@router.post("/conflicts/merge/preview", response_model=dict)
+async def preview_conflict_merge(
+    merge: GlossaryMergePreviewRequest,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    return _state_mutation(
+        lambda: svc.preview_merge(merge.canonical_id, merge.duplicate_ids)
+    )
+
+
+@router.post("/conflicts/merge/apply", response_model=dict)
+async def apply_conflict_merge(
+    merge: GlossaryMergeApplyRequest,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    actor, request_id = _mutation_metadata(request)
+    return _state_mutation(
+        lambda: svc.apply_merge(
+            merge.canonical_id,
+            merge.duplicate_ids,
+            merge.digest,
+            actor=actor,
+            request_id=request_id,
+        )
+    )
 
 
 @router.post("/tm", response_model=dict, status_code=201)
@@ -133,33 +433,78 @@ async def clear_tm(
 @router.post("/terms", response_model=dict, status_code=201)
 async def add_term(
     term: GlossaryTermCreate,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Add a new glossary term."""
-    term_id = svc.add_term(term.model_dump())
-    return {"id": term_id, "message": "Term added"}
+    actor, request_id = _mutation_metadata(request)
+    resource = _state_mutation(
+        lambda: svc.add_term_resource(term.model_dump(), actor=actor, request_id=request_id)
+    )
+    return {**resource, "message": "Term added"}
+
+
+@router.post("/terms/bulk", response_model=dict)
+async def bulk_terms(
+    bulk: GlossaryBulkRequest,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    actor, request_id = _mutation_metadata(request)
+    return _state_mutation(
+        lambda: svc.bulk_terms(
+            bulk.action,
+            [term.model_dump() for term in bulk.terms],
+            actor=actor,
+            request_id=request_id,
+        )
+    )
+
+
+@router.get("/terms/{term_id}", response_model=dict)
+async def get_term_detail(
+    term_id: int,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    resource = _authorized(lambda: svc.get_term_detail(term_id))
+    if resource is None:
+        raise HTTPException(status_code=404, detail="Term not found")
+    return resource
 
 
 @router.patch("/terms/{term_id}", response_model=dict)
 async def update_term(
     term_id: int,
     update: GlossaryTermUpdate,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Update a glossary term."""
-    success = svc.update_term(term_id, update.model_dump(exclude_none=True))
-    if not success:
+    actor, request_id = _mutation_metadata(request)
+    resource = _state_mutation(
+        lambda: svc.update_term_resource(
+            term_id,
+            update.model_dump(exclude_none=True),
+            actor=actor,
+            request_id=request_id,
+        )
+    )
+    if resource is None:
         raise HTTPException(status_code=404, detail="Term not found")
-    return {"message": "Term updated"}
+    return {**resource, "message": "Term updated"}
 
 
 @router.post("/terms/{term_id}/lock", response_model=dict)
 async def lock_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Lock a glossary term so translation prompts treat it as non-negotiable."""
-    success = svc.set_term_locked(term_id, True)
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.set_term_locked(term_id, True, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term locked"}
@@ -168,10 +513,14 @@ async def lock_term(
 @router.post("/terms/{term_id}/unlock", response_model=dict)
 async def unlock_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Unlock a glossary term."""
-    success = svc.set_term_locked(term_id, False)
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.set_term_locked(term_id, False, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"message": "Term unlocked"}
@@ -184,7 +533,14 @@ async def delete_term(
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Delete a glossary term."""
-    success = svc.delete_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.delete_term(
+            term_id,
+            actor=actor,
+            request_id=request_id,
+        )
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found")
     record_audit_event(
@@ -198,13 +554,37 @@ async def delete_term(
     return {"message": "Term deleted"}
 
 
+@router.post("/terms/{term_id}/restore", response_model=dict)
+async def restore_term(
+    term_id: int,
+    request: Request,
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    """Restore an archived glossary term."""
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.restore_term(
+            term_id,
+            actor=actor,
+            request_id=request_id,
+        )
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Term not found")
+    return {"message": "Term restored"}
+
+
 @router.post("/terms/{term_id}/approve", response_model=dict)
 async def approve_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Approve a pending glossary term."""
-    success = svc.approve_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.approve_term(term_id, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term approved"}
@@ -213,23 +593,82 @@ async def approve_term(
 @router.post("/terms/{term_id}/reject", response_model=dict)
 async def reject_term(
     term_id: int,
+    request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Reject a pending glossary term."""
-    success = svc.reject_term(term_id)
+    actor, request_id = _mutation_metadata(request)
+    success = _state_mutation(
+        lambda: svc.reject_term(term_id, actor=actor, request_id=request_id)
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Term not found or already approved")
     return {"message": "Term rejected"}
 
 
+@router.post("/import/preview", response_model=dict)
+async def preview_import_glossary(
+    request: Request,
+    conflict_policy: str = Query(""),
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    payload, csv_payload = await _bounded_import_payload(request)
+    items = payload["items"]
+    policy = (
+        (conflict_policy or "skip_conflicts")
+        if csv_payload
+        else str(payload.get("conflict_policy") or "skip_conflicts")
+    )
+    return _validated_mutation(
+        lambda: svc.preview_import(
+            items,
+            policy,
+            scope=payload.get("scope") or payload.get("authorization_scopes"),
+        )
+    )
+
+
+@router.post("/import/apply", response_model=dict)
+async def apply_import_glossary(
+    request: Request,
+    digest: str = Query(""),
+    conflict_policy: str = Query(""),
+    svc: GlossaryService = Depends(get_glossary_service),
+):
+    payload, csv_payload = await _bounded_import_payload(request)
+    items = payload["items"]
+    resolved_digest = digest if csv_payload else str(payload.get("digest") or "")
+    if len(resolved_digest) != 64:
+        raise HTTPException(status_code=422, detail={"code": "digest_required"})
+    policy = (
+        conflict_policy or "skip_conflicts"
+        if csv_payload
+        else str(payload.get("conflict_policy") or "skip_conflicts")
+    )
+    actor, request_id = _mutation_metadata(request)
+    return _validated_mutation(
+        lambda: svc.apply_import(
+            items,
+            resolved_digest,
+            policy,
+            scope=payload.get("scope") or payload.get("authorization_scopes"),
+            actor=actor,
+            request_id=request_id,
+        )
+    )
+
+
 @router.post("/import", response_model=ImportGlossaryResponse)
 async def import_glossary(
-    data: list[dict],
     request: Request,
     svc: GlossaryService = Depends(get_glossary_service),
 ):
-    """Import glossary from JSON."""
-    result = svc.import_glossary(data)
+    """Bounded legacy adapter over atomic preview/apply."""
+    data = _bounded_items(await _bounded_json(request))
+    actor, request_id = _mutation_metadata(request)
+    result = _authorized(
+        lambda: svc.import_glossary(data, actor=actor, request_id=request_id)
+    )
     record_audit_event(
         event_type="import_complete",
         severity="info",
@@ -250,10 +689,14 @@ async def export_glossary(
     request: Request,
     book_id: int | None = Query(None),
     format: str = Query("json", pattern="^(json|csv)$"),
+    scope: Literal["all", "book", "global"] | None = Query(None),
     svc: GlossaryService = Depends(get_glossary_service),
 ):
     """Export glossary as JSON or CSV."""
-    terms = svc.export_glossary(book_id)
+    resolved_scope = scope or ("book" if book_id is not None else "all")
+    if resolved_scope == "book" and book_id is None:
+        raise HTTPException(status_code=422, detail={"code": "book_id_required"})
+    terms = _authorized(lambda: svc.export_glossary(book_id, resolved_scope))
     record_audit_event(
         event_type="export_download",
         severity="info",
@@ -269,17 +712,29 @@ async def export_glossary(
         },
     )
     if format == "csv":
-        import csv
-        import io
         output = io.StringIO()
+        fieldnames = [
+            "schema_version", "scope", "scope_book_id", *EXPORT_FIELDS, "archived",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        metadata = {
+            "schema_version": 1,
+            "scope": resolved_scope,
+            "scope_book_id": book_id or 0,
+        }
         if terms:
-            writer = csv.DictWriter(output, fieldnames=list(terms[0].keys()))
-            writer.writeheader()
-            writer.writerows(terms)
-        from fastapi.responses import Response
+            writer.writerows({**metadata, **term} for term in terms)
+        else:
+            writer.writerow(metadata)
         return Response(
             content=output.getvalue(),
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=glossary.csv"},
         )
-    return {"terms": terms, "total": len(terms)}
+    return {
+        "schema_version": 1,
+        "scope": {"type": resolved_scope, "book_id": book_id or 0},
+        "terms": terms,
+        "total": len(terms),
+    }

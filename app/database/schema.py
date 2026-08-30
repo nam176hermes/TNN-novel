@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS glossary_terms (
     notes_vi TEXT DEFAULT '',
     variants TEXT DEFAULT '',
     occurrence_count INTEGER DEFAULT 0,
+    chapter_count INTEGER DEFAULT 0,
     priority INTEGER DEFAULT 0,
     locked INTEGER DEFAULT 0,
     genre TEXT DEFAULT '',
@@ -205,10 +206,33 @@ CREATE TABLE IF NOT EXISTS glossary_terms (
     first_seen_chapter_number INTEGER DEFAULT 0,
     review_status TEXT DEFAULT '',
     source_context TEXT DEFAULT '',
+    source_key TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT NOT NULL DEFAULT '',
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT '',
     UNIQUE(book_id, source_term)
+);
+
+CREATE TABLE IF NOT EXISTS glossary_term_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    term_id INTEGER NOT NULL,
+    book_id INTEGER NOT NULL DEFAULT 0,
+    chapter_id INTEGER NOT NULL DEFAULT 0,
+    extractor TEXT NOT NULL DEFAULT '',
+    evidence_type TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (term_id) REFERENCES glossary_terms(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS book_glossary_settings (
+    book_id INTEGER PRIMARY KEY,
+    extraction_mode TEXT NOT NULL DEFAULT 'deterministic'
+        CHECK(extraction_mode IN ('deterministic', 'hybrid')),
+    provider_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS style_profiles (
@@ -219,6 +243,7 @@ CREATE TABLE IF NOT EXISTS style_profiles (
     preferred_terms TEXT DEFAULT '',
     banned_modern_terms TEXT DEFAULT '',
     prompt_rules TEXT DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
     is_default INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import time
@@ -27,6 +28,7 @@ from app.database.db import (
     save_mobile_job,
     save_qa_report,
 )
+from app.database.glossary_resolver import EffectiveGlossary, resolve_effective_glossary
 from app.ingestion.source_adapters import SourceAdapterError, SourceBlockedError, validate_public_http_url
 from app.ingestion.source_policies import chapter_url_matches_source_book, get_source_policy
 from app.mobile_api.config import mobile_settings
@@ -46,6 +48,15 @@ TTS_JOB_FAILURE_DETAIL = "TTS job failed. Check TTS settings and server logs."
 DAILY_JOB_FAILURE_DETAIL = "Daily job failed. Check provider settings and server logs."
 QA_JOB_FAILURE_DETAIL = "QA failed. Check provider settings and server logs."
 IMPORT_CHAPTER_FAILURE_DETAIL = "import failed; check server logs"
+GLOSSARY_WARNING_LIMIT = 10
+GLOSSARY_WARNING_MESSAGES = {
+    "provider_not_configured": "Hybrid glossary extraction was skipped.",
+    "provider_unavailable": "Hybrid glossary extraction was skipped.",
+    "provider_malformed_response": "Hybrid glossary extraction was skipped.",
+    "provider_output_truncated": "Hybrid output was limited to 100 candidates.",
+    "provider_duplicates_ignored": "Duplicate hybrid candidates were ignored.",
+    "provider_items_ignored": "Invalid hybrid candidates were ignored.",
+}
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -67,6 +78,20 @@ def _safe_stage_timings(value: object) -> list[dict]:
             safe_item["error"] = "Stage failed. Check server logs."
         safe_timings.append(safe_item)
     return safe_timings
+
+
+def _safe_glossary_warnings(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    safe: list[dict[str, str]] = []
+    for item in value[:GLOSSARY_WARNING_LIMIT]:
+        code = str(item.get("code") or "") if isinstance(item, dict) else ""
+        message = GLOSSARY_WARNING_MESSAGES.get(code)
+        if message is None:
+            code = "extraction_warning"
+            message = "Glossary extraction completed with a warning."
+        safe.append({"code": code, "message": message})
+    return safe
 
 
 class JobStatus:
@@ -168,6 +193,7 @@ class JobStatus:
             "previous_error": params.get("previous_error") or "",
             "last_retry_job_id": params.get("last_retry_job_id") or "",
             "skipped_completed_chapter_ids": params.get("skipped_completed_chapter_ids") or [],
+            "glossary_fingerprint": params.get("glossary_fingerprint") or "",
         }
 
     def to_record(self) -> dict:
@@ -980,6 +1006,23 @@ class JobService:
             self.tracker.update_job(job.job_id, status="completed", message="No chapters to translate")
             return job.job_id
 
+        glossary_snapshots: dict[int, EffectiveGlossary] = {}
+        for chapter_id in target_ids:
+            chapter = self.pipeline.get_chapter(chapter_id)
+            snapshot_book_id = _safe_int((chapter or {}).get("book_id"), 0)
+            if snapshot_book_id not in glossary_snapshots:
+                glossary_snapshots[snapshot_book_id] = resolve_effective_glossary(
+                    self.pipeline.db_path,
+                    snapshot_book_id,
+                    style_profile_id=style_profile_id,
+                )
+        snapshot_fingerprints = sorted(snapshot.fingerprint for snapshot in glossary_snapshots.values())
+        glossary_fingerprint = (
+            snapshot_fingerprints[0]
+            if len(snapshot_fingerprints) == 1
+            else hashlib.sha256(":".join(snapshot_fingerprints).encode("ascii")).hexdigest()
+        )
+
         job = self.tracker.create_job(
             "translate",
             target_ids,
@@ -996,6 +1039,7 @@ class JobService:
                 "retry_count": max(0, retry_count),
                 "previous_error": previous_error,
                 "skipped_completed_chapter_ids": skipped_completed_chapter_ids or [],
+                "glossary_fingerprint": glossary_fingerprint,
             },
             status="retrying" if retry_of_job_id else "queued",
         )
@@ -1010,6 +1054,7 @@ class JobService:
                 style_profile_id,
                 preset_id,
                 resolved_chunk_size,
+                glossary_snapshots,
             ),
         )
         return job.job_id
@@ -1286,6 +1331,7 @@ class JobService:
         style_profile_id: str | None,
         preset_id: str | None,
         chunk_size: int | None,
+        glossary_snapshots: dict[int, EffectiveGlossary],
     ) -> None:
         for idx, chapter_id in enumerate(chapter_ids):
             if self._cancel_if_requested(job_id):
@@ -1316,6 +1362,7 @@ class JobService:
                         model=model or "",
                     )
                     resolved_style_profile_id = style_profile_id or job.params.get("style_profile_id")
+                    effective_glossary = glossary_snapshots.get(book_id)
                     if resolved_preset_id:
                         await asyncio.to_thread(
                             self.pipeline.translate_chapter_with_pipeline,
@@ -1327,6 +1374,7 @@ class JobService:
                             chunk_size=chunk_size,
                             stage_callback=self._stage_timing_callback(job_id),
                             cancel_check=lambda: self._job_cancel_requested(job_id),
+                            effective_glossary=effective_glossary,
                         )
                     else:
                         self._update_stage_timing(
@@ -1348,6 +1396,7 @@ class JobService:
                             style_profile_id=resolved_style_profile_id,
                             chunk_size=chunk_size,
                             cancel_check=lambda: self._job_cancel_requested(job_id),
+                            effective_glossary=effective_glossary,
                         )
                     if self._cancel_if_requested(job_id):
                         return
@@ -1374,6 +1423,10 @@ class JobService:
                                 book_id,
                                 chapter_id,
                                 job_id,
+                                effective_glossary,
+                            )
+                            safe_glossary_warnings = _safe_glossary_warnings(
+                                extracted.get("warnings")
                             )
                             record_job_log(
                                 self.pipeline.db_path,
@@ -1388,6 +1441,16 @@ class JobService:
                                     "warning_count": len(qa_report.get("issues") or []),
                                     "glossary_candidates_created": extracted.get("created", 0),
                                     "glossary_candidates_updated": extracted.get("updated", 0),
+                                    "glossary_warning_count": len(extracted.get("warnings") or []),
+                                    "glossary_warning_codes": ",".join(
+                                        warning["code"] for warning in safe_glossary_warnings
+                                    ),
+                                    "glossary_warning_messages": " | ".join(
+                                        warning["message"] for warning in safe_glossary_warnings
+                                    ),
+                                    "glossary_warnings_truncated": len(
+                                        extracted.get("warnings") or []
+                                    ) > GLOSSARY_WARNING_LIMIT,
                                 },
                             )
                         except Exception:
