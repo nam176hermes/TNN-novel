@@ -300,6 +300,74 @@ def test_deterministic_extraction_uses_title_repetition_suffixes_and_real_idempo
     assert evidence_count == 2
 
 
+def test_deterministic_service_counts_one_cleaned_title_corpus_consistently(
+    temp_db_path: Path,
+    tmp_path: Path,
+) -> None:
+    init_db(temp_db_path)
+    book_id = add_book(temp_db_path, "Book")
+    chapter_id = _chapter(
+        temp_db_path,
+        tmp_path,
+        book_id,
+        1,
+        "第一章 第千两章",
+        "千两。千两",
+    )
+    service = _service(temp_db_path)
+
+    first = service.extract_chapter_terms(book_id, chapter_id)
+    candidate = next(
+        item for item in first["candidates"] if item["source_term"] == "千两"
+    )
+    with get_connection(temp_db_path) as conn:
+        term = conn.execute(
+            "SELECT id, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE book_id = ? AND source_key = '千两'",
+            (book_id,),
+        ).fetchone()
+        evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence "
+            "WHERE term_id = ? AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (term["id"], chapter_id),
+        ).fetchone()[0]
+        history = conn.execute(
+            "SELECT before_json, after_json FROM glossary_history WHERE term_id = ? ",
+            (term["id"],),
+        ).fetchall()
+
+    retry = service.extract_chapter_terms(book_id, chapter_id)
+    with get_connection(temp_db_path) as conn:
+        retry_term = conn.execute(
+            "SELECT id, occurrence_count, chapter_count, version "
+            "FROM glossary_terms WHERE id = ?",
+            (term["id"],),
+        ).fetchone()
+        retry_evidence = conn.execute(
+            "SELECT evidence_json FROM glossary_term_evidence "
+            "WHERE term_id = ? AND chapter_id = ? AND extractor = 'deterministic-v2'",
+            (term["id"], chapter_id),
+        ).fetchone()[0]
+        retry_history = conn.execute(
+            "SELECT before_json, after_json FROM glossary_history WHERE term_id = ? ",
+            (term["id"],),
+        ).fetchall()
+
+    assert candidate["mention_count"] == 3
+    assert (term["occurrence_count"], term["chapter_count"]) == (3, 1)
+    assert json.loads(evidence)["mention_count"] == 3
+    assert retry["updated"] == 0
+    assert tuple(retry_term) == tuple(term)
+    assert retry_evidence == evidence
+    assert retry_history == history
+    history_json = "".join(
+        str(value or "") for row in history for value in row
+    )
+    private_json = evidence + history_json + json.dumps(first, ensure_ascii=False)
+    assert "occurrence_corpus" not in private_json
+    assert "occurrence_spans" not in private_json
+
+
 def test_deterministic_producer_counts_late_unique_surface_without_span_payload() -> None:
     candidates = glossary_module.extract_candidate_terms_from_text(
         ("x" * 250_001) + "玄天圣典。玄天圣典",

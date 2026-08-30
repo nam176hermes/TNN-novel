@@ -1024,8 +1024,9 @@ class GlossaryService:
                 counts = {key: counts[key] + hybrid_counts[key] for key in counts}
             return {**counts, "candidates": [], "warnings": []}
 
-        chapter_title = _clean_chapter_title(str(chapter.get("title") or ""))
-        candidates = extract_candidate_terms_from_text(raw_text, chapter_title)
+        raw_chapter_title = str(chapter.get("title") or "")
+        chapter_title = _clean_chapter_title(raw_chapter_title)
+        candidates = extract_candidate_terms_from_text(raw_text, raw_chapter_title)
         _, deterministic_corpus = _normalized_extraction_corpus(chapter_title, raw_text)
         chapter_number = int(chapter.get("chapter_number") or 0)
         repository = GlossaryRepository(self.db_path)
