@@ -101,6 +101,24 @@ No production fix was needed. The affected Phase 4/6 and orchestrator-contract
 suite exited `0` with `31 passed, 49 warnings in 30.73s`. `scripts/lint.sh`
 and `git diff --check` also exited `0`.
 
+The round-2 test/docs commit is
+`adc6f71813406926beddb6ec803e31efc1656bef`, tree
+`1cbe1cfb9c36b2cd0c37d3910ac1ed0aa6e087c3`. On that committed tree, the
+literal canonical command
+`NOVEL_PIPELINE_IGNORE_DOTENV=1 scripts/verify.sh` exited `0`:
+
+- compile, shell syntax, environment, lint/typecheck, and Python dependency
+  consistency passed;
+- backend: `1455 passed, 469 warnings in 491.75s`;
+- frontend: `87` files and `799` tests passed in `34.66s`;
+- frontend build: `1858` modules transformed and built in `945ms`.
+
+That run used only an ignored comment-only `.env` and a symlink to a newly
+initialized synthetic `/tmp/novel-tnn-phase6-round2-verify1-a6uNhu/data`
+tree. The symlink, ignored file, and exact temporary tree were removed after
+the run. Browser certification was not repeated because round 2 changes no
+production, frontend, or browser code.
+
 ## Implementation boundaries
 
 The implementation continues to reuse
