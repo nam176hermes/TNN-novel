@@ -8,19 +8,25 @@ the repository; image pins stay in a versioned repository overlay.
 Run from the WSL repository:
 
 ```bash
+set -euo pipefail
 REPO=/home/thenam176/Novel-TNN
 PROJECT_NAME=novel-tnn-wsl
 PRODUCTION_ENV="${HOME}/.config/novel-tnn/production.env"
-RELEASE_OVERLAY=deploy/production/compose.release.ux-pwa-001-production-20260724-r1.yaml
-ROLLBACK_OVERLAY=deploy/production/compose.rollback.pre-ux-pwa-001-production-20260724-r1.yaml
 PUBLIC_BASE_URL=https://novel-tnn.tradingcompanydirect.com
 cd "$REPO"
+CURRENT_RELEASE=deploy/production/current-release.env
+unset RELEASE_OVERLAY ROLLBACK_OVERLAY ROLLBACK_IMAGE_TAG
+source "$CURRENT_RELEASE"
+: "${RELEASE_OVERLAY:?}"
+: "${ROLLBACK_OVERLAY:?}"
+: "${ROLLBACK_IMAGE_TAG:?}"
 ```
 
-`compose.yaml` is the tracked base. `$RELEASE_OVERLAY` is the current release
-pin. Historical external Phase 4 and TTS overrides are evidence only; do not
-add them to new commands because this versioned overlay replaces their final
-image choices.
+`compose.yaml` is the tracked base. `$CURRENT_RELEASE` is the tracked pointer
+to the current release overlay, exact rollback overlay, and approved rollback
+image tag; update all three entries in the same change. Historical external
+Phase 4 and TTS overrides are evidence only; do not add them to new commands
+because the selected release overlay replaces their final image choices.
 
 `$PRODUCTION_ENV` is operator-owned. Never commit it, copy its values into an
 overlay, or run `docker compose config` without `--quiet` or `--images`.
@@ -63,20 +69,17 @@ docker compose -p "$PROJECT_NAME" \
   config --images
 ```
 
-For `ux-pwa-001-production-20260724-r1`, expected images are:
-
-```text
-novel-pipeline-api:ux-pwa-001-production-20260724-r1
-novel-pipeline-import-worker:ux-pwa-001-production-20260724-r1
-```
-
-The overlay comments record image IDs. Confirm them before deployment:
+The `config --images` output is the authoritative image list. The overlay
+comments record image IDs; confirm every rendered image before deployment:
 
 ```bash
-docker image inspect \
-  novel-pipeline-api:ux-pwa-001-production-20260724-r1 \
-  novel-pipeline-import-worker:ux-pwa-001-production-20260724-r1 \
-  --format '{{index .RepoTags 0}} {{.Id}}'
+docker compose -p "$PROJECT_NAME" \
+  --env-file "$PRODUCTION_ENV" \
+  -f compose.yaml \
+  -f "$RELEASE_OVERLAY" \
+  config --images | \
+  xargs --no-run-if-empty docker image inspect \
+    --format '{{index .RepoTags 0}} {{.Id}}'
 ```
 
 Confirm no durable job has `queued` or `running` status. Recreate the worker
