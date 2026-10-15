@@ -631,8 +631,8 @@ async def test_translate_worker_failure_marks_job_failed(temp_db_path, caplog: p
     assert attempts[0]["provider_id"] == "gemini"
     assert attempts[0]["model"] == "gemini-live"
     assert attempts[0]["status"] == "failed"
-    assert attempts[0]["error"] == "provider rejected request with provider-secret"
-    assert "provider rejected request with provider-secret" in caplog.text
+    assert attempts[0]["error"] == "Provider attempt failed"
+    assert "provider-secret" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -668,7 +668,7 @@ async def test_translate_worker_does_not_block_event_loop_during_slow_provider_c
 
 
 @pytest.mark.asyncio
-async def test_translate_worker_retries_transient_provider_503(temp_db_path, monkeypatch) -> None:
+async def test_translate_worker_does_not_multiply_transport_retry_budget(temp_db_path, monkeypatch) -> None:
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -707,9 +707,9 @@ async def test_translate_worker_retries_transient_provider_503(temp_db_path, mon
 
     status = service.get_job_status(job_id)
     assert status is not None
-    assert status["status"] == "completed"
-    assert pipeline.calls == 2
-    assert sleeps == [5.0]
+    assert status["status"] == "failed"
+    assert pipeline.calls == 1
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
@@ -873,7 +873,13 @@ async def test_qa_worker_persists_report(
         def get_chapter(self, target_chapter_id: int) -> dict:
             return {"id": target_chapter_id, "book_id": book_id}
 
-        def run_qa_check(self, **kwargs) -> dict:
+        def get_chapter_source(self, _chapter_id):
+            return ""
+
+        def get_chapter_translation(self, _chapter_id):
+            return "Bản dịch kiểm tra."
+
+        def run_qa_check(self, *_args, **kwargs) -> dict:
             return {
                 "quality_score": 8.5,
                 "fidelity_score": 9,

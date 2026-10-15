@@ -4,6 +4,7 @@ import type {
   BookAudioPlaylistResponse,
   BookUpdate,
   ChapterApi,
+  RawBacklogPage,
   ChapterContentResponse,
   ChapterTextResponse,
   CostEstimate,
@@ -102,6 +103,7 @@ export type ReaderBookSearchOptions = {
 };
 
 export type ApiRequestOptions = {
+  onContentRevision?: (revision: number) => void;
   signal?: AbortSignal;
 };
 
@@ -318,6 +320,23 @@ export class ApiClient {
 
     const data = (await response.json()) as { books: TranslatedBookSummary[] };
     return data.books;
+  }
+
+  async getRawBacklog(offset = 0, limit = 50, options: ApiRequestOptions = {}): Promise<RawBacklogPage> {
+    const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    const response = await this.fetcher(`${this.baseUrl}/api/library/raw?${query}`, {
+      headers: this.headers(), signal: options.signal,
+    });
+    await this.assertOk(response, 'Failed to load raw backlog');
+    return await response.json() as RawBacklogPage;
+  }
+
+  async getRawChapterIds(bookId: number): Promise<number[]> {
+    const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/raw-ids`, {
+      headers: this.headers(),
+    });
+    await this.assertOk(response, 'Failed to load raw chapter selection');
+    return await response.json() as number[];
   }
 
   async updateBook(bookId: number, updates: BookUpdate): Promise<Book> {
@@ -846,6 +865,7 @@ export class ApiClient {
     await this.assertOk(response, 'Failed to load chapter translation');
 
     const data = (await response.json()) as ChapterTextResponse;
+    if (typeof data.content_revision === 'number') options.onContentRevision?.(data.content_revision);
     return data.text;
   }
 
@@ -861,13 +881,15 @@ export class ApiClient {
     return { text: data.text, html: data.html };
   }
 
-  async saveChapterTranslation(bookId: number, chapterId: number, text: string): Promise<void> {
+  async saveChapterTranslation(bookId: number, chapterId: number, text: string, expectedContentRevision?: number, translatedTitle?: string): Promise<number | undefined> {
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/translation`, {
       method: 'PATCH',
       headers: { ...this.headers(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, expected_content_revision: expectedContentRevision, translated_title: translatedTitle }),
     });
     await this.assertOk(response, 'Failed to save chapter translation');
+    const data = await response.json() as { content_revision?: number };
+    return data.content_revision;
   }
 
   async deleteChapterTranslation(bookId: number, chapterId: number): Promise<void> {
@@ -990,6 +1012,7 @@ export class ApiClient {
     bookId: number,
     query: string,
     options: ReaderBookSearchOptions = {},
+    requestOptions: ApiRequestOptions = {},
   ): Promise<ReaderSearchResult[]> {
     const params = new URLSearchParams({ q: query });
     if (options.scopes?.length) params.set('scope', options.scopes.join(','));
@@ -999,6 +1022,7 @@ export class ApiClient {
 
     const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/search?${params.toString()}`, {
       headers: this.headers(),
+      signal: requestOptions.signal,
     });
     await this.assertOk(response, 'Failed to search reader book');
 
@@ -1118,12 +1142,12 @@ export class ApiClient {
     };
   }
 
-  chapterAudioUrl(bookId: number, chapterId: number): string {
-    return `${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/audio`;
+  chapterAudioUrl(bookId: number, chapterId: number, version?: string): string {
+    return `${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/audio${version ? `?v=${encodeURIComponent(version)}` : ''}`;
   }
 
-  chapterAudioDownloadUrl(bookId: number, chapterId: number): string {
-    return `${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/audio/download`;
+  chapterAudioDownloadUrl(bookId: number, chapterId: number, version?: string): string {
+    return `${this.baseUrl}/api/books/${bookId}/chapters/${chapterId}/audio/download${version ? `?v=${encodeURIComponent(version)}` : ''}`;
   }
 
   async getBookAudioPlaylist(bookId: number): Promise<BookAudioPlaylistResponse> {
@@ -1295,8 +1319,8 @@ export class ApiClient {
     };
   }
 
-  async downloadAudiobookExport(bookId: number, format: AudiobookExportFormat): Promise<ExportDownload> {
-    const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/exports/audiobook/${format}/download`, {
+  async downloadAudiobookExport(bookId: number, format: AudiobookExportFormat, allowPartial = false): Promise<ExportDownload> {
+    const response = await this.fetcher(`${this.baseUrl}/api/books/${bookId}/exports/audiobook/${format}/download${allowPartial ? '?allow_partial=true' : ''}`, {
       headers: this.headers(),
     });
     await this.assertOk(response, 'Failed to download audiobook export');

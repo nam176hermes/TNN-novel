@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pyperclip
@@ -8,6 +7,7 @@ from rich.console import Console
 
 from app.config import settings
 from app.database.db import add_book, get_book_by_title, add_chapter
+from app.storage.chapter_content import write_versioned_text
 
 console = Console()
 
@@ -30,14 +30,14 @@ def _save_raw(text: str, book_title: str, chapter_number: int, chapter_title: st
     raw_dir = data_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = str(int(time.time()))
-    safe_title = "".join(c if c.isalnum() or c in "._-" else "_" for c in book_title)
-    raw_path = raw_dir / f"{safe_title}_ch{chapter_number}_{chapter_title}_{ts}.txt"
-    raw_path.write_text(text, encoding="utf-8")
-
     db_path = data_dir / "pipeline.db"
     book_id = _get_or_create_book(book_title)
-    add_chapter(db_path, book_id, chapter_number, chapter_title, "", raw_text_path=raw_path)
+    raw_path = write_versioned_text(raw_dir, f"book{book_id}_ch{chapter_number}", text)
+    try:
+        add_chapter(db_path, book_id, chapter_number, chapter_title, "", raw_text_path=raw_path)
+    except Exception:
+        raw_path.unlink(missing_ok=True)
+        raise
     return raw_path
 
 

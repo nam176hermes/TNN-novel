@@ -34,7 +34,7 @@ describe('useReaderChapterData', () => {
     expect(client.getQaReport).toHaveBeenCalledTimes(1);
   });
 
-  it('uses 15 canonical resource requests for four rapid chapter transitions without duplicates', async () => {
+  it('uses 10 canonical resource requests for four rapid chapter transitions without fetching source', async () => {
     const getChapterSource = vi.fn((_bookId: number, chapterId: number) => Promise.resolve(`source-${chapterId}`));
     const getChapterTranslation = vi.fn((_bookId: number, chapterId: number) => Promise.resolve(`translation-${chapterId}`));
     const getQaReport = vi.fn((_bookId: number, chapterId: number) => Promise.resolve({
@@ -69,7 +69,7 @@ describe('useReaderChapterData', () => {
       await waitFor(() => expect(client.getQaReport).toHaveBeenCalledTimes(index + 2));
     }
 
-    expect(getChapterSource).toHaveBeenCalledTimes(5);
+    expect(getChapterSource).not.toHaveBeenCalled();
     expect(getChapterTranslation).toHaveBeenCalledTimes(5);
     expect(getQaReport).toHaveBeenCalledTimes(5);
     expect(client.getChapterContent).not.toHaveBeenCalled();
@@ -77,6 +77,6 @@ describe('useReaderChapterData', () => {
       getChapterSource.mock.calls.length
       + getChapterTranslation.mock.calls.length
       + getQaReport.mock.calls.length,
-    ).toBe(15);
+    ).toBe(10);
   });
 });

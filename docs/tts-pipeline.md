@@ -28,14 +28,12 @@ TTS_CKPT_FILE=
 TTS_VOCAB_FILE=
 TTS_DEVICE=cuda
 TTS_NORMALIZER=vinorm
-TTS_OUTPUT_FORMAT=mp3
 TTS_CHUNK_MAX_CHARS=450
 TTS_CHUNK_MAX_SENTENCES=4
 TTS_REFERENCE_AUDIO_PATH=/path/to/reference.wav
 TTS_REFERENCE_TEXT="Đoạn transcript khớp với file reference audio."
 TTS_AUDIO_SAMPLE_RATE=24000
 TTS_ENABLE_QA=true
-TTS_ENABLE_M4B=true
 TTS_CACHE=true
 ```
 
@@ -74,7 +72,7 @@ f5tts = F5TTS(device="cuda")
 f5tts.infer(ref_file="voice.wav", ref_text="...", gen_text="...", file_wave="chunk.wav")
 ```
 
-If CUDA is requested but unavailable, the wrapper falls back to CPU and logs a warning. F5-TTS needs a valid reference audio file and matching reference text.
+F5/ViVoice requires CUDA. If a supported GPU or runtime is unavailable, the app reports `tts_unavailable` and rejects the job; it never falls back to CPU. F5-TTS needs a valid reference audio file and matching reference text.
 
 ## Production Reference Voice
 
@@ -158,7 +156,15 @@ POST /api/jobs/tts
 
 ## Resume and Cache
 
-Chunks are stored in `tts_chunks` with stable `chunk_index`, text hash, output path, QA status, and errors. If a job is retried with the same text and voice config, completed chunk files are reused. F5 chunk cache keys are based on normalized text, voice config, and model config.
+Jobs freeze the chapter revision, translated-text hash, voice/reference fingerprint, model, normalizer, chunk limits, QA flag and retry budget. Each chapter in a batch has its own child job. Retry uses the original manifest; an edited chapter or changed voice/reference requires a new job. Existing jobs without a manifest remain unverified and cannot be rebound to current content.
+
+Chunks are stored in `tts_chunks` with stable `chunk_index`, text hash, output path, QA status, and errors. Completed chunks are rechecked before reuse when QA is enabled. F5 cache entries require a passed QA receipt matching the actual audio bytes; keys include normalized text, voice configuration, reference audio contents and model identity. Disabling QA records `skipped` and never promotes an unchecked cache entry.
+
+F5 runs in a persistent child process. Its deadline includes GPU-lock acquisition, model loading and inference. Cancellation or timeout terminates and joins the worker; a batch can reuse a warm worker until it closes. Workers sharing the data/cache volume serialize GPU use with a file lock. Keep that volume shared across workers; separate containers with independent volumes do not share this lock.
+
+Audio is decoded to a common PCM format before merging. Rate, volume and loudness are applied once to the final output, which is checked again after compression before its immutable path is published. An edited translation makes previous audio stale; legacy audio is retained as unverified. Versioned stream URLs also prevent an offline cache from silently serving an older recording.
+
+M4B exports require usable audio for every active chapter by default and include chapter markers. The explicit `allow_partial=true` API option or `--allow-partial` book CLI option permits an incomplete export, labels its filename and records missing chapters in a manifest. A concurrent chapter/audio change rejects the export rather than publishing a mixed snapshot.
 
 ## Debug Common Failures
 

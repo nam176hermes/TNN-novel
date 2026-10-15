@@ -221,6 +221,35 @@ def test_tts_pipeline_resume_reuses_completed_chunks(
     assert first_engine.calls > 0
 
 
+def test_tts_input_change_during_inference_cannot_publish(temp_db_path, tmp_path, monkeypatch):
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    _patch_final_mp3_qa(monkeypatch)
+    monkeypatch.setattr(tts_pipeline_module, "merge_chapter_audio", lambda paths, output, **kw: output.write_bytes(b"new audio"))
+    class EditingEngine(FakeEngine):
+        def synthesize_chunk(self, *args, **kwargs):
+            result = super().synthesize_chunk(*args, **kwargs)
+            changed = tmp_path / "new-translation.txt"
+            changed.write_text("Bản dịch mới phải giữ nguyên.", encoding="utf-8")
+            update_chapter_paths(temp_db_path, chapter_id, translated_text_path=changed)
+            return result
+    report = TTSPipeline(temp_db_path, tmp_path, engine_factory=EditingEngine).generate_chapter(
+        book_id=book_id, chapter_id=chapter_id, job_id="tts-stale-input")
+    assert report.status == "failed"
+    assert not get_chapter_by_id(temp_db_path, chapter_id)["audio_path"]
+
+
+def test_tts_resume_rejects_a_changed_voice_and_preserves_manifest(temp_db_path, tmp_path, monkeypatch):
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    _patch_final_mp3_qa(monkeypatch)
+    monkeypatch.setattr(tts_pipeline_module, "merge_chapter_audio", lambda paths, output, **kw: output.write_bytes(b"audio"))
+    pipeline = TTSPipeline(temp_db_path, tmp_path, engine_factory=FakeEngine)
+    pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="tts-voice", voice_config={"voice_id": "one"})
+    before = pipeline.get_job_status("tts-voice")
+    with pytest.raises(ValueError, match="input.*changed"):
+        pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="tts-voice", voice_config={"voice_id": "two"})
+    assert pipeline.get_job_status("tts-voice")["voice_config_hash"] == before["voice_config_hash"]
+
+
 def test_tts_pipeline_retry_failed_chunks_only_regenerates_failed_chunks(
     temp_db_path: Path,
     tmp_path: Path,
@@ -319,6 +348,29 @@ def test_tts_pipeline_preserves_cancelled_state_when_provider_errors_after_cance
     status = pipeline.get_job_status(job_id)
     assert status is not None
     assert status["status"] == "cancelled"
+
+
+def test_cancellation_at_progress_callback_blocks_merge_and_late_updates(temp_db_path, tmp_path, monkeypatch):
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    pipeline = TTSPipeline(temp_db_path, tmp_path, engine_factory=FakeEngine)
+    monkeypatch.setattr(tts_pipeline_module, "merge_chapter_audio", lambda *_args, **_kwargs: pytest.fail("cancelled job merged"))
+    report = pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="cancel-progress",
+        progress_callback=lambda *_: pipeline.cancel_job("cancel-progress"))
+    pipeline._update_job("cancel-progress", status="running", progress=99)
+    pipeline._update_chunk("cancel-progress", 0, status="running")
+    assert report.status == pipeline.get_job_status("cancel-progress")["status"] == "cancelled"
+    assert pipeline.get_job_status("cancel-progress")["chunks"][0]["status"] == "completed"
+    assert not get_chapter_by_id(temp_db_path, chapter_id)["audio_path"]
+
+
+def test_engine_start_failure_is_recorded_without_publishing(temp_db_path, tmp_path):
+    book_id, chapter_id = _prepare_translated_chapter(temp_db_path, tmp_path)
+    def unavailable():
+        raise tts_pipeline_module.TTSDependencyError("test dependency unavailable")
+    pipeline = TTSPipeline(temp_db_path, tmp_path, engine_factory=unavailable)
+    report = pipeline.generate_chapter(book_id=book_id, chapter_id=chapter_id, job_id="engine-start-error")
+    assert report.status == "failed"
+    assert not get_chapter_by_id(temp_db_path, chapter_id)["audio_path"]
 
 
 def test_tts_pipeline_audio_summary_flags_missing_completed_chunk_files(

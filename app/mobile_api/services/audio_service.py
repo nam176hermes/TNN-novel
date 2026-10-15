@@ -26,7 +26,7 @@ class AudioService:
     def get_audio_path(self, chapter_id: int) -> Path | None:
         """Get the audio file path for a chapter."""
         chapter = self.pipeline.get_chapter(chapter_id)
-        if not chapter or not chapter.get("audio_path"):
+        if not chapter or not chapter.get("audio_path") or chapter.get("audio_status") == "stale":
             return None
         return self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
 
@@ -62,23 +62,25 @@ class AudioService:
         playlist = []
         order = 0
         for chapter in chapters:
-            if chapter.get("audio_path"):
+            if chapter.get("audio_path") and chapter.get("audio_status") != "stale":
                 try:
                     audio_path = self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
                 except ArtifactPathError:
                     continue
                 if audio_path.is_file():
                     chapter_id = chapter["id"]
+                    version = f"?v={chapter['audio_version']}" if chapter.get("audio_version") else ""
                     playlist.append({
                         "chapter_id": chapter_id,
                         "chapter_number": chapter["chapter_number"],
-                        "title": chapter["title"],
+                        "title": chapter.get("translated_title") or chapter["title"],
+                        "audio_status": chapter.get("audio_status", "legacy_unverified"),
                         "duration_seconds": audio_duration_seconds(audio_path),
-                        "download_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio/download",
+                        "download_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio/download{version}",
                         "filename": audio_path.name,
                         "order": order,
                         "size_bytes": audio_path.stat().st_size,
-                        "stream_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio",
+                        "stream_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio{version}",
                     })
                     order += 1
         return playlist

@@ -60,7 +60,7 @@ def test_qa_service_accepts_chapter_content_reader_protocol(temp_db_path, tmp_pa
     assert reader.calls == [("source", chapter_id), ("translation", chapter_id)]
 
 
-def test_qa_summary_treats_saved_0_to_10_score_as_pass(temp_db_path) -> None:
+def test_qa_summary_does_not_certify_legacy_report(temp_db_path) -> None:
     init_db(temp_db_path)
     book_id = add_book(temp_db_path, "Book")
     chapter_id = add_chapter(temp_db_path, book_id, 1, "Chapter")
@@ -81,9 +81,10 @@ def test_qa_summary_treats_saved_0_to_10_score_as_pass(temp_db_path) -> None:
 
     summary = service.get_book_qa_summary(book_id)
 
-    assert summary["pass_count"] == 1
+    assert summary["pass_count"] == 0
     assert summary["fail_count"] == 0
-    assert summary["chapters"][0]["status"] == "pass"
+    assert summary["qa_done"] == 0
+    assert summary["chapters"][0]["status"] == "legacy_unverified"
 
 
 def test_retranslate_paragraph_passes_default_provider_usage_metadata(temp_db_path, tmp_path, monkeypatch) -> None:
@@ -110,8 +111,8 @@ def test_retranslate_paragraph_passes_default_provider_usage_metadata(temp_db_pa
     assert captured["db_path"] == temp_db_path
     assert captured["chapter_id"] == chapter_id
     assert captured["api_key"] == "provider-secret"
-    assert "Không dùng \"tôi\" khi nhân vật đang gọi Lục ca" in str(captured["prompt"])
-    assert "Lục ca, mấy ngày nay nhờ huynh chăm sóc" in str(captured["prompt"])
+    assert "Selected style:" in str(captured["prompt"])
+    assert "Bad:" not in str(captured["prompt"])
 
 
 def test_polish_paragraph_uses_classical_pronoun_style_prompt(temp_db_path, tmp_path, monkeypatch) -> None:
@@ -139,5 +140,5 @@ def test_polish_paragraph_uses_classical_pronoun_style_prompt(temp_db_path, tmp_
     assert result.startswith("Lục ca")
     assert captured["provider_id"] == "gemini"
     assert captured["task_type"] == "polish"
-    assert "Không dùng \"tôi\" khi nhân vật đang gọi Lục ca" in str(captured["prompt"])
-    assert "xin huynh đừng cho ta thêm đồ nữa" in str(captured["prompt"])
+    assert "Selected style:" in str(captured["prompt"])
+    assert "xin huynh đừng cho ta thêm đồ nữa" not in str(captured["prompt"])

@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiClient, ApiError } from './client';
 
 describe('ApiClient', () => {
+  it('loads a cancellable raw page and the complete raw ID list with authorization', async () => {
+    const page = { chapters: [], total_chapters: 60, total_books: 1, book_counts: { 42: 60 }, offset: 50, limit: 50 };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => page })
+      .mockResolvedValueOnce({ ok: true, json: async () => [4201, 4259] });
+    const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
+    client.token = 'access';
+    const signal = new AbortController().signal;
+    await expect(client.getRawBacklog(50, 50, { signal })).resolves.toEqual(page);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, 'http://test/api/library/raw?offset=50&limit=50',
+      expect.objectContaining({ signal, headers: expect.objectContaining({ Authorization: 'Bearer access' }) }));
+    await expect(client.getRawChapterIds(42)).resolves.toEqual([4201, 4259]);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'http://test/api/books/42/chapters/raw-ids',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access' }) }));
+  });
+
   it('binds the default browser fetch so login does not throw illegal invocation', async () => {
     const fetchMock = vi.fn(function (this: unknown) {
       if (this !== undefined) throw new TypeError('Illegal invocation');

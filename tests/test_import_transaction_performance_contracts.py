@@ -8,6 +8,7 @@ import app.database.db as db_mod
 from app.mobile_api.services.glossary_service import GlossaryService
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
+from scripts.benchmark_import_transaction import _run_case
 
 
 def _pipeline(db_path: Path, data_dir: Path) -> PipelineService:
@@ -38,7 +39,17 @@ def _all_import_files(data_dir: Path) -> list[Path]:
     ]
 
 
-def test_reviewed_import_uses_one_connection_transaction_and_bounded_duplicate_queries(
+def test_import_benchmark_measures_the_extracted_commit_stages(tmp_path: Path) -> None:
+    result = _run_case(count=3, text_bytes=0, include_followups=False, work_root=tmp_path)
+
+    assert result["imported_chapters"] == 3
+    assert result["connections"] == 1
+    assert result["commit_calls"] == 2
+    for phase in ("validation_ms", "duplicate_detection_ms", "file_staging_ms", "file_finalization_ms"):
+        assert result[phase] > 0, phase
+
+
+def test_reviewed_import_uses_one_connection_two_transactions_and_bounded_duplicate_queries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -81,9 +92,9 @@ def test_reviewed_import_uses_one_connection_transaction_and_bounded_duplicate_q
     ]
     assert result["imported_chapters"] == 120
     assert len(result["chapter_ids"]) == 120
-    assert counters == {"connections": 1, "commit_calls": 1}
-    assert len([statement for statement in statements if statement.upper().startswith("BEGIN")]) == 1
-    assert len([statement for statement in statements if statement.upper().startswith("COMMIT")]) == 1
+    assert counters == {"connections": 1, "commit_calls": 2}
+    assert len([statement for statement in statements if statement.upper().startswith("BEGIN")]) == 2
+    assert len([statement for statement in statements if statement.upper().startswith("COMMIT")]) == 2
     assert len(duplicate_queries) <= 2
 
 

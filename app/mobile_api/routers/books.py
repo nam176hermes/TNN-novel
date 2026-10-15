@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from app.mobile_api.schemas import (
     ReaderExplainRequest,
     ReaderExplainResponse,
     ReaderProgressUpdate,
+    RawBacklogPage,
     ReaderSyncRequest,
     ReaderXrayEnrichRequest,
     TranslationEdit,
@@ -25,6 +27,8 @@ from app.mobile_api.schemas import (
 )
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.upload_limits import read_upload_bytes_limited
+from app.database.chapter_repository import ContentRevisionConflict
+from app.database.chapter_repository import list_raw_backlog, list_raw_chapter_ids
 from app.storage.artifact_paths import ArtifactPathError, ResolutionStatus
 
 router = APIRouter(prefix="/api", tags=["books"])
@@ -68,7 +72,7 @@ def _safe_chapter_response(chapter: dict) -> dict:
 
 
 @router.get("/books", response_model=list[dict])
-async def list_books(
+def list_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     books = pipeline.list_books()
@@ -76,14 +80,14 @@ async def list_books(
 
 
 @router.get("/library/books", response_model=dict)
-async def list_translated_library_books(
+def list_translated_library_books(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     return {"books": [_safe_book_response(book) for book in pipeline.list_translated_book_summaries()]}
 
 
 @router.post("/books", response_model=dict, status_code=201)
-async def create_book(
+def create_book(
     book: BookCreate,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
@@ -96,8 +100,20 @@ async def create_book(
     return _safe_book_response(pipeline.get_book(book_id))
 
 
+@router.get("/library/raw", response_model=RawBacklogPage)
+def get_raw_backlog(
+    book_id: int | None = Query(None, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    pipeline: PipelineService = Depends(get_pipeline),
+):
+    page = list_raw_backlog(pipeline.db_path, book_id=book_id, limit=limit, offset=offset)
+    page["chapters"] = [_safe_chapter_response(chapter) for chapter in page["chapters"]]
+    return page
+
+
 @router.get("/books/{book_id}", response_model=dict)
-async def get_book(
+def get_book(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
@@ -108,7 +124,7 @@ async def get_book(
 
 
 @router.patch("/books/{book_id}", response_model=dict)
-async def update_book(
+def update_book(
     book_id: int,
     update: BookUpdate,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -127,7 +143,8 @@ async def update_book_cover(
 ):
     try:
         content = await read_upload_bytes_limited(cover, label="Cover upload")
-        book = pipeline.update_book_cover(
+        book = await asyncio.to_thread(
+            pipeline.update_book_cover,
             book_id,
             filename=cover.filename or "",
             content_type=cover.content_type or "",
@@ -144,7 +161,7 @@ async def update_book_cover(
 
 
 @router.delete("/books/{book_id}")
-async def delete_book(
+def delete_book(
     book_id: int,
     request: Request,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -166,7 +183,7 @@ async def delete_book(
 
 
 @router.get("/reader/dictionaries", response_model=dict)
-async def list_reader_dictionaries(
+def list_reader_dictionaries(
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     return {"dictionaries": pipeline.list_reader_dictionaries()}
@@ -179,7 +196,8 @@ async def upload_reader_dictionary(
 ):
     try:
         content = await read_upload_bytes_limited(file, label="Dictionary upload")
-        return pipeline.save_reader_dictionary(
+        return await asyncio.to_thread(
+            pipeline.save_reader_dictionary,
             filename=file.filename or "",
             content=content,
         )
@@ -190,7 +208,7 @@ async def upload_reader_dictionary(
 
 
 @router.get("/reader/dictionaries/{filename}/download")
-async def download_reader_dictionary(
+def download_reader_dictionary(
     filename: str,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
@@ -205,7 +223,7 @@ async def download_reader_dictionary(
 
 
 @router.delete("/reader/dictionaries/{filename}", response_model=dict)
-async def delete_reader_dictionary(
+def delete_reader_dictionary(
     filename: str,
     request: Request,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -231,7 +249,7 @@ async def delete_reader_dictionary(
 
 
 @router.get("/books/{book_id}/reader/state", response_model=dict)
-async def get_reader_state(
+def get_reader_state(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
@@ -242,7 +260,7 @@ async def get_reader_state(
 
 
 @router.patch("/books/{book_id}/reader/progress", response_model=dict)
-async def update_reader_progress(
+def update_reader_progress(
     book_id: int,
     update: ReaderProgressUpdate,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -254,7 +272,7 @@ async def update_reader_progress(
 
 
 @router.get("/books/{book_id}/annotations", response_model=dict)
-async def list_reader_annotations(
+def list_reader_annotations(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
@@ -265,7 +283,7 @@ async def list_reader_annotations(
 
 
 @router.post("/books/{book_id}/annotations/import", response_model=dict)
-async def import_reader_annotations(
+def import_reader_annotations(
     book_id: int,
     request: ReaderAnnotationImportRequest,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -280,7 +298,7 @@ async def import_reader_annotations(
 
 
 @router.post("/books/{book_id}/chapters/{chapter_id}/annotations", response_model=dict, status_code=201)
-async def create_reader_annotation(
+def create_reader_annotation(
     book_id: int,
     chapter_id: int,
     annotation: ReaderAnnotationCreate,
@@ -293,7 +311,7 @@ async def create_reader_annotation(
 
 
 @router.patch("/books/{book_id}/annotations/{annotation_id}", response_model=dict)
-async def update_reader_annotation(
+def update_reader_annotation(
     book_id: int,
     annotation_id: int,
     update: ReaderAnnotationUpdate,
@@ -310,7 +328,7 @@ async def update_reader_annotation(
 
 
 @router.delete("/books/{book_id}/annotations/{annotation_id}", response_model=dict)
-async def delete_reader_annotation(
+def delete_reader_annotation(
     book_id: int,
     annotation_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -321,7 +339,7 @@ async def delete_reader_annotation(
 
 
 @router.post("/books/{book_id}/reader/sync", response_model=dict)
-async def sync_reader_state(
+def sync_reader_state(
     book_id: int,
     request: ReaderSyncRequest,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -339,7 +357,7 @@ async def sync_reader_state(
 
 
 @router.get("/books/{book_id}/search", response_model=dict)
-async def search_reader_book(
+def search_reader_book(
     book_id: int,
     q: str = Query(""),
     scope: str = Query("translation,notes,highlights"),
@@ -372,7 +390,7 @@ async def search_reader_book(
 
 
 @router.get("/books/{book_id}/reader/xray", response_model=dict)
-async def get_reader_xray(
+def get_reader_xray(
     book_id: int,
     chapter_id: int | None = Query(None),
     spoiler_mode: str = Query("no_spoiler", pattern="^(no_spoiler|allow_spoiler)$"),
@@ -389,7 +407,7 @@ async def get_reader_xray(
 
 
 @router.post("/books/{book_id}/reader/xray/enrich", response_model=dict)
-async def enrich_reader_xray(
+def enrich_reader_xray(
     book_id: int,
     request: ReaderXrayEnrichRequest,
     http_request: Request,
@@ -432,7 +450,7 @@ async def enrich_reader_xray(
 
 
 @router.get("/books/{book_id}/dictionary/lookup", response_model=dict)
-async def lookup_reader_dictionary(
+def lookup_reader_dictionary(
     book_id: int,
     q: str = Query(..., min_length=1),
     chapter_id: int | None = Query(None),
@@ -454,7 +472,7 @@ async def lookup_reader_dictionary(
 
 
 @router.get("/books/{book_id}/dictionary/pack", response_model=dict)
-async def get_reader_dictionary_pack(
+def get_reader_dictionary_pack(
     book_id: int,
     chapter_id: int | None = Query(None),
     pipeline: PipelineService = Depends(get_pipeline),
@@ -472,7 +490,7 @@ async def get_reader_dictionary_pack(
     "/books/{book_id}/chapters/{chapter_id}/reader/explain",
     response_model=ReaderExplainResponse,
 )
-async def explain_reader_selection(
+def explain_reader_selection(
     book_id: int,
     chapter_id: int,
     request: ReaderExplainRequest,
@@ -519,15 +537,22 @@ async def explain_reader_selection(
 
 
 @router.get("/books/{book_id}/chapters", response_model=list[dict])
-async def list_chapters(
+def list_chapters(
     book_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
 ):
     return [_safe_chapter_response(chapter) for chapter in pipeline.list_chapters(book_id)]
 
 
+@router.get("/books/{book_id}/chapters/raw-ids", response_model=list[int])
+def get_raw_chapter_ids(book_id: int, pipeline: PipelineService = Depends(get_pipeline)):
+    if not pipeline.get_book(book_id):
+        raise HTTPException(status_code=404, detail="Book not found")
+    return list_raw_chapter_ids(pipeline.db_path, book_id)
+
+
 @router.get("/books/{book_id}/chapters/{chapter_id}", response_model=dict)
-async def get_chapter(
+def get_chapter(
     book_id: int,
     chapter_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -539,7 +564,7 @@ async def get_chapter(
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/source")
-async def get_chapter_source(
+def get_chapter_source(
     book_id: int,
     chapter_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -548,18 +573,18 @@ async def get_chapter_source(
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
     try:
-        text = pipeline.get_chapter_source(chapter_id)
+        text = pipeline.get_chapter_source(chapter_id, chapter=chapter)
     except ArtifactPathError as exc:
         if exc.status is ResolutionStatus.FILE_MISSING:
             return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
         raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
-    return {"text": text, "chapter_id": chapter_id, "missing": False}
+    return {"text": text, "chapter_id": chapter_id, "missing": False, "content_revision": chapter["content_revision"]}
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/translation")
-async def get_chapter_translation(
+def get_chapter_translation(
     book_id: int,
     chapter_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -568,18 +593,18 @@ async def get_chapter_translation(
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
     try:
-        text = pipeline.get_chapter_translation(chapter_id)
+        text = pipeline.get_chapter_translation(chapter_id, chapter=chapter)
     except ArtifactPathError as exc:
         if exc.status is ResolutionStatus.FILE_MISSING:
             return {"text": "", "chapter_id": chapter_id, "missing": True, "missing_reason": exc.status.value}
         raise _artifact_http_exception(exc) from exc
     if text is None:
         return {"text": "", "chapter_id": chapter_id, "missing": True}
-    return {"text": text, "chapter_id": chapter_id, "missing": False}
+    return {"text": text, "chapter_id": chapter_id, "missing": False, "content_revision": chapter["content_revision"]}
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/content")
-async def get_chapter_content(
+def get_chapter_content(
     book_id: int,
     chapter_id: int,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -588,16 +613,16 @@ async def get_chapter_content(
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
     try:
-        content = pipeline.get_chapter_content(chapter_id)
+        content = pipeline.get_chapter_content(chapter_id, chapter=chapter)
     except ArtifactPathError as exc:
         raise _artifact_http_exception(exc) from exc
     if content is None:
         raise HTTPException(status_code=404, detail="Translation not found")
-    return {"chapter_id": chapter_id, **content}
+    return {"chapter_id": chapter_id, **content, "content_revision": chapter["content_revision"]}
 
 
 @router.patch("/books/{book_id}/chapters/{chapter_id}/translation", response_model=dict)
-async def update_chapter_translation(
+def update_chapter_translation(
     book_id: int,
     chapter_id: int,
     edit: TranslationEdit,
@@ -606,14 +631,24 @@ async def update_chapter_translation(
     chapter = pipeline.get_chapter(chapter_id)
     if not chapter or chapter.get("book_id") != book_id:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    success = pipeline.update_chapter_translation(chapter_id, edit.text)
+    try:
+        options = {}
+        if edit.expected_content_revision is not None:
+            options["expected_content_revision"] = edit.expected_content_revision
+        if edit.translated_title is not None:
+            options["translated_title"] = edit.translated_title.strip()
+        success = pipeline.update_chapter_translation(chapter_id, edit.text, **options)
+    except ContentRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail={"code": "content_revision_conflict", "message": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not success:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    return {"message": "Translation updated"}
+    return {"message": "Translation updated", "content_revision": pipeline.get_chapter(chapter_id)["content_revision"]}
 
 
 @router.delete("/books/{book_id}/chapters/{chapter_id}/translation", response_model=dict)
-async def delete_chapter_translation(
+def delete_chapter_translation(
     book_id: int,
     chapter_id: int,
     request: Request,
@@ -638,7 +673,7 @@ async def delete_chapter_translation(
 
 
 @router.delete("/books/{book_id}/chapters/{chapter_id}", response_model=dict)
-async def delete_chapter(
+def delete_chapter(
     book_id: int,
     chapter_id: int,
     request: Request,
@@ -663,7 +698,7 @@ async def delete_chapter(
 
 
 @router.post("/books/{book_id}/chapters/{chapter_id}/paragraphs/{paragraph_index}/retranslate", response_model=dict)
-async def retranslate_paragraph(
+def retranslate_paragraph(
     book_id: int,
     chapter_id: int,
     paragraph_index: int,
@@ -745,7 +780,7 @@ async def retranslate_paragraph(
 
 
 @router.post("/books/{book_id}/chapters/{chapter_id}/paragraphs/{paragraph_index}/polish", response_model=dict)
-async def polish_paragraph(
+def polish_paragraph(
     book_id: int,
     chapter_id: int,
     paragraph_index: int,

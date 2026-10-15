@@ -1,4 +1,5 @@
 import { Headphones, Moon, Sun, X } from 'lucide-react';
+import { useDialogFocusLifecycle } from '../../hooks/useDialogFocusLifecycle';
 import type {
   ReaderFontFamily,
   ReaderMode,
@@ -67,6 +68,7 @@ export default function ReaderSettingsSheet({
   onTextModeChange,
   onUpdate,
 }: ReaderSettingsSheetProps) {
+  const dialogRef = useDialogFocusLifecycle<HTMLElement>(open, onClose);
   if (!open) return null;
 
   const updateFontSize = (delta: number) => {
@@ -75,7 +77,14 @@ export default function ReaderSettingsSheet({
 
   return (
     <div className="reader-sheet-backdrop">
-      <section aria-label="Cài đặt đọc" className="reader-settings-sheet" role="dialog">
+      <section
+        aria-label="Cài đặt đọc"
+        aria-modal="true"
+        className="reader-settings-sheet"
+        ref={dialogRef}
+        role="dialog"
+        tabIndex={-1}
+      >
         <header className="reader-sheet-header">
           <div>
             <p className="section-label">Aa</p>
@@ -84,6 +93,7 @@ export default function ReaderSettingsSheet({
           <button
             aria-label="Đóng cài đặt đọc"
             className="reader-icon-button"
+            data-dialog-initial-focus
             onClick={onClose}
             title="Đóng cài đặt đọc"
             type="button"

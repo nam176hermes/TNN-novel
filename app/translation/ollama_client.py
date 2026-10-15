@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
+import json
 import logging
 import os
 import random
@@ -16,7 +18,6 @@ from app.config import settings
 from app.database.db import (
     add_fuzzy_tm_entry,
     get_default_style_profile,
-    get_fuzzy_tm_match,
     get_last_summary,
     get_style_profile,
     list_model_providers,
@@ -37,7 +38,7 @@ from app.translation.template_rules import TemplateEngine
 
 console = Console()
 logger = logging.getLogger(__name__)
-TRANSLATION_CACHE_PROMPT_VERSION = "p6-styleguide-config-v1"
+TRANSLATION_CACHE_PROMPT_VERSION = "p7-effective-context-v1"
 RETRYABLE_PROVIDER_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
@@ -111,12 +112,15 @@ def call_openai_compatible_chat(
     temperature: float = 0.3,
     timeout: int = 180,
     max_retries: int = 2,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Call an OpenAI-compatible chat completions endpoint."""
     stripped_api_key = api_key.strip()
     url = f"{base_url.rstrip('/')}/chat/completions"
 
     for attempt in range(max(0, max_retries) + 1):
+        if cancel_check and cancel_check():
+            raise TranslationError("Translation cancelled by user")
         try:
             response = requests.post(
                 url,
@@ -132,21 +136,32 @@ def call_openai_compatible_chat(
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                return {"text": "", "usage": {}}
+                raise TranslationError("Provider response is malformed")
 
             choices = data.get("choices")
             first_choice = choices[0] if isinstance(choices, list) and choices else {}
             message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
             content = message.get("content", "") if isinstance(message, dict) else ""
             text = content.strip() if isinstance(content, str) else ""
+            if not text or first_choice.get("finish_reason") in {"length", "content_filter", "tool_calls", "function_call"}:
+                raise TranslationError("Provider returned empty or incomplete content")
             usage = data.get("usage", {})
             return {"text": text, "usage": usage if isinstance(usage, dict) else {}}
         except requests.RequestException as exc:
             if attempt >= max_retries or not is_retryable_provider_error(exc):
                 raise
             delay = provider_retry_delay_seconds(attempt + 1, exc)
-            logger.warning("Retryable provider error from %s; retrying in %.1fs: %s", url, delay, exc)
-            time.sleep(delay)
+            logger.warning("Transient provider response status=%s; retrying in %.1fs", _provider_status_code(exc), delay)
+            if cancel_check is None:
+                time.sleep(delay)
+            else:
+                remaining = delay
+                while remaining > 0:
+                    if cancel_check():
+                        raise TranslationError("Translation cancelled by user")
+                    interval = min(0.1, remaining)
+                    time.sleep(interval)
+                    remaining -= interval
 
     return {"text": "", "usage": {}}
 
@@ -705,39 +720,6 @@ def _postprocess_translation(text: str) -> str:
     text = re.sub(r'(.)\1{3,}', lambda m: m.group(1) * 3, text)
     # Clean up multiple blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Pronoun normalization: "anh" -> "hắn" for 3rd-person male.
-    # Protect Vietnamese proper terms containing "Anh" (Nguyên Anh, Kim Anh, etc.)
-    # by skipping replacements when preceded by a known Sino-Vietnamese surname.
-    # Module-level constants for performance (avoid rebuild on every call)
-    _PROTECTED_SURNAMES = ('Nguyên', 'Hàn', 'Kim', 'Lý', 'Trần', 'Vương', 'Triệu',
-                           'La', 'Tống', 'Đỗ', 'Phạm', 'Hoàng', 'Đường', 'Tạ',
-                           'Bạch', 'Diệp', 'Lâm', 'Mạc', 'Tô', 'Tôn', 'Chu')
-    _PROTECTED_COMPOUNDS = ('cả', 'hai', 'ba', 'họ', 'chị', 'trai', 'em',
-                            'ngố', 'rể', 'út', 'bạn', 'tuấn', 'đẹp', 'dũng')
-
-    def _should_replace_anh(m: re.Match) -> str:
-        word = m.group(0)
-        start = m.start()
-        after = text[m.end():m.end() + 15]
-        after_lower = after.lower()
-        for compound in _PROTECTED_COMPOUNDS:
-            compound_prefix = ' ' + compound
-            if after_lower.startswith(compound_prefix) and (
-                len(after_lower) <= len(compound_prefix)
-                or not after_lower[len(compound_prefix)].isalpha()
-            ):
-                return word  # keep original
-        if start >= 2:
-            before = text[max(0, start - 20):start]
-            # If preceded by a protected surname, don't replace
-            for surname in _PROTECTED_SURNAMES:
-                if before.endswith(surname + ' '):
-                    return word  # keep original
-        return 'Hắn' if word[0].isupper() else 'hắn'
-
-    text = re.sub(r'\bAnh\b', _should_replace_anh, text)
-    text = re.sub(r'\banh\b', _should_replace_anh, text)
-
     # Apply idiom corrections and known translation error fixes
     text = post_process_with_idioms(text)
 
@@ -879,10 +861,14 @@ def _extract_translation_block(raw_output: str) -> str:
 
 
 def _extract_clean_translation(raw_output: str, chunk_index: int) -> str:
+    if re.search(r"</?TRANSLATION\b", raw_output, re.IGNORECASE) and not re.search(
+        r"<TRANSLATION>.*?</TRANSLATION>", raw_output, re.IGNORECASE | re.DOTALL
+    ):
+        raise TranslationError(f"Chunk {chunk_index} produced incomplete translation markup")
     translation_part = _extract_translation_block(raw_output)
     translation_part = _postprocess_translation(translation_part)
     if not translation_part.strip():
-        raise ValueError(f"Chunk {chunk_index} produced empty translation after postprocess")
+        raise TranslationError(f"Chunk {chunk_index} produced empty translation after postprocess")
     return translation_part
 
 
@@ -938,6 +924,10 @@ def translate_chapter(
     chapter_id: Optional[int] = None,
     style_profile_id: Optional[str] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    db_path: Optional[Path] = None,
+    book_id: Optional[int] = None,
+    chunk_callback: Optional[Callable[[str, str], None]] = None,
+    style_profile_snapshot: Optional[dict] = None,
 ) -> str:
     """Translate chapter using Ollama with glossary, chunking, and cache.
 
@@ -953,15 +943,15 @@ def translate_chapter(
     api_key = api_key if api_key is not None else settings.ollama_api_key or os.environ.get("NINEROUTER_API_KEY", "")
 
     data_dir = settings.resolved_data_dir
-    db_path = data_dir / "pipeline.db"
+    db_path = db_path or data_dir / "pipeline.db"
 
     from app.database.db import get_book_by_title
     from app.translation.cache import get_cached_translation, set_cached_translation
-    book = get_book_by_title(db_path, book_title)
-    book_id = book["id"] if book else 0
+    book = get_book_by_title(db_path, book_title) if book_id is None else None
+    book_id = book_id if book_id is not None else book["id"] if book else 0
     glossary = load_glossary(db_path, book_id)
     name_map = load_glossary_names(db_path, book_id)
-    style_profile = (
+    style_profile = style_profile_snapshot if style_profile_snapshot is not None else (
         get_style_profile(db_path, style_profile_id)
         if style_profile_id
         else get_default_style_profile(db_path)
@@ -971,7 +961,7 @@ def translate_chapter(
         book_id,
         genre=style_profile["id"] if style_profile else None,
     )
-    previous_summary = get_last_summary(db_path, book_id) or ""
+    previous_summary = get_last_summary(db_path, book_id, before_chapter_number=chapter_number) or ""
 
     chunks = _split_into_chunks(text, max_chars=chunk_size)
     translated_chunks: List[str] = []
@@ -998,7 +988,7 @@ def translate_chapter(
             )
 
             # Run deterministic pretranslate for guide text (not replacing source)
-            pretranslated_text, pretokens = pretranslate(
+            _, pretokens = pretranslate(
                 templated_chunk, lexicon, prioritize_names=True, check_longest=True
             )
 
@@ -1015,26 +1005,6 @@ def translate_chapter(
             # Apply glossary pre-substitution: replace exact terms with source【target】 format
             processed_chunk = _pre_substitute_glossary_terms(chunk, glossary)
 
-            # Exact cache hit on processed chunk
-            if use_cache:
-                cached = get_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model))
-                if cached is not None:
-                    translated_chunks.append(cached)
-                    console.print(f"  [dim]Chunk {i}/{len(chunks)} cache hit[/dim]")
-                    # Update previous_summary from cached translation
-                    if cached:
-                        paras = [p.strip() for p in cached.split("\n\n") if p.strip()]
-                        if paras:
-                            previous_summary = " ".join(paras[-2:])
-                            previous_translated_tail = "\n\n".join(paras[-2:])
-                    continue
-            # Fuzzy TM lookup on processed chunk (suggestion only, not auto-used)
-            fuzzy_match = get_fuzzy_tm_match(db_path, processed_chunk, threshold=80)
-            if fuzzy_match is not None:
-                # Store as suggestion but don't auto-use - just log
-                console.print(f"  [dim]Chunk {i}/{len(chunks)} fuzzy TM suggestion (score >=80)[/dim]")
-                # Fall through to Ollama for actual translation
-            # No cache hit, need Ollama
             prev_suffix = chunks[i-2] if i >= 2 else ""
             prompt = _build_translation_prompt(
                 chunk=processed_chunk,  # Use processed chunk with glossary markers
@@ -1050,110 +1020,56 @@ def translate_chapter(
                 style_profile=style_profile,
                 locked_glossary_terms=locked_glossary,
             )
+            cache_identity = _cache_model_key(model) + ":" + hashlib.sha256(json.dumps(
+                {"prompt": prompt, "host": host.rstrip("/"), "temperature": temperature,
+                 "source": "zh", "target": "vi"}, sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            # Exact cache hit on processed chunk
+            if use_cache:
+                cached = get_cached_translation(db_path, processed_chunk, "zh", "vi", cache_identity)
+                if cached is not None:
+                    translated_chunks.append(cached)
+                    if chunk_callback:
+                        chunk_callback(chunk, cached)
+                    console.print(f"  [dim]Chunk {i}/{len(chunks)} cache hit[/dim]")
+                    # Update previous_summary from cached translation
+                    if cached:
+                        paras = [p.strip() for p in cached.split("\n\n") if p.strip()]
+                        if paras:
+                            previous_summary = " ".join(paras[-2:])
+                            previous_translated_tail = "\n\n".join(paras[-2:])
+                    continue
+            # No cache hit, need Ollama
             try:
-                resp = requests.post(
-                    f"{host.rstrip('/')}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": temperature,
-                        "stream": False,
-                    },
-                    timeout=timeout,
+                result = call_openai_compatible_chat(
+                    prompt=prompt, base_url=host, model=model, api_key=api_key,
+                    temperature=temperature, timeout=timeout, cancel_check=cancel_check,
                 )
-                resp.raise_for_status()
-                data = resp.json()
                 _record_provider_usage_from_response(
-                    db_path=db_path,
-                    provider_id=provider_id,
-                    model=model,
-                    task_type=task_type,
-                    usage=data.get("usage", {}) if isinstance(data, dict) else {},
-                    job_id=job_id,
-                    chapter_id=chapter_id,
+                    db_path=db_path, provider_id=provider_id, model=model, task_type=task_type,
+                    usage=result.get("usage", {}), job_id=job_id, chapter_id=chapter_id,
                 )
-                raw_output = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-
+                raw_output = result["text"]
                 translation_part = _extract_clean_translation(raw_output, i)
+                if not translation_part.strip():
+                    raise TranslationError("Provider returned empty translation")
                 translated_chunks.append(translation_part)
-
-                # Store in both exact cache and fuzzy TM
+                if chunk_callback:
+                    chunk_callback(chunk, translation_part)
                 if use_cache:
-                    set_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model), translation_part)
+                    set_cached_translation(db_path, processed_chunk, "zh", "vi", cache_identity, translation_part)
                 add_fuzzy_tm_entry(db_path, processed_chunk, translation_part, score=85)
-
-                new_terms = _extract_new_terms(raw_output)
-                for src, tgt in new_terms:
+                for src, tgt in _extract_new_terms(raw_output):
                     pending_new_terms.append((src, tgt))
                     glossary[src] = tgt
-
-                console.print(f"  [dim]Chunk {i}/{len(chunks)} done[/dim]")
-                if translation_part:
-                    paras = [p.strip() for p in translation_part.split("\n\n") if p.strip()]
-                    if paras:
-                        previous_summary = " ".join(paras[-2:])
-                        previous_translated_tail = "\n\n".join(paras[-2:])
-
+                paras = [p.strip() for p in translation_part.split("\n\n") if p.strip()]
+                if paras:
+                    previous_summary = " ".join(paras[-2:])
+                    previous_translated_tail = "\n\n".join(paras[-2:])
+            except TranslationError:
+                raise
             except (requests.RequestException, ValueError) as exc:
-                console.print(f"[red]Chunk {i} failed: {exc}[/red]")
-                # Retry with exponential backoff + jitter
-                import time, random
-                max_retries = 2
-                last_exc = exc
-                for attempt in range(1, max_retries + 1):
-                    if cancel_check and cancel_check():
-                        raise TranslationError("Translation cancelled by user")
-                    delay = min(2 ** attempt + random.uniform(0, 1), 30)
-                    console.print(f"[yellow]Retrying chunk {i} in {delay:.1f}s (attempt {attempt}/{max_retries})...[/yellow]")
-                    time.sleep(delay)
-                    try:
-                        resp = requests.post(
-                            f"{host.rstrip('/')}/chat/completions",
-                            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-                            json={
-                                "model": model,
-                                "messages": [{"role": "user", "content": prompt}],
-                                "temperature": max(0.0, temperature - 0.1 * attempt),
-                                "stream": False,
-                            },
-                            timeout=timeout,
-                        )
-                        resp.raise_for_status()
-                        data = resp.json()
-                        _record_provider_usage_from_response(
-                            db_path=db_path,
-                            provider_id=provider_id,
-                            model=model,
-                            task_type=task_type,
-                            usage=data.get("usage", {}) if isinstance(data, dict) else {},
-                            job_id=job_id,
-                            chapter_id=chapter_id,
-                        )
-                        raw_output = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                        translation_part = _extract_clean_translation(raw_output, i)
-                        translated_chunks.append(translation_part)
-                        # Store retry result in caches too
-                        if use_cache:
-                            set_cached_translation(db_path, processed_chunk, "zh", "vi", _cache_model_key(model), translation_part)
-                        add_fuzzy_tm_entry(db_path, processed_chunk, translation_part, score=85)
-                        new_terms = _extract_new_terms(raw_output)
-                        for src, tgt in new_terms:
-                            pending_new_terms.append((src, tgt))
-                            glossary[src] = tgt
-                        if translation_part:
-                            paras = [p.strip() for p in translation_part.split("\n\n") if p.strip()]
-                            if paras:
-                                previous_summary = " ".join(paras[-2:])
-                                previous_translated_tail = "\n\n".join(paras[-2:])
-                        break  # success, exit retry loop
-                    except Exception as retry_exc:
-                        last_exc = retry_exc
-                        console.print(f"[red]Chunk {i} retry {attempt} failed: {retry_exc}[/red]")
-                else:
-                    # All retries exhausted
-                    console.print(f"[red]Chunk {i} all attempts failed.[/red]")
-                    raise TranslationError(f"Chunk {i} failed after {max_retries} retries: {last_exc}")
+                raise TranslationError(f"Chunk {i} provider request failed") from exc
 
     for src, tgt in dict(pending_new_terms).items():
         put_glossary_term(db_path, book_id, src, tgt, approved=0)

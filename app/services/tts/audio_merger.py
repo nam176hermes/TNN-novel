@@ -3,6 +3,9 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import re
+import wave
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,107 +60,118 @@ def _create_silence(path: Path, *, sample_rate: int, silence_ms: int) -> None:
         timeout=30,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed to create TTS silence: {result.stderr.strip()}")
+        raise RuntimeError("FFmpeg failed to create TTS silence")
 
 
-def merge_chapter_audio(
-    chunk_paths: list[Path],
-    output_path: Path,
-    *,
-    metadata: AudioMetadata,
-    sample_rate: int = 24000,
-    silence_ms: int = 350,
-) -> Path:
+def _decode_pcm(paths, directory, sample_rate=24000):
+    decoded = []
+    for index, source in enumerate(paths):
+        try:
+            with wave.open(str(source), "rb") as wav:
+                if (wav.getcomptype() == "NONE" and wav.getnchannels() == 1
+                        and wav.getsampwidth() == 2 and wav.getframerate() == sample_rate
+                        and wav.getnframes() > 0):
+                    # Check the last frame too: a truncated data chunk is not reusable PCM.
+                    wav.setpos(wav.getnframes() - 1)
+                    if len(wav.readframes(1)) == 2:
+                        decoded.append(source)
+                        continue
+        except (OSError, EOFError, wave.Error):
+            pass  # Non-WAV and malformed input still use the existing FFmpeg decoder.
+        target = directory / f"pcm_{index:06d}.wav"
+        result = subprocess.run([ensure_ffmpeg(), "-v", "error", "-i", str(source), "-ac", "1",
+            "-ar", str(sample_rate), "-c:a", "pcm_s16le", str(target)], capture_output=True, timeout=300)
+        if result.returncode:
+            raise RuntimeError("FFmpeg could not decode chapter audio")
+        decoded.append(target)
+    return decoded
+
+
+def _voice_filters(rate, volume):
+    if not re.fullmatch(r"[+-]?\d+%", rate) or not re.fullmatch(r"[+-]?\d+%", volume):
+        raise ValueError("Rate and volume must be percentages")
+    tempo, gain = 1 + int(rate[:-1]) / 100, 1 + int(volume[:-1]) / 100
+    if not .05 <= tempo <= 4 or not 0 <= gain <= 4:
+        raise ValueError("Rate or volume is outside the supported range")
+    filters = ["loudnorm=I=-16:TP=-1.5:LRA=11"]
+    while tempo < .5:
+        filters.append("atempo=0.5")
+        tempo *= 2
+    while tempo > 2:
+        filters.append("atempo=2")
+        tempo /= 2
+    filters.extend([f"atempo={tempo}", f"volume={gain}"])
+    return ",".join(filters)
+
+
+def merge_chapter_audio(chunk_paths: list[Path], output_path: Path, *, metadata: AudioMetadata,
+                        sample_rate: int = 24000, silence_ms: int = 350,
+                        rate: str = "+0%", volume: str = "+0%") -> Path:
     if not chunk_paths:
         raise ValueError("No TTS chunks to merge")
     ffmpeg = ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="tts-merge-") as tmp:
-        tmp_dir = Path(tmp)
-        silence_path = tmp_dir / "silence.wav"
-        _create_silence(silence_path, sample_rate=sample_rate, silence_ms=silence_ms)
-        concat_paths: list[Path] = []
-        for index, chunk_path in enumerate(chunk_paths):
-            concat_paths.append(chunk_path)
-            if index < len(chunk_paths) - 1:
-                concat_paths.append(silence_path)
-        list_path = tmp_dir / "chunks.ffconcat"
-        _write_concat_file(concat_paths, list_path)
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-filter:a",
-            "loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-ar",
-            str(sample_rate),
-            "-codec:a",
-            "libmp3lame",
-            "-qscale:a",
-            "2",
-            "-metadata",
-            f"title={metadata.title}",
-            "-metadata",
-            f"artist={metadata.author or 'novel_pipeline'}",
-            "-metadata",
-            f"album={metadata.source_book}",
-        ]
+    with tempfile.TemporaryDirectory(prefix="tts-merge-", dir=output_path.parent) as tmp:
+        directory = Path(tmp)
+        decoded = _decode_pcm(chunk_paths, directory, sample_rate)
+        silence = directory / "silence.wav"
+        if silence_ms > 0:
+            _create_silence(silence, sample_rate=sample_rate, silence_ms=silence_ms)
+        paths = []
+        for index, path in enumerate(decoded):
+            paths.append(path)
+            if silence_ms > 0 and index < len(decoded) - 1:
+                paths.append(silence)
+        concat = directory / "chunks.ffconcat"
+        _write_concat_file(paths, concat)
+        staged = directory / "chapter.mp3"
+        command = [ffmpeg, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
+            "-filter:a", _voice_filters(rate, volume), "-ar", str(sample_rate), "-codec:a", "libmp3lame", "-qscale:a", "2",
+            "-metadata", f"title={metadata.title}", "-metadata", f"artist={metadata.author or 'novel_pipeline'}",
+            "-metadata", f"album={metadata.source_book}"]
         if metadata.chapter_number:
-            cmd.extend(["-metadata", f"track={metadata.chapter_number}"])
-        cmd.append(str(output_path))
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed to merge TTS chunks: {result.stderr.strip()}")
-    if not output_path.exists() or output_path.stat().st_size <= 0:
-        raise RuntimeError("ffmpeg merge produced an empty chapter MP3")
+            command.extend(["-metadata", f"track={metadata.chapter_number}"])
+        result = subprocess.run([*command, str(staged)], capture_output=True, timeout=300)
+        if result.returncode or not staged.exists() or staged.stat().st_size <= 0:
+            raise RuntimeError("FFmpeg failed to merge chapter audio")
+        os.replace(staged, output_path)
     return output_path
 
 
-def merge_book_m4b(
-    chapter_paths: list[Path],
-    output_path: Path,
-    *,
-    metadata: AudioMetadata,
-) -> Path:
+def _metadata_text(value):
+    return str(value).replace("\\", "\\\\").replace("\n", " ").replace("\r", " ").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#")
+
+
+def merge_book_m4b(chapter_paths: list[Path], output_path: Path, *, metadata: AudioMetadata,
+                   chapter_titles: list[str] | None = None) -> Path:
     if not chapter_paths:
         raise ValueError("No chapter audio files to merge into M4B")
     ffmpeg = ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="tts-m4b-") as tmp:
-        list_path = Path(tmp) / "chapters.ffconcat"
-        _write_concat_file(chapter_paths, list_path)
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-vn",
-            "-codec:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-movflags",
-            "+faststart",
-            "-metadata",
-            f"title={metadata.title}",
-            "-metadata",
-            f"artist={metadata.author or 'novel_pipeline'}",
-            "-metadata",
-            f"album={metadata.source_book or metadata.title}",
-            str(output_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed to create M4B audiobook: {result.stderr.strip()}")
-    if not output_path.exists() or output_path.stat().st_size <= 0:
-        raise RuntimeError("ffmpeg created an empty M4B audiobook")
+    with tempfile.TemporaryDirectory(prefix="tts-m4b-", dir=output_path.parent) as tmp:
+        directory = Path(tmp)
+        decoded = _decode_pcm(chapter_paths, directory)
+        concat = directory / "chapters.ffconcat"
+        _write_concat_file(decoded, concat)
+        lines, elapsed_frames = [";FFMETADATA1"], 0
+        for index, path in enumerate(decoded):
+            with wave.open(str(path), "rb") as wav:
+                frames = wav.getnframes()
+                sample_rate = wav.getframerate()
+            start, end = round(elapsed_frames * 1000 / sample_rate), round((elapsed_frames + frames) * 1000 / sample_rate)
+            title = chapter_titles[index] if chapter_titles else f"Chương {index + 1}"
+            lines.extend(["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={end}", f"title={_metadata_text(title)}"])
+            elapsed_frames += frames
+        chapter_metadata = directory / "chapters.ffmetadata"
+        chapter_metadata.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        staged = directory / "book.m4b"
+        command = [ffmpeg, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(concat),
+            "-i", str(chapter_metadata), "-map_metadata", "1", "-map_chapters", "1", "-vn", "-c:a", "aac",
+            "-b:a", "96k", "-movflags", "+faststart", "-metadata", f"title={metadata.title}",
+            "-metadata", f"artist={metadata.author or 'novel_pipeline'}", "-metadata", f"album={metadata.source_book or metadata.title}",
+            "-metadata", "genre=Audiobook", str(staged)]
+        result = subprocess.run(command, capture_output=True, timeout=600)
+        if result.returncode or not staged.exists() or staged.stat().st_size <= 0:
+            raise RuntimeError("FFmpeg failed to create M4B audiobook")
+        os.replace(staged, output_path)
     return output_path

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 import re
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable
 from urllib.parse import urljoin
 
 from app.ingestion.chapter_cleaner import clean_chapter
@@ -64,22 +64,6 @@ class DomParserError(ValueError):
 
     def __post_init__(self) -> None:
         ValueError.__init__(self, self.message)
-
-
-class DomParserContract(Protocol):
-    adapter_version: str
-
-    def domain_policy(self, url: str) -> bool: ...
-
-    def canonicalize_url(self, url: str, *, base_url: str | None = None) -> str: ...
-
-    def parse_preview(self, url: str, html: str): ...
-
-    def parse_chapter(self, url: str, html: str): ...
-
-    def normalize_cleanup(self, text: str) -> str: ...
-
-    def validate_content(self, text: str, *, html: str = "") -> None: ...
 
 
 @dataclass

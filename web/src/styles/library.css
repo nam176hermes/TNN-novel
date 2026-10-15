@@ -756,13 +756,18 @@
   }
 
   .translated-book-card-open {
-    display: contents;
+    gap: 12px;
+    grid-column: 1 / -1;
+    grid-template-columns: 82px minmax(0, 1fr);
+    min-height: 44px;
+    position: relative;
   }
 
   .translated-book-cover-frame {
-    grid-column: 1;
-    grid-row: 1 / span 3;
     height: 124px;
+    left: 0;
+    position: absolute;
+    top: 0;
     width: 82px;
   }
 

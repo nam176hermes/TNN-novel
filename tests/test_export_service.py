@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from zipfile import ZipFile
 
 import httpx
@@ -201,27 +200,57 @@ def test_export_service_creates_m4b_audiobook(temp_db_path: Path, tmp_path: Path
     }
 
 
-def test_export_m4b_uses_isolated_concat_file_and_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.export.m4b_exporter import export_m4b
-
+def test_export_m4b_delegates_to_shared_merger(tmp_path, monkeypatch):
+    from app.export import m4b_exporter
     chapter = tmp_path / "chapter.mp3"
     chapter.write_bytes(b"audio")
-    output_path = tmp_path / "exports" / "book.m4b"
-    commands: list[tuple[list[str], dict]] = []
+    output = tmp_path / "book.m4b"
+    calls = []
+    def merge(paths, destination, **kwargs):
+        calls.append((paths, kwargs["chapter_titles"]))
+        destination.write_bytes(b"m4b")
+        return destination
+    monkeypatch.setattr(m4b_exporter, "merge_book_m4b", merge)
+    assert m4b_exporter.export_m4b("Book", "Author", [{"chapter_number": 1, "title": "Chương một", "audio_path": str(chapter)}], output) == output
+    assert calls == [([chapter], ["Chương một"])]
 
-    def fake_run(command, **kwargs):  # type: ignore[no-untyped-def]
-        commands.append((command, kwargs))
-        Path(command[-1]).write_bytes(b"m4b")
-        return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr("app.export.m4b_exporter.subprocess.run", fake_run)
+def test_audiobook_requires_all_chapters_unless_partial_is_explicit(temp_db_path, tmp_path, monkeypatch):
+    from app.export.m4b_exporter import IncompleteAudiobookError
+    book_id = seed_translated_book(temp_db_path, tmp_path)
+    service = make_export_service(temp_db_path, tmp_path)
+    chapters = service.pipeline.list_chapters(book_id)
+    audio = tmp_path / "audio" / "one.mp3"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    update_chapter_paths(temp_db_path, chapters[0]["id"], audio_path=audio)
+    with pytest.raises(IncompleteAudiobookError) as exc:
+        service.export_audiobook(book_id, "m4b")
+    assert exc.value.chapter_ids == [chapters[1]["id"]]
+    monkeypatch.setattr("app.mobile_api.services.export_service.export_m4b", lambda *args, **kwargs: args[3].parent.mkdir(parents=True, exist_ok=True) or args[3].write_bytes(b"partial"))
+    assert service.export_audiobook(book_id, "m4b", allow_partial=True)["chapter_count"] == 1
 
-    assert export_m4b("Book", "Author", [{"chapter_number": 1, "audio_path": str(chapter)}], output_path) == output_path
-    command, kwargs = commands[0]
-    concat_path = Path(command[command.index("-i") + 1])
-    assert concat_path.name != "m4b_concat.txt"
-    assert command[-1] == str(output_path)
-    assert kwargs["timeout"] == 600
+
+def test_audio_changed_during_m4b_export_is_not_published(temp_db_path, tmp_path, monkeypatch):
+    book_id = seed_translated_book(temp_db_path, tmp_path)
+    service = make_export_service(temp_db_path, tmp_path)
+    chapters = service.pipeline.list_chapters(book_id)
+    audio = tmp_path / "audio" / "one.mp3"
+    audio.parent.mkdir()
+    audio.write_bytes(b"audio")
+    for chapter in chapters:
+        update_chapter_paths(temp_db_path, chapter["id"], audio_path=audio)
+    outputs = []
+    def concurrent_edit(_title, _author, _chapters, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"stale m4b")
+        outputs.append(destination)
+        service.pipeline.update_chapter_translation(chapters[0]["id"], "Bản dịch mới.")
+        return destination
+    monkeypatch.setattr("app.mobile_api.services.export_service.export_m4b", concurrent_edit)
+    with pytest.raises(ValueError, match="changed"):
+        service.export_audiobook(book_id, "m4b")
+    assert outputs and not outputs[0].exists()
 
 
 @pytest.mark.asyncio
@@ -276,7 +305,7 @@ async def test_audiobook_export_download_endpoint_returns_m4b(
     audio_path.write_bytes(b"audio")
     update_chapter_paths(temp_db_path, chapters[0]["id"], audio_path=audio_path, status="audio_done")
 
-    def fake_export_m4b(book_title: str, author: str, chapters_arg: list[dict], output_path: Path) -> Path:
+    def fake_export_m4b(book_title: str, author: str, chapters_arg: list[dict], output_path: Path, **kwargs) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"m4b-download")
         return output_path
@@ -293,6 +322,9 @@ async def test_audiobook_export_download_endpoint_returns_m4b(
                 f"/api/books/{book_id}/exports/audiobook/m4b/download",
                 headers=headers,
             )
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "incomplete_audiobook"
+            response = await client.get(f"/api/books/{book_id}/exports/audiobook/m4b/download?allow_partial=true", headers=headers)
     finally:
         app.dependency_overrides.pop(exports_router.get_export_service, None)
 

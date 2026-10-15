@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Chapter } from '../../api/types';
 import {
   READER_CACHE_UPDATED_EVENT,
+  readerChapterRevision,
   cacheReaderAudio,
   getCachedChapterAsync,
   getCachedReaderAssetUrl,
@@ -225,7 +226,7 @@ export function useReaderOfflineCache({
     }).catch(() => null);
     const chapterRequest = dependencies.getCachedChapter(bookId, selectedChapterId)
       .then(async (chapter) => {
-        const currentRevision = selectedChapter?.content_html_path?.trim() ?? '';
+        const currentRevision = selectedChapter ? readerChapterRevision(selectedChapter) : '';
         if (chapter?.contentRevision && chapter.contentRevision !== currentRevision) return null;
         if (!chapter?.html.trim()) return chapter;
         const hydratedHtml = await dependencies.hydrateCachedChapterHtml(
@@ -273,6 +274,7 @@ export function useReaderOfflineCache({
     nextChapterId,
     refreshVersion,
     selectedChapter?.content_html_path,
+    selectedChapter?.content_revision,
     selectedChapterId,
   ]);
 

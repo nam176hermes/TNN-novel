@@ -186,6 +186,27 @@
   }
 }
 
+#root:has(> .login-screen):has(> .pwa-install-prompt) {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 100dvh;
+}
+
+#root:has(> .login-screen):has(> .pwa-install-prompt) > .pwa-install-prompt {
+  inset: auto;
+  justify-self: center;
+  margin: 14px auto 0;
+  position: static;
+  width: min(560px, calc(100vw - 28px));
+}
+
+#root:has(> .login-screen):has(> .pwa-install-prompt) > .login-screen {
+  align-items: start;
+  min-height: 0;
+  overflow-y: auto;
+  padding-top: 16px;
+}
+
 .sidebar,
 .translator-sidebar {
   background: var(--surface);
@@ -1679,17 +1700,19 @@
 }
 @media (max-width: 820px) {
   .workflow-shell:not([data-active-view="reader"]) {
-    display: block;
-    height: 100dvh;
-    min-height: 100dvh;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: calc(100dvh - var(--mobile-nav-height) - env(safe-area-inset-bottom));
+    min-height: 0;
     overflow: hidden;
   }
 
   .workflow-shell:not([data-active-view="reader"]) .workflow-main {
-    height: 100dvh;
+    height: auto;
+    min-height: 0;
     overflow-x: hidden;
     overflow-y: auto;
-    padding: 16px 16px calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 20px);
+    padding: 16px;
     scroll-padding-bottom: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 32px);
   }
 

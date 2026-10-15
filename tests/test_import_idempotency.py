@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.database import db
+from app.database import db, import_repository
 from app.database.db import get_book_by_title, get_chapter, init_db, list_chapters
 from app.mobile_api.services.pipeline_service import PipelineService
 
@@ -104,7 +104,7 @@ def test_import_transaction_rolls_back_new_book_when_chapter_write_fails(
         raise sqlite3.OperationalError("forced chapter failure")
 
     monkeypatch.setattr(
-        "app.mobile_api.services.pipeline_service.upsert_import_chapter_with_connection",
+        "app.mobile_api.services.import_commit_service.upsert_import_chapter_with_connection",
         fail_write,
     )
 
@@ -188,7 +188,7 @@ def test_canonicalize_import_url_does_not_resolve_dns(monkeypatch: pytest.Monkey
         captured["resolver"] = resolver
         return Result()
 
-    monkeypatch.setattr(db, "validate_fetch_url", validate)
+    monkeypatch.setattr(import_repository, "validate_fetch_url", validate)
 
     assert db.canonicalize_import_url("HTTPS://Example.TEST/chapter/1") == Result.canonical_url
     assert captured == {

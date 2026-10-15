@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.export.docx_exporter import export_docx
 from app.export.epub_exporter import export_epub
-from app.export.m4b_exporter import export_m4b
+from app.export.m4b_exporter import export_m4b, select_audiobook_chapters, validate_audiobook_snapshot
 from app.export.text_exporter import export_txt
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
@@ -68,10 +69,12 @@ class ExportService:
         resolved: list[dict] = []
         for chapter in chapters:
             if not chapter.get("audio_path"):
+                resolved.append({**chapter, "audio_path": ""})
                 continue
             try:
                 path = self.pipeline.resolve_artifact_file(chapter["audio_path"], ArtifactClass.AUDIO)
             except ArtifactPathError:
+                resolved.append({**chapter, "audio_path": ""})
                 continue
             resolved.append({**chapter, "audio_path": str(path)})
         return resolved
@@ -271,7 +274,7 @@ class ExportService:
             "chapter_count": len(chapters),
         }
 
-    def export_audiobook(self, book_id: int, format: str) -> dict:
+    def export_audiobook(self, book_id: int, format: str, *, allow_partial: bool = False) -> dict:
         export_format = format.casefold()
         if export_format not in AUDIOBOOK_EXPORT_FORMATS:
             raise ValueError(f"Unsupported audiobook export format: {format}")
@@ -279,17 +282,24 @@ class ExportService:
         book = self.pipeline.get_book(book_id)
         if not book:
             raise ValueError(f"Book {book_id} not found")
-        chapters = self.audio_chapters(book_id)
-        if not chapters:
-            raise ValueError("No chapter audio files found. Run TTS first.")
+        chapter_rows = self.audio_chapters(book_id)
+        chapters, missing = select_audiobook_chapters(chapter_rows, allow_partial=allow_partial)
 
         safe_title = self._safe_filename_part(book["title"])
         if safe_title == "book":
             safe_title = f"book_{book_id}"
         output_dir = self.pipeline.data_dir / "exports" / safe_title
-        output_path = output_dir / f"{safe_title}.{export_format}"
+        partial_label = "_partial" if missing else ""
+        output_path = output_dir / f"{safe_title}{partial_label}_{uuid.uuid4().hex}.{export_format}"
 
-        export_m4b(book["title"], book.get("author", ""), chapters, output_path)
+        export_m4b(book["title"], book.get("author", ""), chapter_rows, output_path,
+                   **({"allow_partial": True} if allow_partial else {}))
+        try:
+            validate_audiobook_snapshot(chapter_rows, self.audio_chapters(book_id))
+        except ValueError:
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".manifest.json").unlink(missing_ok=True)
+            raise
 
         size_bytes = output_path.stat().st_size
         return {

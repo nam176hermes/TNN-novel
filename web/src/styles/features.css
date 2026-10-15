@@ -4472,6 +4472,18 @@
   min-width: 0;
 }
 
+.workbench-translated-title {
+  display: grid;
+  font-size: 13px;
+  gap: 6px;
+  max-width: 36rem;
+}
+
+.workbench-translated-title input {
+  min-width: 0;
+  width: 100%;
+}
+
 .workbench-breadcrumb {
   align-items: center;
   color: rgb(229 238 234 / 58%);

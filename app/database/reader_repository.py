@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -598,9 +599,10 @@ def add_reader_entity(
     first_chapter_number: int = 0,
     importance: int = 0,
     metadata: dict | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
+    with (nullcontext(connection) if connection is not None else get_connection(db_path)) as conn:
+        conn.execute(
             """
             INSERT INTO reader_entities (
                 book_id, entity_type, name, aliases_json, description,
@@ -626,17 +628,11 @@ def add_reader_entity(
                 json.dumps(metadata or {}, ensure_ascii=False),
             ),
         )
-        entity_id = int(cur.lastrowid or 0)
-        if entity_id <= 0:
-            row = conn.execute(
-                """
-                SELECT id FROM reader_entities
-                WHERE book_id = ? AND entity_type = ? AND name = ?
-                """,
-                (book_id, entity_type, name),
-            ).fetchone()
-            entity_id = int(row["id"])
-        conn.commit()
+        row = conn.execute("SELECT id FROM reader_entities WHERE book_id = ? AND entity_type = ? AND name = ?",
+                           (book_id, entity_type, name)).fetchone()
+        entity_id = int(row["id"])
+        if connection is None:
+            conn.commit()
         row = conn.execute("SELECT * FROM reader_entities WHERE id = ?", (entity_id,)).fetchone()
     return _reader_entity_row_payload(row)
 
@@ -652,8 +648,9 @@ def add_reader_entity_mention(
     mention_text: str = "",
     context: str = "",
     spoiler_level: int = 0,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
-    with get_connection(db_path) as conn:
+    with (nullcontext(connection) if connection is not None else get_connection(db_path)) as conn:
         cur = conn.execute(
             """
             INSERT INTO reader_entity_mentions (
@@ -665,7 +662,8 @@ def add_reader_entity_mention(
             (book_id, entity_id, chapter_id, chapter_number, paragraph_index, mention_text, context, spoiler_level),
         )
         mention_id = int(cur.lastrowid)
-        conn.commit()
+        if connection is None:
+            conn.commit()
         row = conn.execute("SELECT * FROM reader_entity_mentions WHERE id = ?", (mention_id,)).fetchone()
     return _reader_entity_mention_payload(row)
 
@@ -681,8 +679,9 @@ def add_reader_timeline_event(
     event_order: int = 0,
     spoiler_level: int = 0,
     entities: list[str] | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
-    with get_connection(db_path) as conn:
+    with (nullcontext(connection) if connection is not None else get_connection(db_path)) as conn:
         cur = conn.execute(
             """
             INSERT INTO reader_timeline_events (
@@ -703,7 +702,8 @@ def add_reader_timeline_event(
             ),
         )
         event_id = int(cur.lastrowid)
-        conn.commit()
+        if connection is None:
+            conn.commit()
         row = conn.execute("SELECT * FROM reader_timeline_events WHERE id = ?", (event_id,)).fetchone()
     return _reader_timeline_event_payload(row)
 

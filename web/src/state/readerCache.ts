@@ -20,6 +20,10 @@ export type ReaderCachedChapter = {
   text: string;
 };
 
+export function readerChapterRevision(chapter: {content_revision?: number; content_html_path?: string | null}): string {
+  return chapter.content_revision === undefined ? chapter.content_html_path?.trim() ?? '' : `revision:${chapter.content_revision}`;
+}
+
 export type ReaderCacheStore = Record<string, ReaderCachedChapter>;
 
 type ReaderCachedChapterRecord = ReaderCachedChapter & {

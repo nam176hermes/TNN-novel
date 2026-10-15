@@ -62,6 +62,7 @@ export type WorkbenchViewProps = {
   translationPresets: TranslationPreset[];
   translateDisabledReason: string;
   translationText: string;
+  translatedTitle: string;
   viewMode: WorkbenchViewMode;
   onCopyTranslation?: () => void;
   onDeleteChapter(): void;
@@ -77,15 +78,13 @@ export type WorkbenchViewProps = {
   onStyleProfileChange(styleProfileId: string): void;
   onTranslate(): void;
   onTranslationChange(text: string): void;
+  onTranslatedTitleChange(title: string): void;
   onViewModeChange(mode: WorkbenchViewMode): void;
 };
 
 function formatChapterStatus(status: string): string {
-  return status
-    .split(/[_-]/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
+  return ({imported: 'Đã nhập', cleaned: 'Đã làm sạch', translated: 'Đã dịch',
+    qa_low: 'Cần xem lại', audio_done: 'Đã có audio', failed: 'Có lỗi'} as Record<string, string>)[status] ?? 'Chưa xử lý';
 }
 
 function splitReaderParagraphs(text: string): string[] {
@@ -112,6 +111,7 @@ export default function WorkbenchView({
   translationPresets,
   translateDisabledReason,
   translationText,
+  translatedTitle,
   viewMode,
   onCopyTranslation,
   onDeleteChapter,
@@ -127,6 +127,7 @@ export default function WorkbenchView({
   onStyleProfileChange,
   onTranslate,
   onTranslationChange,
+  onTranslatedTitleChange,
   onViewModeChange,
 }: WorkbenchViewProps) {
   const [mobileSection, setMobileSection] = useState<'editor' | 'assist'>('editor');
@@ -301,6 +302,16 @@ export default function WorkbenchView({
             <span>Chương {chapter.chapter_number}</span>
           </nav>
           <h2>{chapter.title}</h2>
+          {viewMode === 'edit' ? (
+            <label className="workbench-translated-title">
+              Tiêu đề bản dịch
+              <input maxLength={300} onChange={(event) => onTranslatedTitleChange(event.target.value)}
+                placeholder={chapter.title} type="text" value={translatedTitle} />
+            </label>
+          ) : null}
+          {chapter.quality_status ? <p role="status">{({pass: 'Đã kiểm tra bản dịch', needs_review: 'Bản dịch cần xem lại',
+            partial: 'Chưa kiểm tra hết bản dịch', stale: 'Cần kiểm tra lại sau khi sửa',
+            legacy_unverified: 'Bản dịch cũ chưa xác minh', unreviewed: 'Bản dịch chưa kiểm tra'})[chapter.quality_status]}</p> : null}
         </div>
         <div className="workbench-title-actions workbench-reference-actions">
           <button className="primary-action" disabled={!isDirty} onClick={onSave} type="button">

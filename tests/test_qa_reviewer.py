@@ -151,8 +151,8 @@ def test_run_qa_check_flags_modern_pronouns_in_classical_context(monkeypatch) ->
 
     pronoun_issues = [issue for issue in report["issues"] if issue.get("type") == "pronoun_modern"]
     assert pronoun_issues
-    assert report["verdict"] == "FAIL"
-    assert report["style_score"] <= 6
+    assert report["verdict"] == "PASS"
+    assert all(issue["severity"] == "low" for issue in pronoun_issues)
 
 
 def test_run_qa_check_flags_third_person_after_direct_vocative(monkeypatch) -> None:
@@ -188,8 +188,8 @@ def test_run_qa_check_flags_third_person_after_direct_vocative(monkeypatch) -> N
         issue for issue in report["issues"] if issue.get("type") == "pronoun_direct_address"
     ]
     assert direct_address_issues
-    assert "Lục ca" in direct_address_issues[0]["segment"]
-    assert report["verdict"] == "FAIL"
+    assert direct_address_issues[0]["ambiguous"] is True
+    assert report["verdict"] == "PASS"
 
 
 def test_run_qa_check_flags_modern_pronouns_when_provider_request_fails(monkeypatch) -> None:
@@ -209,7 +209,8 @@ def test_run_qa_check_flags_modern_pronouns_when_provider_request_fails(monkeypa
     issue_types = [issue.get("type") for issue in report["issues"]]
     assert "qa_request_failed" in issue_types
     assert "pronoun_modern" in issue_types
-    assert report["verdict"] == "FAIL"
+    assert report["verdict"] == "WARNING"
+    assert report["qa_complete"] is False
 
 
 def test_run_qa_check_hard_fails_system_and_forbidden_translation_errors(monkeypatch) -> None:

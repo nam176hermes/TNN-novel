@@ -106,6 +106,8 @@ def number_to_vietnamese(value: int) -> str:
         return "không"
     if value < 0:
         return "âm " + number_to_vietnamese(abs(value))
+    if value >= 1_000_000_000_000:
+        return " ".join(_DIGIT_WORDS[int(digit)] for digit in str(value))
     groups: list[int] = []
     current = value
     while current:
@@ -132,17 +134,33 @@ def _normalize_chapter_numbers(text: str) -> str:
 
 
 def _normalize_inline_numbers(text: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        raw = match.group(0)
+    def date_words(match):
+        from datetime import date
+        day, month, year = (int(value) for value in match.groups())
         try:
-            value = int(raw.replace(".", "").replace(",", ""))
+            date(year, month, day)
         except ValueError:
-            return raw
-        if value > 9999:
-            return raw
-        return number_to_vietnamese(value)
+            return match.group(0)
+        return f"ngày {number_to_vietnamese(day)} tháng {number_to_vietnamese(month)} năm {number_to_vietnamese(year)}"
 
-    return re.sub(r"(?<![\w/])\d{1,4}(?![\w/])", repl, text)
+    text = re.sub(r"(?<![\w/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\w/])", date_words, text)
+    text = re.sub(r"ngày\s+ngày\s+", "ngày ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(\d)(kg|km|cm|mm|ml|mg|%)(?=\W|$)", r"\1 \2", text, flags=re.IGNORECASE)
+    def repl(match):
+        raw = match.group(0)
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", raw):
+            return number_to_vietnamese(int(raw.replace(".", "")))
+        if "," in raw or "." in raw:
+            if raw.count(",") + raw.count(".") > 1:
+                return raw
+            integer, fraction = re.split(r"[.,]", raw, maxsplit=1)
+            return number_to_vietnamese(int(integer)) + " phẩy " + " ".join(_DIGIT_WORDS[int(n)] for n in fraction)
+        digits = raw.lstrip("-")
+        if (len(digits) > 1 and digits.startswith("0")) or len(digits) > 12:
+            return ("âm " if raw.startswith("-") else "") + " ".join(_DIGIT_WORDS[int(n)] for n in digits)
+        return number_to_vietnamese(int(raw))
+
+    return re.sub(r"(?<![\w./])-?\d+(?:[.,]\d+)*(?![\w/]|\.\d)", repl, text)
 
 
 def _load_backend(backend: str) -> Callable[[str], str] | None:
@@ -175,7 +193,7 @@ def _load_backend(backend: str) -> Callable[[str], str] | None:
 
 def _finalize_spacing(text: str) -> str:
     value = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    value = re.sub(r"([,.;:!?])(?=\S)", r"\1 ", value)
+    value = re.sub(r"([,.;:!?])(?!\d)(?=\S)", r"\1 ", value)
     value = re.sub(r"([.!?])(?:\s+\1)+", r"\1", value)
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
@@ -193,7 +211,6 @@ def rule_based_normalize(text: str, *, convert_numbers: bool = True) -> str:
     value = value.translate(_PUNCT_TRANSLATION)
     value = re.sub(r"\.{4,}", "...", value)
     value = re.sub(r"\s+([,.;:!?])", r"\1", value)
-    value = re.sub(r"([,.;:!?])(?=\S)", r"\1 ", value)
     value = _normalize_chapter_numbers(value)
     if convert_numbers:
         value = _normalize_inline_numbers(value)

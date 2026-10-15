@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from app.mobile_api.audit import record_audit_event
+from app.database.chapter_repository import ContentRevisionConflict
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
 
@@ -14,7 +15,7 @@ def get_qa_service():
 
 
 @router.get("/books/{book_id}/chapters/{chapter_id}/qa", response_model=dict)
-async def get_qa_report(
+def get_qa_report(
     book_id: int,
     chapter_id: int,
     svc: QAService = Depends(get_qa_service),
@@ -27,7 +28,7 @@ async def get_qa_report(
 
 
 @router.get("/books/{book_id}/qa/summary", response_model=dict)
-async def get_qa_summary(
+def get_qa_summary(
     book_id: int,
     svc: QAService = Depends(get_qa_service),
 ):
@@ -36,7 +37,7 @@ async def get_qa_summary(
 
 
 @router.post("/books/{book_id}/chapters/{chapter_id}/qa/run", response_model=dict)
-async def run_qa_check(
+def run_qa_check(
     book_id: int,
     chapter_id: int,
     request: Request,
@@ -54,6 +55,8 @@ async def run_qa_check(
     try:
         result = svc.run_qa_check(book_id, chapter_id)
         return result
+    except ContentRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         record_audit_event(
             event_type="qa_failure",

@@ -43,6 +43,7 @@ def _api_tts_job_payload(job: dict[str, Any], *, request: Request) -> dict[str, 
     payload.pop("report_json_path", None)
     payload.pop("output_mp3_path", None)
     payload.pop("output_m4b_path", None)
+    payload.pop("input_snapshot_json", None)
     audio_summary = payload.get("audio_summary") if isinstance(payload.get("audio_summary"), dict) else {}
     payload["output_mp3_ready"] = bool(audio_summary.get("output_mp3_ready"))
     payload["output_m4b_ready"] = bool(audio_summary.get("output_m4b_ready"))
@@ -93,12 +94,20 @@ async def get_tts_job(
     if mobile_job and mobile_job.job_type == "tts":
         payload = mobile_job.to_dict()
         payload["chunks"] = []
+        payload["children"] = pipeline.get_child_jobs(job_id)
         return sanitize_public_payload(payload) if is_public_request(request) else payload
     raise HTTPException(status_code=404, detail="TTS job not found")
 
 
 def _retry_job(job_id: str) -> None:
-    TTSPipeline(get_db_path(), get_data_dir()).retry_failed_chunks(job_id)
+    pipeline = TTSPipeline(get_db_path(), get_data_dir())
+    try:
+        children = pipeline.get_child_jobs(job_id)
+        targets = [child["id"] for child in children if child["status"] != "completed"] if children else [job_id]
+        for target in targets:
+            pipeline.retry_failed_chunks(target)
+    finally:
+        pipeline.close()
 
 
 @router.post("/jobs/{job_id}/retry", response_model=TTSJobResponse)
@@ -107,8 +116,14 @@ async def retry_tts_job(
     background_tasks: BackgroundTasks,
     pipeline: TTSPipeline = Depends(get_tts_pipeline),
 ):
-    if not pipeline.get_job_status(job_id):
+    children = pipeline.get_child_jobs(job_id)
+    if not pipeline.get_job_status(job_id) and not children:
         raise HTTPException(status_code=404, detail="TTS job not found")
+    try:
+        for target in ([child["id"] for child in children if child["status"] != "completed"] if children else [job_id]):
+            pipeline.validate_retry(target)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": "tts_input_changed", "message": "Đầu vào TTS đã thay đổi. Hãy tạo tác vụ mới."}) from exc
     background_tasks.add_task(_retry_job, job_id)
     return TTSJobResponse(job_id=job_id, status="retrying", message="TTS retry started")
 

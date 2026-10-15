@@ -77,6 +77,8 @@ function buildWorkbenchProps(overrides: Partial<Parameters<typeof WorkbenchView>
     onStyleProfileChange: vi.fn(),
     onTranslate: vi.fn(),
     onTranslationChange: vi.fn(),
+    onTranslatedTitleChange: vi.fn(),
+    translatedTitle: '',
     onViewModeChange: vi.fn(),
     selectedPresetId: 'balanced',
     selectedStyleProfileId: 'tien_hiep',

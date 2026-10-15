@@ -135,4 +135,26 @@ describe('RawBacklogView', () => {
 
     expect(onBatchTranslate).toHaveBeenCalledWith(1, [11]);
   });
+
+  it('uses server totals and translates the whole book across pages', async () => {
+    const onBatchTranslateBook = vi.fn();
+    const onPageChange = vi.fn();
+    const onOpenWorkbench = vi.fn();
+    render(<RawBacklogView
+      books={books} chapters={{ data: [chapters[0]], error: '', state: 'ready' }}
+      backlog={{ total_chapters: 117, total_books: 2, book_counts: { 1: 57 }, first_chapter_ids: { 1: 7 }, offset: 50, limit: 50 }}
+      page={1}
+      onBatchTranslateBook={onBatchTranslateBook} onPageChange={onPageChange}
+      onOpenImport={vi.fn()} onOpenWorkbench={onOpenWorkbench} onRefresh={vi.fn()}
+    />);
+    expect(screen.getByText('117')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dịch theo từng truyện' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Dịch 57 chương' }));
+    expect(onBatchTranslateBook).toHaveBeenCalledWith(1);
+    await userEvent.click(screen.getByRole('button', { name: 'Mở chương raw đầu tiên của Thanh Sơn' }));
+    expect(onOpenWorkbench).toHaveBeenCalledWith(1, 7);
+    expect(screen.getByRole('button', { name: 'Trang raw trước' })).not.toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Trang raw sau' }));
+    expect(onPageChange).toHaveBeenCalledWith(2);
+  });
 });

@@ -164,7 +164,7 @@ describe('translator API methods', () => {
   });
 
   it('patches chapter translation JSON', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
     const client = new ApiClient('http://test', fetchMock as unknown as typeof fetch);
     client.token = 'access';
 

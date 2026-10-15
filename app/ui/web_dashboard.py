@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.storage.chapter_content import publish_translation
 from app.config import settings
 from app.utils.rate_limiter import limiter
 from app.database.db import (
@@ -18,7 +19,6 @@ from app.database.db import (
     get_chapter_by_id,
     list_books,
     list_chapters,
-    update_chapter_paths,
     add_translation_suggestion,
 )
 from app.translation.ollama_client import translate_chapter
@@ -32,7 +32,7 @@ from app.scheduler.daily_queue import (
     approve_glossary_term,
     reject_glossary_term,
 )
-from app.audio.edge_tts_engine import text_to_speech_file
+from app.services.tts.tts_pipeline import TTSPipeline
 
 app = FastAPI(title="Novel Translation Pipeline Dashboard")
 
@@ -233,17 +233,13 @@ async def translate_chapter_endpoint(chapter_id: int):
         chapter_number=ch["chapter_number"],
     )
 
-    safe_book = "".join(c if c.isalnum() or c in "._-" else "_" for c in book_title)
-    trans_path = data_dir / "translated" / safe_book / f"chapter_{ch['chapter_number']:04d}.txt"
-    trans_path.parent.mkdir(parents=True, exist_ok=True)
-    trans_path.write_text(translated, encoding="utf-8")
-
-    update_chapter_paths(db_path, ch["id"], translated_text_path=trans_path, status="translated")
+    trans_path = publish_translation(db_path, data_dir, ch["id"], translated,
+                                     expected_content_revision=ch["content_revision"])
 
     return JSONResponse(
         content={
             "message": f"Translated chapter {chapter_id}",
-            "translated_path": str(trans_path),
+            "translated_path": "", "translated": trans_path is not None,
         }
     )
 
@@ -259,33 +255,23 @@ async def tts_chapter_endpoint(chapter_id: int, voice: Optional[str] = None, rat
     book_row = get_book_by_id(db_path, ch["book_id"])
     if not book_row:
         raise HTTPException(status_code=404, detail=f"Book for chapter {chapter_id} not found")
-    book_title = book_row["title"]
 
     if not ch.get("translated_text_path") or not Path(ch["translated_text_path"]).exists():
         raise HTTPException(status_code=400, detail="No translated text available. Translate first.")
 
-    translated_text = Path(ch["translated_text_path"]).read_text(encoding="utf-8")
-    safe_book = "".join(c if c.isalnum() or c in "._-" else "_" for c in book_title)
-    audio_dir = data_dir / "audio" / safe_book
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    audio_path = audio_dir / f"chapter_{ch['chapter_number']:04d}.mp3"
-
-    text_to_speech_file(
-        text=translated_text,
-        output_path=audio_path,
-        book_title=book_title,
-        chapter_number=ch["chapter_number"],
-        chapter_title=ch["title"],
-        voice=voice,
-        rate=rate,
-    )
-
-    update_chapter_paths(db_path, ch["id"], audio_path=audio_path, status="audio_done")
+    pipeline = TTSPipeline(db_path, data_dir)
+    try:
+        report = pipeline.generate_chapter(book_id=book_row["id"], chapter_id=ch["id"], provider="edge_tts",
+            voice_config={"voice_id": voice or settings.edge_tts_voice, "rate": rate})
+        if report.status != "completed":
+            raise HTTPException(status_code=502, detail="Audio generation failed; check TTS settings")
+    finally:
+        pipeline.close()
 
     return JSONResponse(
         content={
             "message": f"Generated audio for chapter {chapter_id}",
-            "audio_path": str(audio_path),
+            "audio_path": "", "audio_available": True,
         }
     )
 

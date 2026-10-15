@@ -18,3 +18,13 @@ export type ReaderSettings = {
   theme: ReaderTheme;
   width: ReaderWidth;
 };
+
+export type ReaderSelectionState = {
+  anchor: { left: number; top: number };
+  charEnd: number;
+  charStart: number;
+  contextAfter: string;
+  contextBefore: string;
+  paragraphIndex: number;
+  text: string;
+};

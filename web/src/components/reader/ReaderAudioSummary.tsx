@@ -23,11 +23,12 @@ export default function ReaderAudioSummary({ audio, visible }: ReaderAudioSummar
           <strong>{playback.chapterTitle.split(' · ')[0]}</strong>
           <small>
             {state.canPlay
-              ? 'Có thể nghe hoặc tải MP3 qua route được bảo vệ.'
+              ? 'Nghe chương này hoặc tải MP3 để nghe ngoại tuyến.'
               : 'Tạo audio từ bản dịch tiếng Việt của chương hiện tại.'}
           </small>
         </div>
         <div className="reader-audio-panel-actions">
+          {!state.canPlay ? <button className="reader-menu-action" onClick={actions.open} type="button">Kiểm tra audio</button> : null}
           {state.canPlay ? (
             <>
               <button className="reader-menu-action" onClick={actions.open} type="button">
@@ -59,7 +60,7 @@ export default function ReaderAudioSummary({ audio, visible }: ReaderAudioSummar
       ) : null}
       {state.canPlay ? (
         <details className="reader-audio-advanced">
-          <summary>Advanced</summary>
+          <summary>Tùy chọn audio</summary>
           <button
             className="reader-menu-action"
             disabled={!state.canStartChapterJob}
@@ -92,8 +93,8 @@ export default function ReaderAudioSummary({ audio, visible }: ReaderAudioSummar
           {state.status ? <p className="reader-export-status">{state.status}</p> : null}
           {state.totalChunks > 0 || state.failedChunks > 0 ? (
             <div className="reader-audio-job-meta">
-              {state.totalChunks > 0 ? <span>{state.completedChunks}/{state.totalChunks} chunks</span> : null}
-              {state.failedChunks > 0 ? <span>{state.failedChunks} chunk lỗi</span> : null}
+              {state.totalChunks > 0 ? <span>{state.completedChunks}/{state.totalChunks} đoạn audio</span> : null}
+              {state.failedChunks > 0 ? <span>{state.failedChunks} đoạn lỗi</span> : null}
             </div>
           ) : null}
           {state.operationalWarnings.length > 0 ? (

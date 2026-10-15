@@ -9,7 +9,7 @@ import {
   UserRound,
   Wrench,
 } from 'lucide-react';
-import type { BookSummary, Chapter } from '../api/types';
+import type { BookSummary, Chapter, RawBacklogPage } from '../api/types';
 import coverDocTu from '../assets/reference-ui/cover-doc-tu-clean.png';
 import coverThanhSon from '../assets/reference-ui/cover-thanh-son-clean.png';
 import type { AsyncState } from '../state/types';
@@ -21,6 +21,10 @@ export type RawBacklogViewProps = {
   onOpenImport(): void;
   onOpenWorkbench(bookId: number, chapterId: number): void;
   onBatchTranslate?(bookId: number, rawChapterIds: number[]): void | Promise<void>;
+  onBatchTranslateBook?(bookId: number): void | Promise<void>;
+  backlog?: Omit<RawBacklogPage, 'chapters'>;
+  page?: number;
+  onPageChange?(page: number): void;
   onRefresh(): void;
 };
 
@@ -88,12 +92,18 @@ export default function RawBacklogView({
   chapters,
   batchBusy = false,
   onBatchTranslate,
+  onBatchTranslateBook,
+  backlog,
+  page = 0,
+  onPageChange,
   onOpenImport,
   onOpenWorkbench,
   onRefresh,
 }: RawBacklogViewProps) {
   const groups = groupRawChapters(books, chapters.data);
-  const rawChapterCount = groups.reduce((total, group) => total + group.chapters.length, 0);
+  const rawChapterCount = backlog?.total_chapters ?? groups.reduce((total, group) => total + group.chapters.length, 0);
+  const rawBookCount = backlog?.total_books ?? groups.length;
+  const pages = Math.max(1, Math.ceil(rawChapterCount / (backlog?.limit || 50)));
 
   return (
     <section aria-labelledby="raw-backlog-title" className="workflow-management-view raw-backlog-view">
@@ -106,20 +116,23 @@ export default function RawBacklogView({
           <button
             className="secondary-action"
             disabled={
-              !onBatchTranslate
+              (!onBatchTranslate && !onBatchTranslateBook)
               || batchBusy
               || rawChapterCount === 0
-              || groups.length !== 1
+              || rawBookCount !== 1
               || chapters.state === 'loading'
             }
             onClick={() => {
               const firstGroup = groups[0];
-              if (firstGroup) void onBatchTranslate?.(firstGroup.book.id, firstGroup.chapters.map((chapter) => chapter.id));
+              if (firstGroup) {
+                if (onBatchTranslateBook) void onBatchTranslateBook(firstGroup.book.id);
+                else void onBatchTranslate?.(firstGroup.book.id, firstGroup.chapters.map((chapter) => chapter.id));
+              }
             }}
             type="button"
           >
             <Send aria-hidden="true" size={16} />
-            {batchBusy ? 'Đang tạo job...' : groups.length > 1 ? 'Dịch theo từng truyện' : 'Dịch hàng loạt'}
+            {batchBusy ? 'Đang tạo job...' : rawBookCount > 1 ? 'Dịch theo từng truyện' : 'Dịch hàng loạt'}
           </button>
           <button className="secondary-action" disabled={chapters.state === 'loading'} onClick={onRefresh} type="button">
             <RefreshCw aria-hidden="true" size={16} />
@@ -136,7 +149,7 @@ export default function RawBacklogView({
         <div>
           <span className="raw-stat-icon" aria-hidden="true"><LibraryBig size={20} /></span>
           <span>Truyện đang chờ</span>
-          <strong>{groups.length.toLocaleString()}</strong>
+          <strong>{rawBookCount.toLocaleString()}</strong>
           <small>Truyện</small>
         </div>
         <div>
@@ -169,6 +182,7 @@ export default function RawBacklogView({
             {groups.map((group) => {
               const coverUrl = fallbackRawCover(group.book.title);
               const firstChapter = group.chapters[0];
+              const chapterCount = backlog?.book_counts[group.book.id] ?? group.chapters.length;
               return (
               <article className="raw-book-group" key={group.book.id}>
                 <header className="raw-book-group-header">
@@ -177,20 +191,21 @@ export default function RawBacklogView({
                   </span>
                   <div>
                     <h3>{group.book.title}</h3>
-                    <p>{group.chapters.length.toLocaleString()} chương còn bản raw chưa dịch</p>
+                    <p>{chapterCount.toLocaleString()} chương còn bản raw chưa dịch</p>
                   </div>
                   <span className="raw-book-status">Đang chờ dịch</span>
-                  {onBatchTranslate ? (
+                  {onBatchTranslate || onBatchTranslateBook ? (
                     <button
                       className="secondary-action"
                       disabled={batchBusy || group.chapters.length === 0}
                       onClick={() => {
-                        void onBatchTranslate(group.book.id, group.chapters.map((chapter) => chapter.id));
+                        if (onBatchTranslateBook) void onBatchTranslateBook(group.book.id);
+                        else void onBatchTranslate?.(group.book.id, group.chapters.map((chapter) => chapter.id));
                       }}
                       type="button"
                     >
                       <Send aria-hidden="true" size={16} />
-                      Dịch {group.chapters.length.toLocaleString()} chương
+                      Dịch {chapterCount.toLocaleString()} chương
                     </button>
                   ) : null}
                   <button
@@ -198,7 +213,8 @@ export default function RawBacklogView({
                     className="raw-kebab"
                     disabled={!firstChapter}
                     onClick={() => {
-                      if (firstChapter) onOpenWorkbench(firstChapter.book_id, firstChapter.id);
+                      if (firstChapter) onOpenWorkbench(firstChapter.book_id,
+                        backlog?.first_chapter_ids?.[group.book.id] ?? firstChapter.id);
                     }}
                     type="button"
                   >
@@ -249,6 +265,15 @@ export default function RawBacklogView({
           </div>
         ) : null}
       </section>
+      {backlog && onPageChange && rawChapterCount > 0 ? (
+        <nav aria-label="Phân trang raw" className="translated-library-pagination">
+          <button aria-label="Trang raw trước" className="secondary-action" type="button"
+            disabled={page <= 0 || chapters.state === 'loading'} onClick={() => onPageChange(page - 1)}>Trang trước</button>
+          <span>Trang {page + 1} / {pages}</span>
+          <button aria-label="Trang raw sau" className="secondary-action" type="button"
+            disabled={page + 1 >= pages || chapters.state === 'loading'} onClick={() => onPageChange(page + 1)}>Trang sau</button>
+        </nav>
+      ) : null}
     </section>
   );
 }

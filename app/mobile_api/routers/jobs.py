@@ -124,7 +124,9 @@ async def start_translate_job(
 ):
     """Start translation job."""
     params = dict(job.params or {})
-    preset_id = params.get("preset_id")
+    preset_id = params.get("preset_id") or (
+        "balanced" if not any(params.get(key) for key in ("provider_id", "model", "host", "api_key")) else None
+    )
     resolved_provider = (
         {"provider_id": None, "model": None, "host": None, "api_key": None}
         if preset_id

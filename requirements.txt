@@ -18,4 +18,3 @@ ebooklib>=0.17
 mutagen>=1.47
 jieba>=0.42.1
 playwright>=1.40.0
-capsolver>=1.0.0

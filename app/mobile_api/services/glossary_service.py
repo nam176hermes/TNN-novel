@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 from pathlib import Path
 
 from app.database.db import (
@@ -416,9 +417,9 @@ class GlossaryService:
         """Get glossary conflicts."""
         return get_glossary_conflicts(self.db_path, book_id)
 
-    def extract_chapter_terms(self, book_id: int, chapter_id: int) -> dict:
+    def extract_chapter_terms(self, book_id: int, chapter_id: int, *, connection=None, chapter=None) -> dict:
         """Extract reviewable candidate terms from a chapter's raw Chinese text."""
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
+        chapter = chapter if chapter is not None else get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or int(chapter.get("book_id") or 0) != int(book_id):
             raise ValueError("Chapter not found")
         raw_path = str(chapter.get("raw_text_path") or "").strip()
@@ -443,7 +444,7 @@ class GlossaryService:
         updated = 0
         skipped = 0
         chapter_number = int(chapter.get("chapter_number") or 0)
-        with get_connection(self.db_path) as conn:
+        with (nullcontext(connection) if connection is not None else get_connection(self.db_path)) as conn:
             for candidate in candidates:
                 source = str(candidate["source_term"])
                 existing = conn.execute(
@@ -492,7 +493,8 @@ class GlossaryService:
                     ),
                 )
                 created += 1
-            conn.commit()
+            if connection is None:
+                conn.commit()
         return {"created": created, "updated": updated, "skipped": skipped, "candidates": candidates}
 
     def get_low_coverage_chapters(self, book_id: int, threshold: float = 30.0) -> list[dict]:

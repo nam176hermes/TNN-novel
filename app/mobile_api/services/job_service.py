@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 import uuid
@@ -24,20 +23,16 @@ from app.database.db import (
     request_cancel_mobile_job,
     sanitize_job_error,
     save_mobile_job,
-    save_qa_report,
 )
 from app.ingestion.source_adapters import SourceAdapterError, SourceBlockedError, validate_public_http_url
 from app.ingestion.source_policies import chapter_url_matches_source_book, get_source_policy
 from app.mobile_api.config import mobile_settings
 from app.mobile_api.services.pipeline_service import PipelineService
-from app.mobile_api.job_states import is_valid_job_state_transition, normalize_job_state, state_for_stage
+from app.jobs.states import is_valid_job_state_transition, normalize_job_state, state_for_stage
 from app.services.tts.availability import require_tts_runtime_available
-from app.translation.ollama_client import is_retryable_provider_error
 from app.translation.presets import get_translation_preset
 
 logger = logging.getLogger(__name__)
-TRANSLATE_CHAPTER_MAX_RETRIES = 2
-TRANSLATE_CHAPTER_RETRY_DELAYS = (5.0, 15.0)
 TRANSLATED_CHAPTER_STATUSES = {"translated", "qa_low", "audio_done"}
 GENERIC_JOB_FAILURE_DETAIL = "Job failed. Check server logs."
 TRANSLATION_JOB_FAILURE_DETAIL = "Translation failed. Check provider settings and server logs."
@@ -535,7 +530,7 @@ class JobTracker:
             except asyncio.CancelledError:
                 self.update_job(job_id, status="cancelled", message="Job cancelled", cancel_requested=True)
             except Exception:
-                logger.exception("Background job %s failed", job_id)
+                logger.error("Background job %s failed", job_id)
                 self.update_job(
                     job_id,
                     status="failed",
@@ -711,7 +706,7 @@ class JobService:
                 provider_id=provider_id or "default",
                 model=model or "default",
                 status=status,
-                error=error,
+                error="Provider attempt failed" if error else "",
                 elapsed_ms=max(0, elapsed_ms),
             )
             if status in {"failed", "retrying"}:
@@ -730,7 +725,7 @@ class JobService:
                     },
                 )
         except Exception:
-            logger.warning("Failed to record provider attempt for job %s", job_id, exc_info=True)
+            logger.warning("Failed to record provider attempt for job %s", job_id)
 
     def start_translate_job(
         self,
@@ -1074,210 +1069,176 @@ class JobService:
         preset_id: str | None,
         chunk_size: int | None,
     ) -> None:
+        provider_snapshot: dict = {}
         for idx, chapter_id in enumerate(chapter_ids):
             if self._cancel_if_requested(job_id):
                 break
             job = self.tracker.get_job(job_id)
             if not job:
                 break
-            for attempt in range(TRANSLATE_CHAPTER_MAX_RETRIES + 1):
-                if self._cancel_if_requested(job_id):
-                    return
-                started_at = time.monotonic()
-                resolved_preset_id = preset_id or job.params.get("preset_id")
-                try:
-                    chapter = self.pipeline.get_chapter(chapter_id)
-                    book_id = chapter["book_id"] if chapter else 0
-                    total_chunks = self._estimate_chapter_chunks(chapter_id, chunk_size)
-                    self.tracker.update_job(
+            if self._cancel_if_requested(job_id):
+                return
+            started_at = time.monotonic()
+            resolved_preset_id = preset_id or job.params.get("preset_id")
+            try:
+                chapter = self.pipeline.get_chapter(chapter_id)
+                book_id = chapter["book_id"] if chapter else 0
+                total_chunks = self._estimate_chapter_chunks(chapter_id, chunk_size)
+                self.tracker.update_job(
+                    job_id,
+                    status="running",
+                    progress=idx,
+                    message=f"Translating chapter {chapter_id}",
+                    current_book_id=book_id,
+                    current_chapter_id=chapter_id,
+                    current_chunk_index=0,
+                    total_chunks=total_chunks,
+                    current_step="TRANSLATING",
+                    provider=str(job.params.get("provider_id") or ""),
+                    model=model or "",
+                )
+                resolved_style_profile_id = style_profile_id or job.params.get("style_profile_id")
+                if resolved_preset_id:
+                    await asyncio.to_thread(
+                        self.pipeline.translate_chapter_with_pipeline,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        preset_id=resolved_preset_id,
+                        job_id=job_id,
+                        style_profile_id=resolved_style_profile_id,
+                        chunk_size=chunk_size,
+                        stage_callback=self._stage_timing_callback(job_id),
+                        cancel_check=lambda: self._job_cancel_requested(job_id),
+                        provider_snapshot=provider_snapshot,
+                    )
+                else:
+                    self._update_stage_timing(
                         job_id,
+                        stage="translate",
                         status="running",
-                        progress=idx,
-                        message=f"Translating chapter {chapter_id}",
-                        current_book_id=book_id,
-                        current_chapter_id=chapter_id,
-                        current_chunk_index=0,
-                        total_chunks=total_chunks,
-                        current_step="TRANSLATING",
-                        provider=str(job.params.get("provider_id") or ""),
+                        provider_id=str(job.params.get("provider_id") or ""),
                         model=model or "",
                     )
-                    resolved_style_profile_id = style_profile_id or job.params.get("style_profile_id")
-                    if resolved_preset_id:
-                        await asyncio.to_thread(
-                            self.pipeline.translate_chapter_with_pipeline,
-                            book_id=book_id,
-                            chapter_id=chapter_id,
-                            preset_id=resolved_preset_id,
-                            job_id=job_id,
-                            style_profile_id=resolved_style_profile_id,
-                            chunk_size=chunk_size,
-                            stage_callback=self._stage_timing_callback(job_id),
-                            cancel_check=lambda: self._job_cancel_requested(job_id),
-                        )
-                    else:
-                        self._update_stage_timing(
-                            job_id,
-                            stage="translate",
-                            status="running",
-                            provider_id=str(job.params.get("provider_id") or ""),
-                            model=model or "",
-                        )
-                        await asyncio.to_thread(
-                            self.pipeline.translate_chapter,
-                            book_id=book_id,
-                            chapter_id=chapter_id,
-                            model=model,
-                            host=host,
-                            api_key=api_key,
-                            provider_id=job.params.get("provider_id"),
-                            job_id=job_id,
-                            style_profile_id=resolved_style_profile_id,
-                            chunk_size=chunk_size,
-                            cancel_check=lambda: self._job_cancel_requested(job_id),
-                        )
-                    if self._cancel_if_requested(job_id):
-                        return
-                    db_chapter = get_chapter_by_id(self.pipeline.db_path, chapter_id)
-                    if db_chapter:
-                        try:
-                            from app.mobile_api.services.glossary_service import GlossaryService
-                            from app.mobile_api.services.qa_service import QAService
+                    await asyncio.to_thread(
+                        self.pipeline.translate_chapter,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        model=model,
+                        host=host,
+                        api_key=api_key,
+                        provider_id=job.params.get("provider_id"),
+                        job_id=job_id,
+                        style_profile_id=resolved_style_profile_id,
+                        chunk_size=chunk_size,
+                        cancel_check=lambda: self._job_cancel_requested(job_id),
+                    )
+                if self._cancel_if_requested(job_id):
+                    return
+                db_chapter = get_chapter_by_id(self.pipeline.db_path, chapter_id)
+                if db_chapter:
+                    try:
+                        from app.mobile_api.services.glossary_service import GlossaryService
+                        from app.mobile_api.services.qa_service import QAService
 
-                            self.tracker.update_job(
-                                job_id,
-                                status="running",
-                                progress=idx,
-                                message=f"Running glossary and QA follow-up for chapter {chapter_id}",
-                                current_step="QA_CHECKING",
-                            )
-                            extracted = await asyncio.to_thread(
-                                GlossaryService.from_db_path(self.pipeline.db_path).extract_chapter_terms,
-                                book_id,
-                                chapter_id,
-                            )
-                            qa_report = await asyncio.to_thread(
-                                QAService(self.pipeline).run_deterministic_qa,
-                                book_id,
-                                chapter_id,
-                                job_id,
-                            )
-                            record_job_log(
-                                self.pipeline.db_path,
-                                job_id=job_id,
-                                event_type="qa_completed",
-                                state="QA_CHECKING",
-                                step="QA_CHECKING",
-                                message="QA and glossary follow-up completed",
-                                details={
-                                    "chapter_id": chapter_id,
-                                    "overall_status": qa_report.get("overall_status"),
-                                    "warning_count": len(qa_report.get("issues") or []),
-                                    "glossary_candidates_created": extracted.get("created", 0),
-                                    "glossary_candidates_updated": extracted.get("updated", 0),
-                                },
-                            )
-                        except Exception:
-                            logger.exception("QA/glossary follow-up failed for job %s chapter %s", job_id, chapter_id)
-                            record_job_log(
-                                self.pipeline.db_path,
-                                job_id=job_id,
-                                event_type="qa_followup_failed",
-                                state="QA_CHECKING",
-                                step="QA_CHECKING",
-                                message="QA/glossary follow-up failed; translation remains saved",
-                                details={"chapter_id": chapter_id},
-                            )
-                    if not resolved_preset_id:
-                        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-                        self._update_stage_timing(
-                            job_id,
-                            stage="translate",
-                            status="success",
-                            provider_id=str(job.params.get("provider_id") or ""),
-                            model=model or "",
-                            elapsed_ms=elapsed_ms,
-                        )
-                        self._record_provider_attempt(
-                            job_id=job_id,
-                            chapter_id=chapter_id,
-                            provider_id=job.params.get("provider_id"),
-                            model=model,
-                            status="success",
-                            elapsed_ms=elapsed_ms,
-                        )
-                    self.tracker.update_job(job_id, progress=idx + 1, current_chunk_index=total_chunks)
-                    break
-                except Exception as exc:
-                    if self._job_cancel_requested(job_id):
-                        self.tracker.update_job(job_id, status="cancelled", message="Job cancelled", cancel_requested=True)
-                        return
-                    if attempt < TRANSLATE_CHAPTER_MAX_RETRIES and is_retryable_provider_error(exc):
-                        if not resolved_preset_id:
-                            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-                            self._update_stage_timing(
-                                job_id,
-                                stage="translate",
-                                status="retrying",
-                                provider_id=str(job.params.get("provider_id") or ""),
-                                model=model or "",
-                                elapsed_ms=elapsed_ms,
-                                error=str(exc),
-                            )
-                            self._record_provider_attempt(
-                                job_id=job_id,
-                                chapter_id=chapter_id,
-                                provider_id=job.params.get("provider_id"),
-                                model=model,
-                                status="retrying",
-                                error=str(exc),
-                                elapsed_ms=elapsed_ms,
-                            )
-                        delay = TRANSLATE_CHAPTER_RETRY_DELAYS[
-                            min(attempt, len(TRANSLATE_CHAPTER_RETRY_DELAYS) - 1)
-                        ]
                         self.tracker.update_job(
                             job_id,
+                            status="running",
                             progress=idx,
-                            message=(
-                                f"Provider temporarily unavailable on chapter {chapter_id}; "
-                                f"retrying in {delay:.0f}s ({attempt + 1}/{TRANSLATE_CHAPTER_MAX_RETRIES})"
-                            ),
+                            message=f"Running glossary and QA follow-up for chapter {chapter_id}",
+                            current_step="QA_CHECKING",
                         )
-                        await asyncio.sleep(delay)
-                        continue
-
-                    if not resolved_preset_id:
-                        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-                        self._update_stage_timing(
+                        extracted = await asyncio.to_thread(
+                            GlossaryService.from_db_path(self.pipeline.db_path).extract_chapter_terms,
+                            book_id,
+                            chapter_id,
+                        )
+                        qa_report = await asyncio.to_thread(
+                            QAService(self.pipeline).run_deterministic_qa,
+                            book_id,
+                            chapter_id,
                             job_id,
-                            stage="translate",
-                            status="failed",
-                            provider_id=str(job.params.get("provider_id") or ""),
-                            model=model or "",
-                            elapsed_ms=elapsed_ms,
-                            error=str(exc),
                         )
-                        self._record_provider_attempt(
+                        record_job_log(
+                            self.pipeline.db_path,
                             job_id=job_id,
-                            chapter_id=chapter_id,
-                            provider_id=job.params.get("provider_id"),
-                            model=model,
-                            status="failed",
-                            error=str(exc),
-                            elapsed_ms=elapsed_ms,
+                            event_type="qa_completed",
+                            state="QA_CHECKING",
+                            step="QA_CHECKING",
+                            message="QA and glossary follow-up completed",
+                            details={
+                                "chapter_id": chapter_id,
+                                "overall_status": qa_report.get("overall_status"),
+                                "warning_count": len(qa_report.get("issues") or []),
+                                "glossary_candidates_created": extracted.get("created", 0),
+                                "glossary_candidates_updated": extracted.get("updated", 0),
+                            },
                         )
-                    logger.exception("Translation job %s failed on chapter %s", job_id, chapter_id)
-                    self.tracker.update_job(
+                    except Exception:
+                        logger.error("QA/glossary follow-up failed for job %s chapter %s", job_id, chapter_id)
+                        record_job_log(
+                            self.pipeline.db_path,
+                            job_id=job_id,
+                            event_type="qa_followup_failed",
+                            state="QA_CHECKING",
+                            step="QA_CHECKING",
+                            message="QA/glossary follow-up failed; translation remains saved",
+                            details={"chapter_id": chapter_id},
+                        )
+                if not resolved_preset_id:
+                    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                    self._update_stage_timing(
                         job_id,
-                        status="failed",
-                        error=TRANSLATION_JOB_FAILURE_DETAIL,
-                        message=(
-                            f"Translation failed on chapter {chapter_id}. "
-                            "Check provider settings and server logs."
-                        ),
+                        stage="translate",
+                        status="success",
+                        provider_id=str(job.params.get("provider_id") or ""),
+                        model=model or "",
+                        elapsed_ms=elapsed_ms,
                     )
+                    self._record_provider_attempt(
+                        job_id=job_id,
+                        chapter_id=chapter_id,
+                        provider_id=job.params.get("provider_id"),
+                        model=model,
+                        status="success",
+                        elapsed_ms=elapsed_ms,
+                    )
+                self.tracker.update_job(job_id, progress=idx + 1, current_chunk_index=total_chunks)
+                continue
+            except Exception as exc:
+                if self._job_cancel_requested(job_id):
+                    self.tracker.update_job(job_id, status="cancelled", message="Job cancelled", cancel_requested=True)
                     return
+                if not resolved_preset_id:
+                    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                    self._update_stage_timing(
+                        job_id,
+                        stage="translate",
+                        status="failed",
+                        provider_id=str(job.params.get("provider_id") or ""),
+                        model=model or "",
+                        elapsed_ms=elapsed_ms,
+                        error="Provider attempt failed",
+                    )
+                    self._record_provider_attempt(
+                        job_id=job_id,
+                        chapter_id=chapter_id,
+                        provider_id=job.params.get("provider_id"),
+                        model=model,
+                        status="failed",
+                        error=str(exc),
+                        elapsed_ms=elapsed_ms,
+                    )
+                logger.error("Translation job %s failed on chapter %s", job_id, chapter_id)
+                self.tracker.update_job(
+                    job_id,
+                    status="failed",
+                    error=TRANSLATION_JOB_FAILURE_DETAIL,
+                    message=(
+                        f"Translation failed on chapter {chapter_id}. "
+                        "Check provider settings and server logs."
+                    ),
+                )
+                return
 
     def start_tts_job(
         self,
@@ -1295,10 +1256,10 @@ class JobService:
             target_ids = chapter_ids
         elif book_id is not None:
             chapters = self._chapters_in_batch_order(self.pipeline.list_chapters(book_id))
-            target_ids = [c["id"] for c in chapters if c.get("translated_text_path") and not c.get("audio_path")][:limit]
+            target_ids = [c["id"] for c in chapters if c.get("translated_text_path") and (not c.get("audio_path") or c.get("audio_status") == "stale")][:limit]
         else:
             chapters = self._chapters_in_batch_order(self.pipeline.list_chapters())
-            target_ids = [c["id"] for c in chapters if c.get("translated_text_path") and not c.get("audio_path")][:limit]
+            target_ids = [c["id"] for c in chapters if c.get("translated_text_path") and (not c.get("audio_path") or c.get("audio_status") == "stale")][:limit]
 
         if not target_ids:
             job = self.tracker.create_job("tts", [], 0)
@@ -1320,50 +1281,56 @@ class JobService:
         rate: str,
         volume: str,
     ) -> None:
-        for idx, chapter_id in enumerate(chapter_ids):
-            if self._cancel_if_requested(job_id):
-                break
-            try:
-                chapter = self.pipeline.get_chapter(chapter_id)
-                book_id = chapter["book_id"] if chapter else 0
-                self.tracker.update_job(
-                    job_id,
-                    status="running",
-                    progress=idx,
-                    message=f"Generating audio for chapter {chapter_id}",
-                    current_book_id=book_id,
-                    current_chapter_id=chapter_id,
-                    current_step="GENERATING_TTS",
-                )
-                if chapter:
-                    await asyncio.to_thread(
-                        self.pipeline.generate_audio,
-                        book_id=chapter["book_id"],
-                        chapter_id=chapter_id,
-                        voice=voice,
-                        rate=rate,
-                        volume=volume,
-                        job_id=job_id,
-                        cancel_check=lambda: self._job_cancel_requested(job_id),
-                        progress_callback=lambda percent, note: self.tracker.update_job(
-                            job_id,
-                            progress=max(idx, min(idx + 1, idx + percent // 100)),
-                            current_step="GENERATING_TTS",
-                            message=note,
-                        ),
-                    )
+        try:
+            for idx, chapter_id in enumerate(chapter_ids):
                 if self._cancel_if_requested(job_id):
+                    break
+                try:
+                    chapter = self.pipeline.get_chapter(chapter_id)
+                    book_id = chapter["book_id"] if chapter else 0
+                    self.tracker.update_job(
+                        job_id,
+                        status="running",
+                        progress=idx,
+                        message=f"Generating audio for chapter {chapter_id}",
+                        current_book_id=book_id,
+                        current_chapter_id=chapter_id,
+                        current_step="GENERATING_TTS",
+                    )
+                    if chapter:
+                        await asyncio.to_thread(
+                            self.pipeline.generate_audio,
+                            book_id=chapter["book_id"],
+                            chapter_id=chapter_id,
+                            voice=voice,
+                            rate=rate,
+                            volume=volume,
+                            job_id=f"{job_id}_ch{chapter_id}",
+                            parent_job_id=job_id,
+                            cancel_check=lambda: self._job_cancel_requested(job_id),
+                            progress_callback=lambda percent, note: self.tracker.update_job(
+                                job_id,
+                                progress=max(idx, min(idx + 1, idx + percent // 100)),
+                                current_step="GENERATING_TTS",
+                                message=note,
+                            ),
+                        )
+                    if self._cancel_if_requested(job_id):
+                        return
+                    self.tracker.update_job(job_id, progress=idx + 1)
+                except Exception:
+                    logger.error("TTS job %s failed on chapter %s", job_id, chapter_id)
+                    self.tracker.update_job(
+                        job_id,
+                        status="failed",
+                        error=TTS_JOB_FAILURE_DETAIL,
+                        message=f"TTS failed on chapter {chapter_id}. Check TTS settings and server logs.",
+                    )
                     return
-                self.tracker.update_job(job_id, progress=idx + 1)
-            except Exception:
-                logger.exception("TTS job %s failed on chapter %s", job_id, chapter_id)
-                self.tracker.update_job(
-                    job_id,
-                    status="failed",
-                    error=TTS_JOB_FAILURE_DETAIL,
-                    message=f"TTS failed on chapter {chapter_id}. Check TTS settings and server logs.",
-                )
-                return
+        finally:
+            close_batch = getattr(self.pipeline, "close_audio_batch", None)
+            if close_batch is not None:
+                close_batch(job_id)
 
     def start_daily_job(self, limit: int = 15) -> str:
         job = self.tracker.create_job("daily", None, limit)
@@ -1425,7 +1392,7 @@ class JobService:
                     raise
             self.tracker.update_job(job_id, status="completed", progress=100, message="Daily batch completed")
         except Exception:
-            logger.exception("Daily job %s failed", job_id)
+            logger.error("Daily job %s failed", job_id)
             self.tracker.update_job(
                 job_id,
                 status="failed",
@@ -1498,8 +1465,9 @@ class JobService:
                     model=model or "",
                 )
                 if chapter:
-                    report = await asyncio.to_thread(
-                        self.pipeline.run_qa_check,
+                    from app.mobile_api.services.qa_service import QAService
+                    await asyncio.to_thread(
+                        QAService(self.pipeline).run_qa_check,
                         book_id=chapter["book_id"],
                         chapter_id=chapter_id,
                         model=model,
@@ -1507,18 +1475,6 @@ class JobService:
                         api_key=api_key,
                         provider_id=provider_id,
                         job_id=job_id,
-                    )
-                    save_qa_report(
-                        self.pipeline.db_path,
-                        book_id=chapter["book_id"],
-                        chapter_id=chapter_id,
-                        quality_score=report.get("quality_score", 0),
-                        fidelity_score=report.get("fidelity_score", 0),
-                        style_score=report.get("style_score", 0),
-                        glossary_score=report.get("glossary_score", 0),
-                        audiobook_score=report.get("audiobook_score", 0),
-                        verdict=report.get("verdict", "UNKNOWN"),
-                        report_json=json.dumps(report, ensure_ascii=False),
                     )
                     self._record_provider_attempt(
                         job_id=job_id,
@@ -1539,7 +1495,7 @@ class JobService:
                     error=str(exc),
                     elapsed_ms=int((time.monotonic() - started_at) * 1000),
                 )
-                logger.exception("QA job %s failed on chapter %s", job_id, chapter_id)
+                logger.error("QA job %s failed on chapter %s", job_id, chapter_id)
                 self.tracker.update_job(
                     job_id,
                     status="failed",

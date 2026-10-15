@@ -3,20 +3,7 @@ from __future__ import annotations
 import re
 
 
-DEFAULT_PRONOUN_MEMORY = [
-    {
-        "character": "Tần Minh",
-        "rules": "khi tự xưng dùng ta; tránh tôi trong bối cảnh cổ trang.",
-    },
-    {
-        "character": "Lục Trạch",
-        "rules": "khi được gọi Lục ca thì người nói xưng ta, gọi huynh; không dùng anh/tôi.",
-    },
-    {
-        "character": "Người lớn tuổi",
-        "rules": "ưu tiên tiền bối, lão nhân, lão giả, lão phu tùy ngữ cảnh.",
-    },
-]
+DEFAULT_PRONOUN_MEMORY = []
 
 MODERN_PRONOUN_PATTERN = re.compile(r"\b(tôi|bạn|anh|em)\b", flags=re.IGNORECASE)
 CLASSICAL_VOCATIVE_PATTERN = re.compile(
@@ -32,19 +19,9 @@ THIRD_PERSON_AFTER_VOCATIVE_PATTERN = re.compile(r"\b(hắn|y|anh ấy|ông ấy
 
 
 def render_pronoun_memory() -> str:
-    lines = ["Pronoun memory:"]
-    for item in DEFAULT_PRONOUN_MEMORY:
-        lines.append(f"- {item['character']}: {item['rules']}")
-    lines.extend(
-        [
-            "- Direct address matrix:",
-            "  * Lục ca/đại ca/huynh/sư huynh -> gọi người nghe là huynh; người nói thường xưng ta/đệ/muội.",
-            "  * Sư tỷ/tỷ -> gọi người nghe là tỷ; người nói thường xưng ta/đệ/muội.",
-            "  * Tiền bối/đạo hữu -> gọi người nghe là tiền bối/đạo hữu; người nói xưng vãn bối/ta.",
-            "  * Sau một vocative cổ trang, không dùng hắn/y/anh ấy để chỉ chính người đang được gọi.",
-        ]
-    )
-    return "\n".join(lines)
+    return ("Pronouns: follow source relationships, the selected style and the book glossary. "
+            "Do not invent character-specific rules. A vocative can be followed by narration about a third person; "
+            "do not replace pronouns without resolving the referent.")
 
 
 def find_modern_pronoun_issues(text: str) -> list[dict]:
@@ -52,13 +29,15 @@ def find_modern_pronoun_issues(text: str) -> list[dict]:
     issues: list[dict] = []
     for match in MODERN_PRONOUN_PATTERN.finditer(text):
         pronoun = match.group(1).lower()
+        if pronoun == "anh" and re.match(r"\s+(hùng|tài|dũng|tuấn)\b", text[match.end():], re.IGNORECASE):
+            continue
         if pronoun in seen:
             continue
         seen.add(pronoun)
         issues.append(
             {
                 "type": "pronoun_modern",
-                "severity": "high",
+                "severity": "low",
                 "message": f"Từ xưng hô hiện đại '{pronoun}' xuất hiện trong bối cảnh cổ trang.",
                 "suggested_fix": "Ưu tiên ta/ngươi/huynh/tỷ/đệ/muội/tiền bối tùy quan hệ nhân vật.",
             }
@@ -80,7 +59,7 @@ def find_direct_address_issues(text: str) -> list[dict]:
         issues.append(
             {
                 "type": "pronoun_direct_address",
-                "severity": "high",
+                "severity": "low",
                 "message": (
                     f"Sau lời gọi '{vocative}', bản dịch dùng '{pronoun}' cho người đang được đối thoại."
                 ),
@@ -88,7 +67,7 @@ def find_direct_address_issues(text: str) -> list[dict]:
                     "Nếu đang nói trực tiếp với người đó, dùng huynh/tỷ/tiền bối/đạo hữu/ngươi theo quan hệ; "
                     "không dùng hắn/y/anh ấy."
                 ),
-                "segment": sentence.strip()[:240],
+                "ambiguous": True,
             }
         )
     return issues

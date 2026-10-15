@@ -1,29 +1,39 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import json
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from app.database import schema_utils as _schema_utils
+from app.database import user_repository as _user_repository
+from app.database import book_repository as _book_repository
+from app.database import import_repository as _import_repository
+from app.database import glossary_repository as _glossary_repository
+from app.database import job_repository as _job_repository
 from app.database import auth_repository as _auth_repository
+from app.database import chapter_repository as _chapter_repository
 from app.database import operations_repository as _operations_repository
+from app.database import qa_repository as _qa_repository
 from app.database import reader_repository as _reader_repository
 from app.database.connection import get_connection
 from app.database.schema import SCHEMA
-from app.database.glossary_history import log_glossary_change
-from app.mobile_api.job_states import normalize_job_state
-from app.mobile_api.services.import_metadata import normalize_book_key
-from app.security.url_policy import UrlPolicyViolation, validate_fetch_url
-from app.translation.styleguide_config import get_locked_terms
+from app.ingestion.import_metadata import normalize_book_key
+from app.security.url_policy import UrlPolicyViolation
 
 
 _utcnow_text = _auth_repository._utcnow_text
+ContentRevisionConflict = _chapter_repository.ContentRevisionConflict
+get_chapter = _chapter_repository.get_chapter
+get_chapter_by_id = _chapter_repository.get_chapter_by_id
+list_chapters = _chapter_repository.list_chapters
+update_chapter_paths = _chapter_repository.update_chapter_paths
+update_chapter_with_connection = _chapter_repository.update_chapter_with_connection
+save_qa_report = _qa_repository.save_qa_report
 auth_session_is_active = _auth_repository.auth_session_is_active
 clear_auth_login_failures = _auth_repository.clear_auth_login_failures
 count_auth_login_failures = _auth_repository.count_auth_login_failures
@@ -57,28 +67,13 @@ list_reader_xray_entities = _reader_repository.list_reader_xray_entities
 list_reader_timeline_events = _reader_repository.list_reader_timeline_events
 
 
-CURRENT_SCHEMA_VERSION = "2026-07-14-import-job-persistence-phase5"
+CURRENT_SCHEMA_VERSION = "2026-10-02-content-integrity-tts-snapshots"
 
 
-@dataclass(frozen=True)
-class ImportChapterUpsert:
-    chapter_id: int
-    operation: str
-    content_hash: str
-    content_revision: int
-    raw_text_path: str
+ImportChapterUpsert = _import_repository.ImportChapterUpsert
 
 
-def canonicalize_import_url(url: str) -> str:
-    """Canonicalize a persisted source identity through the P02 URL policy.
-
-    Resolution is deliberately omitted here: URLs have already passed the fetch
-    policy before import, while migrations must never perform network I/O.
-    """
-    value = str(url or "").strip()
-    if not value:
-        return ""
-    return validate_fetch_url(value, resolver=None).canonical_url
+canonicalize_import_url = _import_repository.canonicalize_import_url
 
 
 def get_db_path(data_dir: Path) -> Path:
@@ -118,63 +113,19 @@ def _record_schema_migration(conn: sqlite3.Connection, version: str) -> None:
     conn.execute("INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)", (version,))
 
 
-def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
+_table_exists = _schema_utils._table_exists
 
 
-def _column_default(conn: sqlite3.Connection, table_name: str, column_name: str) -> str | None:
-    for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall():
-        if row["name"] == column_name:
-            return row["dflt_value"]
-    return None
+_column_default = _schema_utils._column_default
 
 
-def _add_column_if_missing(conn: sqlite3.Connection, table_name: str, column_sql: str) -> bool:
-    column_name = column_sql.split()[0]
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
-    if column_name not in columns:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
-        return True
-    return False
+_add_column_if_missing = _schema_utils._add_column_if_missing
 
 
-def _glossary_review_status(approved: int = 1, locked: int = 0, review_status: str = "") -> str:
-    normalized = str(review_status or "").strip().upper()
-    if normalized in {"NEEDS_REVIEW", "APPROVED", "REJECTED", "CONFLICT", "LOCKED"}:
-        return normalized
-    if int(locked or 0):
-        return "LOCKED"
-    if int(approved or 0) < 0:
-        return "REJECTED"
-    if int(approved or 0) == 1:
-        return "APPROVED"
-    return "NEEDS_REVIEW"
+_glossary_review_status = _glossary_repository._glossary_review_status
 
 
-def _ensure_users_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT NOT NULL UNIQUE,
-            display_name TEXT DEFAULT '',
-            source TEXT NOT NULL DEFAULT 'env',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            disabled_at TEXT DEFAULT ''
-        )
-        """
-    )
-    _add_column_if_missing(conn, "users", "username TEXT DEFAULT ''")
-    _add_column_if_missing(conn, "users", "display_name TEXT DEFAULT ''")
-    _add_column_if_missing(conn, "users", "source TEXT DEFAULT 'env'")
-    _add_column_if_missing(conn, "users", "created_at TEXT DEFAULT ''")
-    _add_column_if_missing(conn, "users", "updated_at TEXT DEFAULT ''")
-    _add_column_if_missing(conn, "users", "disabled_at TEXT DEFAULT ''")
+_ensure_users_table = _user_repository._ensure_users_table
 
 
 def _ensure_source_catalog_table(conn: sqlite3.Connection) -> None:
@@ -388,74 +339,16 @@ def _ensure_managed_sources_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_managed_source_tests_tested ON managed_source_tests(tested_at DESC)")
 
 
-def _normalize_operator_username(username: str | None = None) -> str:
-    value = (username if username is not None else os.getenv("MOBILE_API_ADMIN_USERNAME", "admin")).strip()
-    return value or "admin"
+_normalize_operator_username = _user_repository._normalize_operator_username
 
 
-def _stable_operator_user_id(username: str) -> str:
-    normalized = username.strip().lower()
-    digest = hashlib.sha256(f"novel-pipeline:env-operator:{normalized}".encode("utf-8")).hexdigest()
-    return f"usr_{digest[:32]}"
+_stable_operator_user_id = _user_repository._stable_operator_user_id
 
 
-def _seed_operator_user(conn: sqlite3.Connection, username: str | None = None) -> dict[str, Any]:
-    _ensure_users_table(conn)
-    resolved_username = _normalize_operator_username(username)
-    now = _utcnow_text()
-    existing = conn.execute(
-        """
-        SELECT * FROM users
-        WHERE source = 'env'
-        ORDER BY created_at, id
-        LIMIT 1
-        """
-    ).fetchone()
-
-    if existing is not None:
-        if existing["username"] != resolved_username or existing["disabled_at"]:
-            conn.execute(
-                """
-                UPDATE users
-                SET username = ?, updated_at = ?, disabled_at = ''
-                WHERE id = ?
-                """,
-                (resolved_username, now, existing["id"]),
-            )
-            existing = conn.execute("SELECT * FROM users WHERE id = ?", (existing["id"],)).fetchone()
-        return dict(existing)
-
-    matching_username = conn.execute(
-        "SELECT * FROM users WHERE username = ?",
-        (resolved_username,),
-    ).fetchone()
-    if matching_username is not None:
-        conn.execute(
-            """
-            UPDATE users
-            SET source = 'env', updated_at = ?, disabled_at = ''
-            WHERE id = ?
-            """,
-            (now, matching_username["id"]),
-        )
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (matching_username["id"],)).fetchone()
-        return dict(row)
-
-    user_id = _stable_operator_user_id(resolved_username)
-    conn.execute(
-        """
-        INSERT INTO users
-        (id, username, display_name, source, created_at, updated_at, disabled_at)
-        VALUES (?, ?, '', 'env', ?, ?, '')
-        """,
-        (user_id, resolved_username, now, now),
-    )
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return dict(row)
+_seed_operator_user = _user_repository._seed_operator_user
 
 
-def _seed_operator_user_from_env(conn: sqlite3.Connection) -> dict[str, Any]:
-    return _seed_operator_user(conn, os.getenv("MOBILE_API_ADMIN_USERNAME", "admin"))
+_seed_operator_user_from_env = _user_repository._seed_operator_user_from_env
 
 
 OWNER_METADATA_TABLES = (
@@ -1646,6 +1539,16 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
                 """
             )
 
+    if _table_exists(conn, "chapters"):
+        for column in ("translation_hash TEXT", "audio_translation_hash TEXT", "audio_invalidated_at TEXT",
+                       "translated_title TEXT DEFAULT ''", "quality_status TEXT NOT NULL DEFAULT 'legacy_unverified'"):
+            _add_column_if_missing(conn, "chapters", column)
+    if _table_exists(conn, "qa_reports"):
+        _add_column_if_missing(conn, "qa_reports", "content_revision INTEGER")
+    if _table_exists(conn, "tts_jobs"):
+        for column in ("source_translation_hash TEXT", "input_snapshot_json TEXT", "parent_job_id TEXT"):
+            _add_column_if_missing(conn, "tts_jobs", column)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tts_jobs_parent ON tts_jobs(parent_job_id)")
     _consolidate_duplicate_book_keys(conn)
 
 
@@ -1670,34 +1573,16 @@ def init_db(db_path: Path) -> None:
     _restrict_database_file_permissions(db_path)
 
 
-def get_or_seed_operator_user(db_path: Path, username: str | None = None) -> dict[str, Any]:
-    with get_connection(db_path) as conn:
-        user = _seed_operator_user(conn, username)
-        conn.commit()
-        return user
+get_or_seed_operator_user = _user_repository.get_or_seed_operator_user
 
 
-def get_operator_user_id(db_path: Path, username: str | None = None) -> str:
-    return str(get_or_seed_operator_user(db_path, username)["id"])
+get_operator_user_id = _user_repository.get_operator_user_id
 
 
-def find_user_by_username(db_path: Path, username: str) -> dict[str, Any] | None:
-    resolved_username = username.strip()
-    if not resolved_username:
-        return None
-    with get_connection(db_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE username = ?",
-            (resolved_username,),
-        ).fetchone()
-    return dict(row) if row else None
+find_user_by_username = _user_repository.find_user_by_username
 
 
-def _resolve_owner_user_id_for_write(db_path: Path, owner_user_id: str = "") -> str:
-    resolved = str(owner_user_id or "").strip()
-    if resolved:
-        return resolved
-    return get_operator_user_id(db_path)
+_resolve_owner_user_id_for_write = _user_repository._resolve_owner_user_id_for_write
 
 
 # ── Model Providers ────────────────────────────────────────────────────────
@@ -2221,491 +2106,72 @@ def get_usage_summary(db_path: Path) -> dict:
         return dict(row)
 
 
-def record_job_attempt(
-    db_path: Path,
-    job_id: str,
-    chapter_id: int | None,
-    provider_id: str,
-    model: str,
-    status: str,
-    stage: str = "",
-    error: str = "",
-    elapsed_ms: int = 0,
-    owner_user_id: str = "",
-) -> int:
-    resolved_owner_user_id = _resolve_owner_user_id_for_write(db_path, owner_user_id)
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO job_attempts
-            (job_id, chapter_id, owner_user_id, stage, provider_id, model, status, error, elapsed_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (job_id, chapter_id, resolved_owner_user_id, stage, provider_id, model, status, error, elapsed_ms),
-        )
-        conn.commit()
-        return cur.lastrowid
+record_job_attempt = _job_repository.record_job_attempt
 
 
-def get_job_attempts(
-    db_path: Path,
-    job_id: str | None = None,
-    chapter_id: int | None = None,
-    limit: int = 50,
-) -> list[dict]:
-    clauses = []
-    params: list[object] = []
-    if job_id is not None:
-        clauses.append("job_id = ?")
-        params.append(job_id)
-    if chapter_id is not None:
-        clauses.append("chapter_id = ?")
-        params.append(chapter_id)
-
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params.append(max(0, limit))
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT * FROM job_attempts
-            {where}
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-        return [dict(row) for row in rows]
+get_job_attempts = _job_repository.get_job_attempts
 
 
 # ── Mobile Jobs ──────────────────────────────────────────────────────────────
 
-_JOB_LOG_SENSITIVE_MARKERS = (
-    "\n",
-    "traceback",
-    "secret",
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer ",
-    "token",
-    "/tmp/",
-    "/home/",
-    "\\users\\",
-    "sk-",
-)
-MAX_JOB_LOG_MESSAGE_LENGTH = 500
-MAX_JOB_LOG_DETAIL_VALUE_LENGTH = 500
-MAX_JOB_LOG_LIMIT = 100
+_JOB_LOG_SENSITIVE_MARKERS = _job_repository._JOB_LOG_SENSITIVE_MARKERS
+MAX_JOB_LOG_MESSAGE_LENGTH = _job_repository.MAX_JOB_LOG_MESSAGE_LENGTH
+MAX_JOB_LOG_DETAIL_VALUE_LENGTH = _job_repository.MAX_JOB_LOG_DETAIL_VALUE_LENGTH
+MAX_JOB_LOG_LIMIT = _job_repository.MAX_JOB_LOG_LIMIT
 
 
-def _job_value_has_sensitive_marker(value: object) -> bool:
-    return any(marker in str(value).lower() for marker in _JOB_LOG_SENSITIVE_MARKERS)
+_job_value_has_sensitive_marker = _job_repository._job_value_has_sensitive_marker
 
 
-def _sanitize_job_log_message(message: str) -> str:
-    if _job_value_has_sensitive_marker(message):
-        return "Job event recorded. Check server logs."
-    return str(message).replace("\n", " ").strip()[:MAX_JOB_LOG_MESSAGE_LENGTH]
+_sanitize_job_log_message = _job_repository._sanitize_job_log_message
 
 
-def _sanitize_job_log_detail_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return value.replace("\n", " ").strip()[:MAX_JOB_LOG_DETAIL_VALUE_LENGTH]
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    rendered = json.dumps(value, ensure_ascii=False, default=str)
-    return rendered[:MAX_JOB_LOG_DETAIL_VALUE_LENGTH]
+_sanitize_job_log_detail_value = _job_repository._sanitize_job_log_detail_value
 
 
-def _sanitize_job_log_details(details: dict[str, Any] | None) -> dict[str, Any]:
-    safe_details: dict[str, Any] = {}
-    for key, value in (details or {}).items():
-        key_text = str(key)
-        lowered_key = key_text.lower()
-        if any(marker in lowered_key for marker in ("secret", "key", "token", "password", "authorization")):
-            safe_details[key_text] = "[redacted]"
-        elif _job_value_has_sensitive_marker(value):
-            safe_details[key_text] = "[redacted]"
-        else:
-            safe_details[key_text] = _sanitize_job_log_detail_value(value)
-    return safe_details
+_sanitize_job_log_details = _job_repository._sanitize_job_log_details
 
 
-def sanitize_job_error(message: str) -> str:
-    if not message:
-        return ""
-    if _job_value_has_sensitive_marker(message):
-        return "Job failed. Check server logs."
-    return str(message).replace("\n", " ").strip()[:500]
+sanitize_job_error = _job_repository.sanitize_job_error
 
 
-def _decode_json_field(value: str | None, fallback: Any) -> Any:
-    if not value:
-        return fallback
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return fallback
+_decode_json_field = _job_repository._decode_json_field
 
 
-def _mobile_job_from_row(row: sqlite3.Row) -> dict:
-    job = dict(row)
-    job["target_ids"] = _decode_json_field(job.pop("target_ids_json", None), [])
-    job["params"] = _decode_json_field(job.pop("params_json", None), {})
-    job["state"] = normalize_job_state(
-        str(job.get("status") or ""),
-        current_step=str(job.get("current_step") or ""),
-        existing_state=str(job.get("state") or ""),
-    )
-    job["cancel_requested"] = bool(int(job.get("cancel_requested") or 0))
-    return job
+_mobile_job_from_row = _job_repository._mobile_job_from_row
 
 
-def save_mobile_job(db_path: Path, job: dict) -> None:
-    target_ids_json = json.dumps(job.get("target_ids", []), ensure_ascii=False)
-    params_json = json.dumps(job.get("params", {}), ensure_ascii=False)
-    status = str(job.get("status") or "queued")
-    current_step = str(job.get("current_step") or "")
-    state = normalize_job_state(status, current_step=current_step, existing_state=str(job.get("state") or ""))
-    retry_count = int(job.get("retry_count") or (job.get("params") or {}).get("retry_count") or 0)
-    with get_connection(db_path) as conn:
-        owner_user_id = str(job.get("owner_user_id") or "").strip()
-        if not owner_user_id:
-            row = conn.execute(
-                "SELECT owner_user_id FROM mobile_jobs WHERE job_id = ?",
-                (job["job_id"],),
-            ).fetchone()
-            owner_user_id = str(row["owner_user_id"] or "") if row else ""
-        if not owner_user_id:
-            owner_user_id = str(_seed_operator_user_from_env(conn).get("id") or "")
-        conn.execute(
-            """
-            INSERT INTO mobile_jobs
-            (
-                job_id, job_type, owner_user_id, status, state, progress, total,
-                current_book_id, current_chapter_id, current_chunk_index, total_chunks,
-                current_step, provider, model, retry_count, target_ids_json, params_json,
-                message, error, created_at, updated_at, started_at, completed_at, failed_at,
-                finished_at, cancel_requested, last_safe_error, internal_error_ref
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET
-                job_type = excluded.job_type,
-                owner_user_id = excluded.owner_user_id,
-                status = excluded.status,
-                state = excluded.state,
-                progress = excluded.progress,
-                total = excluded.total,
-                current_book_id = excluded.current_book_id,
-                current_chapter_id = excluded.current_chapter_id,
-                current_chunk_index = excluded.current_chunk_index,
-                total_chunks = excluded.total_chunks,
-                current_step = excluded.current_step,
-                provider = excluded.provider,
-                model = excluded.model,
-                retry_count = excluded.retry_count,
-                target_ids_json = excluded.target_ids_json,
-                params_json = excluded.params_json,
-                message = excluded.message,
-                error = excluded.error,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at,
-                failed_at = excluded.failed_at,
-                finished_at = excluded.finished_at,
-                cancel_requested = excluded.cancel_requested,
-                last_safe_error = excluded.last_safe_error,
-                internal_error_ref = excluded.internal_error_ref
-            """,
-            (
-                job["job_id"],
-                job["job_type"],
-                owner_user_id,
-                status,
-                state,
-                int(job.get("progress", 0)),
-                int(job.get("total", 0)),
-                int(job.get("current_book_id") or 0),
-                int(job.get("current_chapter_id") or 0),
-                int(job.get("current_chunk_index") or 0),
-                int(job.get("total_chunks") or 0),
-                current_step,
-                str(job.get("provider") or ""),
-                str(job.get("model") or ""),
-                retry_count,
-                target_ids_json,
-                params_json,
-                job.get("message", ""),
-                job.get("error", ""),
-                job.get("created_at", ""),
-                job.get("updated_at", ""),
-                job.get("started_at", ""),
-                job.get("completed_at", ""),
-                job.get("failed_at", ""),
-                job.get("finished_at"),
-                1 if job.get("cancel_requested") else 0,
-                str(job.get("last_safe_error") or ""),
-                str(job.get("internal_error_ref") or ""),
-            ),
-        )
-        conn.commit()
+save_mobile_job = _job_repository.save_mobile_job
 
 
-def get_mobile_job(db_path: Path, job_id: str) -> dict | None:
-    with get_connection(db_path) as conn:
-        row = conn.execute("SELECT * FROM mobile_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        return _mobile_job_from_row(row) if row else None
+get_mobile_job = _job_repository.get_mobile_job
 
 
-def list_mobile_jobs(db_path: Path, limit: int = 50) -> list[dict]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM mobile_jobs
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (max(0, limit),),
-        ).fetchall()
-        return [_mobile_job_from_row(row) for row in rows]
+list_mobile_jobs = _job_repository.list_mobile_jobs
 
 
-def claim_mobile_job(
-    db_path: Path,
-    *,
-    job_id: str,
-    worker_id: str,
-    lease_token: str,
-    lease_seconds: int = 120,
-) -> bool:
-    now = datetime.now(timezone.utc)
-    now_text = now.isoformat()
-    expires_at = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE mobile_jobs
-            SET status = 'running',
-                state = 'CLAIMED',
-                current_step = 'CLAIMED',
-                lease_token = ?,
-                lease_owner = ?,
-                lease_expires_at = ?,
-                heartbeat_at = ?,
-                updated_at = ?,
-                started_at = CASE WHEN COALESCE(started_at, '') = '' THEN ? ELSE started_at END
-            WHERE job_id = ?
-              AND status IN ('queued', 'retrying', 'pending')
-              AND COALESCE(lease_token, '') = ''
-            """,
-            (lease_token, worker_id, expires_at, now_text, now_text, now_text, job_id),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+claim_mobile_job = _job_repository.claim_mobile_job
 
 
-def heartbeat_mobile_job_lease(
-    db_path: Path,
-    *,
-    job_id: str,
-    lease_token: str,
-    lease_seconds: int = 120,
-) -> bool:
-    now = datetime.now(timezone.utc)
-    now_text = now.isoformat()
-    expires_at = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE mobile_jobs
-            SET heartbeat_at = ?,
-                lease_expires_at = ?,
-                updated_at = ?
-            WHERE job_id = ?
-              AND lease_token = ?
-              AND status = 'running'
-            """,
-            (now_text, expires_at, now_text, job_id, lease_token),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+heartbeat_mobile_job_lease = _job_repository.heartbeat_mobile_job_lease
 
 
-def release_mobile_job_lease(db_path: Path, *, job_id: str, lease_token: str) -> bool:
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE mobile_jobs
-            SET lease_token = '',
-                lease_owner = '',
-                lease_expires_at = '',
-                heartbeat_at = ''
-            WHERE job_id = ?
-              AND lease_token = ?
-            """,
-            (job_id, lease_token),
-        )
-        conn.commit()
-        return cur.rowcount == 1
+release_mobile_job_lease = _job_repository.release_mobile_job_lease
 
 
-def mark_interrupted_mobile_jobs(
-    db_path: Path,
-    *,
-    stale_after_seconds: int = 300,
-    include_queued: bool = True,
-) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=max(1, stale_after_seconds))).isoformat()
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE mobile_jobs
-            SET status = 'interrupted',
-                state = 'STALE_INTERRUPTED',
-                message = 'Job interrupted before completion. Please retry the job.',
-                error = 'Job interrupted before completion',
-                last_safe_error = 'Job interrupted before completion',
-                updated_at = ?,
-                finished_at = ?,
-                lease_token = '',
-                lease_owner = '',
-                lease_expires_at = '',
-                heartbeat_at = ''
-            WHERE (
-                    ? = 1
-                    AND status IN ('pending', 'queued', 'retrying')
-                    AND COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), '') <= ?
-               )
-               OR (
-                    status = 'running'
-                    AND (
-                        (
-                            COALESCE(lease_token, '') = ''
-                            AND COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), '') <= ?
-                        )
-                        OR (
-                            COALESCE(lease_token, '') != ''
-                            AND (
-                                COALESCE(lease_expires_at, '') = ''
-                                OR lease_expires_at <= ?
-                                OR COALESCE(heartbeat_at, '') = ''
-                                OR heartbeat_at <= ?
-                            )
-                        )
-                    )
-               )
-            """,
-            (now, now, 1 if include_queued else 0, stale_before, stale_before, now, stale_before),
-        )
-        conn.commit()
-        return cur.rowcount
+mark_interrupted_mobile_jobs = _job_repository.mark_interrupted_mobile_jobs
 
 
-def count_mobile_jobs_by_status(db_path: Path) -> dict[str, int]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT status, COUNT(*) AS count
-            FROM mobile_jobs
-            GROUP BY status
-            """
-        ).fetchall()
-        return {str(row["status"]): int(row["count"]) for row in rows}
+count_mobile_jobs_by_status = _job_repository.count_mobile_jobs_by_status
 
 
-def request_cancel_mobile_job(db_path: Path, *, job_id: str) -> bool:
-    now = datetime.now(timezone.utc).isoformat()
-    with get_connection(db_path) as conn:
-        row = conn.execute("SELECT status FROM mobile_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        if not row:
-            return False
-        status = str(row["status"] or "").lower()
-        if status in {"completed", "failed", "cancelled", "canceled", "interrupted"}:
-            return True
-        if status in {"pending", "queued", "retrying"}:
-            cur = conn.execute(
-                """
-                UPDATE mobile_jobs
-                SET cancel_requested = 1,
-                    status = 'cancelled',
-                    state = 'CANCELED',
-                    message = 'Job cancelled before claim',
-                    updated_at = ?,
-                    finished_at = ?
-                WHERE job_id = ?
-                """,
-                (now, now, job_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE mobile_jobs
-                SET cancel_requested = 1,
-                    message = 'Cancel requested',
-                    updated_at = ?
-                WHERE job_id = ?
-                """,
-                (now, job_id),
-            )
-        conn.commit()
-        return cur.rowcount > 0
+request_cancel_mobile_job = _job_repository.request_cancel_mobile_job
 
 
-def record_job_log(
-    db_path: Path,
-    *,
-    job_id: str,
-    event_type: str,
-    state: str = "",
-    step: str = "",
-    message: str = "",
-    details: dict[str, Any] | None = None,
-) -> int:
-    safe_message = _sanitize_job_log_message(message)
-    safe_details = _sanitize_job_log_details(details)
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO job_logs
-            (job_id, event_type, state, step, message, details_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                event_type,
-                state,
-                step,
-                safe_message,
-                json.dumps(safe_details, ensure_ascii=False),
-            ),
-        )
-        conn.commit()
-        return cur.lastrowid
+record_job_log = _job_repository.record_job_log
 
 
-def get_job_logs(db_path: Path, job_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-    safe_limit = min(MAX_JOB_LOG_LIMIT, max(0, int(limit)))
-    safe_offset = max(0, int(offset))
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM job_logs
-            WHERE job_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            OFFSET ?
-            """,
-            (job_id, safe_limit, safe_offset),
-        ).fetchall()
-    logs: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        item["details"] = _decode_json_field(item.pop("details_json", None), {})
-        logs.append(item)
-    return logs
+get_job_logs = _job_repository.get_job_logs
 
 
 # ── Source Catalog ─────────────────────────────────────────────────────────────
@@ -3451,1007 +2917,77 @@ def list_source_adapter_candidates(
 
 # ── Books ──────────────────────────────────────────────────────────────────
 
-def add_book(
-    db_path: Path,
-    title: str,
-    author: str = "",
-    source: str = "manual",
-    source_url: str = "",
-    cover_path: str = "",
-    owner_user_id: str = "",
-) -> int:
-    book_key = normalize_book_key(title)
-    resolved_owner_user_id = _resolve_owner_user_id_for_write(db_path, owner_user_id)
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO books (title, book_key, owner_user_id, author, source, source_url, cover_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (title, book_key, resolved_owner_user_id, author, source, source_url, cover_path),
-        )
-        conn.commit()
-        return cur.lastrowid
+add_book = _book_repository.add_book
 
 
-def get_book_by_title(db_path: Path, title: str) -> Optional[dict]:
-    book_key = normalize_book_key(title)
-    with get_connection(db_path) as conn:
-        row = conn.execute("SELECT * FROM books WHERE title = ?", (title,)).fetchone()
-        if not row and book_key:
-            row = conn.execute(
-                "SELECT * FROM books WHERE book_key = ? ORDER BY id ASC LIMIT 1",
-                (book_key,),
-            ).fetchone()
-        return dict(row) if row else None
+get_book_by_title = _book_repository.get_book_by_title
 
 
-def get_book_by_id(db_path: Path, book_id: int) -> Optional[dict]:
-    with get_connection(db_path) as conn:
-        row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
-        return dict(row) if row else None
+get_book_by_id = _book_repository.get_book_by_id
 
 
-def list_books(db_path: Path) -> list[dict]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute("SELECT * FROM books ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+list_books = _book_repository.list_books
 
 
-def list_books_with_active_chapters(db_path: Path) -> list[dict]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT books.*
-            FROM books
-            WHERE EXISTS (
-                SELECT 1
-                FROM chapters
-                WHERE chapters.book_id = books.id
-                  AND chapters.deleted_at IS NULL
-            )
-            ORDER BY books.id DESC
-            """
-        ).fetchall()
-        return [dict(row) for row in rows]
+list_books_with_active_chapters = _book_repository.list_books_with_active_chapters
 
 
-def list_translated_book_summaries(db_path: Path) -> list[dict]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            WITH active_chapters AS (
-                SELECT
-                    chapters.*,
-                    CASE
-                        WHEN COALESCE(chapters.translated_text_path, '') != ''
-                          OR COALESCE(chapters.content_html_path, '') != ''
-                          OR chapters.status IN ('translated', 'qa_low', 'audio_done')
-                        THEN 1 ELSE 0
-                    END AS has_translation
-                FROM chapters
-                WHERE chapters.deleted_at IS NULL
-            ),
-            chapter_counts AS (
-                SELECT
-                    book_id,
-                    COUNT(*) AS total_chapters,
-                    SUM(has_translation) AS translated_chapters,
-                    SUM(CASE WHEN COALESCE(audio_path, '') != '' THEN 1 ELSE 0 END) AS audio_chapters,
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_chapters,
-                    SUM(CASE WHEN status = 'qa_low' THEN 1 ELSE 0 END) AS qa_low_chapters
-                FROM active_chapters
-                GROUP BY book_id
-            ),
-            translated_ranked AS (
-                SELECT
-                    book_id,
-                    id,
-                    chapter_number,
-                    title,
-                    translated_at,
-                    audio_created_at,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY book_id ORDER BY chapter_number ASC, id ASC
-                    ) AS first_rank,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY book_id ORDER BY chapter_number DESC, id DESC
-                    ) AS latest_rank
-                FROM active_chapters
-                WHERE has_translation = 1
-            ),
-            translated_bounds AS (
-                SELECT
-                    book_id,
-                    MAX(CASE WHEN first_rank = 1 THEN id END) AS first_translated_chapter_id,
-                    MAX(CASE WHEN latest_rank = 1 THEN id END) AS latest_translated_chapter_id,
-                    MAX(CASE WHEN latest_rank = 1 THEN chapter_number END) AS latest_chapter_number,
-                    MAX(CASE WHEN latest_rank = 1 THEN title END) AS latest_chapter_title,
-                    MAX(CASE WHEN latest_rank = 1 THEN translated_at END) AS latest_translated_at,
-                    MAX(CASE WHEN latest_rank = 1 THEN audio_created_at END) AS latest_audio_created_at
-                FROM translated_ranked
-                GROUP BY book_id
-            )
-            SELECT
-                books.id,
-                books.title,
-                books.author,
-                books.source,
-                books.source_url,
-                books.cover_path,
-                chapter_counts.total_chapters,
-                chapter_counts.translated_chapters,
-                chapter_counts.audio_chapters,
-                chapter_counts.failed_chapters,
-                chapter_counts.qa_low_chapters,
-                translated_bounds.first_translated_chapter_id,
-                translated_bounds.latest_translated_chapter_id,
-                translated_bounds.latest_chapter_number,
-                translated_bounds.latest_chapter_title,
-                COALESCE(
-                    NULLIF(translated_bounds.latest_translated_at, ''),
-                    NULLIF(translated_bounds.latest_audio_created_at, ''),
-                    books.created_at,
-                    ''
-                ) AS last_activity
-            FROM books
-            JOIN chapter_counts ON chapter_counts.book_id = books.id
-            JOIN translated_bounds ON translated_bounds.book_id = books.id
-            WHERE chapter_counts.translated_chapters > 0
-            ORDER BY last_activity DESC, books.id DESC
-            """
-        ).fetchall()
-        return [dict(row) for row in rows]
+list_translated_book_summaries = _book_repository.list_translated_book_summaries
 
 
-def _is_empty_value(value: object) -> bool:
-    return value is None or value == ""
+_is_empty_value = _book_repository._is_empty_value
 
 
-def _best_chapter_status(target: sqlite3.Row, source: sqlite3.Row) -> str:
-    if target["audio_path"]:
-        return target["status"] or "audio_done"
-    if source["audio_path"]:
-        return source["status"] or "audio_done"
-    if target["translated_text_path"]:
-        return target["status"] or "translated"
-    if source["translated_text_path"]:
-        return source["status"] or "translated"
-    if target["cleaned_text_path"]:
-        return target["status"] or "cleaned"
-    if source["cleaned_text_path"]:
-        return source["status"] or "cleaned"
-    return target["status"] or source["status"] or "imported"
+_best_chapter_status = _book_repository._best_chapter_status
 
 
-def _merge_chapter_into_existing(conn: sqlite3.Connection, source: sqlite3.Row, target: sqlite3.Row) -> None:
-    merged_fields = {
-        "title": target["title"] if not _is_empty_value(target["title"]) else source["title"],
-        "source_url": target["source_url"] if not _is_empty_value(target["source_url"]) else source["source_url"],
-        "adapter_id": target["adapter_id"] if not _is_empty_value(target["adapter_id"]) else source["adapter_id"],
-        "raw_text_path": target["raw_text_path"] if not _is_empty_value(target["raw_text_path"]) else source["raw_text_path"],
-        "cleaned_text_path": (
-            target["cleaned_text_path"] if not _is_empty_value(target["cleaned_text_path"]) else source["cleaned_text_path"]
-        ),
-        "translated_text_path": (
-            target["translated_text_path"]
-            if not _is_empty_value(target["translated_text_path"])
-            else source["translated_text_path"]
-        ),
-        "content_html_path": (
-            target["content_html_path"]
-            if not _is_empty_value(target["content_html_path"])
-            else source["content_html_path"]
-        ),
-        "audio_path": target["audio_path"] if not _is_empty_value(target["audio_path"]) else source["audio_path"],
-        "source_hash": target["source_hash"] if not _is_empty_value(target["source_hash"]) else source["source_hash"],
-        "status": _best_chapter_status(target, source),
-        "translated_at": target["translated_at"] or source["translated_at"],
-        "audio_created_at": target["audio_created_at"] or source["audio_created_at"],
-    }
-    conn.execute(
-        """
-        UPDATE chapters
-        SET title = ?,
-            source_url = ?,
-            adapter_id = ?,
-            raw_text_path = ?,
-            cleaned_text_path = ?,
-            translated_text_path = ?,
-            content_html_path = ?,
-            audio_path = ?,
-            source_hash = ?,
-            status = ?,
-            translated_at = ?,
-            audio_created_at = ?
-        WHERE id = ?
-        """,
-        (
-            merged_fields["title"],
-            merged_fields["source_url"],
-            merged_fields["adapter_id"],
-            merged_fields["raw_text_path"],
-            merged_fields["cleaned_text_path"],
-            merged_fields["translated_text_path"],
-            merged_fields["content_html_path"],
-            merged_fields["audio_path"],
-            merged_fields["source_hash"],
-            merged_fields["status"],
-            merged_fields["translated_at"],
-            merged_fields["audio_created_at"],
-            target["id"],
-        ),
-    )
-
-    deleted_at = datetime.now(timezone.utc).isoformat()
-    if _table_exists(conn, "reader_annotations"):
-        conn.execute(
-            """
-            UPDATE reader_annotations
-            SET book_id = ?, chapter_id = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE chapter_id = ?
-            """,
-            (target["book_id"], target["id"], source["id"]),
-        )
-    if _table_exists(conn, "reader_progress"):
-        conn.execute(
-            """
-            UPDATE OR REPLACE reader_progress
-            SET book_id = ?, chapter_id = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE chapter_id = ?
-            """,
-            (target["book_id"], target["id"], source["id"]),
-        )
-    conn.execute(
-        """
-        UPDATE chapters
-        SET chapter_number = -ABS(id),
-            status = 'deleted',
-            deleted_at = ?
-        WHERE id = ?
-        """,
-        (deleted_at, source["id"]),
-    )
+_merge_chapter_into_existing = _book_repository._merge_chapter_into_existing
 
 
-def _merge_book_into_existing(
-    conn: sqlite3.Connection,
-    source_book_id: int,
-    target_book_id: int,
-    *,
-    title: str,
-    author: str | None = None,
-    source: str | None = None,
-    source_url: str | None = None,
-    cover_path: str | None = None,
-) -> None:
-    target = conn.execute("SELECT * FROM books WHERE id = ?", (target_book_id,)).fetchone()
-    source_book = conn.execute("SELECT * FROM books WHERE id = ?", (source_book_id,)).fetchone()
-    if not target or not source_book:
-        return
-
-    target_updates = {
-        "title": title,
-        "book_key": normalize_book_key(title),
-        "author": target["author"] if not _is_empty_value(target["author"]) else (author or source_book["author"]),
-        "source": target["source"] if not _is_empty_value(target["source"]) else (source or source_book["source"]),
-        "source_url": (
-            target["source_url"] if not _is_empty_value(target["source_url"]) else (source_url or source_book["source_url"])
-        ),
-        "cover_path": (
-            target["cover_path"] if not _is_empty_value(target["cover_path"]) else (cover_path or source_book["cover_path"])
-        ),
-    }
-    conn.execute(
-        """
-        UPDATE books
-        SET title = ?,
-            book_key = ?,
-            author = ?,
-            source = ?,
-            source_url = ?,
-            cover_path = ?
-        WHERE id = ?
-        """,
-        (
-            target_updates["title"],
-            target_updates["book_key"],
-            target_updates["author"],
-            target_updates["source"],
-            target_updates["source_url"],
-            target_updates["cover_path"],
-            target_book_id,
-        ),
-    )
-
-    source_chapters = conn.execute(
-        """
-        SELECT * FROM chapters
-        WHERE book_id = ? AND deleted_at IS NULL
-        ORDER BY chapter_number ASC, id ASC
-        """,
-        (source_book_id,),
-    ).fetchall()
-    for source_chapter in source_chapters:
-        target_chapter = conn.execute(
-            """
-            SELECT * FROM chapters
-            WHERE book_id = ? AND chapter_number = ? AND deleted_at IS NULL
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (target_book_id, source_chapter["chapter_number"]),
-        ).fetchone()
-        if target_chapter:
-            _merge_chapter_into_existing(conn, source_chapter, target_chapter)
-        else:
-            conn.execute("UPDATE chapters SET book_id = ? WHERE id = ?", (target_book_id, source_chapter["id"]))
-
-    if _table_exists(conn, "glossary_terms"):
-        conn.execute(
-            """
-            UPDATE OR IGNORE glossary_terms
-            SET book_id = ?
-            WHERE book_id = ?
-            """,
-            (target_book_id, source_book_id),
-        )
-        conn.execute("DELETE FROM glossary_terms WHERE book_id = ?", (source_book_id,))
-    if _table_exists(conn, "user_corrections"):
-        conn.execute("UPDATE user_corrections SET book_id = ? WHERE book_id = ?", (target_book_id, source_book_id))
-    if _table_exists(conn, "reader_annotations"):
-        conn.execute("UPDATE reader_annotations SET book_id = ? WHERE book_id = ?", (target_book_id, source_book_id))
-    if _table_exists(conn, "reader_progress"):
-        target_progress = conn.execute("SELECT 1 FROM reader_progress WHERE book_id = ?", (target_book_id,)).fetchone()
-        if target_progress:
-            conn.execute("DELETE FROM reader_progress WHERE book_id = ?", (source_book_id,))
-        else:
-            conn.execute("UPDATE reader_progress SET book_id = ? WHERE book_id = ?", (target_book_id, source_book_id))
-    conn.execute("DELETE FROM books WHERE id = ?", (source_book_id,))
+_merge_book_into_existing = _book_repository._merge_book_into_existing
 
 
-def _consolidate_duplicate_book_keys(conn: sqlite3.Connection) -> None:
-    if not (_table_exists(conn, "books") and _table_exists(conn, "chapters")):
-        return
-
-    groups = conn.execute(
-        """
-        SELECT book_key
-        FROM books
-        WHERE book_key IS NOT NULL AND book_key != ''
-        GROUP BY book_key
-        HAVING COUNT(*) > 1
-        """
-    ).fetchall()
-    for group in groups:
-        books = conn.execute(
-            """
-            SELECT * FROM books
-            WHERE book_key = ?
-            ORDER BY id ASC
-            """,
-            (group["book_key"],),
-        ).fetchall()
-        if len(books) < 2:
-            continue
-
-        target = books[0]
-        for source_book in books[1:]:
-            _merge_book_into_existing(
-                conn,
-                int(source_book["id"]),
-                int(target["id"]),
-                title=target["title"] or source_book["title"],
-            )
+_consolidate_duplicate_book_keys = _book_repository._consolidate_duplicate_book_keys
 
 
-def update_book(
-    db_path: Path,
-    book_id: int,
-    *,
-    title: str | None = None,
-    author: str | None = None,
-    source: str | None = None,
-    source_url: str | None = None,
-    cover_path: str | None = None,
-) -> bool:
-    next_book_key = normalize_book_key(title) if title is not None else None
-
-    updates = {
-        "title": title,
-        "book_key": next_book_key,
-        "author": author,
-        "source": source,
-        "source_url": source_url,
-        "cover_path": cover_path,
-    }
-    fields = [f"{column} = ?" for column, value in updates.items() if value is not None]
-    params = [value for value in updates.values() if value is not None]
-    if not fields:
-        return get_book_by_id(db_path, book_id) is not None
-
-    with get_connection(db_path) as conn:
-        if title is not None and next_book_key:
-            target = conn.execute(
-                """
-                SELECT id FROM books
-                WHERE book_key = ? AND id != ?
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (next_book_key, book_id),
-            ).fetchone()
-            if target:
-                _merge_book_into_existing(
-                    conn,
-                    book_id,
-                    int(target["id"]),
-                    title=title,
-                    author=author,
-                    source=source,
-                    source_url=source_url,
-                    cover_path=cover_path,
-                )
-                conn.commit()
-                return True
-
-        params.append(book_id)
-        cur = conn.execute(f"UPDATE books SET {', '.join(fields)} WHERE id = ?", params)
-        conn.commit()
-        return cur.rowcount > 0
+update_book = _book_repository.update_book
 
 
-def delete_book(db_path: Path, book_id: int) -> bool:
-    with get_connection(db_path) as conn:
-        cur = conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
-        conn.commit()
-        return cur.rowcount > 0
+delete_book = _book_repository.delete_book
 
 
 # ── Ebook Import Runs ─────────────────────────────────────────────────────
 
-def record_ebook_import_run(
-    db_path: Path,
-    *,
-    book_id: int,
-    title: str,
-    filename: str,
-    source_format: str,
-    duplicate_strategy: str,
-    split_mode: str,
-    chapter_count: int,
-    imported_chapters: int,
-    skipped_chapters: int,
-    overwritten_chapters: int = 0,
-    warnings: list[dict] | None = None,
-    owner_user_id: str = "",
-) -> int:
-    warnings_json = json.dumps(warnings or [], ensure_ascii=False)
-    resolved_owner_user_id = _resolve_owner_user_id_for_write(db_path, owner_user_id)
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO ebook_import_runs (
-                book_id, owner_user_id, title, filename, source_format, duplicate_strategy,
-                split_mode, chapter_count, imported_chapters, skipped_chapters,
-                overwritten_chapters, warning_count, warnings_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                book_id,
-                resolved_owner_user_id,
-                title,
-                filename,
-                source_format,
-                duplicate_strategy,
-                split_mode,
-                chapter_count,
-                imported_chapters,
-                skipped_chapters,
-                overwritten_chapters,
-                len(warnings or []),
-                warnings_json,
-            ),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
+record_ebook_import_run = _import_repository.record_ebook_import_run
 
 
-def list_ebook_import_runs(db_path: Path, limit: int = 20) -> list[dict]:
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM ebook_import_runs
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
-    runs: list[dict] = []
-    for row in rows:
-        item = dict(row)
-        item["warnings"] = _decode_json_field(item.pop("warnings_json", "[]"), [])
-        runs.append(item)
-    return runs
+list_ebook_import_runs = _import_repository.list_ebook_import_runs
 
 
 # ── Chapters ───────────────────────────────────────────────────────────────
 
-def find_import_book_with_connection(
-    conn: sqlite3.Connection,
-    *,
-    title: str,
-    target_book_id: int | None = None,
-) -> Optional[dict]:
-    if target_book_id is not None:
-        row = conn.execute("SELECT * FROM books WHERE id = ?", (target_book_id,)).fetchone()
-        return dict(row) if row else None
-
-    book_key = normalize_book_key(title)
-    row = conn.execute("SELECT * FROM books WHERE title = ?", (title,)).fetchone()
-    if not row and book_key:
-        row = conn.execute(
-            "SELECT * FROM books WHERE book_key = ? ORDER BY id ASC LIMIT 1",
-            (book_key,),
-        ).fetchone()
-    return dict(row) if row else None
+find_import_book_with_connection = _book_repository.find_import_book_with_connection
 
 
-def resolve_import_book_with_connection(
-    conn: sqlite3.Connection,
-    *,
-    title: str,
-    author: str = "",
-    source: str = "wizard",
-    source_url: str = "",
-    canonical_source_url: str = "",
-    target_book_id: int | None = None,
-) -> dict:
-    book = find_import_book_with_connection(
-        conn,
-        title=title,
-        target_book_id=target_book_id,
-    )
-    if target_book_id is not None and not book:
-        raise ValueError(f"Book {target_book_id} not found")
-
-    if book:
-        updates: list[str] = []
-        params: list[Any] = []
-        if author and not str(book.get("author") or ""):
-            updates.append("author = ?")
-            params.append(author)
-        current_source = str(book.get("source") or "")
-        if source and (not current_source or current_source == "manual"):
-            updates.append("source = ?")
-            params.append(source)
-        if source_url and not str(book.get("source_url") or ""):
-            updates.append("source_url = ?")
-            params.append(source_url)
-        if canonical_source_url and not str(book.get("canonical_source_url") or ""):
-            updates.append("canonical_source_url = ?")
-            params.append(canonical_source_url)
-        if updates:
-            params.append(int(book["id"]))
-            conn.execute(f"UPDATE books SET {', '.join(updates)} WHERE id = ?", params)
-            row = conn.execute("SELECT * FROM books WHERE id = ?", (int(book["id"]),)).fetchone()
-            book = dict(row)
-        return book
-
-    operator_user = _seed_operator_user_from_env(conn)
-    owner_user_id = str(operator_user.get("id") or "")
-    cursor = conn.execute(
-        """
-        INSERT INTO books (
-            title, book_key, owner_user_id, author, source, source_url, canonical_source_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            title,
-            normalize_book_key(title),
-            owner_user_id,
-            author,
-            source,
-            source_url,
-            canonical_source_url,
-        ),
-    )
-    row = conn.execute("SELECT * FROM books WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return dict(row)
+resolve_import_book_with_connection = _book_repository.resolve_import_book_with_connection
 
 
-def list_active_import_chapters_with_connection(
-    conn: sqlite3.Connection,
-    book_id: int,
-) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM chapters
-        WHERE book_id = ? AND deleted_at IS NULL
-        ORDER BY chapter_number ASC, id ASC
-        """,
-        (book_id,),
-    ).fetchall()
-    return [dict(row) for row in rows]
+list_active_import_chapters_with_connection = _import_repository.list_active_import_chapters_with_connection
 
 
-def insert_import_chapter_with_connection(
-    conn: sqlite3.Connection,
-    *,
-    book_id: int,
-    chapter_number: int,
-    title: str,
-    raw_text_path: Path | None,
-    translated_text_path: Path | None,
-    source_hash: str,
-    status: str,
-) -> int:
-    cursor = conn.execute(
-        """
-        INSERT INTO chapters (
-            book_id, chapter_number, title, raw_text_path, translated_text_path,
-            source_hash, status, translated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END)
-        """,
-        (
-            book_id,
-            chapter_number,
-            title,
-            str(raw_text_path) if raw_text_path else None,
-            str(translated_text_path) if translated_text_path else None,
-            source_hash,
-            status,
-            str(translated_text_path) if translated_text_path else None,
-        ),
-    )
-    return int(cursor.lastrowid)
+insert_import_chapter_with_connection = _import_repository.insert_import_chapter_with_connection
 
 
-def update_import_chapter_with_connection(
-    conn: sqlite3.Connection,
-    *,
-    chapter_id: int,
-    title: str,
-    raw_text_path: Path | None,
-    translated_text_path: Path | None,
-    status: str,
-) -> None:
-    fields = ["title = ?", "status = ?"]
-    params: list[Any] = [title, status]
-    if raw_text_path is not None:
-        fields.append("raw_text_path = ?")
-        params.append(str(raw_text_path))
-    if translated_text_path is not None:
-        fields.extend(["translated_text_path = ?", "translated_at = CURRENT_TIMESTAMP"])
-        params.append(str(translated_text_path))
-    params.append(chapter_id)
-    conn.execute(f"UPDATE chapters SET {', '.join(fields)} WHERE id = ?", params)
+update_import_chapter_with_connection = _import_repository.update_import_chapter_with_connection
 
 
-def _active_chapter_by_canonical_identity(
-    conn: sqlite3.Connection,
-    *,
-    book_id: int,
-    adapter_id: str,
-    canonical_chapter_url: str,
-) -> sqlite3.Row | None:
-    if not adapter_id or not canonical_chapter_url:
-        return None
-    return conn.execute(
-        """
-        SELECT * FROM chapters
-        WHERE book_id = ?
-          AND adapter_id = ?
-          AND canonical_chapter_url = ?
-          AND deleted_at IS NULL
-        LIMIT 1
-        """,
-        (book_id, adapter_id, canonical_chapter_url),
-    ).fetchone()
+_active_chapter_by_canonical_identity = _import_repository._active_chapter_by_canonical_identity
 
 
-def upsert_import_chapter_with_connection(
-    conn: sqlite3.Connection,
-    *,
-    book_id: int,
-    chapter_number: int,
-    title: str,
-    source_url: str,
-    canonical_chapter_url: str,
-    adapter_id: str,
-    raw_text_path: Path,
-    content_hash: str,
-    source_updated_at: str,
-) -> ImportChapterUpsert:
-    """Store one sourced chapter using canonical URL identity.
-
-    A canonical identity is only available for source-backed imports.  Manual
-    pastes intentionally keep the existing chapter-number duplicate behavior.
-    The caller owns the surrounding transaction and artifact cleanup.
-    """
-    existing = _active_chapter_by_canonical_identity(
-        conn,
-        book_id=book_id,
-        adapter_id=adapter_id,
-        canonical_chapter_url=canonical_chapter_url,
-    )
-    if existing is not None:
-        existing_hash = str(existing["content_hash"] or existing["source_hash"] or "")
-        if existing_hash == content_hash:
-            conn.execute(
-                "UPDATE chapters SET last_import_operation = 'skipped_duplicate' WHERE id = ?",
-                (existing["id"],),
-            )
-            return ImportChapterUpsert(
-                chapter_id=int(existing["id"]),
-                operation="skipped_duplicate",
-                content_hash=existing_hash,
-                content_revision=max(1, int(existing["content_revision"] or 1)),
-                raw_text_path=str(existing["raw_text_path"] or ""),
-            )
-
-        next_revision = max(1, int(existing["content_revision"] or 1)) + 1
-        conn.execute(
-            """
-            UPDATE chapters
-            SET chapter_number = ?, title = ?, source_url = ?,
-                canonical_chapter_url = ?, adapter_id = ?, raw_text_path = ?,
-                source_hash = ?, content_hash = ?, source_updated_at = ?,
-                last_import_operation = 'updated', content_revision = ?
-            WHERE id = ?
-            """,
-            (
-                chapter_number,
-                title,
-                source_url,
-                canonical_chapter_url,
-                adapter_id,
-                str(raw_text_path),
-                content_hash,
-                content_hash,
-                source_updated_at,
-                next_revision,
-                existing["id"],
-            ),
-        )
-        return ImportChapterUpsert(
-            chapter_id=int(existing["id"]),
-            operation="updated",
-            content_hash=content_hash,
-            content_revision=next_revision,
-            raw_text_path=str(raw_text_path),
-        )
-
-    if not canonical_chapter_url:
-        duplicate_number = conn.execute(
-            """
-            SELECT id FROM chapters
-            WHERE book_id = ? AND chapter_number = ? AND deleted_at IS NULL
-            LIMIT 1
-            """,
-            (book_id, chapter_number),
-        ).fetchone()
-        if duplicate_number is not None:
-            raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id}")
-
-    try:
-        cursor = conn.execute(
-            """
-            INSERT INTO chapters (
-                book_id, chapter_number, title, source_url, canonical_chapter_url,
-                adapter_id, raw_text_path, source_hash, content_hash,
-                source_updated_at, last_import_operation, content_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', 1)
-            """,
-            (
-                book_id,
-                chapter_number,
-                title,
-                source_url,
-                canonical_chapter_url,
-                adapter_id,
-                str(raw_text_path),
-                content_hash,
-                content_hash,
-                source_updated_at,
-            ),
-        )
-    except sqlite3.IntegrityError:
-        # A concurrent import can win after this transaction has started.
-        # Re-read the identity and return its idempotent outcome instead of a 500.
-        existing = _active_chapter_by_canonical_identity(
-            conn,
-            book_id=book_id,
-            adapter_id=adapter_id,
-            canonical_chapter_url=canonical_chapter_url,
-        )
-        if existing is None:
-            raise
-        existing_hash = str(existing["content_hash"] or existing["source_hash"] or "")
-        if existing_hash == content_hash:
-            return ImportChapterUpsert(
-                chapter_id=int(existing["id"]),
-                operation="skipped_duplicate",
-                content_hash=existing_hash,
-                content_revision=max(1, int(existing["content_revision"] or 1)),
-                raw_text_path=str(existing["raw_text_path"] or ""),
-            )
-        next_revision = max(1, int(existing["content_revision"] or 1)) + 1
-        conn.execute(
-            """
-            UPDATE chapters
-            SET chapter_number = ?, title = ?, source_url = ?, raw_text_path = ?,
-                source_hash = ?, content_hash = ?, source_updated_at = ?,
-                last_import_operation = 'updated', content_revision = ?
-            WHERE id = ?
-            """,
-            (
-                chapter_number,
-                title,
-                source_url,
-                str(raw_text_path),
-                content_hash,
-                content_hash,
-                source_updated_at,
-                next_revision,
-                existing["id"],
-            ),
-        )
-        return ImportChapterUpsert(
-            chapter_id=int(existing["id"]),
-            operation="updated",
-            content_hash=content_hash,
-            content_revision=next_revision,
-            raw_text_path=str(raw_text_path),
-        )
-
-    return ImportChapterUpsert(
-        chapter_id=int(cursor.lastrowid),
-        operation="created",
-        content_hash=content_hash,
-        content_revision=1,
-        raw_text_path=str(raw_text_path),
-    )
+upsert_import_chapter_with_connection = _import_repository.upsert_import_chapter_with_connection
 
 
-def add_chapter(
-    db_path: Path,
-    book_id: int,
-    chapter_number: int,
-    title: str,
-    source_url: str = "",
-    raw_text_path: Optional[Path] = None,
-    source_hash: str = "",
-    adapter_id: str = "",
-) -> int:
-    with get_connection(db_path) as conn:
-        duplicate_number = conn.execute(
-            """
-            SELECT id FROM chapters
-            WHERE book_id = ? AND chapter_number = ? AND deleted_at IS NULL
-            LIMIT 1
-            """,
-            (book_id, chapter_number),
-        ).fetchone()
-        if duplicate_number:
-            raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id}")
-        if source_hash:
-            duplicate_source = conn.execute(
-                """
-                SELECT id FROM chapters
-                WHERE book_id = ? AND source_hash = ? AND deleted_at IS NULL
-                LIMIT 1
-                """,
-                (book_id, source_hash),
-            ).fetchone()
-            if duplicate_source:
-                raise ValueError(f"Duplicate chapter source for book {book_id}")
-        cur = conn.execute(
-            """INSERT INTO chapters (book_id, chapter_number, title, source_url, adapter_id, raw_text_path, source_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                book_id,
-                chapter_number,
-                title,
-                source_url,
-                adapter_id,
-                str(raw_text_path) if raw_text_path else None,
-                source_hash,
-            ),
-        )
-        conn.commit()
-        return cur.lastrowid
-
-
-def update_chapter_paths(
-    db_path: Path,
-    chapter_id: int,
-    *,
-    title: Optional[str] = None,
-    raw_text_path: Optional[Path] = None,
-    cleaned_text_path: Optional[Path] = None,
-    translated_text_path: Optional[Path] = None,
-    content_html_path: Optional[Path] = None,
-    clear_content_html_path: bool = False,
-    audio_path: Optional[Path] = None,
-    status: Optional[str] = None,
-) -> None:
-    fields = []
-    params: list = []
-    if title is not None:
-        fields.append("title = ?")
-        params.append(title)
-    if raw_text_path is not None:
-        fields.append("raw_text_path = ?")
-        params.append(str(raw_text_path))
-    if cleaned_text_path is not None:
-        fields.append("cleaned_text_path = ?")
-        params.append(str(cleaned_text_path))
-    if translated_text_path is not None:
-        fields.append("translated_text_path = ?")
-        params.append(str(translated_text_path))
-    if content_html_path is not None:
-        fields.append("content_html_path = ?")
-        params.append(str(content_html_path))
-    if clear_content_html_path:
-        fields.append("content_html_path = NULL")
-    if audio_path is not None:
-        fields.append("audio_path = ?")
-        params.append(str(audio_path))
-    if status is not None:
-        fields.append("status = ?")
-        params.append(status)
-    if translated_text_path is not None:
-        fields.append("translated_at = CURRENT_TIMESTAMP")
-    if audio_path is not None:
-        fields.append("audio_created_at = CURRENT_TIMESTAMP")
-    if not fields:
-        return
-    params.append(chapter_id)
-    with get_connection(db_path) as conn:
-        conn.execute(f"UPDATE chapters SET {', '.join(fields)} WHERE id = ?", params)
-        conn.commit()
-
-
-def get_chapter(db_path: Path, book_id: int, chapter_number: int) -> Optional[dict]:
-    with get_connection(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM chapters
-            WHERE book_id = ? AND chapter_number = ? AND deleted_at IS NULL
-            """,
-            (book_id, chapter_number),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def get_chapter_by_id(db_path: Path, chapter_id: int, include_deleted: bool = False) -> Optional[dict]:
-    with get_connection(db_path) as conn:
-        sql = "SELECT * FROM chapters WHERE id = ?"
-        if not include_deleted:
-            sql += " AND deleted_at IS NULL"
-        row = conn.execute(sql, (chapter_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def list_chapters(db_path: Path, book_id: Optional[int] = None, include_deleted: bool = False) -> list[dict]:
-    deleted_clause = "" if include_deleted else "deleted_at IS NULL"
-    with get_connection(db_path) as conn:
-        if book_id is not None:
-            where = "book_id = ?"
-            if deleted_clause:
-                where += f" AND {deleted_clause}"
-            rows = conn.execute(
-                f"SELECT * FROM chapters WHERE {where} ORDER BY chapter_number DESC",
-                (book_id,),
-            ).fetchall()
-        else:
-            where = f"WHERE {deleted_clause}" if deleted_clause else ""
-            rows = conn.execute(f"SELECT * FROM chapters {where} ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+add_chapter = _import_repository.add_chapter
 
 
 def _delete_mobile_jobs_for_chapter(conn: sqlite3.Connection, chapter_id: int) -> None:
@@ -4492,7 +3028,8 @@ def delete_chapter_translation_data(db_path: Path, chapter_id: int) -> bool:
                 audio_path = NULL,
                 translated_at = NULL,
                 audio_created_at = NULL,
-                status = 'cleaned'
+                status = 'cleaned', translation_hash = NULL, audio_translation_hash = NULL,
+                quality_status = 'unreviewed', content_revision = content_revision + 1
             WHERE id = ?
             """,
             (chapter_id,),
@@ -4532,473 +3069,45 @@ def soft_delete_chapter(db_path: Path, chapter_id: int) -> bool:
         return True
 
 
-def sort_glossary_terms(terms: list[dict]) -> list[dict]:
-    """Sort glossary terms by priority (high first), then by source term length (longer first), then alphabetically.
-
-    OmegaT-style sorting: priority entries first, then longer source terms (more specific), then alphabetical.
-    """
-    return sorted(terms, key=lambda t: (
-        -t.get('priority', 0),           # high priority first
-        -len(t.get('source_term', '')),  # longer source first (more specific)
-        t.get('source_term', '').lower(),
-    ))
+sort_glossary_terms = _glossary_repository.sort_glossary_terms
 
 
 # ── Glossary ───────────────────────────────────────────────────────────────
 
-def _split_glossary_variants(variants: str | None) -> list[str]:
-    if not variants:
-        return []
-    normalized = variants
-    for separator in ("|", "/", ",", "，", ";", "；", "\n", "\r"):
-        normalized = normalized.replace(separator, "|")
-    seen: set[str] = set()
-    result: list[str] = []
-    for variant in (part.strip() for part in normalized.split("|")):
-        if variant and variant not in seen:
-            seen.add(variant)
-            result.append(variant)
-    return result
+_split_glossary_variants = _glossary_repository._split_glossary_variants
 
 
-def _styleguide_locked_term_row(term: dict, index: int = 0) -> dict:
-    term_type = str(term.get("term_type") or "term").strip() or "term"
-    return {
-        "id": -100000 - index,
-        "book_id": 0,
-        "source_term": str(term.get("source") or "").strip(),
-        "target_term": str(term.get("target") or "").strip(),
-        "category": term_type,
-        "approved": 1,
-        "mode": str(term.get("mode") or "translate").strip() or "translate",
-        "pinyin": str(term.get("pinyin") or "").strip(),
-        "notes_vi": str(term.get("note") or "").strip(),
-        "variants": str(term.get("variants") or "").strip(),
-        "occurrence_count": 0,
-        "priority": int(term.get("priority") or 0),
-        "locked": 1,
-        "genre": str(term.get("genre") or "").strip(),
-        "term_type": term_type,
-    }
+_styleguide_locked_term_row = _glossary_repository._styleguide_locked_term_row
 
 
-def _styleguide_locked_term_rows(genre: str | None = None) -> list[dict]:
-    rows: list[dict] = []
-    for index, term in enumerate(get_locked_terms()):
-        row = _styleguide_locked_term_row(term, index)
-        if not row["source_term"] or not row["target_term"]:
-            continue
-        if genre and row["genre"] and row["genre"] != genre:
-            continue
-        rows.append(row)
-    return rows
+_styleguide_locked_term_rows = _glossary_repository._styleguide_locked_term_rows
 
 
-def load_glossary(db_path: Path, book_id: int = 0) -> dict[str, str]:
-    """Load approved translate-mode glossary terms for forced substitution.
-
-    Only returns terms with mode='translate'. Terms with mode='context' or
-    mode='transliterate' are handled separately (prompt context / name map).
-    """
-    glossary: dict[str, str] = {}
-    for term in _styleguide_locked_term_rows():
-        if term["mode"] != "translate":
-            continue
-        glossary[term["source_term"]] = term["target_term"]
-        for variant in _split_glossary_variants(term.get("variants")):
-            glossary.setdefault(variant, term["target_term"])
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """SELECT source_term, target_term, variants FROM glossary_terms
-               WHERE book_id IN (0, ?) AND approved = 1 AND mode = 'translate'
-               ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC""",
-            (book_id,),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+load_glossary = _glossary_repository.load_glossary
 
 
-def put_glossary_term(
-    db_path: Path,
-    book_id: int,
-    source: str,
-    target: str,
-    category: str = "term",
-    mode: str = "translate",
-    pinyin: str = "",
-    notes_vi: str = "",
-    variants: str = "",
-    approved: int = 1,
-    priority: int = 0,
-    locked: int = 0,
-    genre: str = "",
-    term_type: str = "term",
-    alternatives: str = "",
-    gender: str = "",
-    first_seen_chapter_id: int = 0,
-    first_seen_chapter_number: int = 0,
-    review_status: str = "",
-    source_context: str = "",
-) -> None:
-    """Insert or update a glossary term, tracking occurrence count.
-
-    On insert: sets occurrence_count = 1, last_seen = CURRENT_TIMESTAMP,
-    approved = provided value (default 1).
-    On conflict (existing term): increments occurrence_count,
-    updates last_seen, updates other fields (target, category, mode, pinyin,
-    notes_vi, variants) but keeps the existing approved status.
-    """
-    source = str(source or "").strip()
-    target = str(target or "").strip()
-    if not source:
-        return
-    normalized_review_status = _glossary_review_status(approved=approved, locked=locked, review_status=review_status)
-    with get_connection(db_path) as conn:
-        # Get current values for history logging
-        cur = conn.execute(
-            "SELECT target_term, mode FROM glossary_terms WHERE book_id = ? AND source_term = ?",
-            (book_id, source),
-        )
-        row = cur.fetchone()
-        old_target = row[0] if row else ""
-        old_mode = row[1] if row else ""
-
-        conn.execute(
-            """
-            INSERT INTO glossary_terms
-            (book_id, source_term, target_term, category, approved, mode, pinyin,
-             notes_vi, variants, occurrence_count, priority, locked, genre, term_type,
-             alternatives, gender, first_seen_chapter_id, first_seen_chapter_number,
-             review_status, source_context, last_seen, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            ON CONFLICT(book_id, source_term) DO UPDATE SET
-                target_term = CASE
-                    WHEN NULLIF(excluded.target_term, '') IS NULL THEN glossary_terms.target_term
-                    WHEN glossary_terms.locked = 1 AND excluded.approved <= 0 THEN glossary_terms.target_term
-                    WHEN glossary_terms.approved = 1 AND excluded.approved <= 0 THEN glossary_terms.target_term
-                    WHEN glossary_terms.approved < 0 AND excluded.approved <= 0 THEN glossary_terms.target_term
-                    ELSE excluded.target_term
-                END,
-                category = excluded.category,
-                mode = excluded.mode,
-                pinyin = excluded.pinyin,
-                notes_vi = excluded.notes_vi,
-                variants = excluded.variants,
-                priority = excluded.priority,
-                locked = CASE WHEN glossary_terms.locked = 1 THEN glossary_terms.locked ELSE excluded.locked END,
-                genre = excluded.genre,
-                term_type = excluded.term_type,
-                alternatives = COALESCE(NULLIF(excluded.alternatives, ''), glossary_terms.alternatives),
-                gender = COALESCE(NULLIF(excluded.gender, ''), glossary_terms.gender),
-                first_seen_chapter_id = CASE
-                    WHEN glossary_terms.first_seen_chapter_id IS NULL OR glossary_terms.first_seen_chapter_id = 0
-                    THEN excluded.first_seen_chapter_id
-                    ELSE glossary_terms.first_seen_chapter_id
-                END,
-                first_seen_chapter_number = CASE
-                    WHEN glossary_terms.first_seen_chapter_number IS NULL OR glossary_terms.first_seen_chapter_number = 0
-                    THEN excluded.first_seen_chapter_number
-                    ELSE glossary_terms.first_seen_chapter_number
-                END,
-                review_status = CASE
-                    WHEN glossary_terms.review_status IN ('APPROVED', 'LOCKED', 'REJECTED', 'CONFLICT')
-                    THEN glossary_terms.review_status
-                    ELSE excluded.review_status
-                END,
-                source_context = COALESCE(NULLIF(excluded.source_context, ''), glossary_terms.source_context),
-                occurrence_count = glossary_terms.occurrence_count + 1,
-                last_seen = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (
-                book_id,
-                source,
-                target,
-                category,
-                approved,
-                mode,
-                pinyin,
-                notes_vi,
-                variants,
-                priority,
-                locked,
-                genre,
-                term_type,
-                alternatives,
-                gender,
-                first_seen_chapter_id,
-                first_seen_chapter_number,
-                normalized_review_status,
-                source_context,
-            ),
-        )
-
-        # Log the change for history
-        if old_target or old_mode:
-            # Update
-            log_glossary_change(
-                conn, book_id, source, "update",
-                target, old_target, old_mode, mode
-            )
-        else:
-            # Insert
-            log_glossary_change(
-                conn, book_id, source, "add",
-                target, "", "", mode
-            )
-
-        conn.commit()
+put_glossary_term = _glossary_repository.put_glossary_term
 
 
-def update_glossary_term(
-    db_path: Path,
-    term_id: int,
-    *,
-    target_term: str | None = None,
-    category: str | None = None,
-    mode: str | None = None,
-    pinyin: str | None = None,
-    notes_vi: str | None = None,
-    variants: str | None = None,
-    approved: int | None = None,
-    priority: int | None = None,
-    locked: int | None = None,
-    genre: str | None = None,
-    term_type: str | None = None,
-    alternatives: str | None = None,
-    gender: str | None = None,
-    review_status: str | None = None,
-    source_context: str | None = None,
-) -> bool:
-    """Update glossary metadata without changing occurrence_count."""
-    if mode is not None and mode not in {"", "translate", "context", "transliterate"}:
-        raise ValueError(f"Invalid mode: {mode}")
-
-    updates = {
-        "target_term": target_term,
-        "category": category,
-        "mode": mode,
-        "pinyin": pinyin,
-        "notes_vi": notes_vi,
-        "variants": variants,
-        "approved": approved,
-        "priority": priority,
-        "locked": locked,
-        "genre": genre,
-        "term_type": term_type,
-        "alternatives": alternatives,
-        "gender": gender,
-        "review_status": review_status,
-        "source_context": source_context,
-    }
-    fields = [f"{column} = ?" for column, value in updates.items() if value is not None]
-    params = [value for value in updates.values() if value is not None]
-
-    with get_connection(db_path) as conn:
-        current = conn.execute(
-            "SELECT * FROM glossary_terms WHERE id = ?",
-            (term_id,),
-        ).fetchone()
-        if not current:
-            return False
-        if not fields:
-            return True
-        fields.append("updated_at = CURRENT_TIMESTAMP")
-
-        params.append(term_id)
-        cur = conn.execute(f"UPDATE glossary_terms SET {', '.join(fields)} WHERE id = ?", params)
-        new_target = target_term if target_term is not None else current["target_term"]
-        new_mode = mode if mode is not None else current["mode"]
-        log_glossary_change(
-            conn,
-            current["book_id"],
-            current["source_term"],
-            "update",
-            new_target,
-            current["target_term"],
-            current["mode"],
-            new_mode,
-        )
-        conn.commit()
-        return cur.rowcount > 0
+update_glossary_term = _glossary_repository.update_glossary_term
 
 
-def list_glossary(db_path: Path, book_id: Optional[int] = None) -> list[dict]:
-    with get_connection(db_path) as conn:
-        if book_id is not None:
-            rows = conn.execute(
-                "SELECT * FROM glossary_terms WHERE book_id IN (0, ?) ORDER BY created_at DESC",
-                (book_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM glossary_terms ORDER BY created_at DESC").fetchall()
-        return [dict(r) for r in rows]
+list_glossary = _glossary_repository.list_glossary
 
 
-def load_locked_glossary_terms(
-    db_path: Path,
-    book_id: int = 0,
-    genre: str | None = None,
-) -> list[dict]:
-    """Load approved locked glossary terms for prompt enforcement."""
-    with get_connection(db_path) as conn:
-        params: list[object] = [book_id]
-        genre_clause = ""
-        if genre:
-            genre_clause = "AND (genre = '' OR genre = ?)"
-            params.append(genre)
-        rows = conn.execute(
-            f"""
-            SELECT * FROM glossary_terms
-            WHERE book_id IN (0, ?)
-              AND approved = 1
-              AND locked = 1
-              {genre_clause}
-            ORDER BY book_id DESC, priority DESC, LENGTH(source_term) DESC
-            """,
-            params,
-        ).fetchall()
-        db_terms = [dict(row) for row in rows]
-    seen_sources = {str(term.get("source_term") or "") for term in db_terms}
-    combined = db_terms + [
-        term for term in _styleguide_locked_term_rows(genre=genre)
-        if term["source_term"] not in seen_sources
-    ]
-    combined.sort(
-        key=lambda term: (
-            int(term.get("book_id") or 0),
-            int(term.get("priority") or 0),
-            len(str(term.get("source_term") or "")),
-        ),
-        reverse=True,
-    )
-    return combined
+load_locked_glossary_terms = _glossary_repository.load_locked_glossary_terms
 
 
-def select_prompt_glossary_terms(
-    db_path: Path,
-    book_id: int,
-    source_text: str,
-    *,
-    max_terms: int = 40,
-    max_chars: int = 2200,
-) -> list[dict]:
-    """Select a bounded, deterministic glossary subset for prompt injection.
-
-    Rejected/pending terms are excluded. Book-specific rows naturally override
-    global rows because they sort before global rows for the same source term.
-    """
-    source_text = source_text or ""
-    selected: list[dict] = []
-    used_chars = 0
-    seen_sources: set[str] = set()
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM glossary_terms
-            WHERE book_id IN (0, ?)
-              AND approved = 1
-              AND COALESCE(review_status, '') != 'REJECTED'
-              AND source_term != ''
-              AND target_term != ''
-            ORDER BY
-              locked DESC,
-              book_id DESC,
-              priority DESC,
-              confidence DESC,
-              occurrence_count DESC,
-              LENGTH(source_term) DESC,
-              source_term ASC
-            """,
-            (book_id,),
-        ).fetchall()
-    for row in rows:
-        term = dict(row)
-        source = str(term.get("source_term") or "")
-        target = str(term.get("target_term") or "")
-        if source in seen_sources:
-            continue
-        if source and source not in source_text and not int(term.get("locked") or 0):
-            continue
-        line_len = len(source) + len(target) + 8
-        if selected and used_chars + line_len > max_chars:
-            continue
-        selected.append(term)
-        seen_sources.add(source)
-        used_chars += line_len
-        if len(selected) >= max_terms:
-            break
-    return selected
+select_prompt_glossary_terms = _glossary_repository.select_prompt_glossary_terms
 
 
-def set_glossary_term_locked(db_path: Path, term_id: int, locked: bool) -> bool:
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE glossary_terms
-            SET locked = ?,
-                review_status = CASE
-                    WHEN ? = 1 THEN 'LOCKED'
-                    WHEN approved = 1 THEN 'APPROVED'
-                    WHEN approved < 0 THEN 'REJECTED'
-                    ELSE 'NEEDS_REVIEW'
-                END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (1 if locked else 0, 1 if locked else 0, term_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+set_glossary_term_locked = _glossary_repository.set_glossary_term_locked
 
 
-def load_glossary_by_mode(db_path: Path, book_id: int = 0, mode: str = "translate") -> dict[str, str]:
-    """Load glossary filtered by mode (translate/context/transliterate)."""
-    glossary: dict[str, str] = {}
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT source_term, target_term, variants FROM glossary_terms
-            WHERE book_id IN (0, ?) AND approved = 1 AND mode = ?
-            ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC
-            """,
-            (book_id, mode),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+load_glossary_by_mode = _glossary_repository.load_glossary_by_mode
 
 
-def load_glossary_names(db_path: Path, book_id: int = 0) -> dict[str, str]:
-    """Load transliteration / name map for use in the translation prompt.
-
-    Includes all name-related categories:
-    - ho_ten_pho_bien: common Vietnamese names
-    - pntt_ten_rieng: book-specific character names (e.g. Phàm Nhân Tu Tiên)
-    - Any term with mode='transliterate'
-    """
-    glossary: dict[str, str] = {}
-    with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT source_term, target_term, variants FROM glossary_terms
-            WHERE book_id IN (0, ?) AND approved = 1
-              AND (category IN ('ho_ten_pho_bien', 'pntt_ten_rieng')
-                   OR mode = 'transliterate')
-            ORDER BY book_id ASC, priority DESC, LENGTH(source_term) DESC
-            """,
-            (book_id,),
-        ).fetchall()
-        for src, tgt, variants in rows:
-            glossary[src] = tgt
-            for variant in _split_glossary_variants(variants):
-                glossary.setdefault(variant, tgt)
-    return glossary
+load_glossary_names = _glossary_repository.load_glossary_names
 
 
 # ── Summaries ──────────────────────────────────────────────────────────────
@@ -5012,14 +3121,15 @@ def save_summary(db_path: Path, chapter_id: int, summary: str) -> None:
         conn.commit()
 
 
-def get_last_summary(db_path: Path, book_id: int) -> Optional[str]:
+def get_last_summary(db_path: Path, book_id: int, *, before_chapter_number: int | None = None) -> Optional[str]:
     with get_connection(db_path) as conn:
         row = conn.execute(
             """SELECT cs.summary FROM chapter_summaries cs
                JOIN chapters c ON cs.chapter_id = c.id
-               WHERE c.book_id = ?
+               WHERE c.book_id = ? AND c.deleted_at IS NULL
+                 AND (? IS NULL OR c.chapter_number < ?)
                ORDER BY c.chapter_number DESC LIMIT 1""",
-            (book_id,),
+            (book_id, before_chapter_number, before_chapter_number),
         ).fetchone()
         return row[0] if row else None
 
@@ -5027,254 +3137,31 @@ def get_last_summary(db_path: Path, book_id: int) -> Optional[str]:
 # ── Glossary Audit / Review ──────────────────────────────────────────────────
 
 
-def glossary_stats(db_path: Path, book_id: Optional[int] = None) -> dict:
-    """Return summary stats about the glossary library.
-
-    Returns dict with: total, translate, transliterate, context, no_mode,
-    approved, pending_approval, categories, has_pinyin, has_notes, has_variants.
-    """
-    with get_connection(db_path) as conn:
-        where = "WHERE book_id IN (0, ?)" if book_id is not None else "WHERE 1=1"
-        params = (book_id,) if book_id is not None else ()
-
-        # Single query with GROUP BY to get all counts at once
-        rows = conn.execute(
-            f"""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN mode = 'translate' THEN 1 ELSE 0 END) as translate,
-                SUM(CASE WHEN mode = 'transliterate' THEN 1 ELSE 0 END) as transliterate,
-                SUM(CASE WHEN mode = 'context' THEN 1 ELSE 0 END) as context,
-                SUM(CASE WHEN mode IS NULL OR mode = '' THEN 1 ELSE 0 END) as no_mode,
-                SUM(CASE WHEN approved = 1 THEN 1 ELSE 0 END) as approved,
-                SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) as pending_approval,
-                COUNT(DISTINCT category) as categories,
-                SUM(CASE WHEN pinyin != '' THEN 1 ELSE 0 END) as has_pinyin,
-                SUM(CASE WHEN notes_vi != '' THEN 1 ELSE 0 END) as has_notes,
-                SUM(CASE WHEN variants != '' THEN 1 ELSE 0 END) as has_variants,
-                COUNT(DISTINCT source_term) as unique_source
-            FROM glossary_terms {where}
-            """,
-            params
-        ).fetchone()
-
-    return dict(
-        total=rows["total"],
-        translate=rows["translate"],
-        transliterate=rows["transliterate"],
-        context=rows["context"],
-        no_mode=rows["no_mode"],
-        approved=rows["approved"],
-        pending_approval=rows["pending_approval"],
-        categories=rows["categories"],
-        has_pinyin=rows["has_pinyin"],
-        has_notes=rows["has_notes"],
-        has_variants=rows["has_variants"],
-        unique_source=rows["unique_source"],
-    )
+glossary_stats = _glossary_repository.glossary_stats
 
 
-def get_glossary_pending(db_path: Path, book_id: Optional[int] = None, limit: int = 20) -> list[dict]:
-    """Get pending (unapproved) glossary terms for review."""
-    with get_connection(db_path) as conn:
-        if book_id is not None:
-            rows = conn.execute(
-                """SELECT id, book_id, source_term, target_term, category, mode,
-                          pinyin, notes_vi, variants, created_at
-                   FROM glossary_terms
-                   WHERE book_id IN (0, ?) AND approved = 0
-                   ORDER BY created_at ASC LIMIT ?""",
-                (book_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT id, book_id, source_term, target_term, category, mode,
-                          pinyin, notes_vi, variants, created_at
-                   FROM glossary_terms WHERE approved = 0
-                   ORDER BY created_at ASC LIMIT ?""",
-                (limit,),
-            ).fetchall()
-        return [dict(r) for r in rows]
+get_glossary_pending = _glossary_repository.get_glossary_pending
 
 
-def approve_glossary_term(db_path: Path, term_id: int) -> bool:
-    """Approve a pending glossary term. Returns True if row existed."""
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE glossary_terms
-            SET approved = 1,
-                review_status = CASE WHEN locked = 1 THEN 'LOCKED' ELSE 'APPROVED' END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND approved = 0
-            """,
-            (term_id,),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+approve_glossary_term = _glossary_repository.approve_glossary_term
 
 
-def reject_glossary_term(db_path: Path, term_id: int) -> bool:
-    """Mark a non-locked term rejected while retaining review history."""
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            """
-            UPDATE glossary_terms
-            SET approved = -1,
-                review_status = 'REJECTED',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND locked = 0
-            """,
-            (term_id,),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+reject_glossary_term = _glossary_repository.reject_glossary_term
 
 
-def delete_glossary_term(db_path: Path, term_id: int) -> bool:
-    """Hard-delete a glossary term for explicit delete actions."""
-    with get_connection(db_path) as conn:
-        cur = conn.execute("DELETE FROM glossary_terms WHERE id = ?", (term_id,))
-        conn.commit()
-        return cur.rowcount > 0
+delete_glossary_term = _glossary_repository.delete_glossary_term
 
 
-def set_glossary_term_mode(db_path: Path, term_id: int, mode: str) -> bool:
-    """Update the mode of a glossary term. Returns True if row existed."""
-    valid_modes = {"translate", "context", "transliterate"}
-    if mode not in valid_modes:
-        raise ValueError(f"Invalid mode: {mode}. Must be one of {valid_modes}")
-    with get_connection(db_path) as conn:
-        cur = conn.execute(
-            "UPDATE glossary_terms SET mode = ? WHERE id = ?",
-            (mode, term_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
+set_glossary_term_mode = _glossary_repository.set_glossary_term_mode
 
 
-def glossary_coverage(db_path: Path, book_id: int, source_text: str) -> dict:
-    """Analyze how well the glossary covers a given text.
-
-    Returns:
-        hits: list of (source_term, target_term) for each matched term
-        misses: list of source terms NOT matched but worth checking
-        covered_chars: count of source chars covered by matched terms
-        total_chars: total chars in source text
-        coverage_pct: percentage of text covered by glossary terms
-    """
-    glossary = load_glossary(db_path, book_id)
-    names = load_glossary_names(db_path, book_id)
-    all_terms = {**glossary, **names}
-
-    hits = []
-    matched_spans: list[tuple[int, int]] = []
-    for src, tgt in sorted(all_terms.items(), key=lambda x: -len(x[0])):
-        start = source_text.find(src)
-        if start != -1:
-            hits.append((src, tgt))
-        while start != -1:
-            matched_spans.append((start, start + len(src)))
-            start = source_text.find(src, start + 1)
-
-    covered_chars = 0
-    current_end = -1
-    for start, end in sorted(matched_spans):
-        if end <= current_end:
-            continue
-        covered_chars += end - max(start, current_end)
-        current_end = end
-
-    return dict(
-        hits=hits,
-        matched_count=len(hits),
-        covered_chars=covered_chars,
-        total_chars=len(source_text),
-        coverage_pct=round(covered_chars / len(source_text) * 100, 1) if source_text else 0,
-    )
+glossary_coverage = _glossary_repository.glossary_coverage
 
 
-def auto_approve_glossary(db_path: Path, min_occurrences: int = 3, book_id: Optional[int] = None) -> int:
-    """Auto-approve pending terms that have been seen multiple times.
-
-    A term seen 3+ times across translations is likely correct.
-    Returns count of auto-approved terms.
-    """
-    with get_connection(db_path) as conn:
-        if book_id is not None:
-            cur = conn.execute(
-                """UPDATE glossary_terms SET approved = 1, mode = COALESCE(NULLIF(mode,''), 'translate')
-                   WHERE approved = 0 AND occurrence_count >= ? AND book_id IN (0, ?)""",
-                (min_occurrences, book_id),
-            )
-        else:
-            cur = conn.execute(
-                """UPDATE glossary_terms SET approved = 1, mode = COALESCE(NULLIF(mode,''), 'translate')
-                   WHERE approved = 0 AND occurrence_count >= ?""",
-                (min_occurrences,),
-            )
-        conn.commit()
-        return cur.rowcount
+auto_approve_glossary = _glossary_repository.auto_approve_glossary
 
 
-def get_glossary_conflicts(db_path: Path, book_id: Optional[int] = None) -> list[dict]:
-    """Find source/target conflicts for glossary review.
-
-    Returns source conflicts and target reuse conflicts. Rejected rows are ignored.
-    """
-    with get_connection(db_path) as conn:
-        where = "WHERE book_id IN (0, ?) AND approved >= 0" if book_id is not None else "WHERE approved >= 0"
-        params = (book_id,) if book_id is not None else ()
-        # Find source_terms with multiple distinct targets
-        rows = conn.execute(
-            f"""SELECT source_term, COUNT(DISTINCT target_term) as tgt_count
-                FROM glossary_terms {where}
-                GROUP BY source_term
-                HAVING tgt_count > 1
-                ORDER BY tgt_count DESC""",
-            params,
-        ).fetchall()
-        conflicts = []
-        for row in rows:
-            src = row[0]
-            detail_rows = conn.execute(
-                """SELECT book_id, target_term, approved, mode FROM glossary_terms
-                   WHERE source_term = ?
-                   ORDER BY book_id""",
-                (src,),
-            ).fetchall()
-            targets = [dict(book_id=r[0], target_term=r[1], approved=r[2], mode=r[3]) for r in detail_rows]
-            conflicts.append(dict(type="source_conflict", source_term=src, targets=targets))
-        target_rows = conn.execute(
-            f"""SELECT target_term, COUNT(DISTINCT source_term) as source_count
-                FROM glossary_terms {where}
-                  AND target_term != ''
-                  AND COALESCE(term_type, category, '') IN
-                      ('character', 'sect', 'realm', 'skill', 'artifact', 'location', 'title',
-                       'cultivation', 'organization', 'place', 'CHARACTER', 'SECT', 'REALM',
-                       'SKILL', 'ARTIFACT', 'LOCATION', 'TITLE', 'CULTIVATION', 'ORGANIZATION', 'PLACE')
-                GROUP BY target_term
-                HAVING source_count > 1
-                ORDER BY source_count DESC""",
-            params,
-        ).fetchall()
-        for row in target_rows:
-            target = row[0]
-            source_rows = conn.execute(
-                """SELECT book_id, source_term, approved, mode, term_type, locked
-                   FROM glossary_terms
-                   WHERE target_term = ? AND approved >= 0
-                   ORDER BY locked DESC, book_id DESC, source_term""",
-                (target,),
-            ).fetchall()
-            conflicts.append(
-                dict(
-                    type="target_reuse",
-                    target_term=target,
-                    sources=[dict(r) for r in source_rows],
-                )
-            )
-        return conflicts
+get_glossary_conflicts = _glossary_repository.get_glossary_conflicts
 
 
 # --- Fuzzy Translation Memory ---
@@ -5501,56 +3388,6 @@ def get_low_coverage_chapters(db_path: Path, book_id: int, threshold: float = 30
 
 
 # ── QA Reports ──────────────────────────────────────────────────────────────
-
-def save_qa_report(
-    db_path: Path,
-    book_id: int,
-    chapter_id: int,
-    quality_score: float,
-    fidelity_score: float,
-    style_score: float,
-    glossary_score: float,
-    audiobook_score: float,
-    verdict: str,
-    report_json: str,
-    job_id: str = "",
-    overall_status: str = "NOT_RUN",
-    missing_paragraph_warning: bool = False,
-    chinese_leakage_count: int = 0,
-    name_consistency_status: str = "NOT_RUN",
-    term_consistency_status: str = "NOT_RUN",
-    length_ratio: float = 0,
-    repetition_warning: bool = False,
-    style_warnings: str | list | None = None,
-    glossary_violations: str | list | None = None,
-    suggested_fixes: str | list | None = None,
-) -> int:
-    """Save a QA report, replacing any existing report for this chapter."""
-    def _json_text(value: str | list | None) -> str:
-        if isinstance(value, str):
-            return value
-        return json.dumps(value or [], ensure_ascii=False)
-
-    with get_connection(db_path) as conn:
-        # Delete existing report for this chapter
-        conn.execute("DELETE FROM qa_reports WHERE chapter_id = ?", (chapter_id,))
-        cur = conn.execute(
-            """INSERT INTO qa_reports
-               (book_id, chapter_id, quality_score, fidelity_score, style_score,
-                glossary_score, audiobook_score, verdict, job_id, overall_status,
-                missing_paragraph_warning, chinese_leakage_count, name_consistency_status,
-                term_consistency_status, length_ratio, repetition_warning, style_warnings,
-                glossary_violations, suggested_fixes, report_json, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (book_id, chapter_id, quality_score, fidelity_score, style_score,
-             glossary_score, audiobook_score, verdict, job_id, overall_status,
-             1 if missing_paragraph_warning else 0, int(chinese_leakage_count or 0),
-             name_consistency_status, term_consistency_status, float(length_ratio or 0),
-             1 if repetition_warning else 0, _json_text(style_warnings),
-             _json_text(glossary_violations), _json_text(suggested_fixes), report_json),
-        )
-        conn.commit()
-        return cur.lastrowid
 
 
 def get_qa_report(db_path: Path, book_id: int, chapter_id: int) -> Optional[dict]:

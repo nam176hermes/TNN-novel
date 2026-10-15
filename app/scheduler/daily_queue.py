@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import settings
-from app.database.db import get_connection
+from app.database.db import get_connection, get_chapter_by_id, update_chapter_paths, save_qa_report as save_revision_qa_report
 
 
 def get_pending_chapters(db_path: Path, book_id: Optional[int] = None, limit: int = 15) -> list[dict]:
@@ -88,14 +88,7 @@ def update_chapter_after_translate(
     status: str = "translated",
 ) -> None:
     """Update chapter with translated path and status."""
-    with get_connection(db_path) as conn:
-        conn.execute(
-            """UPDATE chapters
-               SET translated_text_path = ?, status = ?, translated_at = CURRENT_TIMESTAMP
-               WHERE id = ?""",
-            (str(translated_path), status, chapter_id),
-        )
-        conn.commit()
+    update_chapter_paths(db_path, chapter_id, translated_text_path=translated_path, status=status)
 
 
 def update_chapter_failed(db_path: Path, chapter_id: int, error: str) -> None:
@@ -110,15 +103,16 @@ def update_chapter_failed(db_path: Path, chapter_id: int, error: str) -> None:
         conn.commit()
 
 
-def save_qa_report(db_path: Path, chapter_id: int, quality_score: float, report: dict) -> None:
+def save_qa_report(db_path: Path, chapter_id: int, quality_score: float, report: dict, *, content_revision=None) -> None:
     """Save QA report for a chapter."""
-    with get_connection(db_path) as conn:
-        conn.execute(
-            """INSERT INTO qa_reports (chapter_id, quality_score, report_json)
-               VALUES (?, ?, ?)""",
-            (chapter_id, quality_score, json.dumps(report, ensure_ascii=False)),
-        )
-        conn.commit()
+    chapter = get_chapter_by_id(db_path, chapter_id)
+    if not chapter:
+        raise ValueError("Chapter not found")
+    save_revision_qa_report(db_path, book_id=chapter["book_id"], chapter_id=chapter_id,
+        content_revision=content_revision, component="semantic", quality_score=quality_score,
+        fidelity_score=report.get("fidelity_score", 0), style_score=report.get("style_score", 0),
+        glossary_score=report.get("glossary_score", 0), audiobook_score=report.get("audiobook_score", 0),
+        verdict=report.get("verdict", "UNKNOWN"), report_json=json.dumps(report, ensure_ascii=False))
 
 
 def add_pending_glossary_term(

@@ -8,13 +8,15 @@ import {
   hydrateCachedReaderAssetUrls,
   putCachedChapterAsync,
   removeCachedChapterAsync,
+  readerChapterRevision,
 } from './readerCache';
 import { formatError, type LoadState } from './types';
 
-export type ChapterTextPrefetchTarget = Pick<Chapter, 'book_id' | 'content_html_path' | 'id'>;
+export type ChapterTextPrefetchTarget = Pick<Chapter, 'book_id' | 'content_html_path' | 'id' | 'content_revision'>;
 
 export type UseChapterTextOptions = {
   cacheOwnership?: 'external' | 'internal';
+  sourceEnabled?: boolean;
 };
 
 function readerHtmlAssetBase(contentHtmlPath?: string | null): string | undefined {
@@ -25,7 +27,7 @@ function readerHtmlAssetBase(contentHtmlPath?: string | null): string | undefine
 }
 
 function chapterRequestKey(chapter: ChapterTextPrefetchTarget): string {
-  return `${chapter.book_id}:${chapter.id}:${chapter.content_html_path?.trim() ?? ''}`;
+  return `${chapter.book_id}:${chapter.id}:${readerChapterRevision(chapter)}`;
 }
 
 export function useChapterText(
@@ -34,11 +36,12 @@ export function useChapterText(
   chapter: Chapter | null,
   onAuthError?: () => void,
   prefetchTargets: ChapterTextPrefetchTarget[] = [],
-  { cacheOwnership = 'internal' }: UseChapterTextOptions = {},
+  { cacheOwnership = 'internal', sourceEnabled = cacheOwnership === 'internal' }: UseChapterTextOptions = {},
 ) {
   const chapterId = chapter?.id ?? null;
   const bookId = chapter?.book_id ?? null;
   const contentHtmlPath = chapter?.content_html_path ?? null;
+  const contentRevision = chapter?.content_revision;
 
   const [sourceText, setSourceText] = useState('');
   const [translationText, setTranslationText] = useState('');
@@ -46,7 +49,15 @@ export function useChapterText(
   const [contentHtml, setContentHtml] = useState('');
   const [state, setState] = useState<LoadState>('idle');
   const [error, setError] = useState('');
+  const [sourceError, setSourceError] = useState('');
+  const [sourceState, setSourceState] = useState<LoadState>('idle');
+  const [translatedTitle, setTranslatedTitle] = useState(chapter?.translated_title ?? '');
+  const [savedTranslatedTitle, setSavedTranslatedTitle] = useState(chapter?.translated_title ?? '');
+  const sourceRequestRef = useRef<{key: string; controller: AbortController; promise: Promise<void>} | null>(null);
+  const sourceGenerationRef = useRef(0);
+  const sourceResolvedGenerationRef = useRef(-1);
   const loadRequestIdRef = useRef(0);
+  const contentRevisionRef = useRef<number | undefined>(undefined);
   const activeLoadRef = useRef<{
     controller: AbortController;
     key: string;
@@ -55,10 +66,11 @@ export function useChapterText(
   const prefetchControllersRef = useRef(new Map<string, AbortController>());
 
   const cacheChapter = useCallback((
-    targetChapter: { book_id: number; id: number },
+    targetChapter: ChapterTextPrefetchTarget,
     text: string,
     html: string,
     sourceTextValue: string,
+    revision?: number,
   ) => {
     if (!text.trim() && !html.trim()) {
       void removeCachedChapterAsync(targetChapter.book_id, targetChapter.id);
@@ -67,6 +79,7 @@ export function useChapterText(
     void putCachedChapterAsync({
       bookId: targetChapter.book_id,
       chapterId: targetChapter.id,
+      contentRevision: readerChapterRevision({...targetChapter, content_revision: revision ?? targetChapter.content_revision}),
       html,
       sourceText: sourceTextValue,
       text,
@@ -75,6 +88,12 @@ export function useChapterText(
 
   const reset = useCallback(() => {
     loadRequestIdRef.current += 1;
+    contentRevisionRef.current = undefined;
+    sourceGenerationRef.current += 1;
+    sourceRequestRef.current?.controller.abort();
+    sourceRequestRef.current = null;
+    setSourceError('');
+    setSourceState('idle');
     setSourceText('');
     setTranslationText('');
     setSavedTranslationText('');
@@ -88,6 +107,7 @@ export function useChapterText(
       const nextChapter = targetChapter ?? (bookId === null || chapterId === null ? null : {
         book_id: bookId,
         content_html_path: contentHtmlPath,
+        content_revision: contentRevision,
         id: chapterId,
       });
 
@@ -108,12 +128,14 @@ export function useChapterText(
       const performLoad = async () => {
       const requestId = loadRequestIdRef.current + 1;
       loadRequestIdRef.current = requestId;
-      const cachedChapter = cacheOwnership === 'internal'
+      contentRevisionRef.current = nextChapter.content_revision;
+      const candidate = cacheOwnership === 'internal'
         ? await getCachedChapterAsync(nextChapter.book_id, nextChapter.id)
         : null;
+      const cachedChapter = candidate && (!candidate.contentRevision || candidate.contentRevision === readerChapterRevision(nextChapter)) ? candidate : null;
       if (requestId !== loadRequestIdRef.current) return;
       if (cachedChapter) {
-        setSourceText(cachedChapter.sourceText);
+        if (sourceResolvedGenerationRef.current !== sourceGenerationRef.current) setSourceText(cachedChapter.sourceText);
         setTranslationText(cachedChapter.text);
         setSavedTranslationText(cachedChapter.text);
         setContentHtml(cachedChapter.html);
@@ -130,7 +152,6 @@ export function useChapterText(
           });
         }
       } else {
-        setSourceText('');
         setTranslationText('');
         setSavedTranslationText('');
         setContentHtml('');
@@ -138,23 +159,43 @@ export function useChapterText(
       }
       setError('');
 
-      try {
-        const [source, translation] = await Promise.all([
-          client.getChapterSource(nextChapter.book_id, nextChapter.id, { signal: controller.signal }),
-          client.getChapterTranslation(nextChapter.book_id, nextChapter.id, { signal: controller.signal }),
-        ]);
-        const richContent = nextHasRichContent
-          ? await client.getChapterContent(nextChapter.book_id, nextChapter.id, { signal: controller.signal })
-          : null;
-        if (requestId !== loadRequestIdRef.current) return;
-        const nextTranslation = richContent?.text ?? translation ?? '';
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        if (!cachedChapter) {
+          setError('Bạn đang ngoại tuyến. Nội dung đã tải sẽ được mở từ bộ nhớ offline.');
+          setState('error');
+        }
+        return;
+      }
 
-        setSourceText(source);
+      try {
+        const translation = await client.getChapterTranslation(nextChapter.book_id, nextChapter.id, {
+          signal: controller.signal,
+          onContentRevision: (revision) => {
+            if (requestId === loadRequestIdRef.current) contentRevisionRef.current = revision;
+          },
+        });
+        if (requestId !== loadRequestIdRef.current) return;
+        const nextTranslation = translation ?? '';
         setTranslationText(nextTranslation);
         setSavedTranslationText(nextTranslation);
-        setContentHtml(richContent?.html ?? '');
+        setContentHtml('');
         setState('ready');
-        cacheChapter(nextChapter, nextTranslation, richContent?.html ?? '', source);
+        cacheChapter(nextChapter, nextTranslation, '', '', contentRevisionRef.current);
+        let richContent = null;
+        if (nextHasRichContent) {
+          try {
+            const response = await client.getChapterContent(nextChapter.book_id, nextChapter.id, { signal: controller.signal });
+            if (requestId !== loadRequestIdRef.current) return;
+            if (response?.text === nextTranslation) richContent = response;
+          } catch (richError) {
+            if (controller.signal.aborted || requestId !== loadRequestIdRef.current) return;
+            if (richError instanceof ApiError && richError.status === 401) onAuthError?.();
+            setError('Không tải được định dạng chương. Bạn vẫn có thể đọc bản dịch.');
+          }
+        }
+        if (requestId !== loadRequestIdRef.current) return;
+        setContentHtml(richContent?.html ?? '');
+        cacheChapter(nextChapter, nextTranslation, richContent?.html ?? '', '', contentRevisionRef.current);
         if (richContent?.html.trim()) {
           const assetBase = readerHtmlAssetBase(nextChapter.content_html_path);
           void (async () => {
@@ -196,7 +237,7 @@ export function useChapterText(
         if (activeLoadRef.current?.promise === promise) activeLoadRef.current = null;
       }
     },
-    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, enabled, onAuthError, reset],
+    [bookId, cacheChapter, cacheOwnership, chapterId, client, contentHtmlPath, contentRevision, enabled, onAuthError, reset],
   );
 
   const save = useCallback(
@@ -204,24 +245,77 @@ export function useChapterText(
       if (!enabled || bookId === null || chapterId === null) return;
 
       const textToSave = nextTranslationText ?? translationText;
+      const requestId = loadRequestIdRef.current;
+      const nextHtml = textToSave === savedTranslationText ? contentHtml : '';
       setError('');
       setState('loading');
 
       try {
-        await client.saveChapterTranslation(bookId, chapterId, textToSave);
+        const revision = contentRevisionRef.current;
+        const updatedRevision = translatedTitle !== savedTranslatedTitle
+          ? await client.saveChapterTranslation(bookId, chapterId, textToSave, revision, translatedTitle.trim())
+          : revision === undefined
+            ? await client.saveChapterTranslation(bookId, chapterId, textToSave)
+            : await client.saveChapterTranslation(bookId, chapterId, textToSave, revision);
+        if (requestId !== loadRequestIdRef.current) return;
+        if (updatedRevision !== undefined) contentRevisionRef.current = updatedRevision;
         setTranslationText(textToSave);
         setSavedTranslationText(textToSave);
-        setContentHtml('');
-        cacheChapter({ book_id: bookId, id: chapterId }, textToSave, '', sourceText);
+        setSavedTranslatedTitle(translatedTitle.trim());
+        setTranslatedTitle(translatedTitle.trim());
+        setContentHtml(nextHtml);
+        cacheChapter({ book_id: bookId, id: chapterId }, textToSave, nextHtml, sourceText, contentRevisionRef.current);
         setState('ready');
       } catch (nextError) {
+        if (requestId !== loadRequestIdRef.current) return;
         setError(formatError(nextError));
         setState('error');
         throw nextError;
       }
     },
-    [bookId, cacheChapter, chapterId, client, enabled, sourceText, translationText],
+    [bookId, cacheChapter, chapterId, client, contentHtml, enabled, savedTranslatedTitle, savedTranslationText, sourceText, translatedTitle, translationText],
   );
+
+  const loadSource = useCallback(async () => {
+    if (!enabled || bookId === null || chapterId === null) return;
+    const key = `${bookId}:${chapterId}:${contentRevision ?? ''}`;
+    if (sourceRequestRef.current?.key === key) return sourceRequestRef.current.promise;
+    sourceRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    const generation = ++sourceGenerationRef.current;
+    setSourceText('');
+    setSourceError('');
+    setSourceState('loading');
+    const promise = client.getChapterSource(bookId, chapterId, {signal: controller.signal}).then((source) => {
+      if (generation !== sourceGenerationRef.current || controller.signal.aborted) return;
+      sourceResolvedGenerationRef.current = generation;
+      setSourceText(source);
+      setSourceState(source ? 'ready' : 'empty');
+    }).catch((nextError) => {
+      if (generation !== sourceGenerationRef.current || controller.signal.aborted) return;
+      if (nextError instanceof ApiError && nextError.status === 401) onAuthError?.();
+      setSourceError(formatError(nextError));
+      setSourceState('error');
+      sourceRequestRef.current = null;
+    });
+    sourceRequestRef.current = {key, controller, promise};
+    return promise;
+  }, [bookId, chapterId, client, contentRevision, enabled, onAuthError]);
+
+  useEffect(() => {
+    setTranslatedTitle(chapter?.translated_title ?? '');
+    setSavedTranslatedTitle(chapter?.translated_title ?? '');
+  }, [bookId, chapterId, chapter?.translated_title]);
+
+  useEffect(() => {
+    sourceGenerationRef.current += 1;
+    sourceRequestRef.current?.controller.abort();
+    sourceRequestRef.current = null;
+    setSourceText('');
+    setSourceError('');
+    setSourceState('idle');
+    if (sourceEnabled) void loadSource();
+  }, [bookId, chapterId, contentRevision, loadSource, sourceEnabled]);
 
   useEffect(() => {
     if (!enabled || bookId === null || chapterId === null) {
@@ -231,11 +325,17 @@ export function useChapterText(
       return;
     }
 
-    void load({ book_id: bookId, content_html_path: contentHtmlPath, id: chapterId }).catch(() => {});
-  }, [bookId, chapterId, contentHtmlPath, enabled, load, reset]);
+    void load({ book_id: bookId, content_html_path: contentHtmlPath, content_revision: contentRevision, id: chapterId }).catch(() => {});
+  }, [bookId, chapterId, contentHtmlPath, contentRevision, enabled, load, reset]);
 
   useEffect(() => {
-    if (!enabled || bookId === null || chapterId === null || prefetchTargets.length === 0) return;
+    if (
+      cacheOwnership === 'external'
+      || !enabled
+      || bookId === null
+      || chapterId === null
+      || prefetchTargets.length === 0
+    ) return;
     const targets = prefetchTargets.filter((target) => (
       target.book_id === bookId
       && target.id !== chapterId
@@ -260,15 +360,17 @@ export function useChapterText(
           prefetchControllersRef.current.set(requestKey, controller);
           effectControllers.push(controller);
           try {
+            let revision = target.content_revision;
             const [translation, richContent] = await Promise.all([
-              client.getChapterTranslation(target.book_id, target.id, { signal: controller.signal }),
+              client.getChapterTranslation(target.book_id, target.id, { signal: controller.signal, onContentRevision: (value) => { revision = value; } }),
               target.content_html_path
                 ? client.getChapterContent(target.book_id, target.id, { signal: controller.signal })
                 : Promise.resolve(null),
             ]);
             if (cancelled) return;
-            const nextTranslation = richContent?.text ?? translation ?? '';
-            cacheChapter(target, nextTranslation, richContent?.html ?? '', '');
+            const nextTranslation = translation ?? '';
+            const html = richContent?.text === nextTranslation ? richContent.html : '';
+            cacheChapter(target, nextTranslation, html, '', revision);
             if (richContent?.html.trim()) {
               void cacheReaderAssetsFromHtml(
                 target.book_id,
@@ -294,25 +396,32 @@ export function useChapterText(
       window.clearTimeout(timeout);
       effectControllers.forEach((controller) => controller.abort());
     };
-  }, [bookId, cacheChapter, chapterId, client, enabled, prefetchTargets]);
+  }, [bookId, cacheChapter, cacheOwnership, chapterId, client, enabled, prefetchTargets]);
 
   useEffect(() => () => {
     loadRequestIdRef.current += 1;
     activeLoadRef.current?.controller.abort();
     activeLoadRef.current = null;
+    sourceGenerationRef.current += 1;
+    sourceRequestRef.current?.controller.abort();
     prefetchControllersRef.current.forEach((controller) => controller.abort());
     prefetchControllersRef.current.clear();
   }, []);
 
   return {
     error,
-    isDirty: translationText !== savedTranslationText,
+    isDirty: translationText !== savedTranslationText || translatedTitle !== savedTranslatedTitle,
     contentHtml,
     load,
     save,
     savedTranslationText,
     setTranslationText,
+    translatedTitle,
+    setTranslatedTitle,
     sourceText,
+    sourceState,
+    sourceError,
+    loadSource,
     state,
     translationText,
   };

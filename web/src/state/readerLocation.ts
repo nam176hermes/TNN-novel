@@ -57,13 +57,9 @@ function clampPercent(value: number): number {
   return Math.min(100, Math.max(0, value));
 }
 
-function isCjkCharacter(value: string): boolean {
-  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u.test(value);
-}
-
 export function countWords(text: string): number {
   if (!text.trim()) return 0;
-  const cjkCount = Array.from(text).filter(isCjkCharacter).length;
+  const cjkCount = text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/gu)?.length ?? 0;
   const nonCjkText = text.replace(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/gu, ' ');
   const tokenCount = nonCjkText
     .trim()
@@ -1047,4 +1043,44 @@ export function bookProgressPercent(input: {
   const safeChapterIndex = clampInteger(chapterIndex, 0, chapterCount - 1);
   const safeChapterPercent = clampPercent(chapterPercent);
   return Math.min(100, Math.max(0, Math.round(((safeChapterIndex + safeChapterPercent / 100) / chapterCount) * 100)));
+}
+
+export function findParagraphElement(container: HTMLElement | null, paragraphIndex: number): HTMLElement | null {
+  if (!container || !Number.isInteger(paragraphIndex) || paragraphIndex < 0) return null;
+  return container.querySelector<HTMLElement>(`.reader-paragraph-block[data-paragraph-index="${paragraphIndex}"]`);
+}
+
+export function getCurrentParagraphIndex(container: HTMLElement | null): number | undefined {
+  if (!container) return undefined;
+  const blocks = Array.from(container.querySelectorAll<HTMLElement>('.reader-paragraph-block[data-paragraph-index]'));
+  if (blocks.length === 0) return undefined;
+
+  const containerRect = container.getBoundingClientRect();
+  if (
+    !Number.isFinite(containerRect.top)
+    || !Number.isFinite(containerRect.bottom)
+    || containerRect.bottom <= containerRect.top
+  ) {
+    return undefined;
+  }
+  const anchorY = containerRect.top + 12;
+  const blockRects = blocks.map((block) => ({
+    block,
+    rect: block.getBoundingClientRect(),
+  }));
+  const currentBlock = [...blockRects]
+    .reverse()
+    .find(({ rect }) => rect.top <= anchorY && rect.bottom >= containerRect.top)
+    ?.block
+    ?? blockRects.find(({ rect }) => rect.top > anchorY && rect.bottom >= containerRect.top)?.block
+    ?? blockRects.find(({ rect }) => rect.bottom >= containerRect.top)?.block
+    ?? blocks[blocks.length - 1];
+  const paragraphIndex = Number(currentBlock.dataset.paragraphIndex);
+  return Number.isInteger(paragraphIndex) && paragraphIndex >= 0 ? paragraphIndex : undefined;
+}
+
+export function paragraphTextElement(container: HTMLElement | null, paragraphIndex: number | undefined): HTMLElement | null {
+  if (paragraphIndex === undefined) return null;
+  const block = findParagraphElement(container, paragraphIndex);
+  return block?.querySelector<HTMLElement>('.reader-paragraph-text') ?? block;
 }

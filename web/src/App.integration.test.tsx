@@ -2,6 +2,8 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import type { ChapterApi } from './api/types';
+import { chapterHasTranslation } from './state/translator';
 import { loadReaderProgressSnapshot, saveReaderProgressSnapshot } from './state/readerProgress';
 import { clearToken, saveToken } from './state/session';
 import {
@@ -95,6 +97,15 @@ function defaultAssistAutoLoadResponse(target: string) {
   return null;
 }
 
+function rawBacklogResponse(chapters: ChapterApi[]) {
+  const raw = chapters.filter((chapter) => !chapterHasTranslation(chapter));
+  return { ok: true, json: async () => ({
+    chapters: raw.map((chapter) => ({ ...chapter, book_title: fixtureBook.title })),
+    total_chapters: raw.length, total_books: raw.length ? 1 : 0,
+    book_counts: { [fixtureBook.id]: raw.length }, offset: 0, limit: 50,
+  }) };
+}
+
 async function expectNoGlobalAlert(): Promise<void> {
   await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
 }
@@ -152,6 +163,7 @@ describe('App live data wiring', () => {
 
       if (target.endsWith('/api/providers')) return { ok: true, json: async () => ({ providers: [] }) };
       if (target.endsWith('/api/style-profiles')) return { ok: true, json: async () => ({ profiles: [] }) };
+      if (target.endsWith('/api/library/books')) return { ok: true, json: async () => ({ books: [] }) };
       if (target.endsWith('/api/books')) return { ok: true, json: async () => [] };
       if (target.endsWith('/api/providers/usage')) {
         return {
@@ -171,8 +183,8 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
-    expect(screen.getByText('Chọn một chương trong danh sách bên trái để bắt đầu biên tập bản dịch.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Chapter editor')).not.toBeInTheDocument();
     expect(screen.queryByText('Phàm Nhân Tu Tiên')).not.toBeInTheDocument();
     expect(screen.queryByText('Gemini Flash')).not.toBeInTheDocument();
     expect(screen.queryByText('gemini-2.5-flash-lite')).not.toBeInTheDocument();
@@ -293,7 +305,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await screen.findByRole('heading', { name: 'Thư viện' });
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Model API' }));
     const keyInput = await screen.findByLabelText('API key cho Missing Key Provider');
     await userEvent.type(keyInput, 'new-secret');
@@ -468,7 +480,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await screen.findByRole('heading', { name: 'Thư viện' });
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Nhập chương' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Ebook bản dịch' }));
     await userEvent.upload(
@@ -567,7 +579,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await screen.findByRole('heading', { name: 'Thư viện' });
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Nhập chương' }));
     await userEvent.click(await screen.findByRole('button', { name: 'Ebook bản dịch' }));
     await userEvent.upload(
@@ -696,7 +708,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
 
     expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
@@ -867,7 +879,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await screen.findByRole('heading', { name: 'Thư viện' });
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
 
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
@@ -950,7 +962,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    await screen.findByRole('heading', { name: 'Chưa chọn chương' });
+    await screen.findByRole('heading', { name: 'Thư viện' });
     await userEvent.click(within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Thư viện' }));
 
     expect(await screen.findByRole('heading', { name: 'Live Book' })).toBeInTheDocument();
@@ -1527,6 +1539,10 @@ describe('App live data wiring', () => {
         };
       }
 
+      if (target.includes('/api/library/raw?')) {
+        return rawBacklogResponse([{ ...fixtureChapter, status: jobCompleted ? 'translated' : 'cleaned', translated_text_path: jobCompleted ? '/tmp/translated.txt' : null }]);
+      }
+
       if (target.endsWith('/api/books/42/chapters')) {
         chaptersLoaded += 1;
         return {
@@ -1702,6 +1718,10 @@ describe('App live data wiring', () => {
           ok: true,
           json: async () => [fixtureBook],
         };
+      }
+
+      if (target.includes('/api/library/raw?')) {
+        return rawBacklogResponse([{ ...fixtureChapter, status: 'cleaned', translated_text_path: null }]);
       }
 
       if (target.endsWith('/api/books/42/chapters')) {
@@ -1955,6 +1975,10 @@ describe('App live data wiring', () => {
         };
       }
 
+      if (target.includes('/api/library/raw?')) {
+        return rawBacklogResponse([{ ...fixtureChapter, status: jobCompleted && postJobChapterLoads > 1 ? 'translated' : 'cleaned', translated_text_path: jobCompleted && postJobChapterLoads > 1 ? '/tmp/translated.txt' : null }]);
+      }
+
       if (target.endsWith('/api/books/42/chapters')) {
         chaptersLoaded += 1;
         if (jobCompleted) {
@@ -2188,7 +2212,7 @@ describe('App live data wiring', () => {
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     await userEvent.click(
       within(screen.getByRole('navigation', { name: 'Quy trình' })).getByRole('button', { name: 'Nhập chương' }),
     );
@@ -2232,6 +2256,10 @@ describe('App live data wiring', () => {
           ok: true,
           json: async () => [fixtureBook],
         };
+      }
+
+      if (target.includes('/api/library/raw?')) {
+        return rawBacklogResponse([{ ...fixtureChapter, id: 4202, chapter_number: 2, title: 'Second Chapter', status: 'cleaned', translated_text_path: null }]);
       }
 
       if (target.endsWith('/api/books/42/chapters')) {

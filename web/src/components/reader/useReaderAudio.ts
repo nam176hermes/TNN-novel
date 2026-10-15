@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ApiClient } from '../../api/client';
+import { ApiError, type ApiClient } from '../../api/client';
 import type {
   BookAudioPlaylistItem,
   Chapter,
@@ -84,7 +84,7 @@ export function friendlyAudioError(
     || cleaned.includes('model') || cleaned.includes('hugging face')
   ) return 'Thiếu model TTS hoặc file cấu hình. Kiểm tra TTS_CKPT_FILE/TTS_VOCAB_FILE trên server.';
   if (cleaned.includes('cuda') || cleaned.includes('gpu') || cleaned.includes('out of memory')) {
-    return 'Thiết bị TTS không sẵn sàng. Kiểm tra CUDA/GPU hoặc chuyển TTS_DEVICE=cpu.';
+    return 'GPU TTS chưa sẵn sàng. Kiểm tra CUDA, driver GPU và bộ nhớ GPU trên server.';
   }
   if (cleaned.includes('already running') || cleaned.includes('job already')) {
     return 'Đã có job audio đang chạy. Đợi job hiện tại xong hoặc mở trang Tác vụ để kiểm tra.';
@@ -166,6 +166,13 @@ export function useReaderAudio({
   const [jobRefreshing, setJobRefreshing] = useState(false);
   const [playlist, setPlaylist] = useState<BookAudioPlaylistItem[]>([]);
   const [playlistError, setPlaylistError] = useState('');
+  const [partialExportAvailable, setPartialExportAvailable] = useState(false);
+  useEffect(() => {
+    playlistRequestRef.current += 1;
+    setPlaylist([]);
+    setPlaylistError('');
+    setPartialExportAvailable(false);
+  }, [activeBookId]);
   const activeJobGenerationRef = useRef(0);
   const activeJobIdRef = useRef('');
   const playlistRequestRef = useRef(0);
@@ -195,23 +202,24 @@ export function useReaderAudio({
   const selectedIndex = translatedChapters.findIndex((chapter) => chapter.id === selectedChapterId);
   const nextChapter = selectedIndex >= 0
     ? translatedChapters.slice(selectedIndex + 1)
-      .find((chapter) => Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id)) ?? null
+      .find((chapter) => chapter.audio_status !== 'stale' && (Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id))) ?? null
     : null;
   const playlistItem = selectedChapterId ? playlistByChapterId.get(selectedChapterId) ?? null : null;
   const canPlay = Boolean(
     apiClient
     && activeBookId
     && selectedChapterId
+    && selectedChapter?.audio_status !== 'stale'
     && (selectedChapter?.audio_path || playlistItem || cachedAudioUrl),
   );
   const streamUrl = canPlay && apiClient && activeBookId && selectedChapterId
     ? selectedChapter?.audio_path
-      ? apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
+      ? apiClient.chapterAudioUrl(activeBookId, selectedChapterId, selectedChapter.audio_version)
       : playlistItem?.stream_url || apiClient.chapterAudioUrl(activeBookId, selectedChapterId)
     : '';
   const downloadUrl = canPlay && apiClient && activeBookId && selectedChapterId
     ? selectedChapter?.audio_path
-      ? apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId)
+      ? apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId, selectedChapter.audio_version)
       : playlistItem?.download_url || apiClient.chapterAudioDownloadUrl(activeBookId, selectedChapterId)
     : '';
 
@@ -236,16 +244,18 @@ export function useReaderAudio({
   }, [activeBookId, apiClient]);
 
   useEffect(() => {
+    if (!open && !autoNext) return;
     let cancelled = false;
     void loadPlaylist().catch(() => {
       if (!cancelled) setPlaylistError('Không tải được danh sách audio của truyện.');
     });
     return () => { cancelled = true; };
-  }, [loadPlaylist]);
+  }, [autoNext, loadPlaylist, open]);
 
   useEffect(() => {
     if (
       !allowAutomaticAudioCache
+      || !open
       || cachedAudioLoading
       || !canPlay
       || !activeBookId
@@ -260,6 +270,7 @@ export function useReaderAudio({
     cacheAudio,
     cachedAudioLoading,
     cachedAudioUrl,
+    open,
     canPlay,
     selectedChapterId,
     streamUrl,
@@ -460,7 +471,7 @@ export function useReaderAudio({
     }
   }, [activateJob, apiClient, jobId, onError, refreshJob, reportError]);
 
-  const downloadAudiobook = useCallback(async () => {
+  const downloadAudiobook = useCallback(async (allowPartial = false) => {
     if (!apiClient || !activeBookId) {
       setStatus('Không thể tải audiobook: thiếu kết nối API hoặc truyện đang đọc.');
       return;
@@ -468,11 +479,14 @@ export function useReaderAudio({
     setJobLoading(true);
     setStatus('Đang xuất audiobook M4B...');
     try {
-      const download = await apiClient.downloadAudiobookExport(activeBookId, 'm4b');
+      const download = allowPartial
+        ? await apiClient.downloadAudiobookExport(activeBookId, 'm4b', true)
+        : await apiClient.downloadAudiobookExport(activeBookId, 'm4b');
       onDownload(download.blob, download.filename);
       setStatus(`Đã tải ${download.filename}`);
       onError('');
     } catch (downloadError) {
+      setPartialExportAvailable(downloadError instanceof ApiError && downloadError.code === 'incomplete_audiobook');
       setStatus('');
       reportError(audioErrorFromUnknown(downloadError, 'Không thể tải audiobook M4B. Hãy tạo audiobook trước.'));
     } finally {
@@ -489,7 +503,7 @@ export function useReaderAudio({
     ),
   ));
   const translatedAudioChapterCount = translatedChapters.filter(
-    (chapter) => Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id),
+    (chapter) => chapter.audio_status !== 'stale' && (Boolean(chapter.audio_path) || playlistByChapterId.has(chapter.id)),
   ).length;
   const generationBlocked = !(selectedChapter?.has_translation && translationText.trim());
   const canStartChapterJob = Boolean(
@@ -501,6 +515,9 @@ export function useReaderAudio({
   const qaOverallStatus = String(qaReport?.overall_status ?? '').toUpperCase();
   const chineseLeakageCount = Math.max(0, Math.round(qaReport?.chinese_leakage_count ?? 0));
   const readinessWarnings = [
+    selectedChapter?.audio_status === 'stale' ? 'Bản dịch đã đổi. Cần tạo lại audio cho nội dung mới.' : '',
+    selectedChapter?.audio_status === 'legacy_unverified' ? 'Audio cũ chưa có thông tin xác minh bản dịch.' : '',
+    selectedChapter?.quality_status === 'needs_review' ? 'Bản dịch cần xem lại trước khi tạo audio.' : '',
     generationBlocked ? 'Chưa có bản dịch tiếng Việt để tạo audio.' : '',
     qaOverallStatus === 'FAIL' ? 'QA đang FAIL. Nên xem lại trước khi tạo audio.' : '',
     chineseLeakageCount > 0 ? `Còn ${chineseLeakageCount.toLocaleString('vi-VN')} dấu hiệu rò chữ Trung trong bản dịch.` : '',
@@ -509,6 +526,7 @@ export function useReaderAudio({
 
   return {
     state: {
+      partialExportAvailable,
       autoNext,
       bulkConfirmOpen,
       canCancelJob: Boolean(apiClient && jobId && CANCELABLE_JOB_STATUSES.has(statusValue.toLowerCase())),

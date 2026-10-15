@@ -11,7 +11,7 @@ from threading import RLock
 
 from app.database.import_jobs import ImportJobRepository, TaskStage
 from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent
-from app.mobile_api.services.import_metadata import normalize_import_text
+from app.ingestion.import_metadata import normalize_import_text
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.observability import Observability, default_observability
 from app.services.import_job_service import TaskImportOutcome

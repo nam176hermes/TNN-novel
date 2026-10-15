@@ -1,83 +1,52 @@
 from __future__ import annotations
 
-import subprocess
-import tempfile
-from shutil import which
+import json
 from pathlib import Path
 
+from app.services.tts.audio_merger import AudioMetadata, merge_book_m4b
 
-def export_m4b(
-    book_title: str,
-    author: str,
-    chapters: list[dict],
-    output_path: Path,
-) -> Path:
-    """
-    Merge chapter MP3s into one M4B audiobook using FFmpeg.
 
-    Args:
-        book_title: Title of the book.
-        author: Author name.
-        chapters: List of chapter dicts with audio_path.
-        output_path: Output .m4b file.
+class IncompleteAudiobookError(ValueError):
+    def __init__(self, chapter_ids):
+        self.chapter_ids = chapter_ids
+        super().__init__("Audiobook is incomplete; missing or stale chapter audio")
 
-    Returns:
-        Path to created M4B file.
-    """
-    audio_paths: list[Path] = []
-    for ch in sorted(chapters, key=lambda c: c.get("chapter_number", 0)):
-        audio_path = ch.get("audio_path")
-        if audio_path and Path(audio_path).exists():
-            audio_paths.append(Path(audio_path))
 
-    if not audio_paths:
+def select_audiobook_chapters(chapters, *, allow_partial=False):
+    included, missing = [], []
+    for chapter in sorted(chapters, key=lambda row: row.get("chapter_number", 0)):
+        value = chapter.get("audio_path")
+        path = Path(value) if value else None
+        if chapter.get("audio_status") == "stale" or path is None or not path.is_file() or path.stat().st_size <= 0:
+            missing.append(chapter.get("id", chapter.get("chapter_number", 0)))
+        else:
+            included.append(chapter)
+    if missing and not allow_partial:
+        raise IncompleteAudiobookError(missing)
+    if not included:
         raise ValueError("No chapter audio files found. Run TTS first.")
-    if which("ffmpeg") is None:
-        raise RuntimeError("FFmpeg is not installed. Install ffmpeg to export M4B audiobooks.")
+    return included, missing
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="m4b-export-", dir=output_path.parent) as tmp:
-        concat_file = Path(tmp) / "chapters.ffconcat"
-        with concat_file.open("w", encoding="utf-8") as f:
-            for p in audio_paths:
-                f.write(f"file '{p.as_posix()}'\n")
+def validate_audiobook_snapshot(before, after):
+    keys = ("id", "content_revision", "audio_path", "audio_status", "audio_translation_hash")
+    def identity(rows):
+        return sorted((tuple(row.get(key) for key in keys) for row in rows), key=lambda row: row[0])
+    if identity(before) != identity(after):
+        raise ValueError("Audiobook inputs changed during export; please retry")
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-vn",
-            "-metadata",
-            f"title={book_title}",
-            "-metadata",
-            f"artist={author or 'Unknown'}",
-            "-metadata",
-            f"album={book_title}",
-            "-metadata",
-            "genre=Audiobook",
-            str(output_path),
-        ]
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("FFmpeg M4B export timed out") from exc
-        if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg M4B export failed: {result.stderr}")
-        if not output_path.exists() or output_path.stat().st_size <= 0:
-            raise RuntimeError("FFmpeg M4B export produced an empty file")
-
-        return output_path
+def export_m4b(book_title: str, author: str, chapters: list[dict], output_path: Path, *, allow_partial=False) -> Path:
+    included, missing = select_audiobook_chapters(chapters, allow_partial=allow_partial)
+    result = merge_book_m4b([Path(chapter["audio_path"]) for chapter in included], output_path,
+        metadata=AudioMetadata(title=book_title, author=author, source_book=book_title),
+        chapter_titles=[chapter.get("translated_title") or chapter.get("title") or f"Chương {chapter.get('chapter_number', 0)}" for chapter in included])
+    output_path.with_suffix(".manifest.json").write_text(json.dumps({
+        "version": 1, "partial": bool(missing), "missing_chapter_ids": missing,
+        "chapters": [{name: chapter.get(name) for name in ("id", "chapter_number", "content_revision", "audio_status", "audio_translation_hash")}
+                     for chapter in included],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
 
 
 def export_mp3_playlist(

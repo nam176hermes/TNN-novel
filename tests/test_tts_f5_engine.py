@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 import sys
 import types
+import multiprocessing
+import time
 
 import pytest
 
@@ -16,6 +18,13 @@ from app.services.tts.f5_vietnamese_engine import (
     stable_audio_cache_key,
 )
 from app.services.tts.availability import TTSUnavailableError
+
+
+@pytest.fixture(autouse=True)
+def fixture_worker_context(monkeypatch):
+    # Fixtures inherit fake modules; production workers always use CUDA-safe spawn.
+    context = multiprocessing.get_context("fork")
+    monkeypatch.setattr("app.services.tts.f5_vietnamese_engine.multiprocessing.get_context", lambda _: context)
 
 
 def test_stable_audio_cache_hash_changes_only_when_inputs_change(tmp_path: Path) -> None:
@@ -72,6 +81,7 @@ def test_f5_engine_captures_upstream_console_output(
         output,
         voice_config=VoiceConfig(reference_audio_path=str(reference), reference_text="một đoạn đọc"),
     )
+    engine.close()
 
     captured = capsys.readouterr()
     assert "noisy f5" not in captured.out
@@ -243,3 +253,85 @@ def test_f5_engine_resolves_relative_checkpoint_paths_from_project_root(tmp_path
     assert model_name == "F5TTS_Base"
     assert ckpt_file == str(PROJECT_ROOT / "data/models/tts/vivoice/model_last.pt")
     assert vocab_file == str(PROJECT_ROOT / "data/models/tts/vivoice/vocab.txt")
+
+
+def test_reference_contents_invalidate_cache_identity(tmp_path):
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"first reference")
+    voice = VoiceConfig(reference_audio_path=str(reference), reference_text="Xin chào")
+    model = F5VietnameseConfig(cache_dir=tmp_path / "cache")
+    first = stable_audio_cache_key("Xin chào", voice_config=voice, model_config=model)
+    reference.write_bytes(b"other reference")
+    assert stable_audio_cache_key("Xin chào", voice_config=voice, model_config=model) != first
+
+
+def test_deadline_kills_worker_instead_of_waiting_for_inference(tmp_path):
+    class SlowRuntime:
+        def infer(self, **options):
+            time.sleep(2)
+            Path(options["file_wave"]).write_bytes(b"late output")
+    engine = F5VietnameseEngine(F5VietnameseConfig(cache_dir=tmp_path / "cache", timeout_seconds=.15))
+    engine._engine = SlowRuntime()
+    output = tmp_path / "late.wav"
+    started = time.monotonic()
+    with pytest.raises(TTSEngineError, match="deadline"):
+        engine._infer_with_timeout("fixture", "reference", "fixture", output)
+    assert time.monotonic() - started < 1
+    assert engine._process is None and not output.exists()
+
+
+def test_f5_cache_requires_qa_receipt(tmp_path, monkeypatch):
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"reference")
+    voice = VoiceConfig(reference_audio_path=str(reference), reference_text="Xin chào")
+    engine = F5VietnameseEngine(F5VietnameseConfig(cache_dir=tmp_path / "cache"))
+    calls = []
+    def infer(text, ref_audio, ref_text, output, **kwargs):
+        calls.append(text)
+        output.write_bytes(b"generated audio")
+    monkeypatch.setattr(engine, "_infer_with_timeout", infer)
+    output = tmp_path / "chunk.wav"
+    engine.synthesize_chunk("Xin chào", output, voice_config=voice)
+    engine.synthesize_chunk("Xin chào", output, voice_config=voice)
+    assert len(calls) == 2
+    engine.confirm_audio_qa("Xin chào", voice, output)
+    engine.synthesize_chunk("Xin chào", output, voice_config=voice)
+    assert len(calls) == 2
+
+
+def test_warm_worker_holds_gpu_lock_until_closed(tmp_path):
+    class Runtime:
+        def infer(self, **options):
+            Path(options["file_wave"]).write_bytes(b"fixture audio")
+    config = F5VietnameseConfig(cache_dir=tmp_path / "cache", timeout_seconds=.5)
+    first, second = F5VietnameseEngine(config), F5VietnameseEngine(config)
+    first._engine, second._engine = Runtime(), Runtime()
+    try:
+        first._infer_with_timeout("first", "ref", "fixture", tmp_path / "first.wav")
+        pid = first._process.pid
+        first._infer_with_timeout("second", "ref", "fixture", tmp_path / "second.wav")
+        assert first._process.pid == pid
+        with pytest.raises(TTSEngineError, match="deadline"):
+            second._infer_with_timeout("other", "ref", "fixture", tmp_path / "other.wav")
+        first.close()
+        second._infer_with_timeout("other", "ref", "fixture", tmp_path / "other.wav")
+        assert (tmp_path / "other.wav").read_bytes() == b"fixture audio"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_cancellation_terminates_inference_worker(tmp_path):
+    class SlowRuntime:
+        def infer(self, **options):
+            time.sleep(2)
+            Path(options["file_wave"]).write_bytes(b"late output")
+    engine = F5VietnameseEngine(F5VietnameseConfig(cache_dir=tmp_path / "cache"))
+    engine._engine = SlowRuntime()
+    started = time.monotonic()
+    output = tmp_path / "cancelled.wav"
+    with pytest.raises(TTSEngineError, match="cancelled"):
+        engine._infer_with_timeout("fixture", "ref", "fixture", output,
+                                   cancel_check=lambda: time.monotonic() - started > .05)
+    assert time.monotonic() - started < 1
+    assert engine._process is None and not output.exists()

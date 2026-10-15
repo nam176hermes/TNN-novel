@@ -194,7 +194,7 @@ def test_call_llm_records_provider_usage_when_metadata_is_supplied(monkeypatch, 
         {"choices": "not-a-list"},
     ],
 )
-def test_call_openai_compatible_chat_returns_empty_text_for_malformed_response(
+def test_call_openai_compatible_chat_rejects_malformed_response(
     monkeypatch,
     payload,
 ) -> None:
@@ -210,13 +210,10 @@ def test_call_openai_compatible_chat_returns_empty_text_for_malformed_response(
 
     monkeypatch.setattr(ollama_client.requests, "post", fake_post)
 
-    result = ollama_client.call_openai_compatible_chat(
-        prompt="dịch",
-        base_url="https://example.invalid/v1",
-        model="cheap-model",
-    )
-
-    assert result == {"text": "", "usage": {}}
+    with pytest.raises(ollama_client.TranslationError):
+        ollama_client.call_openai_compatible_chat(
+            prompt="dịch", base_url="https://example.invalid/v1", model="cheap-model",
+        )
 
 
 class TestSplitIntoChunks:
@@ -274,7 +271,7 @@ class TestPostprocessTranslation:
         text = "Anh cả khẽ gật đầu. Anh đi vào phòng. Người anh trai kia im lặng."
         result = _postprocess_translation(text)
         assert "Anh cả khẽ gật đầu" in result
-        assert "Hắn đi vào phòng" in result
+        assert "Anh đi vào phòng" in result
         assert "người anh trai kia im lặng" in result.lower()
 
     def test_removes_new_terms_section(self):
@@ -298,11 +295,10 @@ class TestPostprocessTranslation:
         assert "Hắn" in result
         assert "liền đi" in result
 
-    def test_normalizes_pronouns(self):
+    def test_preserves_pronouns_without_source_context(self):
         text = "Anh đi vào phòng. anh ta nói."
         result = _postprocess_translation(text)
-        assert "Hắn đi vào phòng" in result  # Anh at start -> Hắn
-        assert "hắn ta nói" in result  # anh -> hắn
+        assert result == text
 
     def test_collapses_excess_blank_lines(self):
         text = "Dòng 1\n\n\n\n\nDòng 2"
@@ -712,7 +708,6 @@ class TestTranslateChapter:
         init_db(db_path)
         add_book(db_path, "Test Book")
         post_calls = 0
-        cancel_checks = 0
 
         def mock_post(*args, **kwargs):
             nonlocal post_calls
@@ -725,9 +720,7 @@ class TestTranslateChapter:
             return resp
 
         def cancel_check() -> bool:
-            nonlocal cancel_checks
-            cancel_checks += 1
-            return cancel_checks > 1
+            return post_calls > 0
 
         monkeypatch.setattr("requests.post", mock_post)
 
@@ -745,7 +738,7 @@ class TestTranslateChapter:
 
         assert post_calls == 1
 
-    def test_retry_temperature_never_increases_above_initial(self, monkeypatch, tmp_path):
+    def test_retry_retains_frozen_temperature(self, monkeypatch, tmp_path):
         import app.translation.ollama_client as ollama_mod
         from app.database.db import add_book, init_db
 
@@ -783,7 +776,7 @@ class TestTranslateChapter:
             use_cache=False,
         )
 
-        assert temperatures == [0.05, 0.0]
+        assert temperatures == [0.05, 0.05]
 
     def test_retry_success_extracts_new_terms(self, monkeypatch, tmp_path):
         import app.translation.ollama_client as ollama_mod
@@ -831,7 +824,7 @@ class TestTranslateChapter:
         assert row["target_term"] == "linh thạch"
         assert row["approved"] == 0
 
-    def test_empty_postprocessed_chunk_is_retried(self, monkeypatch, tmp_path):
+    def test_empty_postprocessed_chunk_is_rejected(self, monkeypatch, tmp_path):
         import app.translation.ollama_client as ollama_mod
         from app.database.db import add_book, init_db
 
@@ -858,17 +851,12 @@ class TestTranslateChapter:
 
         monkeypatch.setattr("requests.post", mock_post)
 
-        result = translate_chapter(
-            text="测试文本。",
-            book_title="Test Book",
-            chapter_title="Ch1",
-            chapter_number=1,
-            model="test-model",
-            use_cache=False,
-        )
-
-        assert result == "Bản dịch hợp lệ."
-        assert call_count == 2
+        with pytest.raises(ollama_client.TranslationError, match="empty"):
+            translate_chapter(
+                text="测试文本。", book_title="Test Book", chapter_title="Ch1", chapter_number=1,
+                model="test-model", use_cache=False,
+            )
+        assert call_count == 1
 
     def test_new_terms_are_not_persisted_when_later_chunk_fails(self, monkeypatch, tmp_path):
         import requests

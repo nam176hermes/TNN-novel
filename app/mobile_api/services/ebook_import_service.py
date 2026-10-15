@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
+import errno
+import json
+import logging
+import os
+import uuid
 import html as html_lib
 from html.parser import HTMLParser
 import posixpath
@@ -15,19 +21,21 @@ import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urldefrag
 import zipfile
 
-from app.database.db import (
-    add_book,
-    add_chapter,
-    get_book_by_id,
-    get_book_by_title,
-    get_chapter,
-    list_chapters,
-    record_ebook_import_run,
-    update_book,
-    update_chapter_paths,
-)
+from app.storage.chapter_content import write_versioned_text, retire_artifact
+from app.database.book_repository import add_book, get_book_by_id, get_book_by_title, update_book
+from app.database.chapter_repository import get_chapter, list_chapters, update_chapter_paths
+from app.database.import_repository import add_chapter, record_ebook_import_run
+from app.mobile_api.audit import record_audit_event
 from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.utils.chinese_numbers import parse_chinese_number
+
+
+logger = logging.getLogger(__name__)
+EBOOK_UPLOAD_TTL_SECONDS = 6 * 60 * 60
+EBOOK_UPLOAD_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
+    "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
+)
 
 
 SUPPORTED_EBOOK_FORMATS = {"epub", "azw3", "mobi", "prc", "txt", "html", "htm"}
@@ -835,6 +843,194 @@ class EbookImportService:
         self.db_path = db_path or get_db_path()
         self.data_dir = data_dir or get_data_dir()
 
+    def _upload_dir(self) -> Path:
+        upload_dir = self.data_dir / "import_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        return upload_dir
+
+    def _cleanup_staged_uploads(self) -> None:
+        upload_dir = self._upload_dir()
+        cutoff = time.time() - EBOOK_UPLOAD_TTL_SECONDS
+        for path in upload_dir.iterdir():
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def stage_upload(self, temp_path: Path, original_name: str) -> str:
+        self._cleanup_staged_uploads()
+        upload_id = uuid.uuid4().hex
+        upload_dir = self._upload_dir()
+        staged_path = upload_dir / f"{upload_id}{temp_path.suffix.lower()}"
+        try:
+            os.replace(temp_path, staged_path)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # ``copy2`` preserves timestamps and permissions, which is rejected by
+            # some production bind mounts. Staging only needs the ebook bytes.
+            try:
+                shutil.copyfile(temp_path, staged_path)
+                temp_path.unlink()
+            except Exception:
+                staged_path.unlink(missing_ok=True)
+                raise
+        meta_path = upload_dir / f"{upload_id}.json"
+        meta_path.write_text(json.dumps({"filename": original_name}, ensure_ascii=False), encoding="utf-8")
+        return upload_id
+
+    def resolve_upload(self, upload_id: str) -> tuple[Path, str]:
+        if not EBOOK_UPLOAD_ID_RE.match(upload_id):
+            raise ValueError("Invalid ebook upload id")
+        upload_dir = self._upload_dir()
+        meta_path = upload_dir / f"{upload_id}.json"
+        if not meta_path.exists():
+            raise ValueError("Preview upload expired; select the ebook file again")
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Preview upload metadata is invalid") from exc
+        original_name = Path(str(metadata.get("filename") or "translated.epub")).name
+        suffix = Path(original_name).suffix.lower()
+        staged_path = upload_dir / f"{upload_id}{suffix}"
+        if not staged_path.exists():
+            raise ValueError("Preview upload expired; select the ebook file again")
+        return staged_path, original_name
+
+    def delete_upload(self, upload_id: str) -> None:
+        if not EBOOK_UPLOAD_ID_RE.match(upload_id):
+            return
+        upload_dir = self._upload_dir()
+        for path in upload_dir.glob(f"{upload_id}*"):
+            path.unlink(missing_ok=True)
+
+    async def run_import_job(
+        self,
+        *,
+        job_id: str,
+        tracker,
+        ebook_path: Path,
+        original_name: str,
+        target_book_id: int | None,
+        duplicate_strategy: str,
+        split_mode: str,
+        confirmed_existing_book_id: int | None,
+        cleanup_upload_id: str = "",
+        cleanup_temp_path: bool = False,
+    ) -> None:
+        tracker.update_job(job_id, status="running", progress=0, message="Importing translated ebook")
+        confirmation_conflict = False
+        try:
+            result = await asyncio.to_thread(
+                self.import_translated_ebook,
+                ebook_path,
+                target_book_id=target_book_id,
+                duplicate_strategy=duplicate_strategy,
+                split_mode=split_mode,
+                original_filename=original_name,
+                confirmed_existing_book_id=confirmed_existing_book_id,
+            )
+            imported = int(result.get("imported_chapters") or 0)
+            skipped = int(result.get("skipped_chapters") or 0)
+            job = tracker.get_job(job_id)
+            params = dict(job.params or {}) if job else {}
+            params.update(
+                {
+                    "book_id": result.get("book_id", 0),
+                    "chapter_count": result.get("chapter_count", imported),
+                    "imported_chapters": imported,
+                    "skipped_chapters": skipped,
+                }
+            )
+            tracker.update_job(
+                job_id,
+                status="completed",
+                progress=1,
+                message=f"Imported {imported} translated ebook chapter(s), skipped {skipped}.",
+                params=params,
+            )
+            record_audit_event(
+                event_type="import_complete",
+                severity="info",
+                source="import",
+                message="Translated ebook import completed",
+                job_id=job_id,
+                details={
+                    "import_type": "ebook",
+                    "result": "success",
+                    "book_id": result.get("book_id", 0),
+                    "chapter_count": imported,
+                    "skipped_chapters": skipped,
+                },
+            )
+        except ExistingBookConfirmationRequired:
+            confirmation_conflict = True
+            job = tracker.get_job(job_id)
+            params = dict(job.params or {}) if job else {}
+            params["confirmed_existing_book_id"] = None
+            if cleanup_upload_id:
+                params["retry_upload_id"] = cleanup_upload_id
+            elif cleanup_temp_path:
+                params["retry_upload_id"] = self.stage_upload(ebook_path, original_name)
+            else:
+                params["retry_inbox_file"] = original_name
+            logger.info("Translated ebook import job %s requires a fresh Preview and confirmation", job_id)
+            tracker.update_job(
+                job_id,
+                status="failed",
+                error=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+                message=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
+                params=params,
+            )
+            record_audit_event(
+                event_type="import_failure",
+                severity="warning",
+                source="import",
+                message="Translated ebook import requires existing book confirmation",
+                job_id=job_id,
+                details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
+            )
+        except ValueError as exc:
+            logger.info("Translated ebook import job %s failed: %s", job_id, exc)
+            tracker.update_job(
+                job_id,
+                status="failed",
+                error="Translated ebook import failed. Check duplicate settings, ebook file, and server logs.",
+                message="Translated ebook import failed. Check duplicate settings, ebook file, and server logs.",
+            )
+            record_audit_event(
+                event_type="import_failure",
+                severity="warning",
+                source="import",
+                message="Translated ebook import failed",
+                job_id=job_id,
+                details={"import_type": "ebook", "result": "failure"},
+            )
+        except Exception:
+            logger.exception("Translated ebook import job %s failed", job_id)
+            tracker.update_job(
+                job_id,
+                status="failed",
+                error="Translated ebook import failed. Check server logs.",
+                message="Translated ebook import failed. Check server logs.",
+            )
+            record_audit_event(
+                event_type="import_failure",
+                severity="error",
+                source="import",
+                message="Translated ebook import failed",
+                job_id=job_id,
+                details={"import_type": "ebook", "result": "failure"},
+            )
+        finally:
+            if not confirmation_conflict:
+                if cleanup_upload_id:
+                    self.delete_upload(cleanup_upload_id)
+                if cleanup_temp_path:
+                    ebook_path.unlink(missing_ok=True)
+
+
     def _stylesheet_pagination_rules_from_epub_css(
         self,
         epub: zipfile.ZipFile,
@@ -965,15 +1161,27 @@ class EbookImportService:
                     raw_text_path=raw_path,
                     adapter_id="ebook",
                 )
-            update_chapter_paths(
-                self.db_path,
-                chapter_id,
-                raw_text_path=raw_path,
-                translated_text_path=translated_path,
-                content_html_path=content_html_path,
-                clear_content_html_path=content_html_path is None,
-                status="translated",
-            )
+            try:
+                update_chapter_paths(
+                    self.db_path,
+                    chapter_id,
+                    raw_text_path=raw_path,
+                    translated_text_path=translated_path,
+                    content_html_path=content_html_path,
+                    clear_content_html_path=content_html_path is None,
+                    status="translated",
+                    expected_content_revision=existing["content_revision"] if existing else 1,
+                )
+            except Exception:
+                current = get_chapter(self.db_path, book_id, chapter.chapter_number) or {}
+                referenced = {current.get(key) for key in ("raw_text_path", "translated_text_path", "content_html_path")}
+                for path in (raw_path, translated_path, content_html_path):
+                    if path is not None and str(path) not in referenced:
+                        retire_artifact(path, self.data_dir, self.db_path)
+                raise
+            if existing:
+                for key in ("raw_text_path", "translated_text_path", "content_html_path"):
+                    retire_artifact(existing.get(key), self.data_dir, self.db_path)
             chapter_ids.append(chapter_id)
             imported += 1
 
@@ -1115,25 +1323,19 @@ class EbookImportService:
         raw_dir = self.data_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         safe_title = re.sub(r"[\W_]+", "_", book_title, flags=re.UNICODE).strip("_") or "ebook"
-        raw_path = raw_dir / f"{safe_title}_ch{chapter.chapter_number}_ebook_{time.time_ns()}.txt"
-        raw_path.write_text(chapter.text, encoding="utf-8")
-        return raw_path
+        return write_versioned_text(raw_dir, f"{safe_title}_ch{chapter.chapter_number}_ebook", chapter.text)
 
     def _write_translated_chapter(self, book_title: str, chapter: ParsedEbookChapter) -> Path:
         translated_dir = self.data_dir / "translated"
         translated_dir.mkdir(parents=True, exist_ok=True)
         safe_title = re.sub(r"[\W_]+", "_", book_title, flags=re.UNICODE).strip("_") or "ebook"
-        translated_path = translated_dir / f"{safe_title}_ch{chapter.chapter_number}_{time.time_ns()}.txt"
-        translated_path.write_text(chapter.text, encoding="utf-8")
-        return translated_path
+        return write_versioned_text(translated_dir, f"{safe_title}_ch{chapter.chapter_number}", chapter.text)
 
     def _write_chapter_html(self, book_title: str, chapter: ParsedEbookChapter, content_html: str) -> Path:
         translated_dir = self.data_dir / "translated"
         translated_dir.mkdir(parents=True, exist_ok=True)
         safe_title = re.sub(r"[\W_]+", "_", book_title, flags=re.UNICODE).strip("_") or "ebook"
-        html_path = translated_dir / f"{safe_title}_ch{chapter.chapter_number}_{time.time_ns()}.html"
-        html_path.write_text(content_html, encoding="utf-8")
-        return html_path
+        return write_versioned_text(translated_dir, f"{safe_title}_ch{chapter.chapter_number}", content_html, suffix=".html")
 
     @staticmethod
     def _safe_asset_name(value: str) -> str:

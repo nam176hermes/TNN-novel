@@ -5,6 +5,8 @@ import importlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -622,6 +624,53 @@ def test_mobile_api_cors_origins_are_not_wildcard() -> None:
 
     assert middleware_options
     assert "*" not in middleware_options[0]["allow_origins"]
+
+
+def test_default_development_secret_is_long_enough_for_hs256() -> None:
+    environment = os.environ.copy()
+    environment["NOVEL_PIPELINE_IGNORE_DOTENV"] = "1"
+    environment.pop("MOBILE_API_SECRET", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import warnings; "
+            "from jwt import InsecureKeyLengthWarning; "
+            "from app.mobile_api.config import mobile_settings; "
+            "from app.mobile_api.security import create_access_token; "
+            "assert mobile_settings.secret_key == 'dev-secret-change-in-production-now'; "
+            "warnings.simplefilter('error', InsecureKeyLengthWarning); "
+            "assert create_access_token({'sub': 'admin'})",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "dev-secret-change-in-production-now",
+        "replace-with-a-long-random-secret",
+    ],
+)
+def test_public_deploy_rejects_known_development_secrets(secret: str) -> None:
+    from app.mobile_api.config import MobileAPISettings, validate_public_deploy_settings
+
+    settings = MobileAPISettings(
+        public_deploy=True,
+        secret_key=secret,
+        admin_username="private_operator",
+        admin_password="correct horse battery staple 2026",
+        cors_origins=["https://novel.example.com"],
+    )
+
+    assert any("MOBILE_API_SECRET" in error for error in validate_public_deploy_settings(settings))
 
 
 def test_public_deploy_safety_gate_rejects_unsafe_defaults() -> None:

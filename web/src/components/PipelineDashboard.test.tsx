@@ -58,6 +58,7 @@ describe('Pipeline dashboard components', () => {
 
         if (target.endsWith('/api/providers')) return { ok: true, json: async () => ({ providers: [] }) };
         if (target.endsWith('/api/style-profiles')) return { ok: true, json: async () => ({ profiles: [] }) };
+        if (target.endsWith('/api/library/books')) return { ok: true, json: async () => ({ books: [] }) };
         if (target.endsWith('/api/books')) return { ok: true, json: async () => [] };
         if (target.endsWith('/api/providers/usage')) {
           return { ok: true, json: async () => ({ usage: fixtureUsage }) };
@@ -71,8 +72,7 @@ describe('Pipeline dashboard components', () => {
 
     expect(screen.getByRole('heading', { name: 'Novel-TNN' })).toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: 'Quy trình' })).toBeInTheDocument();
-    expect(await screen.findByRole('heading', { name: 'Chưa chọn chương' })).toBeInTheDocument();
-    expect(screen.getByText('Chọn một chương trong danh sách bên trái để bắt đầu biên tập bản dịch.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Thư viện' })).toBeInTheDocument();
     expect(screen.queryByText('Sơn biên tiểu thôn')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Chapter editor')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Translate' })).not.toBeInTheDocument();

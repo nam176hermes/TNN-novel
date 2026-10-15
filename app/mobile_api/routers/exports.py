@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from app.mobile_api.audit import record_audit_event
+from app.export.m4b_exporter import IncompleteAudiobookError
 from app.mobile_api.schemas import ExportRequest, ExportResponse
 from app.mobile_api.services.export_service import ExportService
 from app.mobile_api.services.pipeline_service import PipelineService
@@ -42,9 +43,12 @@ def _annotation_export_or_404(book_id: int, format: str, service: ExportService,
         raise HTTPException(status_code=status, detail=message) from exc
 
 
-def _audiobook_export_or_404(book_id: int, format: str, service: ExportService) -> dict:
+def _audiobook_export_or_404(book_id: int, format: str, service: ExportService, allow_partial=False) -> dict:
     try:
-        return service.export_audiobook(book_id, format)
+        return service.export_audiobook(book_id, format, **({"allow_partial": True} if allow_partial else {}))
+    except IncompleteAudiobookError as exc:
+        raise HTTPException(status_code=409, detail={"code": "incomplete_audiobook",
+            "message": "Một số chương chưa có audio hoặc audio đã cũ.", "missing_chapter_ids": exc.chapter_ids}) from exc
     except ValueError as exc:
         message = str(exc)
         status = 404 if "not found" in message.lower() else 400
@@ -52,7 +56,7 @@ def _audiobook_export_or_404(book_id: int, format: str, service: ExportService) 
 
 
 @router.post("", response_model=ExportResponse)
-async def export_book(
+def export_book(
     book_id: int,
     request: ExportRequest,
     http_request: Request,
@@ -78,10 +82,11 @@ async def download_audiobook_export(
     book_id: int,
     format: str,
     request: Request,
+    allow_partial: bool = Query(False),
     service: ExportService = Depends(get_export_service),
 ):
     """Create and download an audiobook export for a book with chapter audio."""
-    result = await asyncio.to_thread(_audiobook_export_or_404, book_id, format, service)
+    result = await asyncio.to_thread(_audiobook_export_or_404, book_id, format, service, allow_partial)
     path = Path(result["path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="Export file not found")
@@ -101,7 +106,7 @@ async def download_audiobook_export(
 
 
 @router.get("/{format}/download")
-async def download_book_export(
+def download_book_export(
     book_id: int,
     format: str,
     request: Request,
@@ -128,7 +133,7 @@ async def download_book_export(
 
 
 @router.get("/annotations/{format}/download")
-async def download_annotation_export(
+def download_annotation_export(
     book_id: int,
     format: str,
     request: Request,

@@ -311,6 +311,7 @@ export type ExportDownload = {
 };
 
 export type ChapterTextResponse = {
+  content_revision?: number;
   chapter_id: number;
   text: string;
 };
@@ -1346,9 +1347,19 @@ export type Book = {
 
 export type BookUpdate = Partial<Pick<Book, 'title' | 'author' | 'source' | 'source_url'>>;
 
-export type ChapterApi = {
+export type ChapterIntegrity = {
+  content_revision?: number;
+  translation_hash?: string | null;
+  translated_title?: string;
+  quality_status?: 'unreviewed' | 'legacy_unverified' | 'pass' | 'needs_review' | 'partial' | 'stale';
+  audio_status?: 'missing' | 'legacy_unverified' | 'ready' | 'stale';
+  audio_version?: string;
+};
+
+export type ChapterApi = ChapterIntegrity & {
   id: number;
   book_id: number;
+  book_title?: string;
   chapter_number: number;
   title: string;
   status: string;
@@ -1360,6 +1371,16 @@ export type ChapterApi = {
   audio_path: string | null;
   translated_at: string | null;
   audio_created_at: string | null;
+};
+
+export type RawBacklogPage = {
+  chapters: ChapterApi[];
+  total_chapters: number;
+  total_books: number;
+  book_counts: Record<number, number>;
+  first_chapter_ids?: Record<number, number>;
+  limit: number;
+  offset: number;
 };
 
 export type BookSummary = {
@@ -1397,7 +1418,7 @@ export type TranslatedBookSummary = {
 export type Chapter = Pick<
   ChapterApi,
   'id' | 'book_id' | 'chapter_number' | 'title' | 'status' | 'audio_path'
-> & {
+> & ChapterIntegrity & {
   book_title?: string;
   content_html_path?: string | null;
   has_translation?: boolean;

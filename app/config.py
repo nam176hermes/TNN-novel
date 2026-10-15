@@ -37,14 +37,12 @@ class Settings(BaseSettings):
     tts_vocab_file: str = ""
     tts_device: str = "cuda"
     tts_normalizer: str = "vinorm"
-    tts_output_format: str = "mp3"
     tts_chunk_max_chars: int = 450
     tts_chunk_max_sentences: int = 4
     tts_reference_audio_path: str = ""
     tts_reference_text: str = ""
     tts_audio_sample_rate: int = 24000
     tts_enable_qa: bool = True
-    tts_enable_m4b: bool = True
     tts_cache: bool = True
     tts_chunk_timeout_seconds: int = 120
     tts_chunk_retries: int = 2

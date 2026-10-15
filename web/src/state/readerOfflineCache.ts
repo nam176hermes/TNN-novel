@@ -4,6 +4,7 @@ import {
   cacheReaderAssetsFromHtml,
   cacheReaderAudio,
   putCachedChapterAsync,
+  readerChapterRevision,
   type ReaderAssetCacheSummary,
   type ReaderAudioCacheSummary,
 } from './readerCache';
@@ -16,12 +17,15 @@ export type ReaderOfflineCacheChapter = {
   audio_path?: string | null;
   book_id: number;
   content_html_path?: string | null;
+  content_revision?: number;
+  audio_status?: string;
+  audio_version?: string;
   has_translation?: boolean;
   id: number;
 };
 
 export type ReaderOfflineCacheClient = {
-  chapterAudioUrl(bookId: number, chapterId: number): string;
+  chapterAudioUrl(bookId: number, chapterId: number, version?: string): string;
   downloadReaderDictionary?(filename: string): Promise<ExportDownload>;
   getBookAudioPlaylist?(bookId: number): Promise<{ chapters: BookAudioPlaylistItem[] }>;
   getChapterContent(bookId: number, chapterId: number): Promise<{ html: string; text: string } | null>;
@@ -519,7 +523,7 @@ export async function cacheChapterForOffline({
     await putCachedChapterAsync({
       bookId,
       chapterId: chapter.id,
-      contentRevision: chapter.content_html_path?.trim() ?? '',
+      contentRevision: readerChapterRevision(chapter),
       html,
       sourceText,
       text: translation,
@@ -547,7 +551,7 @@ export async function cacheChapterForOffline({
       summary.assetsTotal = assetSummary.total;
     }
 
-    const normalizedAudioUrl = audioUrl?.trim() || (chapter.audio_path ? client.chapterAudioUrl(bookId, chapter.id) : '');
+    const normalizedAudioUrl = audioUrl?.trim() || (chapter.audio_path && chapter.audio_status !== 'stale' ? client.chapterAudioUrl(bookId, chapter.id, chapter.audio_version) : '');
     if (normalizedAudioUrl) {
       summary.audioTotal = 1;
       const audioSummary = await cacheAudio(bookId, chapter.id, normalizedAudioUrl);
@@ -719,7 +723,7 @@ export async function cacheBookForOffline({
       await putCachedChapterAsync({
         bookId,
         chapterId: chapter.id,
-        contentRevision: chapter.content_html_path?.trim() ?? '',
+        contentRevision: readerChapterRevision(chapter),
         html,
         sourceText,
         text: translation,
@@ -748,7 +752,7 @@ export async function cacheBookForOffline({
       }
 
       const playlistAudio = audioPlaylistByChapterId.get(chapter.id);
-      const audioUrl = playlistAudio?.stream_url || (chapter.audio_path ? client.chapterAudioUrl(bookId, chapter.id) : '');
+      const audioUrl = playlistAudio?.stream_url || (chapter.audio_path && chapter.audio_status !== 'stale' ? client.chapterAudioUrl(bookId, chapter.id, chapter.audio_version) : '');
       if (audioUrl) {
         summary.audioTotal += 1;
         const audioSummary = await cacheAudio(bookId, chapter.id, audioUrl);

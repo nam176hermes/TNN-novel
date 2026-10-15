@@ -5,6 +5,7 @@ import math
 import shutil
 import struct
 import subprocess
+import tempfile
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,46 +66,39 @@ def _probe_duration(path: Path) -> float:
 
 
 def _read_wav_metrics(path: Path) -> tuple[float, float, float, float]:
+    square_sum, peak_abs, clipped, count = 0, 0, 0, 0
     with wave.open(str(path), "rb") as wav:
-        channels = max(1, wav.getnchannels())
-        sample_width = wav.getsampwidth()
-        frames = wav.getnframes()
-        frame_rate = wav.getframerate()
-        raw = wav.readframes(frames)
-    duration = frames / frame_rate if frame_rate else 0
-    if not raw or sample_width not in {1, 2, 3, 4}:
-        return duration, 0, 0, 0
+        width = wav.getsampwidth()
+        duration = wav.getnframes() / wav.getframerate()
+        if width not in {1, 2, 3, 4}:
+            raise wave.Error("Unsupported PCM sample width")
+        max_abs = 1 << (width * 8 - 1)
+        while raw := wav.readframes(8192):
+            if width == 1:
+                samples = [value - 128 for value in raw]
+            elif width == 3:
+                samples = [int.from_bytes(raw[i:i + 3], "little", signed=True) for i in range(0, len(raw), 3)]
+            else:
+                samples = struct.unpack(f"<{len(raw) // width}{'h' if width == 2 else 'i'}", raw)
+            count += len(samples)
+            square_sum += sum(value * value for value in samples)
+            peak_abs = max(peak_abs, max((abs(value) for value in samples), default=0))
+            clipped += sum(abs(value) >= max_abs * .98 for value in samples)
+    return (duration, math.sqrt(square_sum / count) / max_abs if count else 0,
+            peak_abs / max_abs, clipped / count if count else 0)
 
-    if sample_width == 1:
-        samples = [sample - 128 for sample in raw]
-        max_abs = 128
-    elif sample_width == 2:
-        count = len(raw) // 2
-        samples = list(struct.unpack(f"<{count}h", raw[: count * 2]))
-        max_abs = 32768
-    elif sample_width == 3:
-        samples = []
-        for index in range(0, len(raw) - 2, 3):
-            value = int.from_bytes(raw[index:index + 3], "little", signed=True)
-            samples.append(value)
-        max_abs = 8388608
-    else:
-        count = len(raw) // 4
-        samples = list(struct.unpack(f"<{count}i", raw[: count * 4]))
-        max_abs = 2147483648
 
-    if channels > 1 and samples:
-        # Keep QA cheap; aggregate over interleaved samples rather than channel splitting.
-        pass
-    if not samples:
-        return duration, 0, 0, 0
-    square_sum = sum(float(sample) * float(sample) for sample in samples)
-    rms = math.sqrt(square_sum / len(samples)) / max_abs
-    peak_abs = max(abs(sample) for sample in samples)
-    peak = peak_abs / max_abs
-    clipped = sum(1 for sample in samples if abs(sample) >= max_abs * 0.98)
-    clipped_ratio = clipped / len(samples)
-    return duration, rms, peak, clipped_ratio
+def _decode_metrics(path: Path):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise OSError("FFmpeg unavailable for decoded audio QA")
+    with tempfile.TemporaryDirectory(prefix="audio-qa-") as tmp:
+        pcm = Path(tmp) / "decoded.wav"
+        result = subprocess.run([ffmpeg, "-v", "error", "-i", str(path), "-ac", "1",
+            "-ar", "24000", "-c:a", "pcm_s16le", str(pcm)], capture_output=True, timeout=300)
+        if result.returncode:
+            raise OSError("Audio decode failed")
+        return _read_wav_metrics(pcm)
 
 
 def analyze_audio(
@@ -123,22 +117,16 @@ def analyze_audio(
         if path.suffix.lower() == ".wav":
             duration, rms, peak, clipped_ratio = _read_wav_metrics(path)
         else:
-            duration = _probe_duration(path)
-            rms = 0
-            peak = 0
-            clipped_ratio = 0
-            if text and not ffprobe_available():
-                warnings.append("ffprobe unavailable; duration QA skipped")
-    except (OSError, wave.Error, struct.error) as exc:
-        return AudioQAResult(False, error=f"Audio QA failed: {exc}")
+            duration, rms, peak, clipped_ratio = _decode_metrics(path)
+    except (OSError, wave.Error, struct.error, subprocess.TimeoutExpired):
+        return AudioQAResult(False, error="Audio QA failed: audio could not be decoded")
 
     if duration <= min_duration_seconds:
         return AudioQAResult(False, duration_seconds=duration, rms=rms, peak=peak, clipped_ratio=clipped_ratio, error="Audio duration is too short")
-    if path.suffix.lower() == ".wav":
-        if rms < 0.0005:
-            return AudioQAResult(False, duration_seconds=duration, rms=rms, peak=peak, clipped_ratio=clipped_ratio, error="Audio appears silent")
-        if clipped_ratio > 0.05:
-            warnings.append("Audio has heavy clipping")
+    if rms < 0.0005:
+        return AudioQAResult(False, duration_seconds=duration, rms=rms, peak=peak, clipped_ratio=clipped_ratio, error="Audio appears silent")
+    if clipped_ratio > 0.05:
+        warnings.append("Audio has heavy clipping")
 
     text_len = len((text or "").strip())
     if text_len:

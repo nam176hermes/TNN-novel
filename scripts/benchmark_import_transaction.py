@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import app.database.db as db_mod
 from app.mobile_api.services.glossary_service import GlossaryService
+from app.mobile_api.services.import_commit_service import ImportCommitService
 from app.mobile_api.services.pipeline_service import PipelineService
 from app.mobile_api.services.qa_service import QAService
 
@@ -39,7 +40,7 @@ def _chapters(count: int, text_bytes: int = 0) -> list[dict]:
     ]
 
 
-def _timed_method(service: PipelineService, name: str, timings: dict[str, float]) -> None:
+def _timed_method(service: PipelineService | ImportCommitService, name: str, timings: dict[str, float]) -> None:
     original = getattr(service, name)
 
     def measured(*args, **kwargs):
@@ -61,6 +62,8 @@ def _run_case(*, count: int, text_bytes: int, include_followups: bool, work_root
         db_path = root / "pipeline.db"
         db_mod.init_db(db_path)
         service = _pipeline(db_path, root)
+        imports = service._imports()
+        service._imports = lambda: imports
         timings: dict[str, float] = {}
         for name in (
             "_prepare_reviewed_import_items",
@@ -68,7 +71,8 @@ def _run_case(*, count: int, text_bytes: int, include_followups: bool, work_root
             "_stage_reviewed_import_files",
             "_finalize_reviewed_import_files",
         ):
-            _timed_method(service, name, timings)
+            owner = service if name == "_stage_reviewed_import_files" else imports
+            _timed_method(owner, name, timings)
 
         original_connect = db_mod.sqlite3.connect
         counters = {"connections": 0, "commit_calls": 0, "sql_statements": 0, "duplicate_queries": 0}

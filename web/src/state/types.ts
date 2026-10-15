@@ -41,14 +41,20 @@ export function formatError(error: unknown): string {
   }
 
   if (
-    status === 502
-    || status === 503
-    || normalized.includes('provider temporarily unavailable')
+    normalized.includes('provider temporarily unavailable')
+    || normalized.includes('provider offline')
     || normalized.includes('provider failed')
     || normalized.includes('quota')
     || normalized.includes('rate limit')
   ) {
     return 'Provider dịch đang lỗi hoặc quá tải. Kiểm tra API key, quota, hoặc thử provider khác.';
+  }
+
+  if (status === 409 && normalized.includes('revision')) {
+    return 'Chương đã được sửa ở nơi khác. Tải lại bản mới trước khi lưu.';
+  }
+  if (status === 502 || status === 503) {
+    return 'API đang tạm thời không phản hồi. Hãy thử tải lại khi kết nối ổn định.';
   }
 
   if (

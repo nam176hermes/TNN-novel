@@ -13,115 +13,23 @@ import {
   Upload,
   UploadCloud,
 } from 'lucide-react';
-import { useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
-import { ApiClient, ApiError } from '../api/client';
+import { useState, type FormEvent } from 'react';
 import type {
   EbookDuplicateStrategy,
-  EbookInboxFile,
-  EbookImportHistoryRun,
-  EbookImportRequest,
-  EbookImportResult,
-  EbookPreview,
-  EbookSplitMode,
-  ImportFileRequest,
-  ImportPasteRequest,
-  ImportUrlRequest,
-  JobStartResponse,
-  SourceCatalogList,
-  SourceCatalogQuery,
-  SourcePreview,
-  URLFetchChapterResult,
-  URLFetchResponse,
-  WizardTextImportRequest,
-  WizardTextImportResult,
+  JobStartResponse
 } from '../api/types';
-import {
-  buildImportPreview,
-  detectImportContentKind,
-  type DetectedImportChapter,
-  type ImportContentKind,
-} from '../state/importWizard';
-import { detectImportMetadata, type DetectedImportMetadata } from '../state/importMetadata';
-import { useImportJob } from '../state/useImportJob';
+import type { DetectedImportChapter, ImportContentKind } from '../state/importWizard';
+import { EbookImportFlow, EbookPreviewPanel } from './import/EbookPreview';
+import { formatBytes } from './import/importLabels';
+import type { ImportMode, ImportPanelProps } from './import/types';
+import { useEbookImport } from './import/useEbookImport';
+import { useSourceImport } from './import/useSourceImport';
+import { useTextImport } from './import/useTextImport';
 import ImportJobProgress from './ImportJobProgress';
-
-export type ImportPanelProps = {
-  importJobClient?: ApiClient;
-  onImportPaste: (request: ImportPasteRequest) => Promise<void> | void;
-  onImportFile?: (request: ImportFileRequest) => Promise<void> | void;
-  onImportWizardText?: (
-    request: WizardTextImportRequest,
-    options?: { finalAction: FinalImportAction },
-  ) => Promise<WizardTextImportResult | void> | void;
-  onPreviewTranslatedEbook?: (
-    file: File,
-    splitMode: EbookSplitMode,
-    options?: { duplicateStrategy?: EbookDuplicateStrategy; targetBookId?: number | null },
-  ) => Promise<EbookPreview>;
-  onPreviewInboxEbook?: (
-    filename: string,
-    splitMode: EbookSplitMode,
-    options?: { duplicateStrategy?: EbookDuplicateStrategy; targetBookId?: number | null },
-  ) => Promise<EbookPreview>;
-  onImportTranslatedEbook?: (request: EbookImportRequest) => Promise<EbookImportResult | void> | void;
-  onPreviewImportUrl?: (url: string) => Promise<SourcePreview>;
-  onStartImportUrlJob?: (request: ImportUrlRequest) => Promise<JobStartResponse | void> | void;
-  onFetchSourceChapters?: (request: {
-    source_url: string;
-    title: string;
-    author: string;
-    source: string;
-    chapters: Array<{ url: string; chapter_number: number; title: string }>;
-  }) => Promise<URLFetchResponse>;
-  onCreateTranslationJob?: (bookId: number, chapterIds: number[]) => Promise<JobStartResponse | void> | void;
-  onCreateTtsJob?: (bookId: number, chapterIds: number[]) => Promise<JobStartResponse | void> | void;
-  loadSourceCatalog?: (params: SourceCatalogQuery) => Promise<SourceCatalogList>;
-  onOpenImportedBook?: (result: WizardTextImportResult) => void;
-  onOpenJob?: (jobId: string) => void;
-  onReturnToLibrary?: () => void;
-  onCancel: () => void;
-  books?: Array<{ id: number; title: string }>;
-  chapters?: Array<{ book_id: number; chapter_number: number; title?: string }>;
-  ebookInboxDirectory?: string;
-  ebookInboxError?: string;
-  ebookInboxFiles?: EbookInboxFile[];
-  ebookImportHistory?: EbookImportHistoryRun[];
-  loading?: boolean;
-  onRefreshEbookInbox?: () => Promise<void> | void;
-};
-
-type ImportMode = 'paste' | 'file' | 'ebook' | 'url' | 'catalog';
-type EbookSource = 'upload' | 'inbox';
-type EbookPreviewState = 'idle' | 'loading' | 'ready' | 'error';
-type EbookPreviewFile = Pick<File, 'name' | 'size'>;
-type FinalImportAction = 'save' | 'open' | 'translate' | 'tts';
+export type { ImportPanelProps } from './import/types';
 
 const CJK_CHARACTER_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff]/g;
 const EBOOK_ACCEPT = '.epub,.azw3,.mobi,.prc,.txt,.html,.htm,application/epub+zip,text/plain,text/html';
-const MAX_BROWSER_EBOOK_UPLOAD_BYTES = 95 * 1024 * 1024;
-const MAX_BROWSER_TEXT_UPLOAD_BYTES = 5 * 1024 * 1024;
-const TEXT_IMPORT_SUFFIXES = new Set(['.txt', '.md', '.markdown', '.html', '.htm']);
-const TEXT_IMPORT_MIME_TYPES = new Set(['', 'text/plain', 'text/markdown', 'text/html']);
-const BLOCKING_EBOOK_WARNING_TYPES = new Set(['unreadable_ebook']);
-const SOURCE_CHAPTER_PAGE_SIZE = 25;
-const disabledImportJobClient = new ApiClient('');
-
-function formatBytes(value: number): string {
-  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
-  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${value.toLocaleString()} bytes`;
-}
-
-function textByteLength(value: string): number {
-  return new TextEncoder().encode(value).length;
-}
-
-function hasUnsupportedEncodingMarkers(value: string): boolean {
-  const replacementCount = value.match(/\uFFFD/g)?.length ?? 0;
-  if (replacementCount === 0) return false;
-  return replacementCount > Math.max(4, value.length * 0.01);
-}
-
 function sourceTextStats(value: string) {
   const trimmed = value.trim();
   const lines = trimmed ? trimmed.split(/\r?\n/).filter((line) => line.trim()).length : 0;
@@ -130,13 +38,6 @@ function sourceTextStats(value: string) {
     cjkCharacters: trimmed.match(CJK_CHARACTER_PATTERN)?.length ?? 0,
     lines,
   };
-}
-
-function isSupportedTextImportFile(file: File): boolean {
-  const lowered = file.name.toLowerCase();
-  const dotIndex = lowered.lastIndexOf('.');
-  const suffix = dotIndex >= 0 ? lowered.slice(dotIndex) : '';
-  return TEXT_IMPORT_SUFFIXES.has(suffix) && TEXT_IMPORT_MIME_TYPES.has(file.type);
 }
 
 function PasteTextStatus({
@@ -242,293 +143,6 @@ function FileImportStatus({
         </div>
       </dl>
     </section>
-  );
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function ebookSplitMethodLabel(preview: EbookPreview): string {
-  const warnings = preview.warnings ?? [];
-  if (preview.split_method !== 'toc' && warnings.some((warning) => warning.type === 'toc_unmapped')) {
-    return 'Có mục lục nhưng không map được chapter';
-  }
-  if (preview.split_method === 'toc') {
-    const tocCount = preview.toc_chapter_count ?? preview.chapter_count;
-    return `Tách theo mục lục: ${tocCount.toLocaleString()} chương`;
-  }
-  if (preview.split_method === 'single') {
-    return 'Import thành một chương';
-  }
-  if (preview.split_method === 'heading') {
-    return 'Không tìm thấy mục lục, dùng heading fallback';
-  }
-  if (preview.split_method === 'regex') {
-    return 'Tách bằng heading TXT/HTML';
-  }
-  if (preview.split_method === 'spine') {
-    return 'Không tìm thấy mục lục, dùng spine fallback';
-  }
-  return 'Tự động: ưu tiên mục lục';
-}
-
-function ebookDuplicateStrategySummary(dryRun: NonNullable<EbookPreview['dry_run']>): string {
-  if (dryRun.duplicate_strategy === 'error') {
-    if (dryRun.would_error === 0) {
-      return `Chiến lược đã chọn: Dừng khi trùng. Không có chương trùng; sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương mới.`;
-    }
-    return `Chiến lược đã chọn: Dừng khi trùng. Có ${dryRun.would_import.toLocaleString('vi-VN')} chương mới và ${dryRun.would_error.toLocaleString('vi-VN')} chương trùng. Import sẽ dừng khi gặp chương trùng; các chương đứng trước đó có thể đã được import.`;
-  }
-  if (dryRun.duplicate_strategy === 'overwrite') {
-    return `Chiến lược đã chọn: Ghi đè chương trùng. Sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương, gồm ghi đè ${dryRun.would_overwrite.toLocaleString('vi-VN')} chương trùng.`;
-  }
-  return `Chiến lược đã chọn: Bỏ qua chương trùng. Sẽ import ${dryRun.would_import.toLocaleString('vi-VN')} chương mới và bỏ qua ${dryRun.would_skip.toLocaleString('vi-VN')} chương trùng.`;
-}
-
-function EbookPreviewPanel({
-  confirmedExistingBookId,
-  error,
-  file,
-  onConfirmedExistingBookIdChange,
-  onRetry,
-  preview,
-  retryDisabled,
-  state,
-}: {
-  confirmedExistingBookId: number | null;
-  error: string;
-  file: EbookPreviewFile | null;
-  onConfirmedExistingBookIdChange: (bookId: number | null) => void;
-  onRetry: () => void;
-  preview: EbookPreview | null;
-  retryDisabled: boolean;
-  state: EbookPreviewState;
-}) {
-  if (!file) {
-    return <p>Chưa chọn ebook.</p>;
-  }
-
-  if (state === 'loading') {
-    return (
-      <div>
-        <p>Đang đọc metadata và mục lục ebook.</p>
-        <button className="secondary-action" disabled onClick={onRetry} type="button">
-          <Loader2 aria-hidden="true" className="status-spinner" size={15} />
-          Preview lại
-        </button>
-      </div>
-    );
-  }
-
-  if (state === 'error') {
-    return (
-      <div>
-        <p className="status-error" role="alert">
-          {error || 'Không đọc được ebook này.'}
-        </p>
-        <button className="secondary-action" disabled={retryDisabled} onClick={onRetry} type="button">
-          Preview lại
-        </button>
-      </div>
-    );
-  }
-
-  if (!preview) {
-    return <p>{file.name} · {formatBytes(file.size)}</p>;
-  }
-
-  const firstChapters = preview.first_chapters ?? preview.chapters.slice(0, 20);
-  const lastChapters = preview.last_chapters ?? (
-    preview.chapters.length > 20 ? preview.chapters.slice(-20) : preview.chapters
-  );
-  const samePreviewWindow =
-    firstChapters.length === lastChapters.length
-    && firstChapters.every((chapter, index) => {
-      const lastChapter = lastChapters[index];
-      return lastChapter
-        && lastChapter.chapter_number === chapter.chapter_number
-        && lastChapter.title === chapter.title;
-    });
-  const warnings = preview.warnings ?? [];
-  const dryRun = preview.dry_run;
-  const coverUrl = preview.cover_preview_url || preview.cover_url || '';
-
-  function renderChapterList(label: string, chapters: EbookPreview['chapters']) {
-    return (
-      <section className="ebook-preview-section">
-        <h5>{label}</h5>
-        <ol className="ebook-preview-chapters">
-          {chapters.map((chapter) => (
-            <li key={`${label}-${chapter.chapter_number}-${chapter.title}`}>
-              <div>
-                <span>#{chapter.chapter_number}</span>
-                <strong>{chapter.title || `Chương ${chapter.chapter_number}`}</strong>
-              </div>
-              <p>{chapter.sample || 'Không có sample.'}</p>
-            </li>
-          ))}
-        </ol>
-      </section>
-    );
-  }
-
-  return (
-    <div className="ebook-preview-card">
-      {error ? (
-        <p className="status-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-      <div className="ebook-preview-header">
-        {coverUrl ? (
-          <img
-            alt={`Bìa ${preview.title || file.name}`}
-            className="ebook-preview-cover"
-            src={coverUrl}
-          />
-        ) : null}
-        <div>
-          <p className="section-label">{preview.source_format.toUpperCase()} preview</p>
-          <h4>{preview.title || file.name}</h4>
-        </div>
-        <span className="status-chip status-chip-success">{preview.chapter_count.toLocaleString()} chương</span>
-      </div>
-      <dl className="ebook-preview-meta">
-        <div>
-          <dt>Tác giả</dt>
-          <dd>{preview.author || 'Không rõ'}</dd>
-        </div>
-        <div>
-          <dt>Ngôn ngữ</dt>
-          <dd>{preview.language || 'Không rõ'}</dd>
-        </div>
-        <div>
-          <dt>Cover</dt>
-          <dd>{preview.cover_present ? 'Có' : 'Không'}</dd>
-        </div>
-        <div>
-          <dt>Cách tách</dt>
-          <dd>{ebookSplitMethodLabel(preview)}</dd>
-        </div>
-      </dl>
-      {dryRun ? (
-        <>
-          <dl className="ebook-dry-run">
-            <div>
-              <dt>Chương mới</dt>
-              <dd>{dryRun.new_chapters.toLocaleString()}</dd>
-            </div>
-            <div>
-              <dt>Chương trùng</dt>
-              <dd>{dryRun.duplicate_chapters.toLocaleString()}</dd>
-            </div>
-            <div>
-              <dt>Khi import</dt>
-              <dd>
-                <span>Sẽ import {dryRun.would_import.toLocaleString()} chương</span>
-                {dryRun.would_skip ? <span>Bỏ qua {dryRun.would_skip.toLocaleString()} chương trùng</span> : null}
-                {dryRun.would_overwrite ? <span>Ghi đè {dryRun.would_overwrite.toLocaleString()} chương trùng</span> : null}
-                {dryRun.would_error ? <span>Sẽ dừng vì {dryRun.would_error.toLocaleString()} chương trùng</span> : null}
-              </dd>
-            </div>
-          </dl>
-          {dryRun.requires_existing_book_confirmation ? (
-            <section className="ebook-preview-warnings" role="alert">
-              <h5>
-                {dryRun.book_match_reason === 'title'
-                  ? 'Truyện này đã có trong Library'
-                  : 'Sẽ gộp vào truyện đã chọn'}
-              </h5>
-              <p>
-                {dryRun.existing_book_title} · {dryRun.existing_chapter_count.toLocaleString('vi-VN')} chương hiện có
-              </p>
-              <p>
-                {dryRun.new_chapters.toLocaleString('vi-VN')} chương mới ·{' '}
-                {dryRun.duplicate_chapters.toLocaleString('vi-VN')} chương trùng
-              </p>
-              <p>{ebookDuplicateStrategySummary(dryRun)}</p>
-              <label>
-                <input
-                  checked={dryRun.existing_book_id !== null && confirmedExistingBookId === dryRun.existing_book_id}
-                  onChange={(event) => onConfirmedExistingBookIdChange(
-                    event.target.checked ? dryRun.existing_book_id : null,
-                  )}
-                  type="checkbox"
-                />
-                <span>Tôi xác nhận gộp ebook này vào truyện đã có.</span>
-              </label>
-            </section>
-          ) : null}
-        </>
-      ) : null}
-      {warnings.length > 0 ? (
-        <section className="ebook-preview-warnings" aria-label="Cảnh báo preview">
-          <h5>Cảnh báo preview</h5>
-          <ul>
-            {warnings.map((warning, index) => (
-              <li key={`${warning.type}-${warning.chapter_number ?? index}-${warning.message}`}>
-                {warning.message}
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-      {renderChapterList(`${firstChapters.length} chương đầu`, firstChapters)}
-      {samePreviewWindow ? null : renderChapterList(`${lastChapters.length} chương cuối`, lastChapters)}
-    </div>
-  );
-}
-
-function EbookImportFlow({
-  canImport,
-  previewState,
-  selectedFile,
-}: {
-  canImport: boolean;
-  previewState: EbookPreviewState;
-  selectedFile: EbookPreviewFile | null;
-}) {
-  const steps = [
-    {
-      label: '1. Chọn nguồn',
-      detail: selectedFile ? selectedFile.name : 'Tải file hoặc chọn từ server inbox',
-      state: selectedFile ? 'done' : 'active',
-    },
-    {
-      label: '2. Preview mục lục',
-      detail:
-        previewState === 'ready'
-          ? 'Đã đọc metadata, cover và chương mẫu'
-          : previewState === 'loading'
-            ? 'Đang đọc ebook'
-            : previewState === 'error'
-              ? 'Cần sửa lỗi preview'
-              : 'Preview trước khi import',
-      state: previewState === 'ready' ? 'done' : previewState === 'loading' ? 'active' : 'pending',
-    },
-    {
-      label: '3. Import vào Library',
-      detail: canImport ? 'Sẵn sàng thêm vào thư viện đã dịch' : 'Hoàn tất preview để mở khóa import',
-      state: canImport ? 'active' : 'pending',
-    },
-  ];
-
-  return (
-    <ol aria-label="Luồng import ebook" className="ebook-import-flow">
-      {steps.map((step) => (
-        <li data-state={step.state} key={step.label}>
-          <span className="ebook-step-number" aria-hidden="true">{step.label.split('.')[0]}</span>
-          <div>
-            <strong>
-              <span className="sr-only">{step.label}</span>
-              <span aria-hidden="true">{step.label.replace(/^\d+\.\s*/, '')}</span>
-            </strong>
-            <span>{step.detail}</span>
-          </div>
-        </li>
-      ))}
-    </ol>
   );
 }
 
@@ -685,124 +299,39 @@ export default function ImportPanel({
   onRefreshEbookInbox,
 }: ImportPanelProps) {
   const [mode, setMode] = useState<ImportMode>('paste');
-  const [title, setTitle] = useState('');
-  const [chapterNumber, setChapterNumber] = useState('1');
-  const [chapterTitle, setChapterTitle] = useState('');
-  const [text, setText] = useState('');
-  const [file, setFile] = useState<File | null>(null);
-  const [titleDirty, setTitleDirty] = useState(false);
-  const [chapterNumberDirty, setChapterNumberDirty] = useState(false);
-  const [chapterTitleDirty, setChapterTitleDirty] = useState(false);
-  const [ebookSource, setEbookSource] = useState<EbookSource>('upload');
-  const [ebookFile, setEbookFile] = useState<File | null>(null);
-  const [selectedInboxFile, setSelectedInboxFile] = useState('');
-  const [ebookPreview, setEbookPreview] = useState<EbookPreview | null>(null);
-  const [ebookPreviewState, setEbookPreviewState] = useState<EbookPreviewState>('idle');
-  const [ebookPreviewError, setEbookPreviewError] = useState('');
-  const [confirmedExistingBookId, setConfirmedExistingBookId] = useState<number | null>(null);
-  const [ebookSubmissionBlocked, setEbookSubmissionBlocked] = useState(false);
-  const ebookPreviewRequestToken = useRef(0);
-  const [lastEbookImportResult, setLastEbookImportResult] = useState<EbookImportResult | null>(null);
   const [duplicateStrategy, setDuplicateStrategy] = useState<EbookDuplicateStrategy>('skip');
   const [targetBookId, setTargetBookId] = useState('');
-  const [splitMode, setSplitMode] = useState<EbookSplitMode>('auto');
   const [helpOpen, setHelpOpen] = useState(false);
-  const [fileText, setFileText] = useState('');
-  const [contentKind, setContentKind] = useState<ImportContentKind>('unknown');
-  const [finalAction, setFinalAction] = useState<FinalImportAction>('open');
-  const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
-  const [chapterEdits, setChapterEdits] = useState<Record<number, { chapterNumber?: string; title?: string }>>({});
-  const [lastWizardResult, setLastWizardResult] = useState<WizardTextImportResult | null>(null);
   const [lastCreatedJob, setLastCreatedJob] = useState<JobStartResponse | null>(null);
-  const [wizardError, setWizardError] = useState('');
-  const [sourceUrl, setSourceUrl] = useState('');
-  const [sourcePreview, setSourcePreview] = useState<SourcePreview | null>(null);
-  const [sourcePreviewState, setSourcePreviewState] = useState<EbookPreviewState>('idle');
-  const [sourcePreviewError, setSourcePreviewError] = useState('');
-  const [selectedChapterUrls, setSelectedChapterUrls] = useState<Set<string>>(new Set());
-  const [chapterPage, setChapterPage] = useState(0);
-  const [rangeStart, setRangeStart] = useState('');
-  const [rangeEnd, setRangeEnd] = useState('');
-  const [fetchState, setFetchState] = useState<EbookPreviewState>('idle');
-  const [fetchResult, setFetchResult] = useState<URLFetchResponse | null>(null);
-  const [fetchError, setFetchError] = useState('');
-  const [catalogQuery, setCatalogQuery] = useState('');
-  const [catalogState, setCatalogState] = useState<EbookPreviewState>('idle');
-  const [catalogError, setCatalogError] = useState('');
-  const [catalog, setCatalog] = useState<SourceCatalogList | null>(null);
-  const importJob = useImportJob(importJobClient ?? disabledImportJobClient, {
-    enabled: Boolean(importJobClient),
-  });
+  const {
+    title, chapterNumber, chapterTitle, text, file, fileText, contentKind, finalAction,
+    overwriteConfirmed, lastWizardResult, wizardError, importFields, textPreview,
+    handleTitleChange, handleChapterNumberChange, handleChapterTitleChange, handleTextChange,
+    handleFileChange, handleChapterEdit, submitWizardText, setContentKind,
+    setFinalAction, setOverwriteConfirmed, clearWizardResult, applyPreviewTitle,
+  } = useTextImport({ mode, books, chapters, targetBookId, duplicateStrategy,
+    onImportWizardText, onCreateTranslationJob, onCreateTtsJob, onJobCreated: setLastCreatedJob });
+  const {
+    sourceUrl, sourcePreview, sourcePreviewState, sourcePreviewError,
+    selectedChapterUrls, chapterPage, setChapterPage, rangeStart, setRangeStart, rangeEnd, setRangeEnd,
+    fetchState, fetchResult, fetchError, catalogQuery, setCatalogQuery, catalogState, catalogError, catalog,
+    importJob, sourceChapterPageCount, visibleSourceChapters, allVisibleChaptersSelected, durableImportActive,
+    handlePreviewSourceUrl, toggleChapterSelection, toggleSelectVisibleChapters,
+    selectChapterRange, handleFetchChapters, handleCatalogSearch, submitSourceUrl,
+    updateSourceUrl, chooseCatalogSource,
+  } = useSourceImport({ importJobClient, title, onPreviewTitle: applyPreviewTitle,
+    onJobCreated: setLastCreatedJob, onPreviewImportUrl, onStartImportUrlJob, onFetchSourceChapters, loadSourceCatalog });
+  const {
+    ebookSource, ebookFile, selectedInboxFile, ebookPreview, ebookPreviewState, ebookPreviewError,
+    confirmedExistingBookId, setConfirmedExistingBookId, ebookSubmissionBlocked,
+    lastEbookImportResult, splitMode, selectedEbookFile, ebookHasBlockingWarning,
+    existingBookConfirmed, ebookPreviewRetryAvailable,
+    handleEbookFileChange, handleEbookDrop, handleEbookSourceChange, handleInboxFileChange,
+    handleSplitModeChange, handleTargetBookChange, handleDuplicateStrategyChange,
+    retryEbookPreview, submitTranslatedEbook, leaveEbookMode, enterEbookMode, cancelEbookPreview,
+  } = useEbookImport({ ebookInboxDirectory, ebookInboxFiles, loading, duplicateStrategy, targetBookId,
+    setDuplicateStrategy, setTargetBookId, onPreviewInboxEbook, onPreviewTranslatedEbook, onImportTranslatedEbook });
 
-  const parsedChapterNumber = Number.parseInt(chapterNumber, 10);
-  const selectedInboxEntry = ebookInboxFiles.find((entry) => entry.name === selectedInboxFile) ?? null;
-  const selectedEbookFile: EbookPreviewFile | null =
-    ebookSource === 'inbox'
-      ? selectedInboxEntry
-        ? { name: selectedInboxEntry.name, size: selectedInboxEntry.size }
-        : null
-      : ebookFile;
-  const importFields = {
-    title,
-    chapter_number: Number.isNaN(parsedChapterNumber) ? 1 : parsedChapterNumber,
-    chapter_title: chapterTitle,
-  };
-  const textDraft = mode === 'file' ? fileText : text;
-  const selectedTargetBookId = targetBookId ? Number.parseInt(targetBookId, 10) : null;
-  const inferredTargetBook = !selectedTargetBookId && title.trim()
-    ? books.find((book) => book.title.trim().toLowerCase() === title.trim().toLowerCase())
-    : null;
-  const effectiveTargetBookId = selectedTargetBookId ?? inferredTargetBook?.id ?? null;
-  const existingChaptersForTarget = useMemo(
-    () => (
-      effectiveTargetBookId
-        ? chapters.filter((chapter) => chapter.book_id === effectiveTargetBookId)
-        : []
-    ),
-    [chapters, effectiveTargetBookId],
-  );
-  const sourceChapterPageCount = Math.max(
-    1,
-    Math.ceil((sourcePreview?.chapters.length ?? 0) / SOURCE_CHAPTER_PAGE_SIZE),
-  );
-  const visibleSourceChapters = sourcePreview?.chapters.slice(
-    chapterPage * SOURCE_CHAPTER_PAGE_SIZE,
-    (chapterPage + 1) * SOURCE_CHAPTER_PAGE_SIZE,
-  ) ?? [];
-  const allVisibleChaptersSelected = visibleSourceChapters.length > 0
-    && visibleSourceChapters.every((chapter) => selectedChapterUrls.has(chapter.url));
-  const durableImportActive = Boolean(importJobClient && importJob.state.phase !== 'idle');
-  const textPreview = useMemo(
-    () => (
-      textDraft.trim()
-        ? buildImportPreview({
-          text: textDraft,
-          selectedKind: contentKind,
-          existingChapters: existingChaptersForTarget,
-        })
-        : null
-    ),
-    [contentKind, existingChaptersForTarget, textDraft],
-  );
-  const ebookHasBlockingWarning = Boolean(
-    ebookPreview?.warnings?.some((warning) => BLOCKING_EBOOK_WARNING_TYPES.has(warning.type)),
-  );
-  const existingBookId = ebookPreview?.dry_run?.existing_book_id ?? null;
-  const requiresExistingBookConfirmation = Boolean(
-    ebookPreview?.dry_run?.requires_existing_book_confirmation,
-  );
-  const existingBookConfirmed = !requiresExistingBookConfirmation
-    || (existingBookId !== null && confirmedExistingBookId === existingBookId);
-  const ebookPreviewRetryAvailable =
-    !loading
-    && ebookPreviewState !== 'loading'
-    && (ebookSource === 'inbox'
-      ? Boolean(selectedInboxFile && onPreviewInboxEbook)
-      : Boolean(
-        ebookFile
-        && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES
-        && onPreviewTranslatedEbook,
-      ));
   const titleReady = title.trim().length > 0;
   const pastedTextReady = text.trim().length > 0;
   const wizardDuplicateCount = textPreview?.duplicateChapterNumbers.length ?? 0;
@@ -917,479 +446,6 @@ export default function ImportPanel({
           ? 3
           : 1;
 
-  function applyDetectedMetadata(metadata: DetectedImportMetadata): void {
-    if (metadata.title) {
-      setTitle((current) => (!titleDirty ? metadata.title : current));
-    }
-    if (metadata.chapterNumber !== null) {
-      setChapterNumber((current) => {
-        return !chapterNumberDirty ? String(metadata.chapterNumber) : current;
-      });
-    }
-    if (metadata.chapterTitle) {
-      setChapterTitle((current) => (!chapterTitleDirty ? metadata.chapterTitle : current));
-    }
-  }
-
-  function detectFromSource(nextText: string, filename = ''): void {
-    applyDetectedMetadata(
-      detectImportMetadata({
-        title: titleDirty ? title : '',
-        chapterNumber: chapterNumberDirty && !Number.isNaN(parsedChapterNumber) ? parsedChapterNumber : null,
-        chapterTitle: chapterTitleDirty ? chapterTitle : '',
-        text: nextText,
-        filename,
-      }),
-    );
-  }
-
-  function updateDetectedContentKind(nextText: string): void {
-    const detected = detectImportContentKind(nextText);
-    if (detected !== 'unknown') {
-      setContentKind((current) => (current === 'unknown' ? detected : current));
-    }
-  }
-
-  function handleTitleChange(event: ChangeEvent<HTMLInputElement>): void {
-    setTitleDirty(true);
-    setTitle(event.target.value);
-  }
-
-  function handleChapterNumberChange(event: ChangeEvent<HTMLInputElement>): void {
-    setChapterNumberDirty(true);
-    setChapterNumber(event.target.value);
-  }
-
-  function handleChapterTitleChange(event: ChangeEvent<HTMLInputElement>): void {
-    setChapterTitleDirty(true);
-    setChapterTitle(event.target.value);
-  }
-
-  function handleTextChange(event: ChangeEvent<HTMLTextAreaElement>): void {
-    const nextText = event.target.value;
-    if (textByteLength(nextText) > MAX_BROWSER_TEXT_UPLOAD_BYTES) {
-      setWizardError(`Pasted text is too large (${formatBytes(textByteLength(nextText))}). Split it into smaller imports or use server-side import.`);
-      return;
-    }
-    setText(nextText);
-    detectFromSource(nextText);
-    updateDetectedContentKind(nextText);
-    setLastWizardResult(null);
-    setLastCreatedJob(null);
-    setWizardError('');
-  }
-
-  async function handleFileChange(event: ChangeEvent<HTMLInputElement>): Promise<void> {
-    const nextFile = event.target.files?.[0] ?? null;
-    setFile(nextFile);
-    setFileText('');
-    setLastWizardResult(null);
-    setLastCreatedJob(null);
-    setWizardError('');
-    if (!nextFile) return;
-    if (onImportWizardText && !isSupportedTextImportFile(nextFile)) {
-      setFile(null);
-      setWizardError('Unsupported TXT import file type. Use TXT, Markdown, HTML, or the Ebook flow for EPUB/AZW3/MOBI/PRC.');
-      return;
-    }
-    if (onImportWizardText && nextFile.size > MAX_BROWSER_TEXT_UPLOAD_BYTES) {
-      setFile(null);
-      setWizardError(`TXT file is too large (${formatBytes(nextFile.size)}). Use a smaller text file or server-side ebook import.`);
-      return;
-    }
-
-    try {
-      const nextText = await nextFile.text();
-      if (onImportWizardText && hasUnsupportedEncodingMarkers(nextText)) {
-        setFile(null);
-        setWizardError('Encoding không được hỗ trợ hoặc file bị lỗi. Hãy lưu lại file dưới dạng UTF-8 rồi thử lại.');
-        return;
-      }
-      if (onImportWizardText && !nextText.trim()) {
-        setFile(null);
-        setWizardError('File is empty.');
-        return;
-      }
-      setFileText(nextText);
-      detectFromSource(nextText, nextFile.name);
-      updateDetectedContentKind(nextText);
-    } catch {
-      detectFromSource('', nextFile.name);
-      setWizardError('Không đọc được file này trong trình duyệt. Hãy kiểm tra encoding hoặc dùng Server inbox nếu file lớn.');
-    }
-  }
-
-  function handleChapterEdit(index: number, field: 'chapterNumber' | 'title', value: string): void {
-    setChapterEdits((current) => ({
-      ...current,
-      [index]: {
-        ...current[index],
-        [field]: value,
-      },
-    }));
-  }
-
-  function reviewedChapter(chapter: DetectedImportChapter, index: number) {
-    const edit = chapterEdits[index] ?? {};
-    const editedNumber = Number.parseInt(edit.chapterNumber ?? '', 10);
-    return {
-      chapter_number: Number.isFinite(editedNumber) && editedNumber > 0 ? editedNumber : chapter.chapterNumber,
-      chapter_title: (edit.title ?? chapter.title).trim() || `Chương ${chapter.chapterNumber}`,
-      text: chapter.text,
-    };
-  }
-
-  async function submitWizardText(sourceType: 'paste' | 'txt'): Promise<void> {
-    if (!onImportWizardText || !textPreview) return;
-    setWizardError('');
-    setLastWizardResult(null);
-    setLastCreatedJob(null);
-    try {
-      const result = await onImportWizardText({
-        title: title.trim(),
-        target_book_id: parsedTargetBookId() ?? undefined,
-        content_kind: contentKind,
-        duplicate_strategy: duplicateStrategy,
-        source_type: sourceType,
-        chapters: textPreview.chapters.map((chapter, index) => reviewedChapter(chapter, index)),
-      }, { finalAction });
-      const resolvedResult = result ?? null;
-      setLastWizardResult(resolvedResult);
-      if (!resolvedResult) return;
-
-      if (finalAction === 'translate' && onCreateTranslationJob && resolvedResult.chapter_ids.length > 0) {
-        const job = await onCreateTranslationJob(resolvedResult.book_id, resolvedResult.chapter_ids);
-        setLastCreatedJob(job ?? null);
-      } else if (finalAction === 'tts' && onCreateTtsJob && resolvedResult.chapter_ids.length > 0) {
-        const job = await onCreateTtsJob(resolvedResult.book_id, resolvedResult.chapter_ids);
-        setLastCreatedJob(job ?? null);
-      }
-    } catch (error) {
-      setWizardError(errorMessage(error));
-    }
-  }
-
-  async function handlePreviewSourceUrl(): Promise<void> {
-    if (!onPreviewImportUrl || !sourceUrl.trim()) return;
-    setSourcePreview(null);
-    setSourcePreviewError('');
-    setSourcePreviewState('loading');
-    setSelectedChapterUrls(new Set());
-    setChapterPage(0);
-    setRangeStart('');
-    setRangeEnd('');
-    setFetchResult(null);
-    setFetchError('');
-    try {
-      const preview = await onPreviewImportUrl(sourceUrl.trim());
-      setSourcePreview(preview);
-      setSourcePreviewState('ready');
-      if (!titleDirty && preview.title) setTitle(preview.title);
-    } catch (error) {
-      setSourcePreviewState('error');
-      setSourcePreviewError(errorMessage(error));
-    }
-  }
-
-  function toggleChapterSelection(url: string): void {
-    setSelectedChapterUrls((prev) => {
-      const next = new Set(prev);
-      if (next.has(url)) next.delete(url);
-      else next.add(url);
-      return next;
-    });
-  }
-
-  function toggleSelectVisibleChapters(): void {
-    if (visibleSourceChapters.length === 0) return;
-    setSelectedChapterUrls((current) => {
-      const next = new Set(current);
-      if (allVisibleChaptersSelected) {
-        visibleSourceChapters.forEach((chapter) => next.delete(chapter.url));
-      } else {
-        visibleSourceChapters.forEach((chapter) => next.add(chapter.url));
-      }
-      return next;
-    });
-  }
-
-  function selectChapterRange(): void {
-    if (!sourcePreview) return;
-    const first = Number.parseInt(rangeStart, 10);
-    const last = Number.parseInt(rangeEnd, 10);
-    if (!Number.isFinite(first) || !Number.isFinite(last)) return;
-    const minimum = Math.min(first, last);
-    const maximum = Math.max(first, last);
-    setSelectedChapterUrls((current) => {
-      const next = new Set(current);
-      sourcePreview.chapters.forEach((chapter) => {
-        if (chapter.chapter_number >= minimum && chapter.chapter_number <= maximum) {
-          next.add(chapter.url);
-        }
-      });
-      return next;
-    });
-  }
-
-  async function handleFetchChapters(): Promise<void> {
-    if (!sourcePreview || selectedChapterUrls.size === 0) return;
-    setFetchState('loading');
-    setFetchError('');
-    setFetchResult(null);
-    try {
-      const chapters = sourcePreview.chapters
-        .filter((c) => selectedChapterUrls.has(c.url))
-        .map((c) => ({ url: c.url, chapter_number: c.chapter_number, title: c.title }));
-      const request = {
-        source_url: sourcePreview.source_url || sourceUrl,
-        title: title || sourcePreview.title,
-        author: sourcePreview.author,
-        source: sourcePreview.source,
-        chapters,
-      };
-      if (importJobClient) {
-        await importJob.createJob(request);
-        return;
-      }
-      if (!onFetchSourceChapters) return;
-      const result = await onFetchSourceChapters(request);
-      setFetchResult(result);
-      setFetchState('ready');
-    } catch (error) {
-      setFetchState('error');
-      setFetchError(errorMessage(error));
-    }
-  }
-
-  async function handleCatalogSearch(): Promise<void> {
-    if (!loadSourceCatalog) return;
-    setCatalogState('loading');
-    setCatalogError('');
-    try {
-      const result = await loadSourceCatalog({
-        query: catalogQuery,
-        supported: 'all',
-        page: 1,
-        page_size: 20,
-      });
-      setCatalog(result);
-      setCatalogState('ready');
-    } catch (error) {
-      setCatalogState('error');
-      setCatalogError(errorMessage(error));
-    }
-  }
-
-  async function submitSourceUrl(): Promise<void> {
-    if (!sourcePreview || !onStartImportUrlJob) return;
-    try {
-      const job = await onStartImportUrlJob({
-        url: sourcePreview.source_url || sourceUrl,
-        title: sourcePreview.title,
-        author: sourcePreview.author,
-        source: sourcePreview.source,
-        chapters: sourcePreview.chapters,
-        retry_limit: sourcePreview.policy?.retry_limit ?? 2,
-        managed_source_id: sourcePreview.managed_source_id,
-      });
-      setLastCreatedJob(job ?? null);
-    } catch (error) {
-      setSourcePreviewError(errorMessage(error));
-    }
-  }
-
-  function parsedTargetBookId(value = targetBookId): number | null {
-    return value ? Number.parseInt(value, 10) : null;
-  }
-
-  function invalidateEbookPreviewRequests(): number {
-    ebookPreviewRequestToken.current += 1;
-    return ebookPreviewRequestToken.current;
-  }
-
-  async function previewEbookFile(
-    nextFile: File,
-    nextSplitMode: EbookSplitMode,
-    nextDuplicateStrategy = duplicateStrategy,
-    nextTargetBookId = targetBookId,
-  ): Promise<void> {
-    const requestToken = invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setEbookPreview(null);
-    setEbookPreviewError('');
-    setEbookSubmissionBlocked(false);
-
-    if (!onPreviewTranslatedEbook) {
-      setEbookPreviewState('error');
-      setEbookPreviewError('Ebook preview is not available.');
-      return;
-    }
-
-    setEbookPreviewState('loading');
-    try {
-      const preview = await onPreviewTranslatedEbook(nextFile, nextSplitMode, {
-        duplicateStrategy: nextDuplicateStrategy,
-        targetBookId: parsedTargetBookId(nextTargetBookId),
-      });
-      if (requestToken !== ebookPreviewRequestToken.current) return;
-      setEbookPreview(preview);
-      setEbookPreviewState('ready');
-    } catch (error) {
-      if (requestToken !== ebookPreviewRequestToken.current) return;
-      setEbookPreviewState('error');
-      setEbookPreviewError(errorMessage(error));
-    }
-  }
-
-  async function previewInboxFile(
-    filename: string,
-    nextSplitMode: EbookSplitMode,
-    nextDuplicateStrategy = duplicateStrategy,
-    nextTargetBookId = targetBookId,
-  ): Promise<void> {
-    const requestToken = invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setEbookPreview(null);
-    setEbookPreviewError('');
-    setEbookSubmissionBlocked(false);
-
-    if (!filename) {
-      setEbookPreviewState('idle');
-      return;
-    }
-
-    if (!onPreviewInboxEbook) {
-      setEbookPreviewState('error');
-      setEbookPreviewError('Server inbox preview is not available.');
-      return;
-    }
-
-    setEbookPreviewState('loading');
-    try {
-      const preview = await onPreviewInboxEbook(filename, nextSplitMode, {
-        duplicateStrategy: nextDuplicateStrategy,
-        targetBookId: parsedTargetBookId(nextTargetBookId),
-      });
-      if (requestToken !== ebookPreviewRequestToken.current) return;
-      setEbookPreview(preview);
-      setEbookPreviewState('ready');
-    } catch (error) {
-      if (requestToken !== ebookPreviewRequestToken.current) return;
-      setEbookPreviewState('error');
-      setEbookPreviewError(errorMessage(error));
-    }
-  }
-
-  function handleEbookFile(nextFile: File | null): void {
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setEbookSource('upload');
-    setEbookFile(nextFile);
-    setSelectedInboxFile('');
-    setEbookPreview(null);
-    setEbookPreviewError('');
-    setEbookSubmissionBlocked(false);
-    setLastEbookImportResult(null);
-    if (nextFile && nextFile.size > MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
-      setEbookPreviewState('error');
-      setEbookPreviewError(
-        `File lớn hơn 95 MB (${formatBytes(nextFile.size)}). Cloudflare có thể chặn upload lớn; hãy copy file vào ${ebookInboxDirectory} rồi chọn Server inbox.`,
-      );
-      return;
-    }
-    setEbookPreviewState(nextFile ? 'loading' : 'idle');
-    if (nextFile) {
-      void previewEbookFile(nextFile, splitMode);
-    }
-  }
-
-  function handleEbookFileChange(event: ChangeEvent<HTMLInputElement>): void {
-    handleEbookFile(event.target.files?.[0] ?? null);
-  }
-
-  function handleEbookDrop(event: DragEvent<HTMLLabelElement>): void {
-    event.preventDefault();
-    handleEbookFile(event.dataTransfer.files[0] ?? null);
-  }
-
-  function handleEbookSourceChange(nextSource: EbookSource): void {
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setEbookSource(nextSource);
-    setEbookPreview(null);
-    setEbookPreviewError('');
-    setEbookSubmissionBlocked(false);
-    setLastEbookImportResult(null);
-    if (nextSource === 'upload') {
-      setSelectedInboxFile('');
-      setEbookPreviewState('idle');
-      return;
-    }
-    setEbookFile(null);
-    setEbookPreviewState(selectedInboxFile ? 'loading' : 'idle');
-    if (selectedInboxFile) {
-      void previewInboxFile(selectedInboxFile, splitMode);
-    }
-  }
-
-  function handleInboxFileChange(event: ChangeEvent<HTMLSelectElement>): void {
-    const filename = event.target.value;
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setEbookSource('inbox');
-    setEbookFile(null);
-    setSelectedInboxFile(filename);
-    setLastEbookImportResult(null);
-    void previewInboxFile(filename, splitMode);
-  }
-
-  function handleSplitModeChange(event: ChangeEvent<HTMLSelectElement>): void {
-    const nextSplitMode = event.target.value as EbookSplitMode;
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setSplitMode(nextSplitMode);
-    if (ebookSource === 'inbox' && selectedInboxFile) {
-      void previewInboxFile(selectedInboxFile, nextSplitMode);
-    } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
-      void previewEbookFile(ebookFile, nextSplitMode);
-    }
-  }
-
-  function handleTargetBookChange(event: ChangeEvent<HTMLSelectElement>): void {
-    const nextTargetBookId = event.target.value;
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setTargetBookId(nextTargetBookId);
-    if (ebookSource === 'inbox' && selectedInboxFile) {
-      void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, nextTargetBookId);
-    } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
-      void previewEbookFile(ebookFile, splitMode, duplicateStrategy, nextTargetBookId);
-    }
-  }
-
-  function handleDuplicateStrategyChange(nextDuplicateStrategy: EbookDuplicateStrategy): void {
-    invalidateEbookPreviewRequests();
-    setConfirmedExistingBookId(null);
-    setDuplicateStrategy(nextDuplicateStrategy);
-    setLastEbookImportResult(null);
-    if (ebookSource === 'inbox' && selectedInboxFile) {
-      void previewInboxFile(selectedInboxFile, splitMode, nextDuplicateStrategy, targetBookId);
-    } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
-      void previewEbookFile(ebookFile, splitMode, nextDuplicateStrategy, targetBookId);
-    }
-  }
-
-  function retryEbookPreview(): void {
-    if (!ebookPreviewRetryAvailable) return;
-    if (ebookSource === 'inbox') {
-      void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, targetBookId);
-      return;
-    }
-    if (ebookFile) {
-      void previewEbookFile(ebookFile, splitMode, duplicateStrategy, targetBookId);
-    }
-  }
-
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     if (!canSubmit) return;
@@ -1429,63 +485,14 @@ export default function ImportPanel({
     });
   }
 
-  async function submitTranslatedEbook(): Promise<void> {
-    if (!onImportTranslatedEbook) return;
-    if (ebookSource === 'upload' && !ebookFile) return;
-    if (ebookSource === 'inbox' && !selectedInboxFile) return;
-
-    setEbookPreviewError('');
-    try {
-      const result = await onImportTranslatedEbook({
-        ...(ebookSource === 'upload'
-          ? { file: ebookFile ?? undefined, uploadId: ebookPreview?.upload_id }
-          : { inboxFile: ebookPreview?.inbox_file ?? selectedInboxFile }),
-        duplicateStrategy,
-        splitMode,
-        targetBookId: targetBookId ? Number.parseInt(targetBookId, 10) : undefined,
-        ...(confirmedExistingBookId !== null && confirmedExistingBookId === existingBookId
-          ? { confirmedExistingBookId }
-          : {}),
-      });
-      setLastEbookImportResult(result ?? null);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 409) {
-        invalidateEbookPreviewRequests();
-        setConfirmedExistingBookId(null);
-        setEbookPreview(null);
-        setEbookPreviewState('error');
-        setEbookSubmissionBlocked(false);
-      } else {
-        setEbookSubmissionBlocked(true);
-      }
-      setEbookPreviewError(errorMessage(error));
-    }
-  }
-
   function handleModeChange(nextMode: ImportMode): void {
-    if (mode === 'ebook' && nextMode !== 'ebook') {
-      invalidateEbookPreviewRequests();
-      setConfirmedExistingBookId(null);
-      setEbookPreview(null);
-      setEbookPreviewState('idle');
-      setEbookPreviewError('');
-      setEbookSubmissionBlocked(false);
-    }
+    if (mode === 'ebook' && nextMode !== 'ebook') leaveEbookMode();
     setMode(nextMode);
-    if (mode !== 'ebook' && nextMode === 'ebook') {
-      if (ebookSource === 'inbox' && selectedInboxFile) {
-        void previewInboxFile(selectedInboxFile, splitMode, duplicateStrategy, targetBookId);
-      } else if (ebookFile && ebookFile.size <= MAX_BROWSER_EBOOK_UPLOAD_BYTES) {
-        void previewEbookFile(ebookFile, splitMode, duplicateStrategy, targetBookId);
-      }
-    }
+    if (mode !== 'ebook' && nextMode === 'ebook') enterEbookMode();
   }
 
   function handleCancel(): void {
-    if (mode === 'ebook') {
-      invalidateEbookPreviewRequests();
-      setConfirmedExistingBookId(null);
-    }
+    if (mode === 'ebook') cancelEbookPreview();
     onCancel();
   }
 
@@ -1803,10 +810,8 @@ export default function ImportPanel({
                           className="secondary-action"
                           disabled={!entry.can_use_in_jobs || !entry.url}
                           onClick={() => {
-                            setSourceUrl(entry.url);
+                            chooseCatalogSource(entry.url);
                             setMode('url');
-                            setSourcePreview(null);
-                            setSourcePreviewState('idle');
                           }}
                           type="button"
                         >
@@ -1843,10 +848,7 @@ export default function ImportPanel({
                   aria-label="Source URL"
                   inputMode="url"
                   onChange={(event) => {
-                    setSourceUrl(event.target.value);
-                    setSourcePreview(null);
-                    setSourcePreviewState('idle');
-                    setSourcePreviewError('');
+                    updateSourceUrl(event.target.value);
                   }}
                   placeholder="https://www.69shuba.com/book/..."
                   type="url"
@@ -2343,7 +1345,7 @@ export default function ImportPanel({
                   View job status
                 </button>
               ) : null}
-              <button className="secondary-action" onClick={() => setLastWizardResult(null)} type="button">
+              <button className="secondary-action" onClick={clearWizardResult} type="button">
                 Import more
               </button>
             </div>

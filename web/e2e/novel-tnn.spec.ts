@@ -265,6 +265,18 @@ async function installApiMock(page: Page, state: MockState) {
     if (path === '/api/books') return json(route, [book]);
     if (path === `/api/books/${book.id}/chapters`) return json(route, chaptersFor(state));
     if (path === '/api/library/books') return json(route, translatedBooksFor(state));
+    if (path === '/api/library/raw' || path === `/api/books/${book.id}/chapters/raw-ids`) {
+      const raw = chaptersFor(state).filter((chapter) => !chapter.translated_text_path
+        && !['translated', 'qa_low', 'audio_done'].includes(chapter.status));
+      if (path.endsWith('/raw-ids')) return json(route, raw.map((chapter) => chapter.id));
+      const offset = Number(url.searchParams.get('offset') || 0);
+      const limit = Number(url.searchParams.get('limit') || 50);
+      return json(route, {
+        chapters: raw.slice(offset, offset + limit).map((chapter) => ({ ...chapter, book_title: book.title })),
+        total_chapters: raw.length, total_books: raw.length ? 1 : 0,
+        book_counts: { [book.id]: raw.length }, offset, limit,
+      });
+    }
     if (path === '/api/import/ebook/history') return json(route, { runs: [] });
     if (path === '/api/import/ebook/inbox') return json(route, { directory: 'inbox/ebooks', files: [] });
     if (path === '/api/import/paste' && request.method() === 'POST') {
@@ -447,7 +459,7 @@ test('login works and protected shell is blocked without a token', async ({ page
   await page.getByRole('button', { name: 'Login' }).click();
 
   await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Chưa chọn chương' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
 });
 
 test('desktop provider table keeps the compact reference sizing', async ({ page }) => {
@@ -573,6 +585,20 @@ test('mobile shell and Reader follow the approved handoff at 390px and 360px', a
   await page.keyboard.press('Escape');
   await expect(readerMore).toBeHidden();
   await expect(readerMoreTrigger).toBeFocused();
+
+  const readerSettingsTrigger = page.getByRole('button', { name: 'Cài đặt chữ', exact: true });
+  await readerSettingsTrigger.focus();
+  await page.keyboard.press('Enter');
+  const readerSettings = page.getByRole('dialog', { name: 'Cài đặt đọc' });
+  const closeReaderSettings = readerSettings.getByRole('button', { name: 'Đóng cài đặt đọc' });
+  await expect(closeReaderSettings).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(readerSettings.getByLabel('Toàn màn hình')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(closeReaderSettings).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(readerSettings).toBeHidden();
+  await expect(readerSettingsTrigger).toBeFocused();
 
   const undersizedReaderButtons = await page.locator('button:visible').evaluateAll((buttons) => (
     buttons
@@ -746,12 +772,95 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(filePreview).toHaveCSS('overflow', 'visible');
 });
 
+test('mobile workflow viewport ends above the fixed navigation', async ({ page }) => {
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await page.setViewportSize({ width: 360, height: 740 });
+  await authenticatedPage(page, state);
+
+  const mainBox = await page.locator('.workflow-main').boundingBox();
+  const navBox = await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' }).boundingBox();
+  expect(mainBox).not.toBeNull();
+  expect(navBox).not.toBeNull();
+  expect((mainBox?.y ?? 0) + (mainBox?.height ?? 0)).toBeLessThanOrEqual((navBox?.y ?? 0) + 1);
+});
+
+test('short desktop login keeps the install prompt outside the login panel', async ({ page }) => {
+  const state: MockState = { imported: false, translated: false, translateRequests: [] };
+  await installApiMock(page, state);
+  await page.setViewportSize({ width: 1280, height: 577 });
+  await page.goto('/');
+  await page.evaluate(() => {
+    const installEvent = new Event('beforeinstallprompt', { cancelable: true });
+    Object.defineProperties(installEvent, {
+      prompt: { value: async () => undefined },
+      userChoice: { value: Promise.resolve({ outcome: 'dismissed', platform: 'web' }) },
+    });
+    window.dispatchEvent(installEvent);
+  });
+
+  const prompt = page.locator('.pwa-install-prompt');
+  const loginPanel = page.locator('.login-panel');
+  await expect(prompt).toBeVisible();
+  await expect(loginPanel).toBeVisible();
+  const promptBox = await prompt.boundingBox();
+  const loginBox = await loginPanel.boundingBox();
+  expect(promptBox).not.toBeNull();
+  expect(loginBox).not.toBeNull();
+  const separated = Boolean(promptBox && loginBox && (
+    promptBox.x + promptBox.width <= loginBox.x
+    || promptBox.x >= loginBox.x + loginBox.width
+    || promptBox.y + promptBox.height <= loginBox.y
+    || promptBox.y >= loginBox.y + loginBox.height
+  ));
+  expect(separated).toBe(true);
+});
+
+test('@mobile-device runs the authenticated shell with a real touch-device profile', async ({ page, isMobile }) => {
+  test.skip(!isMobile, 'Requires the separately approved mobile-device Playwright project.');
+  const state: MockState = { imported: false, translated: true, translateRequests: [] };
+  await authenticatedPage(page, state);
+
+  const deviceProfile = await page.evaluate(() => ({
+    coarse: window.matchMedia('(pointer: coarse)').matches,
+    touchPoints: navigator.maxTouchPoints,
+    width: window.innerWidth,
+  }));
+  expect(deviceProfile).toMatchObject({ coarse: true, width: 412 });
+  expect(deviceProfile.touchPoints).toBeGreaterThan(0);
+  const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  await expect(mobileNav).toBeVisible();
+  await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+});
+
+test('@mobile-device reads translation before requesting optional Reader data', async ({ page, isMobile }) => {
+  test.skip(!isMobile, 'Requires the mobile-device project.');
+  const requests: string[] = [];
+  page.on('request', (request) => {
+    if (request.url().includes('/api/')) requests.push(new URL(request.url()).pathname);
+  });
+  await authenticatedPage(page, { imported: false, translated: true, translateRequests: [] });
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await page.route('**/api/books/42/chapters/4201/source', (route) => json(route, { detail: 'Source unavailable' }, 503));
+  requests.length = 0;
+  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await expect(page.getByText('Trời dần trở lạnh')).toBeVisible();
+  expect(requests.filter((path) => path.endsWith('/reader/state'))).toHaveLength(1);
+  expect(requests.filter((path) => /\/(source|dictionary\/pack|audio\/playlist)$/.test(path))).toEqual([]);
+  await expectNoHorizontalOverflow(page);
+  await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
+  const more = page.getByRole('dialog', { name: 'Tùy chọn đọc' });
+  await expect(more.getByRole('group', { name: 'Đọc truyện' })).toBeVisible();
+  await expect(more.getByRole('group', { name: 'Nghe và tải audio' })).toBeVisible();
+});
+
 test('visible mobile controls use the approved touch-target policy', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await page.setViewportSize({ width: 390, height: 844 });
   await authenticatedPage(page, state);
 
-  await expectVisibleMobileTouchTargets(page, 'Dashboard');
+  await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
+  await expectVisibleMobileTouchTargets(page, 'Library');
 
   const mobileNav = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
   await mobileNav.getByRole('button', { name: 'Tác vụ' }).click();
@@ -769,7 +878,7 @@ test('visible mobile controls use the approved touch-target policy', async ({ pa
   await expectVisibleMobileTouchTargets(page, 'Status and Settings');
 
   await mobileNav.getByRole('button', { name: 'Thư viện' }).click();
-  await page.getByRole('button', { name: `Đọc tiếp ${book.title}` }).click();
+  await page.getByRole('button', { name: `Mở sách ${book.title}` }).click();
   await page.getByRole('button', { name: 'Thêm tùy chọn' }).click();
   await expectVisibleMobileTouchTargets(page, 'Reader More');
   await page.keyboard.press('Escape');

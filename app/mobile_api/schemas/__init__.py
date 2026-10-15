@@ -140,6 +140,12 @@ class BookResponse(BaseModel):
 # ── Chapters ─────────────────────────────────────────────────────────────
 
 class ChapterResponse(BaseModel):
+    content_revision: int = 1
+    translation_hash: str | None = None
+    translated_title: str = ""
+    quality_status: str = "legacy_unverified"
+    audio_status: str = "missing"
+    audio_version: str = ""
     id: int
     book_id: int
     chapter_number: int
@@ -157,7 +163,9 @@ class ChapterResponse(BaseModel):
 
 
 class TranslationEdit(BaseModel):
-    text: str
+    text: str = Field(min_length=1)
+    expected_content_revision: int | None = Field(default=None, ge=1)
+    translated_title: str | None = Field(default=None, max_length=300)
 
 
 class TextResponse(BaseModel):
@@ -172,6 +180,16 @@ class ReaderProgressAnchor(BaseModel):
     offset: int = Field(default=0, ge=0)
     prefix: str = Field(default="", max_length=128)
     suffix: str = Field(default="", max_length=128)
+
+
+class RawBacklogPage(BaseModel):
+    chapters: list[dict]
+    total_chapters: int
+    total_books: int
+    book_counts: dict[int, int]
+    first_chapter_ids: dict[int, int]
+    limit: int
+    offset: int
 
 
 class ReaderProgressUpdate(BaseModel):

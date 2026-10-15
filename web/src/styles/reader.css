@@ -542,7 +542,7 @@
 .reader-more-backdrop {
   inset: 0;
   position: absolute;
-  z-index: 27;
+  z-index: 80;
 }
 
 .reader-more-popover {
@@ -553,12 +553,32 @@
   color: #f5efe4;
   display: grid;
   gap: 12px;
+  max-height: calc(100dvh - 112px);
   min-width: min(280px, calc(100vw - 28px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 14px;
   position: absolute;
   right: clamp(14px, 3vw, 28px);
   top: 86px;
+  width: min(420px, calc(100% - 28px));
   z-index: 1;
+}
+
+.reader-tools-group {
+  border: 0;
+  border-top: 1px solid var(--reader-drawer-border);
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+  padding: 10px 0 0;
+}
+
+.reader-tools-group legend {
+  font-size: 13px;
+  font-weight: 800;
+  padding-right: 8px;
 }
 
 .reader-more-popover label,

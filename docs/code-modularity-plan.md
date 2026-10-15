@@ -4,7 +4,41 @@
 
 Yes, the code should be divided further, but only along measured responsibility and test boundaries. A rewrite or line-count-driven split is not justified. P2A and P2B proved that high-value performance fixes can be delivered through narrow seams while preserving the current architecture.
 
-## P2C status
+## T12 structural refactor — 2026-10-02
+
+The authorized remaining ownership boundaries are implemented. Final acceptance
+requires fresh verification and Reader measurements on the refactored candidate;
+P2C and earlier repair receipts do not qualify changed code.
+
+- Reader feature hooks own progress/sync, marks/annotation transfer, selection,
+  search, dictionary, AI and X-Ray state/actions. `ReaderView` owns DOM layout,
+  pagination, viewport restoration and feature/chrome composition.
+- Import hooks own paste/file, ebook and URL/catalog preview/commit lifecycles;
+  `ImportPanel` owns transport selection, shared target/duplicate choices and
+  result navigation. Existing durable import job helpers are reused.
+- App hooks own catalog loading, jobs, import, operations/export/backup,
+  source management, library mutations and workbench/provider actions. `App`
+  owns the shared session, navigation, selection and unsaved-edit confirmation.
+- Book, import, glossary, user and job repositories are authoritative modules;
+  `db.py` keeps identity-compatible exports and migrations. Shared import
+  metadata and job states belong to ingestion/jobs instead of the API layer.
+- `BookService` owns metadata/covers/artifact cleanup; `ImportCommitService`
+  owns reviewed storage, revalidation, rollback and follow-ups. Pipeline public
+  signatures are unchanged. Ebook staging, retry cleanup and job execution
+  belong to the existing `EbookImportService`; routes keep HTTP mapping and
+  compatibility delegates.
+
+This is a behavior-preserving extraction: no new dependencies, public routes,
+SQL/migration changes, state framework or browser-session replacement. Existing
+security, cancellation, conflict, overwrite, recovery and transaction tests
+remain acceptance requirements. Three repository ownership contracts prevent
+API dependencies and duplicate implementations from returning.
+
+Source/TTS repositories, API-client subdivision, rendering-only decomposition
+and route-lazy CSS remain possible future work requiring a concrete benefit;
+they are not prerequisites for these selected T12 boundaries.
+
+## Earlier P2C status
 
 P2C implemented the first approved seams without a broad rewrite:
 
@@ -20,9 +54,9 @@ P2C implemented the first approved seams without a broad rewrite:
 - `styles.css` is an ordered layer/import manifest and feature rules, including
   responsive rules, are owned by feature stylesheets.
 
-These are compatibility facades, not duplicate implementations. Books/import,
-glossary, sources, TTS, App-shell orchestration, and ImportPanel remain future
-seams and must not be moved only to reduce line count.
+These P2C compatibility facades remain authoritative. T12 now completes the
+selected ownership boundaries above; further subdivision needs a measured
+responsibility or performance gap, not a line-count target.
 
 ## Baseline evidence before P2C
 
@@ -46,7 +80,11 @@ At this pre-P2C baseline, the local import graph also contained the direct
 `pipeline_service -> qa_service -> pipeline_service` cycle. P2C removed that
 runtime cycle through `ChapterContentReader`; it is not current work.
 
-## Recommended Splits
+## Earlier recommendations before T12
+
+The recommendations below record the earlier audit. Use the T12 ownership map
+above for the current implementation; recommendations alone do not imply an
+unfinished requirement or justify another extraction.
 
 ### Reader
 

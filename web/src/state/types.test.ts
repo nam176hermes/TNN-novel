@@ -35,4 +35,8 @@ describe('formatError', () => {
       'Không kết nối được API. Kiểm tra server local, Cloudflare Tunnel, hoặc mạng.',
     );
   });
+
+  it('does not blame a translation provider for a source loading failure', () => {
+    expect(formatError(new ApiError('Failed to load chapter source', 503))).not.toContain('Provider dịch');
+  });
 });

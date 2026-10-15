@@ -21,6 +21,23 @@ describe('useChapterText', () => {
     window.localStorage.clear();
   });
 
+  it('shows translation while optional source and HTML are still pending', async () => {
+    const source = deferred<string>();
+    const rich = deferred<{text: string; html: string}>();
+    const client = {
+      getChapterSource: vi.fn(() => source.promise),
+      getChapterTranslation: vi.fn().mockResolvedValue('Đọc được ngay'),
+      getChapterContent: vi.fn(() => rich.promise),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useChapterText(client, true,
+      { ...fixtureChapter, content_html_path: '/rich.html' }, undefined, [], { sourceEnabled: false }));
+    await waitFor(() => expect(result.current.translationText).toBe('Đọc được ngay'));
+    expect(result.current.state).toBe('ready');
+    expect(client.getChapterSource).not.toHaveBeenCalled();
+    await act(async () => { rich.resolve({text: 'Đọc được ngay', html: '<p>Đọc được ngay</p>'}); });
+    expect(result.current.contentHtml).toContain('<p>');
+  });
+
   it('loads source and translation, tracks dirty state, and saves edits', async () => {
     const client = {
       getChapterSource: vi.fn().mockResolvedValue('原文'),
@@ -43,6 +60,41 @@ describe('useChapterText', () => {
 
     await act(async () => result.current.save());
     expect(client.saveChapterTranslation).toHaveBeenCalledWith(42, 4201, 'Bản dịch sửa');
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it('saves an explicit translated title without dropping unchanged rich content', async () => {
+    const client = {
+      getChapterTranslation: vi.fn().mockResolvedValue('Bản dịch'),
+      getChapterContent: vi.fn().mockResolvedValue({text: 'Bản dịch', html: '<p>Bản dịch</p>'}),
+      saveChapterTranslation: vi.fn().mockResolvedValue(7),
+    } as unknown as ApiClient;
+    const { result } = renderHook(() => useChapterText(client, true,
+      {...fixtureChapter, content_revision: 7, content_html_path: '/rich.html'}, undefined, [], {sourceEnabled: false}));
+    await waitFor(() => expect(result.current.contentHtml).toBe('<p>Bản dịch</p>'));
+    act(() => result.current.setTranslatedTitle('Tiêu đề mới'));
+    expect(result.current.isDirty).toBe(true);
+    await act(async () => result.current.save());
+    expect(client.saveChapterTranslation).toHaveBeenCalledWith(42, 4201, 'Bản dịch', 7, 'Tiêu đề mới');
+    expect(result.current.contentHtml).toBe('<p>Bản dịch</p>');
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it('ignores a late save response after the active chapter changes', async () => {
+    const saved = deferred<number>();
+    const client = {
+      getChapterTranslation: vi.fn((_book, id) => Promise.resolve(`Chương ${id}`)),
+      saveChapterTranslation: vi.fn(() => saved.promise),
+    } as unknown as ApiClient;
+    const {result, rerender} = renderHook(({chapter}) => useChapterText(client, true, chapter,
+      undefined, [], {sourceEnabled: false}), {initialProps: {chapter: fixtureChapter}});
+    await waitFor(() => expect(result.current.translationText).toBe('Chương 4201'));
+    let saving: Promise<void>;
+    act(() => { saving = result.current.save('Sửa chương cũ'); });
+    rerender({chapter: {...fixtureChapter, id: 4202}});
+    await waitFor(() => expect(result.current.translationText).toBe('Chương 4202'));
+    await act(async () => { saved.resolve(8); await saving; });
+    expect(result.current.translationText).toBe('Chương 4202');
     expect(result.current.isDirty).toBe(false);
   });
 
@@ -146,7 +198,7 @@ describe('useChapterText', () => {
         { ...fixtureChapter, audio_path: '' },
         undefined,
         [],
-        { cacheOwnership: 'external' },
+        { cacheOwnership: 'external', sourceEnabled: true },
       ),
     );
 
@@ -158,6 +210,40 @@ describe('useChapterText', () => {
     source.resolve('新原文');
     translation.resolve('Bản dịch mới');
     await waitFor(() => expect(result.current.translationText).toBe('Bản dịch mới'));
+  });
+
+  it('does not issue opportunistic translation prefetches when the Reader owns cache orchestration', async () => {
+    const client = {
+      getChapterSource: vi.fn().mockResolvedValue('原文'),
+      getChapterTranslation: vi.fn().mockResolvedValue('Bản dịch'),
+      getChapterContent: vi.fn(),
+      saveChapterTranslation: vi.fn(),
+    } as unknown as ApiClient;
+    const nextChapter = {
+      ...fixtureChapter,
+      id: 4301,
+      title: 'Chương kế',
+      audio_path: '',
+      content_html_path: null,
+    };
+    const { rerender } = renderHook(
+      ({ chapter }) => useChapterText(
+        client,
+        true,
+        chapter,
+        undefined,
+        [nextChapter],
+        { cacheOwnership: 'external', sourceEnabled: true },
+      ),
+      { initialProps: { chapter: { ...fixtureChapter, audio_path: '', content_html_path: null } } },
+    );
+
+    await waitFor(() => expect(client.getChapterTranslation).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+    expect(client.getChapterTranslation).toHaveBeenCalledTimes(1);
+
+    rerender({ chapter: nextChapter });
+    await waitFor(() => expect(client.getChapterTranslation).toHaveBeenCalledTimes(2));
   });
 
   it('removes stale cache when the API no longer has translated text', async () => {
@@ -254,7 +340,7 @@ describe('useChapterText', () => {
         chapter,
         undefined,
         [],
-        { cacheOwnership: 'external' },
+        { cacheOwnership: 'external', sourceEnabled: true },
       ),
       { initialProps: { chapter: { ...fixtureChapter, audio_path: '' } } },
     );

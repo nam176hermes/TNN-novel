@@ -37,6 +37,13 @@ function chapter(overrides: Partial<ChapterApi> = {}): ChapterApi {
 }
 
 describe('translator state helpers', () => {
+  it('excludes stale audio from the library count while retaining unverified legacy audio', () => {
+    const summary = mapBookSummary(book, [
+      chapter({ audio_path: 'available', audio_status: 'stale' }),
+      chapter({ audio_path: 'available', audio_status: 'legacy_unverified' }),
+    ]);
+    expect(summary.audio).toBe(1);
+  });
   it('maps a backend book with no chapters into a usable summary', () => {
     expect(mapBookSummary(book)).toEqual({
       id: 7,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import hashlib
 import io
 import json
 import logging
 import shutil
+import multiprocessing
+import time
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from typing import Any
 from app.config import PROJECT_ROOT, settings
 from app.observability import StructuredEventLogger
 from app.services.tts.availability import require_tts_runtime_available
+from app.database.chapter_repository import file_digest
 
 logger = logging.getLogger(__name__)
 _events = StructuredEventLogger(logger)
@@ -230,10 +233,20 @@ def stable_audio_cache_key(
     model_config: F5VietnameseConfig,
 ) -> str:
     payload = {
+        "version": 2,
         "text": normalized_text,
         "voice": voice_config.safe_dict(),
+        "reference_digest": file_digest(Path(_resolve_project_path(voice_config.reference_audio_path))) if voice_config.reference_audio_path else None,
         "model": model_config.safe_dict(),
     }
+    for name in ("ckpt_file", "vocab_file"):
+        value = getattr(model_config, name)
+        if value:
+            try:
+                stat = Path(_resolve_project_path(value)).stat()
+                payload[name + "_identity"] = [stat.st_size, stat.st_mtime_ns]
+            except OSError:
+                payload[name + "_identity"] = None
     digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     return digest
 
@@ -267,6 +280,8 @@ class F5VietnameseEngine:
     def __init__(self, config: F5VietnameseConfig | None = None):
         self.config = config or F5VietnameseConfig.from_settings()
         self._engine: Any | None = None
+        self._process = None
+        self._connection = None
 
     def _load(self):
         if self._engine is not None:
@@ -336,6 +351,7 @@ class F5VietnameseEngine:
         output_wav_path: Path,
         *,
         voice_config: VoiceConfig,
+        cancel_check=None,
     ) -> Path:
         if not normalized_text.strip():
             raise ValueError("Cannot synthesize empty TTS chunk")
@@ -347,17 +363,21 @@ class F5VietnameseEngine:
             model_config=self.config,
         )
         cache_path = self.config.cache_dir / f"{cache_key}.wav"
-        if self.config.cache_enabled and cache_path.exists() and cache_path.stat().st_size > 0:
-            shutil.copy2(cache_path, output_wav_path)
-            return output_wav_path
+        marker = cache_path.with_suffix(".qa.json")
+        if self.config.cache_enabled and cache_path.exists() and marker.exists():
+            try:
+                receipt = json.loads(marker.read_text(encoding="utf-8"))
+                if receipt.get("passed") is True and receipt.get("audio_hash") == file_digest(cache_path):
+                    shutil.copy2(cache_path, output_wav_path)
+                    return output_wav_path
+            except (OSError, ValueError):
+                pass
 
         last_diagnostic = "Upstream output was suppressed."
-        for attempt in range(max(1, self.config.retries + 1)):
+        # The pipeline owns the retry budget, including audio QA failures.
+        for attempt in range(1):
             try:
-                self._infer_with_timeout(normalized_text, reference_audio, reference_text, output_wav_path)
-                if self.config.cache_enabled:
-                    self.config.cache_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(output_wav_path, cache_path)
+                self._infer_with_timeout(normalized_text, reference_audio, reference_text, output_wav_path, cancel_check=cancel_check)
                 return output_wav_path
             except Exception as exc:
                 category, last_diagnostic = _classify_upstream_diagnostic(exc)
@@ -377,19 +397,85 @@ class F5VietnameseEngine:
         reference_audio: str,
         reference_text: str,
         output_wav_path: Path,
+        *, cancel_check=None,
     ) -> None:
-        engine = self._load()
+        deadline = time.monotonic() + max(.05, self.config.timeout_seconds)
+        try:
+            if self._process is None or not self._process.is_alive():
+                self.close()
+                context = multiprocessing.get_context("spawn")
+                self._connection, child = context.Pipe()
+                self._process = context.Process(target=_f5_worker, args=(child, self.config, self._engine), daemon=True)
+                self._process.start()
+                child.close()
+            self._connection.send((normalized_text, reference_audio, reference_text, str(output_wav_path)))
+            while time.monotonic() < deadline:
+                if cancel_check and cancel_check():
+                    raise TTSEngineError("TTS cancelled")
+                if self._connection.poll(min(.1, max(0, deadline - time.monotonic()))):
+                    error = self._connection.recv()
+                    if error:
+                        raise TTSEngineError(error)
+                    return
+                if not self._process.is_alive():
+                    raise TTSEngineError("F5 worker exited")
+            raise TTSEngineError("F5 inference deadline exceeded")
+        except BaseException:
+            self.close()
+            output_wav_path.unlink(missing_ok=True)
+            raise
 
-        def run_infer() -> None:
-            with _capture_upstream_output("infer"):
-                engine.infer(
-                    ref_file=reference_audio,
-                    ref_text=reference_text,
-                    gen_text=normalized_text,
-                    file_wave=str(output_wav_path),
-                    seed=None,
-                )
+    def confirm_audio_qa(self, text, voice, path):
+        if not self.config.cache_enabled:
+            return
+        self.config.cache_dir.mkdir(parents=True, exist_ok=True)
+        key = stable_audio_cache_key(text, voice_config=voice, model_config=self.config)
+        cache = self.config.cache_dir / f"{key}.wav"
+        temporary = cache.with_name(f"{key}.{os.getpid()}.tmp")
+        shutil.copy2(path, temporary)
+        os.replace(temporary, cache)
+        marker = cache.with_suffix(".qa.json")
+        temporary = marker.with_name(f"{key}.{os.getpid()}.json.tmp")
+        temporary.write_text(json.dumps({"passed": True, "audio_hash": file_digest(cache)}), encoding="utf-8")
+        os.replace(temporary, marker)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_infer)
-            future.result(timeout=max(1, self.config.timeout_seconds))
+    def invalidate_audio_cache(self, text, voice):
+        key = stable_audio_cache_key(text, voice_config=voice, model_config=self.config)
+        cache = self.config.cache_dir / f"{key}.wav"
+        cache.with_suffix(".qa.json").unlink(missing_ok=True)
+        cache.unlink(missing_ok=True)
+
+    def close(self):
+        if self._process is not None:
+            if self._process.is_alive():
+                self._process.terminate()
+            self._process.join(timeout=1)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=1)
+        if self._connection is not None:
+            self._connection.close()
+        self._process = self._connection = None
+
+
+def _f5_worker(connection, config, injected_engine=None):
+    # One CUDA worker owns the GPU across its warm batch; close it at batch end.
+    import fcntl
+    config.cache_dir.mkdir(parents=True, exist_ok=True)
+    with (config.cache_dir.parent / ".f5-cuda.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        engine = F5VietnameseEngine(config)
+        engine._engine = injected_engine
+        while True:
+            try:
+                text, reference_audio, reference_text, output = connection.recv()
+            except EOFError:
+                return
+            try:
+                runtime = engine._load()
+                with _capture_upstream_output("infer"):
+                    runtime.infer(ref_file=reference_audio, ref_text=reference_text, gen_text=text, file_wave=output, seed=None)
+                connection.send("")
+            except Exception as exc:
+                _, diagnostic = _classify_upstream_diagnostic(exc)
+                connection.send(diagnostic)

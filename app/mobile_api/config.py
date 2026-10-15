@@ -30,7 +30,7 @@ class MobileAPISettings(BaseModel):
     host: str = os.getenv("MOBILE_API_HOST", "127.0.0.1")
     port: int = int(os.getenv("MOBILE_API_PORT", "7860"))
     public_deploy: bool = _parse_bool(os.getenv("PUBLIC_DEPLOY", "0"))
-    secret_key: str = os.getenv("MOBILE_API_SECRET", "dev-secret-change-in-production")
+    secret_key: str = os.getenv("MOBILE_API_SECRET", "dev-secret-change-in-production-now")
     algorithm: str = "HS256"
     access_token_expire_minutes: int = int(os.getenv("MOBILE_API_ACCESS_MINUTES", "60"))
     refresh_token_expire_days: int = int(os.getenv("MOBILE_API_REFRESH_DAYS", "14"))
@@ -142,6 +142,8 @@ _DEV_SECRET_VALUES = {
     "",
     "dev-secret",
     "dev-secret-change-in-production",
+    "dev-secret-change-in-production-now",
+    "replace-with-a-long-random-secret",
     "change-this-jwt-secret",
     "change_me",
     "changeme",

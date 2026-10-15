@@ -5,7 +5,9 @@ import re
 from pathlib import Path
 from typing import Protocol
 
+from app.translation.qa_report import merge_qa_report
 from app.database.db import (
+    get_chapter_by_id,
     get_qa_report as db_get_qa_report,
     list_glossary,
     list_qa_reports,
@@ -45,6 +47,28 @@ def _repeated_paragraph_warning(translated_text: str) -> bool:
             return True
         seen.add(normalized)
     return False
+
+
+def _report_status(report: dict, chapter: dict) -> str:
+    revision = report.get("content_revision")
+    if revision is None:
+        return "legacy_unverified"
+    if revision != chapter.get("content_revision") or report.get("overall_status") == "STALE":
+        return "stale"
+    payload = report.get("report_json") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            return "legacy_unverified"
+    if not isinstance(payload, dict) or payload.get("report_version") != 1:
+        return "legacy_unverified"
+    provenance = payload.get("provenance") or {}
+    if provenance.get("translation_hash") != chapter.get("translation_hash"):
+        return "stale"
+    if str(report.get("verdict", "")).upper() == "FAIL":
+        return "fail"
+    return "pass" if payload.get("quality_status") == "pass" else payload.get("quality_status", "partial")
 
 
 def _locked_glossary_violations(glossary_terms: list[dict], source_text: str, translated_text: str) -> list[dict]:
@@ -194,16 +218,28 @@ class QAService:
                     report["report_json"] = json.loads(report["report_json"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            chapter = get_chapter_by_id(self.pipeline.db_path, chapter_id)
+            if not chapter or chapter["book_id"] != book_id:
+                return None
+            status = _report_status(report, chapter)
+            report["quality_status"] = status
+            if status in {"stale", "legacy_unverified"}:
+                report["previous_verdict"] = report["verdict"]
+                report["verdict"] = "STALE" if status == "stale" else "NOT_RUN"
+                report["overall_status"] = report["verdict"]
             return report
         return None
 
-    def run_deterministic_qa(self, book_id: int, chapter_id: int, job_id: str = "") -> dict:
+    def run_deterministic_qa(self, book_id: int, chapter_id: int, job_id: str = "", *,
+                             connection=None, chapter=None, source_text=None,
+                             translated_text=None, glossary_terms=None) -> dict:
         """Run deterministic chapter QA without calling an LLM provider."""
-        source_text = self.pipeline.get_chapter_source(chapter_id) or ""
-        translated_text = self.pipeline.get_chapter_translation(chapter_id) or ""
+        snapshot = chapter if chapter is not None else get_chapter_by_id(self.pipeline.db_path, chapter_id)
+        source_text = source_text if source_text is not None else self.pipeline.get_chapter_source(chapter_id) or ""
+        translated_text = translated_text if translated_text is not None else self.pipeline.get_chapter_translation(chapter_id) or ""
         if not translated_text:
             raise ValueError(f"No translation for chapter {chapter_id}")
-        glossary_terms = list_glossary(self.pipeline.db_path, book_id)
+        glossary_terms = glossary_terms if glossary_terms is not None else list_glossary(self.pipeline.db_path, book_id)
         report = build_deterministic_chapter_qa_report(
             book_id=book_id,
             chapter_id=chapter_id,
@@ -214,7 +250,10 @@ class QAService:
         )
         save_qa_report(
             self.pipeline.db_path,
+            connection=connection,
             book_id=book_id,
+            content_revision=snapshot["content_revision"] if snapshot else None,
+            component="rule_based",
             chapter_id=chapter_id,
             quality_score=report["quality_score"],
             fidelity_score=report["fidelity_score"],
@@ -243,27 +282,24 @@ class QAService:
         chapter_id: int,
         model: str | None = None,
         host: str | None = None,
+        *, api_key: str | None = None, provider_id: str | None = None, job_id: str = "",
     ) -> dict:
         """Run QA check and return formatted report."""
-        report = self.pipeline.run_qa_check(book_id, chapter_id, model, host)
-        deterministic = None
-        try:
-            source_text = self.pipeline.get_chapter_source(chapter_id) or ""
-            translated_text = self.pipeline.get_chapter_translation(chapter_id) or ""
-            deterministic = build_deterministic_chapter_qa_report(
+        snapshot = get_chapter_by_id(self.pipeline.db_path, chapter_id)
+        options = {key: value for key, value in {"api_key": api_key, "provider_id": provider_id, "job_id": job_id}.items() if value}
+        report = self.pipeline.run_qa_check(book_id, chapter_id, model, host, **options)
+        source_text = self.pipeline.get_chapter_source(chapter_id) or ""
+        translated_text = self.pipeline.get_chapter_translation(chapter_id) or ""
+        deterministic = build_deterministic_chapter_qa_report(
                 book_id=book_id,
                 chapter_id=chapter_id,
                 source_text=source_text,
                 translated_text=translated_text,
                 glossary_terms=list_glossary(self.pipeline.db_path, book_id),
-            )
-            report.setdefault("issues", [])
-            report["issues"] = [*report.get("issues", []), *deterministic.get("issues", [])]
-            report["overall_status"] = deterministic["overall_status"]
-            report["chinese_leakage_count"] = deterministic["chinese_leakage_count"]
-            report["glossary_violations"] = deterministic["glossary_violations"]
-        except Exception:
-            deterministic = None
+        )
+        report = merge_qa_report(deterministic, report, {"complete": report.get("qa_complete", True), "required": True})
+        report["chinese_leakage_count"] = deterministic["chinese_leakage_count"]
+        report["glossary_violations"] = deterministic["glossary_violations"]
         result = {
             "chapter_id": chapter_id,
             "book_id": book_id,
@@ -281,10 +317,12 @@ class QAService:
             "created_at": "",
         }
         # Persist the report to database
-        try:
-            save_qa_report(
+        save_qa_report(
                 self.pipeline.db_path,
                 book_id=book_id,
+                content_revision=snapshot["content_revision"] if snapshot else None,
+                expected_translation_hash=snapshot.get("translation_hash") if snapshot else None,
+                job_id=job_id,
                 chapter_id=chapter_id,
                 quality_score=result["quality_score"],
                 fidelity_score=result["fidelity_score"],
@@ -299,10 +337,7 @@ class QAService:
                 ),
                 glossary_violations=result["glossary_violations"],
                 report_json=json.dumps(report),
-            )
-            result["created_at"] = ""  # DB will set this
-        except Exception:
-            pass  # If saving fails, still return the result
+        )
         return result
 
     def get_book_qa_summary(self, book_id: int) -> dict:
@@ -323,14 +358,15 @@ class QAService:
             ch_id = chapter["id"]
             report = reports_by_chapter.get(ch_id)
             if report:
-                qa_done += 1
                 score = report.get("quality_score", 0)
-                total_score += score
                 verdict = str(report.get("verdict", "UNKNOWN") or "UNKNOWN")
-                status = "pass" if verdict.upper() == "PASS" or score >= 6 else "fail"
+                status = _report_status(report, chapter)
+                if status not in {"stale", "legacy_unverified"}:
+                    qa_done += 1
+                    total_score += score
                 if status == "pass":
                     pass_count += 1
-                else:
+                elif status == "fail":
                     fail_count += 1
                 chapter_details.append({
                     "chapter_id": ch_id,

@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chapter, JobStatus, TtsJobStatus } from '../../api/types';
-import { useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
+import { friendlyAudioError, useReaderAudio, type ReaderAudioApiClient } from './useReaderAudio';
 
 const chapters: Chapter[] = [
   { id: 101, book_id: 42, chapter_number: 1, title: 'Sơn biên tiểu thôn', status: 'translated', audio_path: null, has_translation: true },
@@ -61,6 +61,14 @@ function deferred<T>() {
 }
 
 describe('useReaderAudio', () => {
+  it('keeps GPU-only recovery guidance and never recommends CPU synthesis', () => {
+    const message = friendlyAudioError('GPU is required but unavailable. Configure TTS_DEVICE=cpu');
+
+    expect(message).toContain('GPU');
+    expect(message).toContain('CUDA');
+    expect(message.toLowerCase()).not.toContain('cpu');
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -83,6 +91,7 @@ describe('useReaderAudio', () => {
     const hookOptions = options({ cacheAudio, cachedAudioUrl: '' });
     const { result } = renderHook(() => useReaderAudio(hookOptions));
 
+    act(() => result.current.actions.open());
     await waitFor(() => expect(cacheAudio).toHaveBeenCalledWith(42, 102, '/api/books/42/chapters/102/audio'));
     expect(result.current.playback.url).toBe('/api/books/42/chapters/102/audio');
   });
@@ -90,8 +99,9 @@ describe('useReaderAudio', () => {
   it('waits for the offline controller metadata lookup before caching live audio', async () => {
     const cacheAudio = vi.fn().mockResolvedValue({ cached: true, failed: false, sizeBytes: 10, url: '/live' });
     const hookOptions = options({ cacheAudio, cachedAudioLoading: true, cachedAudioUrl: '' });
-    renderHook(() => useReaderAudio(hookOptions));
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
 
+    act(() => result.current.actions.open());
     await waitFor(() => expect(hookOptions.apiClient.getBookAudioPlaylist).toHaveBeenCalledTimes(1));
     expect(cacheAudio).not.toHaveBeenCalled();
   });
@@ -104,8 +114,9 @@ describe('useReaderAudio', () => {
       cachedAudioLoading: false,
       cachedAudioUrl: '',
     });
-    renderHook(() => useReaderAudio(hookOptions));
+    const { result } = renderHook(() => useReaderAudio(hookOptions));
 
+    act(() => result.current.actions.open());
     await waitFor(() => expect(hookOptions.apiClient.getBookAudioPlaylist).toHaveBeenCalledTimes(1));
     expect(cacheAudio).not.toHaveBeenCalled();
   });
@@ -136,6 +147,7 @@ describe('useReaderAudio', () => {
       { initialProps: { bookId: 42 } },
     );
 
+    act(() => result.current.actions.open());
     expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(1);
     rerender({ bookId: 43 });
     expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(2);
@@ -192,7 +204,7 @@ describe('useReaderAudio', () => {
     await act(async () => Promise.resolve());
 
     expect(result.current.state.jobSnapshot?.status).toBe('completed');
-    expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(2);
+    expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(1);
   });
 
   it('serializes overlapping refreshes for the same audio job', async () => {
@@ -367,7 +379,7 @@ describe('useReaderAudio', () => {
     expect(result.current.state.ttsSnapshot).toBeNull();
     expect(result.current.state.statusValue).toBe('completed');
     await act(async () => Promise.resolve());
-    expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(2);
+    expect(client.getBookAudioPlaylist).toHaveBeenCalledTimes(1);
 
     await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
     expect(client.getJobStatus).toHaveBeenCalledTimes(2);

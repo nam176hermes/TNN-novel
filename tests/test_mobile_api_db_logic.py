@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 
 import httpx
@@ -459,17 +461,18 @@ async def test_audio_playlist_returns_client_urls_without_local_paths(
     assert response.status_code == 200
     payload = response.json()
     assert payload["book_id"] == book_id
+    version = override_audio_pipeline.get_chapter(chapter_id)["audio_version"]
     assert payload["chapters"] == [
         {
             "chapter_id": chapter_id,
             "chapter_number": 1,
             "title": "Chương có audio",
             "duration_seconds": 123.45,
-            "download_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio/download",
+            "download_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio/download?v={version}",
             "filename": "chapter-1.mp3",
             "order": 0,
             "size_bytes": len(b"fake mp3"),
-            "stream_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio",
+            "stream_url": f"/api/books/{book_id}/chapters/{chapter_id}/audio?v={version}",
         }
     ]
     assert "audio_path" not in payload["chapters"][0]
@@ -532,10 +535,11 @@ async def test_reader_cover_and_audio_resolve_exact_legacy_artifact_paths(
     finally:
         app.dependency_overrides.pop(audio_router.get_audio_service, None)
 
-    assert source.json() == {"text": "原文章节", "chapter_id": chapter_id, "missing": False}
-    assert translation.json() == {"text": "Bản dịch chương", "chapter_id": chapter_id, "missing": False}
+    assert source.json() == {"text": "原文章节", "chapter_id": chapter_id, "missing": False, "content_revision": 2}
+    assert translation.json() == {"text": "Bản dịch chương", "chapter_id": chapter_id, "missing": False, "content_revision": 2}
     assert content.json() == {
         "chapter_id": chapter_id,
+        "content_revision": 2,
         "text": "Bản dịch chương",
         "html": "<p>Bản dịch chương</p>",
     }
@@ -731,7 +735,7 @@ def test_translate_chapter_with_pipeline_runs_translate_polish_and_qa(
 
     def fake_call_llm(**kwargs):
         calls.append((kwargs["task_type"], kwargs))
-        assert "Pronoun memory" in kwargs["prompt"]
+        assert "Selected style" in kwargs["prompt"]
         return "Lục ca, ta cảm tạ huynh."
 
     def fake_qa(**kwargs):
@@ -816,7 +820,8 @@ def test_fast_draft_pipeline_only_translates_and_records_stage_timing(
     assert result["text"] == "Ký chủ hoàn thành nhiệm vụ ẩn và nhận điểm tích lũy."
     assert result["qa_report"] is None
     assert temp_pipeline.get_chapter_translation(chapter_id) == "Ký chủ hoàn thành nhiệm vụ ẩn và nhận điểm tích lũy."
-    assert get_qa_report(temp_pipeline.db_path, book_id, chapter_id) is None
+    report = get_qa_report(temp_pipeline.db_path, book_id, chapter_id)
+    assert json.loads(report["report_json"])["quality_status"] == "unreviewed"
 
     attempts = get_job_attempts(temp_pipeline.db_path, job_id="job-fast-draft")
     assert len(attempts) == 1
@@ -1105,7 +1110,10 @@ def test_generate_audio_writes_under_pipeline_data_dir(
             self.data_dir = data_dir
             captured.update(_)
 
-        def generate_chapter(self, *, book_id: int, chapter_id: int, job_id: str, voice_config: dict[str, str]):
+        def close(self):
+            captured["closed"] = True
+
+        def generate_chapter(self, *, book_id: int, chapter_id: int, job_id: str, voice_config: dict[str, str], parent_job_id: str):
             output_path = self.data_dir / "audio" / f"book{book_id}_ch{chapter_id}_{job_id or 'tts'}.mp3"
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"fake mp3")
@@ -1124,6 +1132,7 @@ def test_generate_audio_writes_under_pipeline_data_dir(
     assert temp_pipeline.data_dir in audio_path.parents
     assert audio_path.read_bytes() == b"fake mp3"
     assert captured["legacy_fallback"] is None
+    assert captured["closed"] is True
 
 
 def test_generate_audio_rejects_unavailable_f5_before_constructing_pipeline(
@@ -1171,6 +1180,9 @@ def test_generate_audio_keeps_legacy_fallback_for_explicit_non_f5_provider(
     class CapturingPipeline:
         def __init__(self, db_path: Path, data_dir: Path, **kwargs: object) -> None:
             captured.update(kwargs)
+
+        def close(self):
+            captured["closed"] = True
 
         def generate_chapter(self, **kwargs: object):
             return type(
@@ -1397,6 +1409,7 @@ async def test_chapter_delete_endpoints_apply_cleanup(
     assert content_response.status_code == 200
     assert content_response.json() == {
         "chapter_id": chapter_id,
+        "content_revision": 2,
         "text": "translation",
         "html": '<p>translation</p><img src="/book-assets/1/sword.png"/>',
     }

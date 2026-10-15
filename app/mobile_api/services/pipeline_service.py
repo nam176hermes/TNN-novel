@@ -5,33 +5,22 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 import re
 import struct
 import time
-import uuid
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable
 
 from app.database.db import (
+    get_style_profile,
+    get_default_style_profile,
     get_book_by_id,
-    find_import_book_with_connection,
-    get_connection,
-    insert_import_chapter_with_connection,
-    list_active_import_chapters_with_connection,
-    list_books_with_active_chapters,
-    list_translated_book_summaries as db_list_translated_book_summaries,
-    add_book,
-    resolve_import_book_with_connection,
-    update_book as db_update_book,
-    delete_book as db_delete_book,
     delete_chapter_translation_data,
-    get_book_by_title,
     get_chapter_by_id,
     get_provider_defaults,
     get_reader_dictionary_cache,
@@ -48,19 +37,18 @@ from app.database.db import (
     add_reader_entity,
     add_reader_entity_mention,
     add_reader_timeline_event,
-    save_qa_report,
     soft_delete_chapter,
     update_chapter_paths,
-    update_import_chapter_with_connection,
-    upsert_import_chapter_with_connection,
-    canonicalize_import_url,
-    add_chapter,
     upsert_reader_ai_cache,
     upsert_reader_dictionary_cache,
 )
-from app.ingestion.source_adapters import FetchErrorCode, SourceAdapterError, SourceChapterContent, get_source_registry
-from app.mobile_api.services.import_metadata import detect_import_metadata, normalize_import_text, source_hash
+from app.ingestion.source_adapters import SourceChapterContent, get_source_registry
 from app.mobile_api.services.content_file_service import ContentFileService
+from app.mobile_api.services import book_service as _book_service
+from app.mobile_api.services.book_service import BookService
+from app.mobile_api.services.import_commit_service import ImportCommitService
+from app.ingestion.import_result import ChapterImportResult
+
 from app.mobile_api.services.reader_dictionary_service import (
     MAX_READER_DICTIONARY_ARCHIVE_FILES as _MAX_READER_DICTIONARY_ARCHIVE_FILES,
     MAX_READER_DICTIONARY_BYTES as _MAX_READER_DICTIONARY_BYTES,
@@ -83,7 +71,10 @@ from app.scheduler.daily_queue import get_pending_chapters, get_failed_chapters
 from app.mobile_api.dependencies import get_data_dir, get_db_path
 from app.config import settings
 from app.services.tts.availability import is_f5_provider, require_tts_runtime_available
-from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
+from app.translation.qa_report import merge_qa_report
+from app.mobile_api.services.qa_service import build_deterministic_chapter_qa_report
+from app.storage.chapter_content import publish_translation, retire_artifact, write_versioned_text
+from app.storage.artifact_paths import ArtifactClass
 
 
 logger = logging.getLogger(__name__)
@@ -94,76 +85,12 @@ MAX_READER_DICTIONARY_BYTES = _MAX_READER_DICTIONARY_BYTES
 READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES = _READER_OFFLINE_DICTIONARY_ARCHIVE_SUFFIXES
 
 
-@dataclass(frozen=True)
-class ChapterImportResult(Mapping[str, object]):
-    """Typed, compatibility-preserving metadata for one stored chapter import."""
 
-    book_id: int
-    chapter_id: int
-    stored_text_length: int
-    content_hash: str
-    operation: str
-    warnings: tuple[str, ...] = ()
-    title: str = ""
-    chapter_number: int = 0
-    chapter_title: str = ""
-    source_type: str = ""
-    source_url: str = ""
-    adapter_id: str = ""
-    path: str = ""
-    fetch_method: str = ""
-    fetch_attempts: int = 0
-    fetch_elapsed_ms: int = 0
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "book_id": self.book_id,
-            "chapter_id": self.chapter_id,
-            "stored_text_length": self.stored_text_length,
-            "content_hash": self.content_hash,
-            "operation": self.operation,
-            "warnings": list(self.warnings),
-            "title": self.title,
-            "chapter_number": self.chapter_number,
-            "chapter_title": self.chapter_title,
-            "source_type": self.source_type,
-            "source_url": self.source_url,
-            "adapter_id": self.adapter_id,
-            "path": self.path,
-            "fetch_method": self.fetch_method,
-            "fetch_attempts": self.fetch_attempts,
-            "fetch_elapsed_ms": self.fetch_elapsed_ms,
-        }
-
-    def __getitem__(self, key: str) -> object:
-        return self.to_dict()[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.to_dict())
-
-    def __len__(self) -> int:
-        return len(self.to_dict())
-
-
-CLASSICAL_PRONOUN_STYLE_GUIDE = """Vietnamese classical web-novel style rules:
-- Keep the meaning faithful, but make Vietnamese natural and slightly cổ phong.
-- Avoid modern pronouns "tôi/bạn/anh/em" in historical, martial, cultivation, sect, or rural cổ trang context.
-- Không dùng "tôi" khi nhân vật đang gọi Lục ca, sư huynh, tiền bối, đạo hữu, hoặc người trong bối cảnh cổ trang/tu luyện.
-- Do not use "hắn/y" for the person being directly addressed after a vocative. Use huynh, tỷ, đệ, muội, ngươi, tiền bối, or đạo hữu as context requires.
-- Bad: "Lục ca, mấy ngày nay đã phiền hắn chăm sóc nhiều rồi, tôi còn chưa biết báo đáp thế nào, xin đừng cho tôi thêm đồ nữa."
-- Good: "Lục ca, mấy ngày nay nhờ huynh chăm sóc, ta còn chưa biết báo đáp thế nào, xin huynh đừng cho ta thêm đồ nữa."
-"""
 
 TRANSLATED_CHAPTER_STATUSES = {"translated", "qa_low", "audio_done"}
-BOOK_COVER_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-}
-BOOK_COVER_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MAX_BOOK_COVER_BYTES = 10 * 1024 * 1024
+BOOK_COVER_CONTENT_TYPES = _book_service.BOOK_COVER_CONTENT_TYPES
+BOOK_COVER_SUFFIXES = _book_service.BOOK_COVER_SUFFIXES
+MAX_BOOK_COVER_BYTES = _book_service.MAX_BOOK_COVER_BYTES
 MAX_READER_XRAY_AUTO_CHAPTERS = 50
 MAX_READER_XRAY_AUTO_ENTITIES = 24
 MAX_READER_XRAY_AUTO_MENTIONS_PER_ENTITY = 6
@@ -748,21 +675,23 @@ def _chapter_has_translation(chapter: dict) -> bool:
     return bool(chapter.get("translated_text_path") or chapter.get("content_html_path")) or status in TRANSLATED_CHAPTER_STATUSES
 
 
-def _build_retranslate_prompt(paragraph: str) -> str:
+def _build_retranslate_prompt(paragraph: str, style_profile: dict | None = None) -> str:
     return (
         "Translate this Chinese paragraph to Vietnamese.\n\n"
-        f"{CLASSICAL_PRONOUN_STYLE_GUIDE}\n"
+        f"Selected style: {json.dumps(style_profile or {}, ensure_ascii=False)}\n"
+        f"{render_pronoun_memory()}\n"
         f"{render_literary_phrase_guide(paragraph)}\n\n"
         "Return only the Vietnamese translation.\n\n"
         f"Chinese paragraph:\n{paragraph}"
     )
 
 
-def _build_polish_prompt(paragraph: str, instructions: str = "") -> str:
+def _build_polish_prompt(paragraph: str, instructions: str = "", style_profile: dict | None = None) -> str:
     extra_instructions = instructions.strip() or "Improve flow, fix awkward phrasing, keep meaning."
     return (
         "Polish this Vietnamese translation for a Chinese web novel.\n\n"
-        f"{CLASSICAL_PRONOUN_STYLE_GUIDE}\n"
+        f"Selected style: {json.dumps(style_profile or {}, ensure_ascii=False)}\n"
+        f"{render_pronoun_memory()}\n"
         "Literary phrase guide:\n"
         f"{LITERARY_STYLE_GUIDE}\n\n"
         f"Additional instructions: {extra_instructions}\n"
@@ -778,15 +707,16 @@ def _build_chapter_polish_prompt(
     book_title: str,
     chapter_title: str,
     chapter_number: int,
+    style_profile: dict | None = None,
 ) -> str:
     return (
-        "Polish this Vietnamese Chinese-web-novel chapter into fluent cổ trang Vietnamese.\n\n"
-        f"{CLASSICAL_PRONOUN_STYLE_GUIDE}\n"
+        "Polish this chapter into fluent Vietnamese according to the selected style.\n\n"
+        f"Selected style: {json.dumps(style_profile or {}, ensure_ascii=False)}\n"
         f"{render_pronoun_memory()}\n\n"
         f"{render_literary_phrase_guide(source_text)}\n\n"
         "Rules:\n"
         "- Keep every source paragraph represented; do not summarize.\n"
-        "- Fix modern pronouns such as tôi/bạn/anh/em unless the source clearly requires modern setting.\n"
+        "- Preserve pronoun referents and relationships; follow the selected style.\n"
         "- Keep names, kinship titles, cultivation terms, sects, places, and chapter meaning stable.\n"
         "- Return only the polished Vietnamese chapter.\n\n"
         f"Book: {book_title}\n"
@@ -804,10 +734,11 @@ def _build_qa_rewrite_prompt(
     book_title: str,
     chapter_title: str,
     chapter_number: int,
+    style_profile: dict | None = None,
 ) -> str:
     return (
         "Rewrite only the flawed Vietnamese passages identified by QA, while preserving the full chapter.\n\n"
-        f"{CLASSICAL_PRONOUN_STYLE_GUIDE}\n"
+        f"Selected style: {json.dumps(style_profile or {}, ensure_ascii=False)}\n"
         f"{render_pronoun_memory()}\n\n"
         f"{render_literary_phrase_guide(source_text)}\n\n"
         "Return the complete corrected Vietnamese chapter only.\n\n"
@@ -2201,6 +2132,13 @@ class PipelineService:
             self.content_file_service = service
         return service
 
+    def _books(self) -> BookService:
+        return BookService(data_dir=self.data_dir, db_path=self.db_path, content_files=self._content_files())
+
+    def _imports(self) -> ImportCommitService:
+        return ImportCommitService(data_dir=self.data_dir, db_path=self.db_path,
+            books=self._books(), content_files=self._content_files())
+
     def _reader(self) -> ReaderService:
         service = getattr(self, "reader_service", None)
         content_files = self._content_files()
@@ -2229,46 +2167,21 @@ class PipelineService:
             self.reader_dictionary_service = service
         return service
 
-    @staticmethod
-    def _safe_filename_part(value: str) -> str:
-        return "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in value)
+    _safe_filename_part = staticmethod(ImportCommitService._safe_filename_part)
 
-    @staticmethod
-    def _unlink_path(value: str | None) -> None:
-        if not value:
-            return
-        Path(value).unlink(missing_ok=True)
+    _unlink_path = staticmethod(BookService._unlink_path)
 
     def _cover_url(self, cover_path: str | None) -> str:
-        if not cover_path:
-            return ""
-        covers_dir = self.data_dir / "covers"
-        try:
-            path = self.resolve_artifact_file(cover_path, ArtifactClass.COVER)
-        except ArtifactPathError:
-            return ""
-        try:
-            relative_path = path.relative_to(covers_dir)
-        except ValueError:
-            return ""
-        return f"/covers/{relative_path.as_posix()}"
+        return self._books()._cover_url(cover_path)
 
     def resolve_artifact_file(self, value: str | Path | None, artifact_class: ArtifactClass) -> Path:
         return self._content_files().resolve_artifact_file(value, artifact_class)
 
     def _book_cover_extension(self, filename: str, content_type: str) -> str:
-        normalized_type = content_type.lower().split(";", 1)[0].strip()
-        if normalized_type in BOOK_COVER_CONTENT_TYPES:
-            return BOOK_COVER_CONTENT_TYPES[normalized_type]
-
-        suffix = Path(filename).suffix.lower()
-        if suffix in BOOK_COVER_SUFFIXES:
-            return ".jpg" if suffix == ".jpeg" else suffix
-        raise ValueError("Unsupported cover image format")
+        return self._books()._book_cover_extension(filename, content_type)
 
     def _safe_book_cover_stem(self, title: str, book_id: int) -> str:
-        safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._-")
-        return safe_title or f"book_{book_id}"
+        return self._books()._safe_book_cover_stem(title, book_id)
 
     def list_reader_dictionaries(self) -> list[dict]:
         return self._reader_dictionaries().list_reader_dictionaries()
@@ -2283,17 +2196,10 @@ class PipelineService:
         return self._reader_dictionaries().get_reader_dictionary_path(filename)
 
     def _book_payload(self, book: dict | None) -> dict | None:
-        if not book:
-            return None
-        payload = dict(book)
-        payload["cover_url"] = self._cover_url(payload.get("cover_path"))
-        return payload
+        return self._books()._book_payload(book)
 
     def _book_id_for_title(self, title: str) -> int:
-        if not title.strip():
-            raise ValueError("Book title is required")
-        book = get_book_by_title(self.db_path, title)
-        return book["id"] if book else self.create_book(title)
+        return self._books()._book_id_for_title(title)
 
     def _book_id_for_import(
         self,
@@ -2303,39 +2209,17 @@ class PipelineService:
         source: str = "manual",
         source_url: str = "",
     ) -> int:
-        if not title.strip():
-            raise ValueError("Book title is required")
-
-        book = get_book_by_title(self.db_path, title)
-        if not book:
-            return self.create_book(title, author=author, source=source, source_url=source_url)
-
-        updates: dict[str, str] = {}
-        if author and not book.get("author"):
-            updates["author"] = author
-        if source and (not book.get("source") or book.get("source") == "manual"):
-            updates["source"] = source
-        if source_url and not book.get("source_url"):
-            updates["source_url"] = source_url
-        if updates:
-            self.update_book(book["id"], **updates)
-        return book["id"]
+        return self._books()._book_id_for_import(title, author=author, source=source, source_url=source_url)
 
     # Books
     def list_books(self) -> list[dict]:
-        return [
-            self._book_payload(book)
-            for book in list_books_with_active_chapters(self.db_path)
-        ]
+        return self._books().list_books()
 
     def list_translated_book_summaries(self) -> list[dict]:
-        summaries = db_list_translated_book_summaries(self.db_path)
-        for summary in summaries:
-            summary["cover_url"] = self._cover_url(summary.get("cover_path"))
-        return summaries
+        return self._books().list_translated_book_summaries()
 
     def get_book(self, book_id: int) -> dict | None:
-        return self._book_payload(get_book_by_id(self.db_path, book_id))
+        return self._books().get_book(book_id)
 
     def create_book(
         self,
@@ -2345,23 +2229,10 @@ class PipelineService:
         source_url: str = "",
         cover_path: str = "",
     ) -> int:
-        return add_book(self.db_path, title, author, source, source_url, cover_path)
+        return self._books().create_book(title, author, source, source_url, cover_path)
 
     def update_book(self, book_id: int, **kwargs) -> dict | None:
-        updated = db_update_book(
-            self.db_path,
-            book_id,
-            title=kwargs.get("title"),
-            author=kwargs.get("author"),
-            source=kwargs.get("source"),
-            source_url=kwargs.get("source_url"),
-            cover_path=kwargs.get("cover_path"),
-        )
-        if not updated:
-            return None
-        if kwargs.get("title"):
-            return self._book_payload(get_book_by_title(self.db_path, kwargs["title"]))
-        return self._book_payload(get_book_by_id(self.db_path, book_id))
+        return self._books().update_book(book_id, **kwargs)
 
     def update_book_cover(
         self,
@@ -2371,42 +2242,10 @@ class PipelineService:
         content_type: str,
         content: bytes,
     ) -> dict | None:
-        book = get_book_by_id(self.db_path, book_id)
-        if not book:
-            return None
-        if not content:
-            raise ValueError("Cover image is empty")
-        if len(content) > MAX_BOOK_COVER_BYTES:
-            raise ValueError("Cover image is too large")
-
-        extension = self._book_cover_extension(filename, content_type)
-        covers_dir = self.data_dir / "covers"
-        covers_dir.mkdir(parents=True, exist_ok=True)
-        safe_stem = self._safe_book_cover_stem(str(book.get("title") or ""), book_id)
-        cover_path = covers_dir / f"{safe_stem}_{book_id}_{time.time_ns()}{extension}"
-        cover_path.write_bytes(content)
-        return self.update_book(book_id, cover_path=str(cover_path))
+        return self._books().update_book_cover(book_id, filename=filename, content_type=content_type, content=content)
 
     def delete_book(self, book_id: int) -> bool:
-        book = get_book_by_id(self.db_path, book_id)
-        if not book:
-            return False
-
-        chapters = list_chapters(self.db_path, book_id)
-        file_paths = [book.get("cover_path")]
-        for chapter in chapters:
-            file_paths.extend(
-                chapter.get(key)
-                for key in ("raw_text_path", "cleaned_text_path", "translated_text_path", "content_html_path", "audio_path")
-            )
-
-        if not db_delete_book(self.db_path, book_id):
-            return False
-
-        for file_path in file_paths:
-            self._unlink_path(file_path)
-        shutil.rmtree(self.data_dir / "book_assets" / str(book_id), ignore_errors=True)
-        return True
+        return self._books().delete_book(book_id)
 
     # Chapters
     def get_chapter(self, chapter_id: int) -> dict | None:
@@ -2421,14 +2260,14 @@ class PipelineService:
     def list_chapters(self, book_id: int | None = None) -> list[dict]:
         return list_chapters(self.db_path, book_id)
 
-    def get_chapter_source(self, chapter_id: int) -> str | None:
-        return self._content_files().get_chapter_source(chapter_id)
+    def get_chapter_source(self, chapter_id: int, *, chapter=None) -> str | None:
+        return self._content_files().get_chapter_source(chapter_id, chapter=chapter)
 
-    def get_chapter_translation(self, chapter_id: int) -> str | None:
-        return self._content_files().get_chapter_translation(chapter_id)
+    def get_chapter_translation(self, chapter_id: int, *, chapter=None) -> str | None:
+        return self._content_files().get_chapter_translation(chapter_id, chapter=chapter)
 
-    def get_chapter_content(self, chapter_id: int) -> dict | None:
-        return self._content_files().get_chapter_content(chapter_id)
+    def get_chapter_content(self, chapter_id: int, *, chapter=None) -> dict | None:
+        return self._content_files().get_chapter_content(chapter_id, chapter=chapter)
 
     # Reader state compatibility facade
     def get_reader_state(self, book_id: int) -> dict | None:
@@ -2553,7 +2392,7 @@ class PipelineService:
 
         if "translation" in scopes:
             for chapter in sorted(chapters_by_id.values(), key=lambda item: (item["chapter_number"], item["id"])):
-                text = self.get_chapter_translation(chapter["id"])
+                text = self.get_chapter_translation(chapter["id"], chapter=chapter)
                 if not text:
                     continue
                 for paragraph_index, paragraph in enumerate(_split_reader_paragraphs(text)):
@@ -2983,800 +2822,12 @@ class PipelineService:
             "timeline": timeline,
         }
 
-    def _upsert_xray_entity(
-        self,
-        book_id: int,
-        entities_by_name: dict[str, dict],
-        *,
-        name: str,
-        entity_type: str,
-        metadata: dict,
-        aliases: list[str] | None = None,
-        description: str = "",
-        first_chapter_number: int = 0,
-        importance: int = 40,
-    ) -> dict:
-        existing = entities_by_name.get(name)
-        merged_aliases = list(dict.fromkeys([
-            *(existing.get("aliases", []) if existing else []),
-            *(aliases or []),
-        ]))
-        merged_metadata = {
-            **(existing.get("metadata", {}) if existing else {}),
-            **metadata,
-        }
-        entity = add_reader_entity(
-            self.db_path,
-            book_id=book_id,
-            entity_type=existing.get("type", entity_type) if existing else entity_type,
-            name=name,
-            aliases=merged_aliases,
-            description=description or (existing.get("description", "") if existing else ""),
-            first_chapter_number=first_chapter_number or (existing.get("first_chapter_number", 0) if existing else 0),
-            importance=existing.get("importance", importance) if existing else importance,
-            metadata=merged_metadata,
-        )
-        entities_by_name[name] = entity
-        return entity
-
-    def _add_xray_ai_mention(
-        self,
-        book_id: int,
-        *,
-        entity: dict,
-        chapter_ids_by_number: dict[int, int],
-        chapter_number: int,
-        default_chapter_id: int | None,
-        mention_text: str,
-        context: str,
-    ) -> None:
-        chapter_id = chapter_ids_by_number.get(chapter_number) or default_chapter_id
-        if not chapter_id:
-            return
-        add_reader_entity_mention(
-            self.db_path,
-            book_id=book_id,
-            entity_id=entity["id"],
-            chapter_id=chapter_id,
-            chapter_number=chapter_number,
-            paragraph_index=0,
-            mention_text=mention_text,
-            context=context,
-        )
-
-    def _apply_reader_xray_ai_payload(
-        self,
-        book_id: int,
-        payload: dict,
-        *,
-        default_chapter_id: int | None,
-        default_chapter_number: int,
-    ) -> None:
-        chapters = list_chapters(self.db_path, book_id)
-        chapter_ids_by_number = {
-            int(chapter.get("chapter_number") or 0): chapter["id"]
-            for chapter in chapters
-        }
-        entities_by_name = {
-            entity["name"]: entity
-            for entity in list_reader_xray_entities(self.db_path, book_id)
-        }
-
-        def ai_text(value: object) -> str:
-            if isinstance(value, dict):
-                for key in ("name", "label", "title", "text", "value", "id"):
-                    text = str(value.get(key) or "").strip()
-                    if text:
-                        return text
-                return ""
-            return str(value or "").strip()
-
-        def ai_payload_list(*keys: str, nested_keys: tuple[str, ...] | None = None) -> list[object]:
-            items: list[object] = []
-            nested_candidates = nested_keys or (
-                "items",
-                "entries",
-                "nodes",
-                "edges",
-                "links",
-                "events",
-                "rankings",
-                "relationships",
-                "factions",
-                "realms",
-            )
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, list):
-                    items.extend(value)
-                elif isinstance(value, dict):
-                    for nested_key in nested_candidates:
-                        nested_value = value.get(nested_key)
-                        if isinstance(nested_value, list):
-                            items.extend(nested_value)
-                            break
-            return items
-
-        graph_node_names: dict[str, str] = {}
-        graph_payload = payload.get("relationship_graph")
-        if isinstance(graph_payload, dict):
-            for raw_node in ai_payload_list("relationship_graph", nested_keys=("nodes", "entities")):
-                if not isinstance(raw_node, dict):
-                    continue
-                node_name = ai_text(raw_node.get("name") or raw_node.get("label") or raw_node.get("title"))
-                if not node_name:
-                    continue
-                for key in ("id", "key", "name", "label"):
-                    node_id = str(raw_node.get(key) or "").strip()
-                    if node_id:
-                        graph_node_names[node_id] = node_name
-
-        allowed_entity_types = {"character", "faction", "location", "item", "realm", "skill"}
-        raw_entities = ai_payload_list("entities", "entity_profiles")
-        if isinstance(graph_payload, dict):
-            raw_entities.extend(ai_payload_list("relationship_graph", nested_keys=("nodes", "entities")))
-        if isinstance(raw_entities, list):
-            for raw in raw_entities:
-                if not isinstance(raw, dict):
-                    continue
-                name = ai_text(raw.get("name") or raw.get("label") or raw.get("title"))
-                if not name:
-                    continue
-                raw_type = str(raw.get("type") or raw.get("entity_type") or raw.get("node_type") or "").strip()
-                entity_type = raw_type if raw_type in allowed_entity_types else _reader_xray_entity_type(name)
-                chapter_number = int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0)
-                raw_aliases = raw.get("aliases", [])
-                aliases = (
-                    [ai_text(alias) for alias in raw_aliases if ai_text(alias) and ai_text(alias) != name]
-                    if isinstance(raw_aliases, list)
-                    else []
-                )
-                metadata = dict(raw.get("metadata")) if isinstance(raw.get("metadata"), dict) else {}
-                metadata["source"] = metadata.get("source") or "ai_xray_profile"
-                for source_key, target_key in (
-                    ("faction", "faction"),
-                    ("sect", "faction"),
-                    ("organization", "faction"),
-                    ("power_rank", "power_rank"),
-                    ("rank", "power_rank"),
-                    ("power_level", "power_rank"),
-                    ("power_label", "power_label"),
-                    ("realm", "power_label"),
-                    ("rank_label", "power_label"),
-                    ("power_basis", "power_basis"),
-                    ("basis", "power_basis"),
-                    ("evidence", "power_basis"),
-                ):
-                    if raw.get(source_key) not in (None, ""):
-                        metadata[target_key] = raw.get(source_key)
-                raw_relationships = raw.get("relationships", [])
-                if isinstance(raw_relationships, list):
-                    relationships: list[dict] = []
-                    for relationship in raw_relationships:
-                        if not isinstance(relationship, dict):
-                            continue
-                        target = str(relationship.get("target") or "").strip()
-                        if not target:
-                            continue
-                        relationships.append(
-                            {
-                                "target": target,
-                                "relation": str(relationship.get("relation") or relationship.get("type") or "liên hệ").strip(),
-                                "evidence": str(relationship.get("evidence") or relationship.get("summary") or "").strip(),
-                                "chapter_number": int(relationship.get("chapter_number") or chapter_number or 0),
-                                "strength": relationship.get("strength") if isinstance(relationship.get("strength"), int | float) else 0.75,
-                                "source_type": "ai",
-                            }
-                        )
-                    if relationships:
-                        metadata["relationships"] = [
-                            *(metadata.get("relationships") if isinstance(metadata.get("relationships"), list) else []),
-                            *relationships,
-                        ]
-
-                entity = self._upsert_xray_entity(
-                    book_id,
-                    entities_by_name,
-                    name=name,
-                    entity_type=entity_type,
-                    aliases=aliases,
-                    description=str(raw.get("description") or "").strip(),
-                    first_chapter_number=chapter_number,
-                    importance=int(raw.get("importance") or 75),
-                    metadata=metadata,
-                )
-                self._add_xray_ai_mention(
-                    book_id,
-                    entity=entity,
-                    chapter_ids_by_number=chapter_ids_by_number,
-                    chapter_number=chapter_number,
-                    default_chapter_id=default_chapter_id,
-                    mention_text=name,
-                    context=str(raw.get("evidence") or raw.get("description") or name).strip(),
-                )
-
-        def typed_ai_int(value: object, fallback: int = 0) -> int:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return fallback
-
-        def typed_ai_values(value: object) -> list[str]:
-            if isinstance(value, list):
-                return [text for item in value if (text := ai_text(item))]
-            text = ai_text(value)
-            return [text] if text else []
-
-        def typed_ai_metadata_value(value: object) -> object | None:
-            if value is None:
-                return None
-            if isinstance(value, str):
-                text = value.strip()
-                return text or None
-            if isinstance(value, list):
-                values = [text for item in value if (text := ai_text(item))]
-                return values or None
-            return value
-
-        def ensure_ai_link_entity(
-            *,
-            name: str,
-            entity_type: str,
-            chapter_number: int,
-            context: str,
-            importance: int = 50,
-        ) -> dict:
-            existing = entities_by_name.get(name)
-            if existing:
-                return existing
-            entity = self._upsert_xray_entity(
-                book_id,
-                entities_by_name,
-                name=name,
-                entity_type=entity_type,
-                metadata={"source": "ai_xray_enrichment"},
-                first_chapter_number=chapter_number,
-                importance=importance,
-            )
-            self._add_xray_ai_mention(
-                book_id,
-                entity=entity,
-                chapter_ids_by_number=chapter_ids_by_number,
-                chapter_number=chapter_number,
-                default_chapter_id=default_chapter_id,
-                mention_text=name,
-                context=context or name,
-            )
-            return entity
-
-        def add_ai_relationship(
-            *,
-            source_name: str,
-            target_name: str,
-            relation: str,
-            evidence: str,
-            chapter_number: int,
-            source_entity_type: str | None = None,
-            target_entity_type: str | None = None,
-        ) -> None:
-            source_entity = ensure_ai_link_entity(
-                name=source_name,
-                entity_type=source_entity_type or _reader_xray_entity_type(source_name),
-                chapter_number=chapter_number,
-                context=evidence,
-                importance=65,
-            )
-            ensure_ai_link_entity(
-                name=target_name,
-                entity_type=target_entity_type or _reader_xray_entity_type(target_name),
-                chapter_number=chapter_number,
-                context=evidence,
-                importance=55,
-            )
-            source_metadata = dict(source_entity.get("metadata", {})) if source_entity else {}
-            relationships = source_metadata.get("relationships")
-            if not isinstance(relationships, list):
-                relationships = []
-            next_relationship = {
-                "target": target_name,
-                "relation": relation,
-                "evidence": evidence,
-                "chapter_number": chapter_number,
-                "strength": 0.8,
-                "source_type": "ai",
-            }
-            if not any(
-                isinstance(item, dict)
-                and item.get("target") == target_name
-                and item.get("relation") == relation
-                and int(item.get("chapter_number") or 0) == chapter_number
-                for item in relationships
-            ):
-                relationships.append(next_relationship)
-            source_metadata["relationships"] = relationships
-            source_metadata["source"] = source_metadata.get("source") or "ai_xray_enrichment"
-            linked_entity = self._upsert_xray_entity(
-                book_id,
-                entities_by_name,
-                name=source_name,
-                entity_type=source_entity_type or _reader_xray_entity_type(source_name),
-                metadata=source_metadata,
-                first_chapter_number=chapter_number,
-                importance=65,
-            )
-            self._add_xray_ai_mention(
-                book_id,
-                entity=linked_entity,
-                chapter_ids_by_number=chapter_ids_by_number,
-                chapter_number=chapter_number,
-                default_chapter_id=default_chapter_id,
-                mention_text=source_name,
-                context=evidence or source_name,
-            )
-
-        def apply_typed_ai_entities(
-            collection_keys: str | tuple[str, ...],
-            entity_type: str,
-            *,
-            metadata_keys: tuple[tuple[str, str], ...],
-            link_keys: tuple[tuple[str, str], ...] = (),
-            nested_keys: tuple[str, ...] | None = None,
-            outbound_link_keys: tuple[tuple[str, str], ...] = (),
-            default_importance: int = 65,
-        ) -> None:
-            keys = (collection_keys,) if isinstance(collection_keys, str) else collection_keys
-            raw_collection = ai_payload_list(*keys, nested_keys=nested_keys)
-            for raw in raw_collection:
-                if not isinstance(raw, dict):
-                    continue
-                name = str(raw.get("name") or "").strip()
-                if not name:
-                    continue
-                chapter_number = typed_ai_int(raw.get("chapter_number") or default_chapter_number, default_chapter_number)
-                raw_aliases = raw.get("aliases", [])
-                aliases = (
-                    [str(alias).strip() for alias in raw_aliases if str(alias).strip() and str(alias).strip() != name]
-                    if isinstance(raw_aliases, list)
-                    else []
-                )
-                metadata = dict(raw.get("metadata")) if isinstance(raw.get("metadata"), dict) else {}
-                metadata["source"] = metadata.get("source") or "ai_xray_enrichment"
-                for source_key, target_key in metadata_keys:
-                    value = typed_ai_metadata_value(raw.get(source_key))
-                    if value is not None:
-                        metadata[target_key] = value
-                entity = self._upsert_xray_entity(
-                    book_id,
-                    entities_by_name,
-                    name=name,
-                    entity_type=entity_type,
-                    aliases=aliases,
-                    description=str(raw.get("description") or "").strip(),
-                    first_chapter_number=chapter_number,
-                    importance=typed_ai_int(raw.get("importance"), default_importance),
-                    metadata=metadata,
-                )
-                context = str(raw.get("evidence") or raw.get("description") or name).strip()
-                self._add_xray_ai_mention(
-                    book_id,
-                    entity=entity,
-                    chapter_ids_by_number=chapter_ids_by_number,
-                    chapter_number=chapter_number,
-                    default_chapter_id=default_chapter_id,
-                    mention_text=name,
-                    context=context,
-                )
-                for source_key, relation in link_keys:
-                    for source_name in typed_ai_values(raw.get(source_key)):
-                        add_ai_relationship(
-                            source_name=source_name,
-                            target_name=name,
-                            relation=relation,
-                            evidence=context,
-                            chapter_number=chapter_number,
-                            target_entity_type=entity_type,
-                        )
-                for target_key, relation in outbound_link_keys:
-                    for target_name in typed_ai_values(raw.get(target_key)):
-                        add_ai_relationship(
-                            source_name=name,
-                            target_name=target_name,
-                            relation=relation,
-                            evidence=context,
-                            chapter_number=chapter_number,
-                            source_entity_type=entity_type,
-                            target_entity_type=entity_type,
-                        )
-
-        apply_typed_ai_entities(
-            ("locations", "places", "world_map"),
-            "location",
-            nested_keys=("locations", "places", "nodes", "items", "entries"),
-            metadata_keys=(
-                ("region", "region"),
-                ("parent", "parent"),
-                ("area", "region"),
-                ("faction", "faction"),
-                ("factions", "factions"),
-                ("sect", "faction"),
-                ("significance", "significance"),
-                ("role", "significance"),
-            ),
-            link_keys=(
-                ("characters", "xuất hiện tại"),
-                ("people", "xuất hiện tại"),
-                ("participants", "xuất hiện tại"),
-                ("factions", "có thế lực tại"),
-                ("sects", "có thế lực tại"),
-                ("organizations", "có thế lực tại"),
-            ),
-            outbound_link_keys=(("parent", "thuộc địa vực"),),
-            default_importance=58,
-        )
-        apply_typed_ai_entities(
-            ("items", "equipment", "treasures", "artifacts"),
-            "item",
-            metadata_keys=(
-                ("owner", "owner"),
-                ("owners", "owners"),
-                ("wielder", "owner"),
-                ("category", "category"),
-                ("grade", "grade"),
-                ("rank", "rank"),
-                ("effect", "effect"),
-                ("origin", "origin"),
-                ("faction", "faction"),
-            ),
-            link_keys=(("owner", "sở hữu"), ("wielder", "sở hữu")),
-            default_importance=60,
-        )
-        apply_typed_ai_entities(
-            ("skills", "techniques", "abilities"),
-            "skill",
-            metadata_keys=(
-                ("user", "user"),
-                ("users", "users"),
-                ("owner", "user"),
-                ("category", "category"),
-                ("realm", "realm"),
-                ("grade", "grade"),
-                ("effect", "effect"),
-                ("faction", "faction"),
-            ),
-            link_keys=(("user", "tu luyện"), ("owner", "tu luyện")),
-            default_importance=62,
-        )
-        apply_typed_ai_entities(
-            ("realms", "realm_hierarchy", "cultivation_realms"),
-            "realm",
-            metadata_keys=(
-                ("order", "order"),
-                ("rank", "rank"),
-                ("parent", "parent"),
-                ("previous", "previous"),
-                ("next", "next"),
-                ("category", "category"),
-                ("evidence", "evidence"),
-            ),
-            outbound_link_keys=(
-                ("next", "tiến tới cảnh giới"),
-                ("previous", "sau cảnh giới"),
-                ("parent", "thuộc hệ cảnh giới"),
-            ),
-            default_importance=68,
-        )
-
-        raw_factions = ai_payload_list("factions", "faction_tree", nested_keys=("factions", "nodes", "items", "entries"))
-        if isinstance(raw_factions, list):
-            def apply_ai_faction(raw: object, *, inherited_parent: str = "", depth: int = 0) -> None:
-                if depth > 4:
-                    return
-                if not isinstance(raw, dict):
-                    name = ai_text(raw)
-                    if not name:
-                        return
-                    raw = {"name": name}
-                name = ai_text(raw.get("name") or raw.get("label") or raw.get("title"))
-                if not name:
-                    return
-                chapter_number = typed_ai_int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number, default_chapter_number)
-                parent = str(raw.get("parent") or raw.get("parent_faction") or inherited_parent or "").strip()
-                faction_entity = self._upsert_xray_entity(
-                    book_id,
-                    entities_by_name,
-                    name=name,
-                    entity_type="faction",
-                    description=str(raw.get("description") or "").strip(),
-                    first_chapter_number=chapter_number,
-                    importance=70,
-                    metadata={
-                        "parent": parent,
-                        "source": "ai_xray_enrichment",
-                    },
-                )
-                faction_chapter_id = chapter_ids_by_number.get(chapter_number) or default_chapter_id
-                if faction_chapter_id:
-                    add_reader_entity_mention(
-                        self.db_path,
-                        book_id=book_id,
-                        entity_id=faction_entity["id"],
-                        chapter_id=faction_chapter_id,
-                        chapter_number=chapter_number,
-                        paragraph_index=0,
-                        mention_text=name,
-                        context=str(raw.get("description") or name).strip(),
-                    )
-                members = [
-                    *typed_ai_values(raw.get("members")),
-                    *typed_ai_values(raw.get("member_names")),
-                ]
-                for member_name in members:
-                    if not member_name:
-                        continue
-                    member_entity = entities_by_name.get(member_name)
-                    member_metadata = dict(member_entity.get("metadata", {})) if member_entity else {}
-                    member_metadata["faction"] = name
-                    member_metadata["source"] = member_metadata.get("source") or "ai_xray_enrichment"
-                    member_entity = self._upsert_xray_entity(
-                        book_id,
-                        entities_by_name,
-                        name=member_name,
-                        entity_type="character",
-                        metadata=member_metadata,
-                        first_chapter_number=member_entity.get("first_chapter_number", chapter_number) if member_entity else chapter_number,
-                    )
-                    self._add_xray_ai_mention(
-                        book_id,
-                        entity=member_entity,
-                        chapter_ids_by_number=chapter_ids_by_number,
-                        chapter_number=chapter_number,
-                        default_chapter_id=default_chapter_id,
-                        mention_text=member_name,
-                        context=str(raw.get("description") or name).strip(),
-                    )
-
-                children = raw.get("children") or raw.get("child_factions") or raw.get("subfactions") or []
-                if isinstance(children, list):
-                    for child in children:
-                        if isinstance(child, dict):
-                            child_payload = dict(child)
-                            child_payload.setdefault("parent", name)
-                            child_payload.setdefault("chapter_number", chapter_number)
-                            apply_ai_faction(child_payload, inherited_parent=name, depth=depth + 1)
-                        else:
-                            child_name = ai_text(child)
-                            if child_name:
-                                apply_ai_faction(
-                                    {"name": child_name, "parent": name, "chapter_number": chapter_number},
-                                    inherited_parent=name,
-                                    depth=depth + 1,
-                                )
-
-            for raw in raw_factions:
-                apply_ai_faction(raw)
-
-        raw_power_rankings = ai_payload_list("power_rankings", "power_ranking", "power_levels")
-        if isinstance(raw_power_rankings, list):
-            for raw in raw_power_rankings:
-                if not isinstance(raw, dict):
-                    continue
-                name = ai_text(raw.get("name") or raw.get("character") or raw.get("entity") or raw.get("label"))
-                if not name:
-                    continue
-                entity = entities_by_name.get(name)
-                metadata = dict(entity.get("metadata", {})) if entity else {}
-                rank_value = raw.get("rank") if raw.get("rank") is not None else raw.get("power_rank")
-                if rank_value is None:
-                    rank_value = raw.get("power_level")
-                if rank_value is not None:
-                    metadata["power_rank"] = rank_value
-                metadata["power_label"] = ai_text(raw.get("label") or raw.get("realm") or raw.get("power_label") or raw.get("rank_label"))
-                metadata["power_basis"] = ai_text(raw.get("basis") or raw.get("reason") or raw.get("evidence"))
-                faction = ai_text(raw.get("faction") or raw.get("sect") or raw.get("organization"))
-                if faction:
-                    metadata["faction"] = faction
-                metadata["source"] = metadata.get("source") or "ai_xray_enrichment"
-                chapter_number = int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0)
-                ranked_entity = self._upsert_xray_entity(
-                    book_id,
-                    entities_by_name,
-                    name=name,
-                    entity_type="character",
-                    metadata=metadata,
-                    first_chapter_number=entity.get("first_chapter_number", chapter_number) if entity else chapter_number,
-                )
-                self._add_xray_ai_mention(
-                    book_id,
-                    entity=ranked_entity,
-                    chapter_ids_by_number=chapter_ids_by_number,
-                    chapter_number=chapter_number,
-                    default_chapter_id=default_chapter_id,
-                    mention_text=name,
-                    context=str(raw.get("basis") or raw.get("label") or name).strip(),
-                )
-
-        raw_relationships = ai_payload_list(
-            "relationships",
-            "relationship_graph",
-            "character_relationships",
-            nested_keys=("relationships", "edges", "links", "items", "entries"),
-        )
-        if isinstance(raw_relationships, list):
-            for raw in raw_relationships:
-                if not isinstance(raw, dict):
-                    continue
-                source_ref = ai_text(
-                    raw.get("source")
-                    or raw.get("from")
-                    or raw.get("source_id")
-                    or raw.get("from_id")
-                    or raw.get("source_name")
-                    or raw.get("from_name")
-                    or raw.get("source_label")
-                    or raw.get("actor")
-                )
-                target_ref = ai_text(
-                    raw.get("target")
-                    or raw.get("to")
-                    or raw.get("target_id")
-                    or raw.get("to_id")
-                    or raw.get("target_name")
-                    or raw.get("to_name")
-                    or raw.get("target_label")
-                    or raw.get("object")
-                )
-                source = graph_node_names.get(source_ref, source_ref)
-                target = graph_node_names.get(target_ref, target_ref)
-                if not source or not target:
-                    continue
-                source_entity = entities_by_name.get(source)
-                if not source_entity:
-                    source_entity = self._upsert_xray_entity(
-                        book_id,
-                        entities_by_name,
-                        name=source,
-                        entity_type=str(raw.get("source_entity_type") or raw.get("source_type") or "character"),
-                        metadata={"source": "ai_xray_enrichment"},
-                        first_chapter_number=int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0),
-                    )
-                    source_chapter_number = int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0)
-                    source_chapter_id = chapter_ids_by_number.get(source_chapter_number) or default_chapter_id
-                    if source_chapter_id:
-                        self._add_xray_ai_mention(
-                            book_id,
-                            entity=source_entity,
-                            chapter_ids_by_number=chapter_ids_by_number,
-                            chapter_number=source_chapter_number,
-                            default_chapter_id=source_chapter_id,
-                            mention_text=source,
-                            context=str(raw.get("evidence") or source).strip(),
-                        )
-                if target not in entities_by_name:
-                    target_entity = self._upsert_xray_entity(
-                        book_id,
-                        entities_by_name,
-                        name=target,
-                        entity_type=str(raw.get("target_entity_type") or raw.get("target_type") or "character"),
-                        metadata={"source": "ai_xray_enrichment"},
-                        first_chapter_number=int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0),
-                    )
-                    target_chapter_number = int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0)
-                    target_chapter_id = chapter_ids_by_number.get(target_chapter_number) or default_chapter_id
-                    if target_chapter_id:
-                        self._add_xray_ai_mention(
-                            book_id,
-                            entity=target_entity,
-                            chapter_ids_by_number=chapter_ids_by_number,
-                            chapter_number=target_chapter_number,
-                            default_chapter_id=target_chapter_id,
-                            mention_text=target,
-                            context=str(raw.get("evidence") or target).strip(),
-                        )
-                metadata = dict(source_entity.get("metadata", {}))
-                relationships = metadata.get("relationships")
-                if not isinstance(relationships, list):
-                    relationships = []
-                next_relationship = {
-                    "target": target,
-                    "relation": ai_text(raw.get("relation") or raw.get("label") or raw.get("type") or "liên hệ"),
-                    "evidence": ai_text(raw.get("evidence") or raw.get("summary")),
-                    "chapter_number": int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0),
-                    "strength": (
-                        raw.get("strength")
-                        if isinstance(raw.get("strength"), int | float)
-                        else raw.get("weight") if isinstance(raw.get("weight"), int | float) else 0.75
-                    ),
-                    "source_type": "ai",
-                }
-                duplicate = any(
-                    isinstance(item, dict)
-                    and item.get("target") == next_relationship["target"]
-                    and item.get("relation") == next_relationship["relation"]
-                    and int(item.get("chapter_number") or 0) == next_relationship["chapter_number"]
-                    for item in relationships
-                )
-                if not duplicate:
-                    relationships.append(next_relationship)
-                metadata["relationships"] = relationships
-                metadata["source"] = metadata.get("source") or "ai_xray_enrichment"
-                self._upsert_xray_entity(
-                    book_id,
-                    entities_by_name,
-                    name=source,
-                    entity_type=source_entity.get("type", "character"),
-                    metadata=metadata,
-                    first_chapter_number=source_entity.get("first_chapter_number", default_chapter_number),
-                )
-
-        raw_timeline = ai_payload_list("timeline", "timeline_events", "events")
-        if isinstance(raw_timeline, list):
-            for raw in raw_timeline:
-                if not isinstance(raw, dict):
-                    continue
-                title = ai_text(raw.get("title") or raw.get("event") or raw.get("name") or raw.get("label"))
-                if not title:
-                    continue
-                chapter_number = int(raw.get("chapter_number") or raw.get("chapter") or default_chapter_number or 0)
-                chapter_id = chapter_ids_by_number.get(chapter_number) or default_chapter_id
-                if not chapter_id:
-                    continue
-                event_entity_types: dict[str, str] = {}
-                event_entities: list[str] = []
-
-                def add_event_entities(value: object, entity_type: str | None = None) -> None:
-                    for entity_name in typed_ai_values(value):
-                        if entity_name not in event_entities:
-                            event_entities.append(entity_name)
-                        if entity_type and entity_name not in event_entity_types:
-                            event_entity_types[entity_name] = entity_type
-
-                add_event_entities(raw.get("entities"))
-                add_event_entities(raw.get("participants"))
-                add_event_entities(raw.get("characters"), "character")
-                add_event_entities(raw.get("people"), "character")
-                add_event_entities(raw.get("locations"), "location")
-                add_event_entities(raw.get("places"), "location")
-                add_event_entities(raw.get("factions"), "faction")
-                add_event_entities(raw.get("sects"), "faction")
-                add_event_entities(raw.get("organizations"), "faction")
-                add_event_entities(raw.get("items"), "item")
-                add_event_entities(raw.get("treasures"), "item")
-                add_event_entities(raw.get("artifacts"), "item")
-                add_event_entities(raw.get("realms"), "realm")
-                add_event_entities(raw.get("cultivation_realms"), "realm")
-                add_event_entities(raw.get("skills"), "skill")
-                add_event_entities(raw.get("techniques"), "skill")
-                add_reader_timeline_event(
-                    self.db_path,
-                    book_id=book_id,
-                    chapter_id=chapter_id,
-                    chapter_number=chapter_number,
-                    event_order=int(raw.get("event_order") or raw.get("order") or 1),
-                    title=title,
-                    summary=ai_text(raw.get("summary") or raw.get("description")),
-                    entities=event_entities,
-                )
-                for entity_name in event_entities:
-                    entity = self._upsert_xray_entity(
-                        book_id,
-                        entities_by_name,
-                        name=entity_name,
-                        entity_type=event_entity_types.get(entity_name) or _reader_xray_entity_type(entity_name),
-                        description="",
-                        first_chapter_number=chapter_number,
-                        importance=55,
-                        metadata={"source": "ai_xray_timeline"},
-                    )
-                    add_reader_entity_mention(
-                        self.db_path,
-                        book_id=book_id,
-                        entity_id=entity["id"],
-                        chapter_id=chapter_id,
-                        chapter_number=chapter_number,
-                        paragraph_index=0,
-                        mention_text=entity_name,
-                        context=str(raw.get("summary") or title).strip(),
-                    )
+    def _apply_reader_xray_ai_payload(self, book_id: int, payload: dict, *,
+                                      default_chapter_id: int | None, default_chapter_number: int) -> None:
+        from app.mobile_api.services.reader_xray_payload import apply_reader_xray_payload
+        apply_reader_xray_payload(self.db_path, book_id, payload,
+            default_chapter_id=default_chapter_id, default_chapter_number=default_chapter_number,
+            entity_type_for_name=_reader_xray_entity_type)
 
     def _reader_xray_enrich_book_context_text(self, book_id: int) -> str:
         chapters = sorted(
@@ -4051,44 +3102,26 @@ class PipelineService:
             "cache": online_cache,
         }
 
-    def update_chapter_translation(self, chapter_id: int, text: str) -> bool:
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
-        if not chapter:
-            return False
-        self._unlink_path(chapter.get("content_html_path"))
-        translated_dir = self.data_dir / "translated"
-        translated_dir.mkdir(parents=True, exist_ok=True)
-        safe_title = f"chapter_{chapter_id}_{time.time_ns()}.txt"
-        translated_path = translated_dir / safe_title
-        translated_path.write_text(clean_translation_layout(text), encoding="utf-8")
-        previous_translation_path = chapter.get("translated_text_path")
-        if previous_translation_path and str(previous_translation_path) != str(translated_path):
-            self._unlink_path(previous_translation_path)
-        update_chapter_paths(
-            self.db_path,
-            chapter_id,
-            translated_text_path=translated_path,
-            clear_content_html_path=True,
-            status="translated",
-        )
-        return True
+    def update_chapter_translation(self, chapter_id: int, text: str, **options) -> bool:
+        return publish_translation(
+            self.db_path, self.data_dir, chapter_id, clean_translation_layout(text), **options,
+        ) is not None
 
     def delete_chapter_translation(self, book_id: int, chapter_id: int) -> bool:
         chapter = self.get_chapter_for_book(book_id, chapter_id)
-        if not chapter:
+        if not chapter or not delete_chapter_translation_data(self.db_path, chapter_id):
             return False
-        self._unlink_path(chapter.get("translated_text_path"))
-        self._unlink_path(chapter.get("content_html_path"))
-        self._unlink_path(chapter.get("audio_path"))
-        return delete_chapter_translation_data(self.db_path, chapter_id)
+        for key in ("translated_text_path", "content_html_path", "audio_path"):
+            retire_artifact(chapter.get(key), self.data_dir, self.db_path)
+        return True
 
     def delete_chapter(self, book_id: int, chapter_id: int) -> bool:
         chapter = self.get_chapter_for_book(book_id, chapter_id)
-        if not chapter:
+        if not chapter or not soft_delete_chapter(self.db_path, chapter_id):
             return False
         for key in ("raw_text_path", "cleaned_text_path", "translated_text_path", "content_html_path", "audio_path"):
-            self._unlink_path(chapter.get(key))
-        return soft_delete_chapter(self.db_path, chapter_id)
+            retire_artifact(chapter.get(key), self.data_dir, self.db_path)
+        return True
 
     def _provider_call_options(
         self,
@@ -4198,7 +3231,7 @@ class PipelineService:
             chunk_size=chunk_size,
             cancel_check=cancel_check,
         )
-        self.update_chapter_translation(chapter_id, translated)
+        self.update_chapter_translation(chapter_id, translated, expected_content_revision=chapter["content_revision"])
         return translated
 
     def translate_chapter_with_pipeline(
@@ -4212,6 +3245,7 @@ class PipelineService:
         chunk_size: int | None = None,
         stage_callback: Callable[[dict], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        provider_snapshot: dict | None = None,
     ) -> dict:
         preset = get_translation_preset(preset_id)
         effective_chunk_size = chunk_size if chunk_size is not None else preset.chunk_size
@@ -4247,226 +3281,119 @@ class PipelineService:
         if not source_text:
             raise ValueError(f"No source text for chapter {chapter_id}")
 
-        translate_options = self._provider_options_for_preset_task(preset.id, "translate")
-        stage_started_at = time.monotonic()
-        notify_stage("translate", "running", translate_options)
-        try:
-            rough_translation = translate_chapter(
-                text=source_text,
-                book_title=book["title"],
-                chapter_title=chapter["title"],
-                chapter_number=chapter["chapter_number"],
-                model=translate_options["model"],
-                host=translate_options["host"],
-                api_key=translate_options["api_key"],
-                provider_id=translate_options["provider_id"],
-                task_type="translate",
-                job_id=job_id,
-                chapter_id=chapter_id,
-                style_profile_id=style_profile_id,
-                chunk_size=effective_chunk_size,
-                cancel_check=cancel_check,
-            )
-        except Exception as exc:
-            notify_stage("translate", "failed", translate_options, stage_started_at, str(exc))
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="translate",
-                provider_options=translate_options,
-                status="failed",
-                started_at=stage_started_at,
-                error=str(exc),
-            )
-            raise
-        notify_stage("translate", "success", translate_options, stage_started_at)
-        self._record_pipeline_stage_attempt(
-            job_id=job_id,
-            chapter_id=chapter_id,
-            stage="translate",
-            provider_options=translate_options,
-            status="success",
-            started_at=stage_started_at,
-        )
-
-        if cancel_check and cancel_check():
-            raise RuntimeError("Translation cancelled by user")
-
-        if not preset.polish_enabled:
-            final_translation = post_process_with_idioms(rough_translation)
-            self.update_chapter_translation(chapter_id, final_translation)
-            return {"text": final_translation, "qa_report": None, "preset_id": preset.id}
-
-        polish_options = self._provider_options_for_preset_task(preset.id, "polish")
-        stage_started_at = time.monotonic()
-        notify_stage("polish", "running", polish_options)
-        polish_fallback_error = ""
-        try:
-            polished_translation = call_llm(
-                prompt=_build_chapter_polish_prompt(
-                    source_text,
-                    rough_translation,
-                    book_title=book["title"],
-                    chapter_title=chapter["title"],
-                    chapter_number=chapter["chapter_number"],
-                ),
-                model=polish_options["model"],
-                host=polish_options["host"],
-                api_key=polish_options["api_key"],
-                db_path=self.db_path,
-                provider_id=polish_options["provider_id"],
-                task_type="polish",
-                job_id=job_id,
-                chapter_id=chapter_id,
-            )
-        except Exception as exc:
-            notify_stage("polish", "failed", polish_options, stage_started_at, str(exc))
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="polish",
-                provider_options=polish_options,
-                status="failed",
-                started_at=stage_started_at,
-                error=str(exc),
-            )
-            if not is_retryable_provider_error(exc):
-                raise
-            polish_fallback_error = str(exc)
-            polished_translation = rough_translation
-
-        if polish_fallback_error:
-            notify_stage("polish", "fallback", polish_options, stage_started_at, polish_fallback_error)
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="polish",
-                provider_options=polish_options,
-                status="fallback",
-                started_at=stage_started_at,
-                error=polish_fallback_error,
-            )
-        else:
-            notify_stage("polish", "success", polish_options, stage_started_at)
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="polish",
-                provider_options=polish_options,
-                status="success",
-                started_at=stage_started_at,
-            )
-        polished_translation = post_process_with_idioms(polished_translation)
-
-        if cancel_check and cancel_check():
-            raise RuntimeError("Translation cancelled by user")
-
-        if not preset.qa_enabled:
-            self.update_chapter_translation(chapter_id, polished_translation)
-            return {"text": polished_translation, "qa_report": None, "preset_id": preset.id}
-
-        qa_options = self._provider_options_for_preset_task(preset.id, "qa")
-        stage_started_at = time.monotonic()
-        notify_stage("qa", "running", qa_options)
-        try:
-            qa_report = run_qa_check(
-                source_text=source_text,
-                translated_text=polished_translation,
-                model=qa_options["model"],
-                host=qa_options["host"],
-                api_key=qa_options["api_key"],
-                db_path=self.db_path,
-                provider_id=qa_options["provider_id"],
-                task_type="qa",
-                job_id=job_id,
-                chapter_id=chapter_id,
-            )
-        except Exception as exc:
-            notify_stage("qa", "failed", qa_options, stage_started_at, str(exc))
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="qa",
-                provider_options=qa_options,
-                status="failed",
-                started_at=stage_started_at,
-                error=str(exc),
-            )
-            raise
-        notify_stage("qa", "success", qa_options, stage_started_at)
-        self._record_pipeline_stage_attempt(
-            job_id=job_id,
-            chapter_id=chapter_id,
-            stage="qa",
-            provider_options=qa_options,
-            status="success",
-            started_at=stage_started_at,
-        )
-
-        final_translation = polished_translation
-        if preset.rewrite_failed and qa_report.get("issues"):
-            rewrite_options = self._provider_options_for_preset_task(preset.id, "rewrite")
-            stage_started_at = time.monotonic()
-            notify_stage("rewrite", "running", rewrite_options)
+        # Resolve effective options once; all stages in this job use this snapshot.
+        tasks = ["translate"] + (["polish"] if preset.polish_enabled else []) + (["qa"] if preset.qa_enabled else []) + (["rewrite"] if preset.rewrite_failed else [])
+        snapshot = provider_snapshot if provider_snapshot is not None else {}
+        if "providers" not in snapshot:
+            snapshot["providers"] = {task: self._provider_options_for_preset_task(preset.id, task) for task in tasks}
+            snapshot["style"] = get_style_profile(self.db_path, style_profile_id) if style_profile_id else get_default_style_profile(self.db_path)
+        options = snapshot["providers"]
+        effective_style = snapshot["style"]
+        def check_cancel():
+            if cancel_check and cancel_check():
+                raise RuntimeError("Translation cancelled by user")
+        def stage(task, operation):
+            check_cancel()
+            started = time.monotonic()
+            notify_stage(task, "running", options[task])
             try:
-                final_translation = call_llm(
-                    prompt=_build_qa_rewrite_prompt(
-                        source_text,
-                        polished_translation,
-                        qa_report,
-                        book_title=book["title"],
-                        chapter_title=chapter["title"],
-                        chapter_number=chapter["chapter_number"],
-                    ),
-                    model=rewrite_options["model"],
-                    host=rewrite_options["host"],
-                    api_key=rewrite_options["api_key"],
-                    db_path=self.db_path,
-                    provider_id=rewrite_options["provider_id"],
-                    task_type="rewrite",
-                    job_id=job_id,
-                    chapter_id=chapter_id,
-                )
-            except Exception as exc:
-                notify_stage("rewrite", "failed", rewrite_options, stage_started_at, str(exc))
-                self._record_pipeline_stage_attempt(
-                    job_id=job_id,
-                    chapter_id=chapter_id,
-                    stage="rewrite",
-                    provider_options=rewrite_options,
-                    status="failed",
-                    started_at=stage_started_at,
-                    error=str(exc),
-                )
+                value = operation()
+                if task != "qa" and (not isinstance(value, str) or not value.strip()):
+                    raise ValueError(f"{task} output is empty")
+            except Exception:
+                notify_stage(task, "failed", options[task], started, "Stage failed")
+                self._record_pipeline_stage_attempt(job_id=job_id, chapter_id=chapter_id, stage=task,
+                    provider_options=options[task], status="failed", started_at=started, error="Stage failed")
                 raise
-            notify_stage("rewrite", "success", rewrite_options, stage_started_at)
-            self._record_pipeline_stage_attempt(
-                job_id=job_id,
-                chapter_id=chapter_id,
-                stage="rewrite",
-                provider_options=rewrite_options,
-                status="success",
-                started_at=stage_started_at,
-            )
-            final_translation = post_process_with_idioms(final_translation)
-
-        if cancel_check and cancel_check():
-            raise RuntimeError("Translation cancelled by user")
-
-        self.update_chapter_translation(chapter_id, final_translation)
-        save_qa_report(
-            self.db_path,
-            book_id=book_id,
-            chapter_id=chapter_id,
-            quality_score=qa_report.get("quality_score", 0),
-            fidelity_score=qa_report.get("fidelity_score", 0),
-            style_score=qa_report.get("style_score", 0),
-            glossary_score=qa_report.get("glossary_score", 0),
-            audiobook_score=qa_report.get("audiobook_score", 0),
-            verdict=qa_report.get("verdict", "UNKNOWN"),
-            report_json=json.dumps(qa_report, ensure_ascii=False),
+            notify_stage(task, "success", options[task], started)
+            self._record_pipeline_stage_attempt(job_id=job_id, chapter_id=chapter_id, stage=task,
+                provider_options=options[task], status="success", started_at=started)
+            return value
+        mapped_chunks = []
+        translate_options = options["translate"]
+        rough_translation = stage("translate", lambda: translate_chapter(
+            text=source_text, book_title=book["title"], chapter_title=chapter["title"],
+            chapter_number=chapter["chapter_number"], model=translate_options["model"],
+            host=translate_options["host"], api_key=translate_options["api_key"],
+            provider_id=translate_options["provider_id"], task_type="translate", job_id=job_id,
+            chapter_id=chapter_id, style_profile_id=style_profile_id, chunk_size=effective_chunk_size,
+            cancel_check=cancel_check, db_path=self.db_path, book_id=book_id,
+            chunk_callback=lambda source, target: mapped_chunks.append((source, target)),
+            style_profile_snapshot=effective_style,
+        ))
+        if not mapped_chunks:
+            mapped_chunks = [(source_text, rough_translation)]
+        final_chunks, reviewed, polish_fallback = [], [], False
+        def inspect(source, target):
+            cfg = options["qa"]
+            return stage("qa", lambda: run_qa_check(
+                source_text=source, translated_text=target, model=cfg["model"], host=cfg["host"],
+                api_key=cfg["api_key"], db_path=self.db_path, provider_id=cfg["provider_id"],
+                task_type="qa", job_id=job_id, chapter_id=chapter_id,
+                style_profile_id=effective_style.get("id") if effective_style else style_profile_id,
+            ))
+        for index, (source, target) in enumerate(mapped_chunks):
+            check_cancel()
+            if preset.polish_enabled:
+                cfg = options["polish"]
+                try:
+                    target = stage("polish", lambda: call_llm(
+                        prompt=_build_chapter_polish_prompt(source, target, book_title=book["title"],
+                            chapter_title=chapter["title"], chapter_number=chapter["chapter_number"], style_profile=effective_style),
+                        model=cfg["model"], host=cfg["host"], api_key=cfg["api_key"], db_path=self.db_path,
+                        provider_id=cfg["provider_id"], task_type="polish", job_id=job_id, chapter_id=chapter_id,
+                    ))
+                except Exception as exc:
+                    if not is_retryable_provider_error(exc):
+                        raise
+                    polish_fallback = True
+                    notify_stage("polish", "fallback", cfg, error="Polish unavailable; retained translation")
+                    self._record_pipeline_stage_attempt(job_id=job_id, chapter_id=chapter_id, stage="polish",
+                        provider_options=cfg, status="fallback", started_at=time.monotonic(), error="Polish unavailable")
+            target = post_process_with_idioms(target)
+            if not target.strip():
+                raise ValueError("Final translation is empty")
+            if preset.qa_enabled:
+                qa = inspect(source, target)
+                if preset.rewrite_failed and qa.get("verdict") == "FAIL" and qa.get("qa_complete", True):
+                    cfg = options["rewrite"]
+                    target = stage("rewrite", lambda: call_llm(
+                        prompt=_build_qa_rewrite_prompt(source, target, qa, book_title=book["title"],
+                            chapter_title=chapter["title"], chapter_number=chapter["chapter_number"], style_profile=effective_style),
+                        model=cfg["model"], host=cfg["host"], api_key=cfg["api_key"], db_path=self.db_path,
+                        provider_id=cfg["provider_id"], task_type="rewrite", job_id=job_id, chapter_id=chapter_id,
+                    ))
+                    target = post_process_with_idioms(target)
+                    if not target.strip():
+                        raise ValueError("Rewrite output is empty")
+                    qa = inspect(source, target)
+                reviewed.append({**qa, "chunk_index": index})
+            final_chunks.append(target)
+        final_translation = "\n\n".join(final_chunks)
+        rules = build_deterministic_chapter_qa_report(
+            book_id=book_id, chapter_id=chapter_id, source_text=source_text, translated_text=final_translation,
+            glossary_terms=list_glossary(self.db_path, book_id), job_id=job_id,
         )
-        return {"text": final_translation, "qa_report": qa_report, "preset_id": preset.id}
+        completed = [item for item in reviewed if item.get("qa_complete", True)]
+        semantic = None
+        if reviewed:
+            semantic = {"chunks": reviewed, "qa_complete": len(completed) == len(mapped_chunks),
+                "verdict": "FAIL" if any(item.get("verdict") == "FAIL" for item in reviewed) else
+                           "WARNING" if any(item.get("verdict") in {"WARN", "WARNING"} for item in reviewed) else "PASS",
+                "issues": [issue for item in reviewed for issue in item.get("issues", [])]}
+            for key in ("quality_score", "fidelity_score", "style_score", "glossary_score", "audiobook_score"):
+                semantic[key] = round(sum(float(item.get(key, 0)) for item in completed) / len(completed), 2) if completed else 0
+        coverage = {"total_chunks": len(mapped_chunks), "evaluated_chunks": len(completed),
+            "source_chars": len(source_text),
+            "reviewed_source_chars": sum(len(mapped_chunks[item["chunk_index"]][0]) for item in completed),
+            "complete": bool(reviewed) and len(completed) == len(mapped_chunks),
+            "required": preset.qa_enabled, "pipeline_complete": not polish_fallback}
+        report = merge_qa_report(rules, semantic, coverage,
+            {"preset_id": preset.id, "style_profile_id": effective_style.get("id") if effective_style else style_profile_id})
+        check_cancel()
+        self.update_chapter_translation(chapter_id, final_translation,
+            expected_content_revision=chapter["content_revision"], qa_report=report)
+        return {"text": final_translation, "qa_report": report if preset.qa_enabled else None, "preset_id": preset.id}
 
     def retranslate_paragraph(
         self,
@@ -4490,7 +3417,7 @@ class PipelineService:
 
         # Translate just this paragraph
         translated = call_llm(
-            prompt=_build_retranslate_prompt(paragraph),
+            prompt=_build_retranslate_prompt(paragraph, get_default_style_profile(self.db_path)),
             model=provider_options["model"],
             host=provider_options["host"],
             api_key=provider_options["api_key"],
@@ -4520,7 +3447,7 @@ class PipelineService:
             raise ValueError(f"Paragraph index {paragraph_index} out of range (0-{len(paragraphs)-1})")
 
         paragraph = paragraphs[paragraph_index]
-        prompt = _build_polish_prompt(paragraph, instructions)
+        prompt = _build_polish_prompt(paragraph, instructions, get_default_style_profile(self.db_path))
         provider_options = self._provider_call_options("polish", model=model, host=host)
         polished = call_llm(
             prompt=prompt,
@@ -4555,9 +3482,14 @@ class PipelineService:
                 return False
             paragraphs[paragraph_index] = new_text
             updated_text = "\n\n".join(paragraphs)
-            # Write back to raw text path
-            raw_path = Path(chapter["raw_text_path"])
-            raw_path.write_text(updated_text, encoding="utf-8")
+            raw_path = write_versioned_text(self.data_dir / "raw", f"chapter_{chapter_id}", updated_text)
+            try:
+                update_chapter_paths(self.db_path, chapter_id, raw_text_path=raw_path,
+                                     expected_content_revision=chapter["content_revision"])
+            except Exception:
+                raw_path.unlink(missing_ok=True)
+                raise
+            retire_artifact(chapter["raw_text_path"], self.data_dir, self.db_path)
         else:
             text = self.get_chapter_translation(chapter_id)
             if not text:
@@ -4567,7 +3499,7 @@ class PipelineService:
                 return False
             paragraphs[paragraph_index] = new_text
             updated_text = "\n\n".join(paragraphs)
-            self.update_chapter_translation(chapter_id, updated_text)
+            self.update_chapter_translation(chapter_id, updated_text, expected_content_revision=chapter["content_revision"])
 
         return True
 
@@ -4582,6 +3514,7 @@ class PipelineService:
         job_id: str = "",
         cancel_check: Callable[[], bool] | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        parent_job_id: str = "",
     ) -> Path | None:
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter:
@@ -4599,25 +3532,37 @@ class PipelineService:
         if is_f5_provider(provider):
             require_tts_runtime_available(provider=provider)
             legacy_fallback = None
-        pipeline = TTSPipeline(
-            self.db_path,
-            self.data_dir,
-            legacy_fallback=legacy_fallback,
-        )
+        if not hasattr(self, "_tts_batches"):
+            self._tts_batches = {}
+        pipeline = self._tts_batches.get(parent_job_id) if parent_job_id else None
+        if pipeline is None:
+            pipeline = TTSPipeline(self.db_path, self.data_dir, legacy_fallback=legacy_fallback)
+            if parent_job_id:
+                self._tts_batches[parent_job_id] = pipeline
         generate_kwargs: dict[str, object] = {
             "book_id": book_id,
             "chapter_id": chapter_id,
             "job_id": job_id,
             "voice_config": {"voice": voice or "", "rate": rate, "volume": volume},
+            "parent_job_id": parent_job_id,
         }
         if cancel_check is not None:
             generate_kwargs["cancel_check"] = cancel_check
         if progress_callback is not None:
             generate_kwargs["progress_callback"] = progress_callback
-        report = pipeline.generate_chapter(**generate_kwargs)
+        try:
+            report = pipeline.generate_chapter(**generate_kwargs)
+        finally:
+            if not parent_job_id:
+                pipeline.close()
         if report.status != "completed" or not report.output_mp3_path:
             raise RuntimeError(report.error_message or "TTS failed. Check TTS settings and server logs.")
         return Path(report.output_mp3_path)
+
+    def close_audio_batch(self, job_id: str) -> None:
+        pipeline = getattr(self, "_tts_batches", {}).pop(job_id, None)
+        if pipeline is not None:
+            pipeline.close()
 
     # QA
     def run_qa_check(
@@ -4684,298 +3629,22 @@ class PipelineService:
         book_source_url: str = "",
         adapter_id: str = "",
     ) -> ChapterImportResult:
-        normalized_text = normalize_import_text(text)
-        if not normalized_text:
-            raise SourceAdapterError(
-                "Chapter content is empty",
-                code=FetchErrorCode.CONTENT_INVALID,
-                retryable=False,
-                http_status=422,
-            )
-        metadata = detect_import_metadata(
-            title=title,
-            chapter_number=chapter_number,
-            chapter_title=chapter_title,
-            text=normalized_text,
-        )
-        detected_title = metadata["title"]
-        detected_chapter_number = metadata["chapter_number"]
-        detected_chapter_title = metadata["chapter_title"]
-        try:
-            canonical_chapter_url = canonicalize_import_url(source_url)
-            canonical_source_url = canonicalize_import_url(book_source_url or source_url)
-        except Exception as exc:
-            code_value = str(getattr(exc, "code", FetchErrorCode.INVALID_URL.value))
-            try:
-                code = FetchErrorCode(code_value)
-            except ValueError:
-                code = FetchErrorCode.INVALID_URL
-            raise SourceAdapterError(
-                "Source URL is invalid for import",
-                code=code,
-                retryable=False,
-                http_status=400,
-            ) from exc
-
-        safe_title = self._safe_filename_part(detected_title) or "book"
-        safe_chapter_title = self._safe_filename_part(detected_chapter_title) or "chapter"
-        raw_dir = self.data_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = raw_dir / f"{safe_title}_ch{detected_chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
-        try:
-            raw_path.write_text(normalized_text, encoding="utf-8")
-            stored_text = raw_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raw_path.unlink(missing_ok=True)
-            raise SourceAdapterError(
-                "Could not store chapter content",
-                code=FetchErrorCode.IMPORT_FAILED,
-                retryable=False,
-                http_status=500,
-            ) from exc
-        try:
-            with get_connection(self.db_path) as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                book = resolve_import_book_with_connection(
-                    conn,
-                    title=detected_title,
-                    author=author,
-                    source=book_source,
-                    source_url=book_source_url or source_url,
-                    canonical_source_url=canonical_source_url,
-                )
-                book_id = int(book["id"])
-                upserted = upsert_import_chapter_with_connection(
-                    conn,
-                    book_id=book_id,
-                    chapter_number=detected_chapter_number,
-                    title=detected_chapter_title,
-                    source_url=source_url,
-                    canonical_chapter_url=canonical_chapter_url,
-                    adapter_id=adapter_id,
-                    raw_text_path=raw_path,
-                    content_hash=metadata["source_hash"],
-                    source_updated_at=datetime.now(timezone.utc).isoformat(),
-                )
-                conn.commit()
-        except ValueError as exc:
-            raw_path.unlink(missing_ok=True)
-            if "Duplicate" in str(exc):
-                raise SourceAdapterError(
-                    str(exc),
-                    code=FetchErrorCode.DUPLICATE,
-                    retryable=False,
-                    http_status=409,
-                ) from exc
-            raise SourceAdapterError(
-                "Could not import chapter content",
-                code=FetchErrorCode.IMPORT_FAILED,
-                retryable=False,
-                http_status=500,
-            ) from exc
-        except Exception as exc:
-            raw_path.unlink(missing_ok=True)
-            raise SourceAdapterError(
-                "Could not import chapter content",
-                code=FetchErrorCode.IMPORT_FAILED,
-                retryable=False,
-                http_status=500,
-            ) from exc
-        chapter_id = upserted.chapter_id
-        operation = upserted.operation
-        if operation == "skipped_duplicate":
-            raw_path.unlink(missing_ok=True)
-            result_path = upserted.raw_text_path
-        else:
-            result_path = str(raw_path)
-        return ChapterImportResult(
-            book_id=book_id,
-            chapter_id=chapter_id,
-            stored_text_length=len(stored_text),
-            content_hash=source_hash(stored_text),
-            operation=operation,
-            title=detected_title,
-            chapter_number=detected_chapter_number,
-            chapter_title=detected_chapter_title,
-            source_type=source_type,
-            source_url=source_url,
-            adapter_id=adapter_id,
-            path=result_path,
+        return self._imports().import_from_text(
+            title, chapter_number, chapter_title, text, source_type, source_url,
+            author, book_source, book_source_url, adapter_id,
         )
 
-    def _write_import_text_file(
-        self,
-        *,
-        book_title: str,
-        chapter_number: int,
-        chapter_title: str,
-        text: str,
-        content_kind: str,
-    ) -> Path:
-        safe_title = self._safe_filename_part(book_title) or "book"
-        safe_chapter_title = self._safe_filename_part(chapter_title) or "chapter"
-        directory = self.data_dir / ("translated" if content_kind == "translated" else "raw")
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{safe_title}_ch{chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
-        path.write_text(text, encoding="utf-8")
-        return path
+    _write_import_text_file = ImportCommitService._write_import_text_file
 
-    def _prepare_reviewed_import_items(
-        self,
-        *,
-        chapters: list[dict],
-        content_kind: str,
-    ) -> list[dict]:
-        prepared: list[dict] = []
-        for item in chapters:
-            chapter_number = int(item.get("chapter_number") or 0)
-            chapter_title = str(item.get("chapter_title") or "").strip() or f"Chương {chapter_number}"
-            if chapter_number <= 0:
-                raise ValueError("Chapter number must be positive")
+    _prepare_reviewed_import_items = ImportCommitService._prepare_reviewed_import_items
 
-            raw_text = str(item.get("raw_text") or "")
-            translated_text = str(item.get("translated_text") or "")
-            text = str(item.get("text") or "")
-            if content_kind == "raw":
-                raw_text = raw_text or text
-            elif content_kind == "translated":
-                translated_text = translated_text or text
-            else:
-                raw_text = raw_text or text
+    _import_chapter_fingerprint = staticmethod(ImportCommitService._import_chapter_fingerprint)
 
-            raw_text = raw_text.strip()
-            translated_text = translated_text.strip()
-            if not raw_text and not translated_text:
-                raise ValueError(f"Chapter {chapter_number} text is empty")
-            prepared.append(
-                {
-                    "chapter_number": chapter_number,
-                    "chapter_title": chapter_title,
-                    "raw_text": raw_text,
-                    "translated_text": translated_text,
-                }
-            )
-        return prepared
+    _classify_reviewed_import_items = ImportCommitService._classify_reviewed_import_items
 
-    @staticmethod
-    def _import_chapter_fingerprint(chapter: dict) -> tuple:
-        return (
-            int(chapter.get("id") or 0),
-            int(chapter.get("chapter_number") or 0),
-            str(chapter.get("title") or ""),
-            str(chapter.get("raw_text_path") or ""),
-            str(chapter.get("translated_text_path") or ""),
-            str(chapter.get("source_hash") or ""),
-            str(chapter.get("status") or ""),
-            str(chapter.get("translated_at") or ""),
-            str(chapter.get("deleted_at") or ""),
-        )
+    _stage_reviewed_import_files = ImportCommitService._stage_reviewed_import_files
 
-    def _classify_reviewed_import_items(
-        self,
-        *,
-        prepared: list[dict],
-        existing_chapters: list[dict],
-        duplicate_strategy: str,
-        book_id: int | None,
-    ) -> list[dict]:
-        by_number = {int(chapter["chapter_number"]): dict(chapter) for chapter in existing_chapters}
-        by_source_hash = {
-            str(chapter.get("source_hash") or ""): dict(chapter)
-            for chapter in existing_chapters
-            if str(chapter.get("source_hash") or "")
-        }
-        classified: list[dict] = []
-
-        for item in prepared:
-            planned = dict(item)
-            chapter_number = int(planned["chapter_number"])
-            source_hash = str(planned["source_hash"])
-            existing = by_number.get(chapter_number)
-            source_duplicate = by_source_hash.get(source_hash)
-            if source_duplicate and int(source_duplicate["chapter_number"]) != chapter_number:
-                raise ValueError(
-                    f"Duplicate chapter content for chapter {chapter_number} in book {book_id or 'new'}"
-                )
-
-            if existing:
-                if duplicate_strategy == "error":
-                    raise ValueError(f"Duplicate chapter number {chapter_number} for book {book_id or 'new'}")
-                planned["action"] = "SKIP" if duplicate_strategy == "skip" else "REPLACE"
-                planned["existing_id"] = int(existing.get("id") or 0)
-                planned["existing_fingerprint"] = self._import_chapter_fingerprint(existing)
-            else:
-                planned["action"] = "ADD"
-                planned["existing_id"] = 0
-                planned["existing_fingerprint"] = None
-
-            classified.append(planned)
-            if planned["action"] != "SKIP":
-                synthetic = {
-                    "id": planned["existing_id"],
-                    "chapter_number": chapter_number,
-                    "title": planned["chapter_title"],
-                    "raw_text_path": existing.get("raw_text_path") if existing else "",
-                    "translated_text_path": existing.get("translated_text_path") if existing else "",
-                    "source_hash": source_hash,
-                    "status": "translated" if planned["translated_text"] else "imported",
-                    "translated_at": existing.get("translated_at") if existing else "",
-                    "deleted_at": "",
-                }
-                by_number[chapter_number] = synthetic
-                by_source_hash[source_hash] = synthetic
-        return classified
-
-    def _stage_reviewed_import_files(self, *, plan: list[dict], book_title: str) -> tuple[Path, list[dict]]:
-        staging_dir = self.data_dir / ".import-staging" / uuid.uuid4().hex
-        staged: list[dict] = []
-        try:
-            for index, item in enumerate(plan):
-                if item["action"] == "SKIP":
-                    continue
-                entry = dict(item)
-                for content_kind in ("raw", "translated"):
-                    text = str(item[f"{content_kind}_text"] or "")
-                    if not text:
-                        entry[f"{content_kind}_staged_path"] = None
-                        entry[f"{content_kind}_final_path"] = None
-                        continue
-                    safe_title = self._safe_filename_part(book_title) or "book"
-                    safe_chapter_title = self._safe_filename_part(item["chapter_title"]) or "chapter"
-                    filename = (
-                        f"{safe_title}_ch{item['chapter_number']}_{safe_chapter_title}_"
-                        f"{uuid.uuid4().hex}.txt"
-                    )
-                    staged_path = staging_dir / f"{index}_{content_kind}.txt"
-                    final_path = self.data_dir / content_kind / filename
-                    staged_path.parent.mkdir(parents=True, exist_ok=True)
-                    staged_path.write_text(text, encoding="utf-8")
-                    entry[f"{content_kind}_staged_path"] = staged_path
-                    entry[f"{content_kind}_final_path"] = final_path
-                staged.append(entry)
-            return staging_dir, staged
-        except Exception:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
-
-    @staticmethod
-    def _finalize_reviewed_import_files(plan: list[dict]) -> list[Path]:
-        finalized: list[Path] = []
-        try:
-            for item in plan:
-                for content_kind in ("raw", "translated"):
-                    staged_path = item.get(f"{content_kind}_staged_path")
-                    final_path = item.get(f"{content_kind}_final_path")
-                    if not staged_path or not final_path:
-                        continue
-                    final_path.parent.mkdir(parents=True, exist_ok=True)
-                    staged_path.replace(final_path)
-                    finalized.append(final_path)
-            return finalized
-        except Exception:
-            for path in finalized:
-                path.unlink(missing_ok=True)
-            raise
+    _finalize_reviewed_import_files = staticmethod(ImportCommitService._finalize_reviewed_import_files)
 
     def import_reviewed_text_plan(
         self,
@@ -4988,197 +3657,16 @@ class PipelineService:
         author: str = "",
         source_type: str = "wizard",
     ) -> dict:
-        if content_kind == "unknown":
-            raise ValueError("Choose raw or translated content mode before importing")
-        if content_kind not in {"raw", "translated", "both"}:
-            raise ValueError("Unsupported import content mode")
-        if duplicate_strategy not in {"error", "skip", "overwrite"}:
-            raise ValueError("Unsupported duplicate strategy")
-        if not chapters:
-            raise ValueError("No chapters to import")
-
-        target_title = title.strip()
-        if target_book_id is None and not target_title:
-            raise ValueError("Book title is required")
-        prepared = self._prepare_reviewed_import_items(chapters=chapters, content_kind=content_kind)
-
-        staging_dir: Path | None = None
-        finalized_paths: list[Path] = []
-        imported = 0
-        skipped = 0
-        overwritten = 0
-        chapter_ids: list[int] = []
-        warnings: list[dict] = []
-
-        with get_connection(self.db_path) as conn:
-            initial_book = find_import_book_with_connection(
-                conn,
-                title=target_title,
-                target_book_id=target_book_id,
-            )
-            if target_book_id is not None and not initial_book:
-                raise ValueError(f"Book {target_book_id} not found")
-            target_title = target_title or str((initial_book or {}).get("title") or "")
-            for item in prepared:
-                item["source_hash"] = detect_import_metadata(
-                    title=target_title,
-                    chapter_number=int(item["chapter_number"]),
-                    chapter_title=str(item["chapter_title"]),
-                    text=str(item["raw_text"] or item["translated_text"]),
-                )["source_hash"]
-
-            initial_book_id = int(initial_book["id"]) if initial_book else None
-            existing = (
-                list_active_import_chapters_with_connection(conn, initial_book_id)
-                if initial_book_id is not None
-                else []
-            )
-            initial_plan = self._classify_reviewed_import_items(
-                prepared=prepared,
-                existing_chapters=existing,
-                duplicate_strategy=duplicate_strategy,
-                book_id=initial_book_id,
-            )
-            staging_dir, staged_plan = self._stage_reviewed_import_files(
-                plan=initial_plan,
-                book_title=target_title,
-            )
-
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                book = resolve_import_book_with_connection(
-                    conn,
-                    title=target_title,
-                    author=author,
-                    source=source_type,
-                    target_book_id=target_book_id,
-                )
-                book_id = int(book["id"])
-                current_plan = self._classify_reviewed_import_items(
-                    prepared=prepared,
-                    existing_chapters=list_active_import_chapters_with_connection(conn, book_id),
-                    duplicate_strategy=duplicate_strategy,
-                    book_id=book_id,
-                )
-                initial_signature = [
-                    (item["action"], item["existing_id"], item["existing_fingerprint"])
-                    for item in initial_plan
-                ]
-                current_signature = [
-                    (item["action"], item["existing_id"], item["existing_fingerprint"])
-                    for item in current_plan
-                ]
-                if current_signature != initial_signature:
-                    raise ValueError("The target book changed after review; preview and confirm the import again")
-
-                finalized_paths = self._finalize_reviewed_import_files(staged_plan)
-                inserted_ids_by_number: dict[int, int] = {}
-                batch_paths_by_number: dict[int, dict[str, Path | None]] = {}
-                for item in staged_plan:
-                    chapter_number = int(item["chapter_number"])
-                    raw_path = item.get("raw_final_path")
-                    translated_path = item.get("translated_final_path")
-                    status = "translated" if translated_path else "imported"
-                    if item["action"] == "REPLACE":
-                        chapter_id = int(item["existing_id"]) or inserted_ids_by_number[chapter_number]
-                        update_import_chapter_with_connection(
-                            conn,
-                            chapter_id=chapter_id,
-                            title=str(item["chapter_title"]),
-                            raw_text_path=raw_path,
-                            translated_text_path=translated_path,
-                            status=status,
-                        )
-                        previous_paths = batch_paths_by_number.get(chapter_number, {})
-                        for content_kind, replacement_path in (
-                            ("raw", raw_path),
-                            ("translated", translated_path),
-                        ):
-                            previous_path = previous_paths.get(content_kind)
-                            if replacement_path and previous_path and previous_path != replacement_path:
-                                previous_path.unlink(missing_ok=True)
-                        batch_paths_by_number[chapter_number] = {
-                            "raw": raw_path or previous_paths.get("raw"),
-                            "translated": translated_path or previous_paths.get("translated"),
-                        }
-                        overwritten += 1
-                    else:
-                        chapter_id = insert_import_chapter_with_connection(
-                            conn,
-                            book_id=book_id,
-                            chapter_number=int(item["chapter_number"]),
-                            title=str(item["chapter_title"]),
-                            raw_text_path=raw_path,
-                            translated_text_path=translated_path,
-                            source_hash=str(item["source_hash"]) if raw_path else "",
-                            status=status,
-                        )
-                        inserted_ids_by_number[chapter_number] = chapter_id
-                        batch_paths_by_number[chapter_number] = {
-                            "raw": raw_path,
-                            "translated": translated_path,
-                        }
-                        imported += 1
-                    item["chapter_id"] = chapter_id
-                    chapter_ids.append(chapter_id)
-
-                skipped_items = [item for item in initial_plan if item["action"] == "SKIP"]
-                skipped = len(skipped_items)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                for path in finalized_paths:
-                    path.unlink(missing_ok=True)
-                raise
-            finally:
-                if staging_dir is not None:
-                    shutil.rmtree(staging_dir, ignore_errors=True)
-
-        for item in initial_plan:
-            if item["action"] == "SKIP":
-                warnings.append(
-                    {
-                        "type": "duplicate_chapter",
-                        "message": f"Skipped existing chapter {item['chapter_number']}",
-                        "chapter_number": int(item["chapter_number"]),
-                        "title": str(item["chapter_title"]),
-                    }
-                )
-        for item in staged_plan:
-            chapter_id_for_followup = int(item["chapter_id"])
-            try:
-                from app.mobile_api.services.glossary_service import GlossaryService
-                from app.mobile_api.services.qa_service import QAService
-
-                GlossaryService.from_db_path(self.db_path).extract_chapter_terms(book_id, chapter_id_for_followup)
-                if item.get("translated_final_path"):
-                    QAService(self).run_deterministic_qa(book_id, chapter_id_for_followup)
-            except Exception:
-                logger.warning(
-                    "Post-import glossary/QA follow-up failed for book %s chapter %s",
-                    book_id,
-                    chapter_id_for_followup,
-                )
-                warnings.append(
-                    {
-                        "type": "post_import_qa_warning",
-                        "message": "Imported content was saved, but glossary/QA follow-up did not complete.",
-                        "chapter_number": int(item["chapter_number"]),
-                        "reason": "Follow-up failed; check server logs.",
-                    }
-                )
-
-        return {
-            "book_id": book_id,
-            "title": target_title,
-            "content_kind": content_kind,
-            "chapter_count": len(chapters),
-            "imported_chapters": imported,
-            "skipped_chapters": skipped,
-            "overwritten_chapters": overwritten,
-            "chapter_ids": chapter_ids,
-            "warnings": warnings,
-        }
+        return self._imports().import_reviewed_text_plan(
+            title=title,
+            chapters=chapters,
+            content_kind=content_kind,
+            duplicate_strategy=duplicate_strategy,
+            target_book_id=target_book_id,
+            author=author,
+            source_type=source_type,
+            stage_files=self._stage_reviewed_import_files,
+        )
 
     def preview_source_url(self, url: str) -> dict:
         return get_source_registry().preview(url).to_dict()
@@ -5225,46 +3713,7 @@ class PipelineService:
         file_path: Path,
         filename: str = "",
     ) -> dict:
-        text = file_path.read_text(encoding="utf-8")
-        metadata = detect_import_metadata(
-            title=title,
-            chapter_number=chapter_number,
-            chapter_title=chapter_title,
-            text=text,
-            filename=filename or file_path.name,
-        )
-        detected_title = metadata["title"]
-        detected_chapter_number = metadata["chapter_number"]
-        detected_chapter_title = metadata["chapter_title"]
-        book_id = self._book_id_for_title(detected_title)
-
-        safe_title = self._safe_filename_part(detected_title) or "book"
-        safe_chapter_title = self._safe_filename_part(detected_chapter_title) or "chapter"
-        raw_dir = self.data_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = raw_dir / f"{safe_title}_ch{detected_chapter_number}_{safe_chapter_title}_{time.time_ns()}.txt"
-        raw_path.write_text(text, encoding="utf-8")
-        try:
-            chapter_id = add_chapter(
-                self.db_path,
-                book_id,
-                detected_chapter_number,
-                detected_chapter_title,
-                "",
-                raw_text_path=raw_path,
-                source_hash=metadata["source_hash"],
-            )
-        except Exception:
-            raw_path.unlink(missing_ok=True)
-            raise
-        return {
-            "book_id": book_id,
-            "chapter_id": chapter_id,
-            "path": str(raw_path),
-            "title": detected_title,
-            "chapter_number": detected_chapter_number,
-            "chapter_title": detected_chapter_title,
-        }
+        return self._imports().import_from_file(title, chapter_number, chapter_title, file_path, filename)
 
     def add_url_note(
         self,
@@ -5275,14 +3724,4 @@ class PipelineService:
         chapter_title: str = "",
     ) -> int:
         # Save URL note as a text file in raw directory
-        safe_title = "".join(c if c.isalnum() or c in "._-" else "_" for c in title or url)
-        raw_dir = self.data_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        ts = str(int(time.time()))
-        content = f"URL: {url}\n\nNotes: {notes}\n\n{notes}"
-        raw_path = raw_dir / f"{safe_title}_url_{ts}.txt"
-        raw_path.write_text(content, encoding="utf-8")
-        book_id = self.create_book(title) if not get_book_by_title(self.db_path, title) else get_book_by_title(self.db_path, title)["id"]
-        from app.database.db import add_chapter
-        add_chapter(self.db_path, book_id, chapter_number, chapter_title or "URL Note", "", raw_text_path=raw_path)
-        return get_book_by_title(self.db_path, title)["id"]
+        return self._imports().add_url_note(title, url, notes, chapter_number, chapter_title)

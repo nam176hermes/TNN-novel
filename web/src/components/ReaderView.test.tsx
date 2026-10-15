@@ -715,6 +715,97 @@ describe('ReaderView', () => {
     }));
   });
 
+  it('measures bounded windows without losing pages or a restored location near the end', async () => {
+    const originalResizeObserver = window.ResizeObserver;
+    const idleWindow = window as TestIdleWindow;
+    const originalRequestIdleCallback = idleWindow.requestIdleCallback;
+    const originalCancelIdleCallback = idleWindow.cancelIdleCallback;
+    const pending = new Map<number, () => void>();
+    let idleId = 0;
+    Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: class {
+      observe() {} disconnect() {}
+    } });
+    Object.defineProperty(idleWindow, 'requestIdleCallback', { configurable: true, value: (callback: () => void) => {
+      pending.set(++idleId, callback);
+      return idleId;
+    } });
+    Object.defineProperty(idleWindow, 'cancelIdleCallback', { configurable: true, value: (id: number) => pending.delete(id) });
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(360);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      const top = this.classList.contains('reader-paragraph-block') ? Number(this.dataset.paragraphIndex) * 140 : 0;
+      return { top, bottom: top + 120, height: 120, width: 300, left: 0, right: 300 } as DOMRect;
+    });
+    window.localStorage.setItem('novel-reader-settings-v1', JSON.stringify({ readingMode: 'paginated' }));
+    saveReaderProgressSnapshot(42, 102, 99, 75, window.localStorage, {
+      mode: 'paginated', pageIndex: 74, paragraphIndex: 149, charOffset: 0,
+    });
+    try {
+      renderReader({ translationText: Array.from({ length: 150 }, (_, i) => `Đoạn ${i}. Nội dung luyện khí.`).join('\n\n') });
+      const surface = document.querySelector('.reader-pagination-measure')!;
+      expect(surface.querySelectorAll('[data-paragraph-index]')).toHaveLength(50);
+      for (let window = 0; window < 3; window++) {
+        await waitFor(() => expect(pending.size).toBeGreaterThan(0));
+        const [id, callback] = [...pending.entries()][0];
+        pending.delete(id);
+        act(() => callback());
+        await waitFor(() => expect(Number(surface.querySelector<HTMLElement>('[data-paragraph-index]')!.dataset.paragraphIndex))
+          .toBe((window + 1) * 48));
+        expect(surface.querySelectorAll('[data-paragraph-index]').length).toBeLessThanOrEqual(50);
+      }
+      await waitFor(() => expect(screen.getByText('Trang 75/75')).toBeInTheDocument());
+      expect(within(screen.getByRole('article', { name: 'Nội dung đọc tiếng Việt' }))
+        .getByText('Đoạn 149. Nội dung luyện khí.')).toBeInTheDocument();
+      fireEvent(window, new Event('resize'));
+      await waitFor(() => expect(surface.querySelector('[data-paragraph-index="0"]')).toBeTruthy());
+      expect(surface.querySelectorAll('[data-paragraph-index]')).toHaveLength(50);
+    } finally {
+      cleanup();
+      Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: originalResizeObserver });
+      Object.defineProperty(idleWindow, 'requestIdleCallback', { configurable: true, value: originalRequestIdleCallback });
+      Object.defineProperty(idleWindow, 'cancelIdleCallback', { configurable: true, value: originalCancelIdleCallback });
+    }
+  });
+
+  it('waits for pending images and fonts before discarding a measurement window', async () => {
+    const idleWindow = window as TestIdleWindow;
+    const original = { ResizeObserver: window.ResizeObserver,
+      requestIdleCallback: idleWindow.requestIdleCallback, cancelIdleCallback: idleWindow.cancelIdleCallback };
+    const originalFonts = Object.getOwnPropertyDescriptor(document, 'fonts');
+    const fonts = Object.assign(new EventTarget(), { status: 'loading' });
+    const advance = vi.fn(() => 1);
+    Object.defineProperty(document, 'fonts', { configurable: true, value: fonts });
+    Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: class { observe() {} disconnect() {} } });
+    Object.defineProperty(idleWindow, 'requestIdleCallback', { configurable: true, value: advance });
+    Object.defineProperty(idleWindow, 'cancelIdleCallback', { configurable: true, value: vi.fn() });
+    let imageReady = false;
+    let measured = false;
+    vi.spyOn(HTMLImageElement.prototype, 'complete', 'get').mockImplementation(() => imageReady);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(360);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains('reader-pagination-measure')) measured = true;
+      const top = this.classList.contains('reader-paragraph-block') ? Number(this.dataset.paragraphIndex) * 140 : 0;
+      return { top, bottom: top + 120, height: 120, width: 300, left: 0, right: 300 } as DOMRect;
+    });
+    window.localStorage.setItem('novel-reader-settings-v1', JSON.stringify({ readingMode: 'paginated' }));
+    try {
+      renderReader({ translationText: '', contentHtml: '<figure><img src="/book-assets/42/map.png"></figure>'
+        + Array.from({ length: 59 }, (_, i) => `<p>Đoạn ${i}.</p>`).join('') });
+      await waitFor(() => expect(measured).toBe(true));
+      expect(advance).not.toHaveBeenCalled();
+      imageReady = true;
+      fireEvent.load(document.querySelector('.reader-pagination-measure img')!);
+      expect(advance).not.toHaveBeenCalled();
+      fonts.status = 'loaded';
+      fonts.dispatchEvent(new Event('loadingdone'));
+      await waitFor(() => expect(advance).toHaveBeenCalled());
+    } finally {
+      cleanup();
+      for (const [name, value] of Object.entries(original)) Object.defineProperty(window, name, { configurable: true, value });
+      if (originalFonts) Object.defineProperty(document, 'fonts', originalFonts);
+      else Reflect.deleteProperty(document, 'fonts');
+    }
+  });
+
   it('uses measured viewport boundaries for paginated pages when layout is available', async () => {
     const originalResizeObserver = window.ResizeObserver;
     const originalClientHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
@@ -2005,8 +2096,8 @@ describe('ReaderView', () => {
     expect(within(menu).getByText('Chương sau đã cache')).toBeInTheDocument();
     expect(within(menu).getByText(/^Cache \d+ KB$/)).toBeInTheDocument();
     expect(within(menu).getByText('Manifest 2 chương · abc12345')).toBeInTheDocument();
-    expect(within(menu).getByText('Coverage 2/2 chương · 0 lỗi')).toBeInTheDocument();
-    expect(within(menu).getByText('Resources 1/1 asset · 1/1 audio · 12 mục từ điển')).toBeInTheDocument();
+    expect(within(menu).getByText('Đã tải 2/2 chương · 0 lỗi')).toBeInTheDocument();
+    expect(within(menu).getByText('Tài nguyên 1/1 ảnh · 1/1 audio · 12 mục từ điển')).toBeInTheDocument();
   });
 
   it('refreshes current offline availability after the established cache update event', async () => {
@@ -2392,17 +2483,17 @@ describe('ReaderView', () => {
 
       expect(screen.getByText('Đoạn 1. Nội dung luyện khí.')).toBeInTheDocument();
       expect(screen.queryByText('Đoạn 120. Nội dung luyện khí.')).not.toBeInTheDocument();
-      expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
+      expect(screen.getByText('Đang nạp thêm đoạn 32/180')).toBeInTheDocument();
 
       const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
-      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(80);
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(32);
       Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
       Object.defineProperty(main, 'clientHeight', { configurable: true, value: 600 });
       Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
 
       fireEvent.scroll(main);
 
-      expect(screen.getByText('Đoạn 120. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(screen.getByText('Đoạn 64. Nội dung luyện khí.')).toBeInTheDocument();
     } finally {
       Object.defineProperty(idleWindow, 'requestIdleCallback', {
         configurable: true,
@@ -2440,7 +2531,7 @@ describe('ReaderView', () => {
 
       expect(screen.getByText('Đoạn QA 1. Nội dung luyện khí.')).toBeInTheDocument();
       expect(screen.queryByText('Đoạn QA 120. Nội dung luyện khí.')).not.toBeInTheDocument();
-      expect(screen.getByText('Đang nạp thêm đoạn 80/180')).toBeInTheDocument();
+      expect(screen.getByText('Đang nạp thêm đoạn 32/180')).toBeInTheDocument();
 
       const main = screen.getByRole('main', { name: 'Vùng đọc chính' });
       Object.defineProperty(main, 'scrollHeight', { configurable: true, value: 1600 });
@@ -2448,8 +2539,8 @@ describe('ReaderView', () => {
       Object.defineProperty(main, 'scrollTop', { configurable: true, value: 940 });
       fireEvent.scroll(main);
 
-      expect(screen.getByText('Đoạn QA 120. Nội dung luyện khí.')).toBeInTheDocument();
-      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(160);
+      expect(screen.getByText('Đoạn QA 64. Nội dung luyện khí.')).toBeInTheDocument();
+      expect(main.querySelectorAll('.reader-paragraph-block[data-paragraph-index]')).toHaveLength(64);
     } finally {
       Object.defineProperty(idleWindow, 'requestIdleCallback', {
         configurable: true,
@@ -3532,6 +3623,7 @@ describe('ReaderView', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Thêm tùy chọn' }));
 
+    await userEvent.click(screen.getByRole('button', {name: 'Kiểm tra audio'}));
     await waitFor(() => expect(apiClient.getBookAudioPlaylist).toHaveBeenCalledWith(42));
     await userEvent.click(await screen.findByRole('button', { name: 'Nghe audio chương' }));
 
@@ -3745,7 +3837,7 @@ describe('ReaderView', () => {
     expect(apiClient.getTtsJob).toHaveBeenCalledWith('tts-failed-123456');
     expect(within(audioStatus).getByText('Job audio tts-fail')).toBeInTheDocument();
     expect(within(audioStatus).getByText('33%')).toBeInTheDocument();
-    expect(within(audioStatus).getByText('2 chunk lỗi')).toBeInTheDocument();
+    expect(within(audioStatus).getByText('2 đoạn lỗi')).toBeInTheDocument();
     expect(within(audioStatus).getByText('1 completed chunk file is missing')).toBeInTheDocument();
     expect(within(audioStatus).getByText('Audio QA reported 2 warning(s)')).toBeInTheDocument();
     expect(within(audioStatus).getByText(/Thiếu ffmpeg/)).toBeInTheDocument();
@@ -3798,7 +3890,7 @@ describe('ReaderView', () => {
     const status = await screen.findByRole('status', { name: 'Trạng thái audio' });
     expect(within(status).getByText('running')).toBeInTheDocument();
     expect(within(status).getByText('25%')).toBeInTheDocument();
-    expect(within(status).getByText('1/2 chunks')).toBeInTheDocument();
+    expect(within(status).getByText('1/2 đoạn audio')).toBeInTheDocument();
 
     await userEvent.click(within(status).getByRole('button', { name: 'Hủy job audio' }));
 
@@ -4897,12 +4989,39 @@ describe('ReaderView', () => {
       regex: undefined,
       scopes: ['translation', 'notes', 'highlights'],
       wholeWord: undefined,
-    }));
+    }, { signal: expect.any(AbortSignal) }));
     expect(await within(panel).findByText('Giữ xưng hô cổ trang.')).toBeInTheDocument();
 
     await userEvent.click(within(panel).getByRole('button', { name: 'Đến Ch. 3 đoạn 5' }));
     expect(props.onSelectChapter).toHaveBeenCalledWith(103);
     expect(screen.queryByRole('dialog', { name: 'Tìm trong truyện' })).not.toBeInTheDocument();
+  });
+
+  it('coalesces rapid Reader progress changes into one remote sync', async () => {
+    const apiClient = mockReaderApiClient();
+    renderReader({ apiClient });
+    const readerMain = screen.getByRole('main', { name: 'Vùng đọc chính' });
+    Object.defineProperties(readerMain, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+
+    await waitFor(() => expect(latestProgressSyncPayload(apiClient)).toBeTruthy());
+    vi.mocked(apiClient.syncReaderState).mockClear();
+
+    for (const scrollTop of [120, 240, 360]) {
+      readerMain.scrollTop = scrollTop;
+      fireEvent.scroll(readerMain);
+      await act(async () => Promise.resolve());
+    }
+
+    await waitFor(() => {
+      const progressCalls = vi.mocked(apiClient.syncReaderState).mock.calls
+        .filter(([, request]) => Boolean(request.progress));
+      expect(progressCalls).toHaveLength(1);
+      expect(progressCalls[0]?.[1].progress).toMatchObject({ chapter_id: 102 });
+    }, { timeout: 1_500 });
   });
 
   it('lets the reader tune theme, type size, line height, width, and hide chrome', async () => {

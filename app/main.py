@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import csv
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from app.storage.chapter_content import publish_translation, write_versioned_text, retire_artifact
 from app.config import settings
 from app.database.db import (
     get_book_by_title,
@@ -20,7 +22,7 @@ from app.database.db import (
     list_books,
     list_chapters,
     update_chapter_paths,
-    get_connection,
+    list_glossary,
     glossary_stats,
     get_glossary_pending,
     approve_glossary_term,
@@ -38,21 +40,21 @@ from app.database.db import (
 from app.ingestion.chapter_cleaner import clean_chapter
 from app.ingestion.importers import import_clipboard, import_file
 from app.translation.qa_reviewer import run_qa_check
+from app.translation.qa_report import merge_qa_report
+from app.mobile_api.services.qa_service import build_deterministic_chapter_qa_report
 from app.translation.ollama_client import translate_chapter, TranslationError
 from app.translation.cache import get_cache_stats, clear_translation_cache
 from app.scheduler.daily_queue import (
     get_pending_chapters,
     get_failed_chapters,
-    update_chapter_after_translate,
-    save_qa_report,
     generate_daily_report,
     save_daily_report,
     get_pending_glossary,
 )
-from app.audio.edge_tts_engine import text_to_speech_file
+from app.services.tts.tts_pipeline import TTSPipeline
 from app.ui.web_dashboard import start_server
 from app.export.epub_exporter import export_epub
-from app.export.m4b_exporter import export_m4b, export_mp3_playlist
+from app.export.m4b_exporter import export_m4b, export_mp3_playlist, select_audiobook_chapters, validate_audiobook_snapshot
 from app.utils import safe_book_name
 
 
@@ -178,11 +180,14 @@ def clean_cmd(
     raw_text = raw_path.read_text(encoding="utf-8")
     cleaned_text = clean_chapter(raw_text)
 
-    safe_book = safe_book_name(book)
-    cleaned_path = data_dir / "cleaned" / f"{safe_book}_ch{chapter}_cleaned.txt"
-    cleaned_path.write_text(cleaned_text, encoding="utf-8")
-
-    update_chapter_paths(db_path, ch["id"], cleaned_text_path=cleaned_path, status="cleaned")
+    cleaned_path = write_versioned_text(data_dir / "cleaned", f"chapter_{ch['id']}", cleaned_text)
+    try:
+        update_chapter_paths(db_path, ch["id"], cleaned_text_path=cleaned_path, status="cleaned",
+                             expected_content_revision=ch["content_revision"])
+    except Exception:
+        cleaned_path.unlink(missing_ok=True)
+        raise
+    retire_artifact(ch.get("cleaned_text_path"), data_dir, db_path)
     console.print(f"[green]✓ Cleaned: {cleaned_path}[/green]")
     console.print(f"  [dim]Chars: {len(raw_text)} → {len(cleaned_text)}[/dim]")
 
@@ -233,12 +238,8 @@ def translate_cmd(
         update_chapter_paths(db_path, ch["id"], status="failed")
         raise typer.Exit(1)
 
-    safe_book = safe_book_name(book)
-    translated_path = data_dir / "translated" / safe_book / f"chapter_{chapter:04d}.txt"
-    translated_path.parent.mkdir(parents=True, exist_ok=True)
-    translated_path.write_text(translated_text, encoding="utf-8")
-
-    update_chapter_paths(db_path, ch["id"], translated_text_path=translated_path, status="translated")
+    translated_path = publish_translation(db_path, data_dir, ch["id"], translated_text,
+                                         expected_content_revision=ch["content_revision"])
     console.print(f"[green]✓ Translated: {translated_path}[/green]")
     console.print(f"  [dim]Output chars: {len(translated_text)}[/dim]")
 
@@ -323,17 +324,13 @@ def daily_cmd(
             model=model, host=host,
         )
 
-        safe_book = safe_book_name(book_title)
-        trans_path = data_dir / "translated" / safe_book / f"chapter_{ch['chapter_number']:04d}.txt"
-        trans_path.parent.mkdir(parents=True, exist_ok=True)
-        trans_path.write_text(translated, encoding="utf-8")
-
-        update_chapter_after_translate(db_path, ch["id"], trans_path)
-        console.print(f"[green]✓ Translated ch{ch['chapter_number']}[/green]")
-
-        # QA check
         qa_report = run_qa_check(source_text, translated, model=model, host=host)
-        save_qa_report(db_path, ch["id"], qa_report["quality_score"], qa_report)
+        rules = build_deterministic_chapter_qa_report(book_id=ch["book_id"], chapter_id=ch["id"],
+            source_text=source_text, translated_text=translated, glossary_terms=list_glossary(db_path, ch["book_id"]))
+        envelope = merge_qa_report(rules, qa_report, {"required": True, "complete": qa_report.get("qa_complete", True)})
+        publish_translation(db_path, data_dir, ch["id"], translated,
+                            expected_content_revision=ch["content_revision"], qa_report=envelope)
+        console.print(f"[green]✓ Translated ch{ch['chapter_number']}[/green]")
 
         if qa_report["quality_score"] < 7.0:
             console.print(f"[yellow]QA score: {qa_report['quality_score']:.1f} - needs review[/yellow]")
@@ -422,11 +419,8 @@ def retry_cmd(
             model=model, host=host,
         )
 
-        safe_book = safe_book_name(book_title)
-        trans_path = data_dir / "translated" / safe_book / f"chapter_{ch['chapter_number']:04d}.txt"
-        trans_path.parent.mkdir(parents=True, exist_ok=True)
-        trans_path.write_text(translated, encoding="utf-8")
-        update_chapter_after_translate(db_path, ch["id"], trans_path)
+        publish_translation(db_path, data_dir, ch["id"], translated,
+                            expected_content_revision=ch["content_revision"])
         console.print(f"[green]✓ Retried ch{ch['chapter_number']}[/green]")
 
 
@@ -504,35 +498,21 @@ def tts_cmd(
         console.print("[red]Translated text is empty[/red]")
         raise typer.Exit(1)
 
-    safe_book = safe_book_name(book)
-    audio_dir = data_dir / "audio" / safe_book
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    audio_path = audio_dir / f"chapter_{chapter:04d}.mp3"
-
     console.print(f"[blue]Generating audio for '{book}' ch{chapter}...[/blue]")
     console.print(f"  Voice: {voice or settings.edge_tts_voice} | Rate: {rate}")
 
+    pipeline = TTSPipeline(db_path, data_dir)
     try:
-        text_to_speech_file(
-            text=translated_text,
-            output_path=audio_path,
-            book_title=book,
-            chapter_number=chapter,
-            chapter_title=ch["title"],
-            voice=voice,
-            rate=rate,
-        )
+        report = pipeline.generate_chapter(book_id=book_row["id"], chapter_id=ch["id"], provider="edge_tts",
+            voice_config={"voice_id": voice or settings.edge_tts_voice, "rate": rate})
+        if report.status != "completed":
+            raise RuntimeError(report.error_message or "Audio generation did not complete")
     except Exception as e:
         console.print(f"[red]TTS failed: {e}[/red]")
         raise typer.Exit(1)
-
-    # Update DB
-    with get_connection(db_path) as conn:
-        conn.execute(
-            "UPDATE chapters SET audio_path = ?, status = 'audio_done' WHERE id = ?",
-            (str(audio_path), ch["id"]),
-        )
-        conn.commit()
+    finally:
+        pipeline.close()
+    audio_path = Path(report.output_mp3_path)
 
     size_mb = audio_path.stat().st_size / (1024 * 1024)
     console.print(f"[green]✓ Audio: {audio_path}[/green] [dim]({size_mb:.1f} MB)[/dim]")
@@ -592,6 +572,7 @@ def export_epub_cmd(
 @app.command("export-m4b")
 def export_m4b_cmd(
     book: str = typer.Option(..., "--book", "-b", help="Book title"),
+    allow_partial: bool = typer.Option(False, "--allow-partial", help="Export only available, current chapter audio"),
 ) -> None:
     """Merge chapter MP3s into single M4B audiobook."""
     data_dir = _ensure_data_dir()
@@ -601,14 +582,19 @@ def export_m4b_cmd(
     except ValueError as e:
         console.print(f"[red]{e}[/red]"); raise typer.Exit(1)
 
-    audio_chapters = [c for c in chapters if c.get("audio_path") and Path(c["audio_path"]).exists()]
-    if not audio_chapters:
-        console.print("[red]No audio chapters to merge. Run TTS first.[/red]"); raise typer.Exit(1)
+    audio_chapters, missing = select_audiobook_chapters(chapters, allow_partial=allow_partial)
 
     safe = safe_book_name(book)
-    m4b_path = data_dir / "exports" / safe / f"{safe}.m4b"
+    partial_label = "_partial" if missing else ""
+    m4b_path = data_dir / "exports" / safe / f"{safe}{partial_label}_{uuid.uuid4().hex}.m4b"
 
-    export_m4b(book, book_row.get("author", ""), audio_chapters, m4b_path)
+    export_m4b(book, book_row.get("author", ""), chapters, m4b_path, allow_partial=allow_partial)
+    try:
+        validate_audiobook_snapshot(chapters, list_chapters(db_path, book_row["id"]))
+    except ValueError:
+        m4b_path.unlink(missing_ok=True)
+        m4b_path.with_suffix(".manifest.json").unlink(missing_ok=True)
+        raise
 
     size_mb = m4b_path.stat().st_size / (1024 * 1024)
     console.print(f"[green]✓ M4B: {m4b_path}[/green] [dim]({size_mb:.1f} MB)[/dim]")

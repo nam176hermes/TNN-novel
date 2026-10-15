@@ -29,25 +29,25 @@ class ContentFileService:
             old_root=self.legacy_artifact_root,
         )
 
-    def get_chapter_source(self, chapter_id: int) -> str | None:
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
+    def get_chapter_source(self, chapter_id: int, *, chapter=None) -> str | None:
+        chapter = chapter if chapter is not None else get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or not chapter.get("raw_text_path"):
             return None
         path = self.resolve_artifact_file(chapter["raw_text_path"], ArtifactClass.RAW)
         return clean_translation_layout(path.read_text(encoding="utf-8"))
 
-    def get_chapter_translation(self, chapter_id: int) -> str | None:
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
+    def get_chapter_translation(self, chapter_id: int, *, chapter=None) -> str | None:
+        chapter = chapter if chapter is not None else get_chapter_by_id(self.db_path, chapter_id)
         if not chapter or not chapter.get("translated_text_path"):
             return None
         path = self.resolve_artifact_file(chapter["translated_text_path"], ArtifactClass.TRANSLATED)
         return path.read_text(encoding="utf-8")
 
-    def get_chapter_content(self, chapter_id: int) -> dict | None:
-        text = self.get_chapter_translation(chapter_id)
+    def get_chapter_content(self, chapter_id: int, *, chapter=None) -> dict | None:
+        chapter = chapter if chapter is not None else get_chapter_by_id(self.db_path, chapter_id)
+        text = self.get_chapter_translation(chapter_id, chapter=chapter)
         if text is None:
             return None
-        chapter = get_chapter_by_id(self.db_path, chapter_id)
         html = ""
         if chapter and chapter.get("content_html_path"):
             path = self.resolve_artifact_file(chapter["content_html_path"], ArtifactClass.HTML)

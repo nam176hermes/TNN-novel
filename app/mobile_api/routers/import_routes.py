@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-import errno
 import json
 import logging
 import os
 from pathlib import Path
-import re
-import shutil
 import time
-import uuid
 
 from fastapi import (
     APIRouter,
@@ -60,6 +56,7 @@ from app.mobile_api.schemas import (
     WizardTextImport,
     WizardTextImportResult,
 )
+from app.mobile_api.services import ebook_import_service as _ebook_service
 from app.mobile_api.services.ebook_import_service import EbookImportService, ExistingBookConfirmationRequired
 from app.mobile_api.services.job_service import JobService, get_shared_job_tracker
 from app.mobile_api.services.pipeline_service import PipelineService
@@ -71,13 +68,12 @@ from app.services.import_job_factory import create_import_job_service
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 logger = logging.getLogger(__name__)
-EBOOK_UPLOAD_TTL_SECONDS = 6 * 60 * 60
-EBOOK_UPLOAD_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+EBOOK_UPLOAD_TTL_SECONDS = _ebook_service.EBOOK_UPLOAD_TTL_SECONDS
+EBOOK_UPLOAD_ID_RE = _ebook_service.EBOOK_UPLOAD_ID_RE
+shutil = _ebook_service.shutil
 SUPPORTED_EBOOK_SUFFIXES = {".epub", ".azw3", ".mobi", ".prc", ".txt", ".html", ".htm"}
 MAX_WIZARD_TEXT_IMPORT_BYTES = 5 * 1024 * 1024
-EBOOK_CONFIRMATION_REQUIRED_DETAIL = (
-    "Truyện này đã tồn tại trong Library. Hãy Preview và xác nhận gộp vào truyện hiện có."
-)
+EBOOK_CONFIRMATION_REQUIRED_DETAIL = _ebook_service.EBOOK_CONFIRMATION_REQUIRED_DETAIL
 IMPORT_JOB_TERMINAL_STATUSES = {
     DurableImportJobStatus.SUCCEEDED,
     DurableImportJobStatus.PARTIALLY_SUCCEEDED,
@@ -438,7 +434,7 @@ def _validated_url_import_payload(data: URLImportStart) -> tuple[str, list[dict]
 
 
 @router.post("/paste", response_model=dict)
-async def import_paste(
+def import_paste(
     data: PasteImport,
     request: Request,
     pipeline: PipelineService = Depends(get_pipeline),
@@ -580,10 +576,11 @@ async def import_file(
     temp_path = raw_dir / f"upload_{time.time_ns()}_{safe_name}"
 
     content = await read_upload_bytes_limited(file, label="Raw text upload")
-    temp_path.write_bytes(content)
+    await asyncio.to_thread(temp_path.write_bytes, content)
 
     try:
-        result = pipeline.import_from_file(
+        result = await asyncio.to_thread(
+            pipeline.import_from_file,
             title=title,
             chapter_number=chapter_number,
             chapter_title=chapter_title,
@@ -638,70 +635,26 @@ async def _uploaded_ebook_temp_path(file: UploadFile) -> tuple[Path, str]:
 
 
 def _ebook_upload_dir(service: EbookImportService) -> Path:
-    upload_dir = service.data_dir / "import_uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    return upload_dir
+    return service._upload_dir()
 
 
 def _cleanup_staged_ebook_uploads(service: EbookImportService) -> None:
-    upload_dir = _ebook_upload_dir(service)
-    cutoff = time.time() - EBOOK_UPLOAD_TTL_SECONDS
-    for path in upload_dir.iterdir():
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink(missing_ok=True)
-        except OSError:
-            continue
+    service._cleanup_staged_uploads()
 
 
 def _stage_ebook_upload(service: EbookImportService, temp_path: Path, original_name: str) -> str:
-    _cleanup_staged_ebook_uploads(service)
-    upload_id = uuid.uuid4().hex
-    upload_dir = _ebook_upload_dir(service)
-    staged_path = upload_dir / f"{upload_id}{temp_path.suffix.lower()}"
-    try:
-        os.replace(temp_path, staged_path)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-        # ``copy2`` preserves timestamps and permissions, which is rejected by
-        # some production bind mounts. Staging only needs the ebook bytes.
-        try:
-            shutil.copyfile(temp_path, staged_path)
-            temp_path.unlink()
-        except Exception:
-            staged_path.unlink(missing_ok=True)
-            raise
-    meta_path = upload_dir / f"{upload_id}.json"
-    meta_path.write_text(json.dumps({"filename": original_name}, ensure_ascii=False), encoding="utf-8")
-    return upload_id
+    return service.stage_upload(temp_path, original_name)
 
 
 def _resolve_staged_ebook_upload(service: EbookImportService, upload_id: str) -> tuple[Path, str]:
-    if not EBOOK_UPLOAD_ID_RE.match(upload_id):
-        raise HTTPException(status_code=400, detail="Invalid ebook upload id")
-    upload_dir = _ebook_upload_dir(service)
-    meta_path = upload_dir / f"{upload_id}.json"
-    if not meta_path.exists():
-        raise HTTPException(status_code=400, detail="Preview upload expired; select the ebook file again")
     try:
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="Preview upload metadata is invalid") from exc
-    original_name = Path(str(metadata.get("filename") or "translated.epub")).name
-    suffix = Path(original_name).suffix.lower()
-    staged_path = upload_dir / f"{upload_id}{suffix}"
-    if not staged_path.exists():
-        raise HTTPException(status_code=400, detail="Preview upload expired; select the ebook file again")
-    return staged_path, original_name
+        return service.resolve_upload(upload_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _delete_staged_ebook_upload(service: EbookImportService, upload_id: str) -> None:
-    if not EBOOK_UPLOAD_ID_RE.match(upload_id):
-        return
-    upload_dir = _ebook_upload_dir(service)
-    for path in upload_dir.glob(f"{upload_id}*"):
-        path.unlink(missing_ok=True)
+    service.delete_upload(upload_id)
 
 
 async def _run_translated_ebook_import_job(
@@ -718,116 +671,12 @@ async def _run_translated_ebook_import_job(
     cleanup_upload_id: str = "",
     cleanup_temp_path: bool = False,
 ) -> None:
-    tracker.update_job(job_id, status="running", progress=0, message="Importing translated ebook")
-    confirmation_conflict = False
-    try:
-        result = await asyncio.to_thread(
-            service.import_translated_ebook,
-            ebook_path,
-            target_book_id=target_book_id,
-            duplicate_strategy=duplicate_strategy,
-            split_mode=split_mode,
-            original_filename=original_name,
-            confirmed_existing_book_id=confirmed_existing_book_id,
-        )
-        imported = int(result.get("imported_chapters") or 0)
-        skipped = int(result.get("skipped_chapters") or 0)
-        job = tracker.get_job(job_id)
-        params = dict(job.params or {}) if job else {}
-        params.update(
-            {
-                "book_id": result.get("book_id", 0),
-                "chapter_count": result.get("chapter_count", imported),
-                "imported_chapters": imported,
-                "skipped_chapters": skipped,
-            }
-        )
-        tracker.update_job(
-            job_id,
-            status="completed",
-            progress=1,
-            message=f"Imported {imported} translated ebook chapter(s), skipped {skipped}.",
-            params=params,
-        )
-        record_audit_event(
-            event_type="import_complete",
-            severity="info",
-            source="import",
-            message="Translated ebook import completed",
-            job_id=job_id,
-            details={
-                "import_type": "ebook",
-                "result": "success",
-                "book_id": result.get("book_id", 0),
-                "chapter_count": imported,
-                "skipped_chapters": skipped,
-            },
-        )
-    except ExistingBookConfirmationRequired:
-        confirmation_conflict = True
-        job = tracker.get_job(job_id)
-        params = dict(job.params or {}) if job else {}
-        params["confirmed_existing_book_id"] = None
-        if cleanup_upload_id:
-            params["retry_upload_id"] = cleanup_upload_id
-        elif cleanup_temp_path:
-            params["retry_upload_id"] = _stage_ebook_upload(service, ebook_path, original_name)
-        else:
-            params["retry_inbox_file"] = original_name
-        logger.info("Translated ebook import job %s requires a fresh Preview and confirmation", job_id)
-        tracker.update_job(
-            job_id,
-            status="failed",
-            error=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
-            message=EBOOK_CONFIRMATION_REQUIRED_DETAIL,
-            params=params,
-        )
-        record_audit_event(
-            event_type="import_failure",
-            severity="warning",
-            source="import",
-            message="Translated ebook import requires existing book confirmation",
-            job_id=job_id,
-            details={"import_type": "ebook", "result": "failure", "reason": "confirmation_required"},
-        )
-    except ValueError as exc:
-        logger.info("Translated ebook import job %s failed: %s", job_id, exc)
-        tracker.update_job(
-            job_id,
-            status="failed",
-            error="Translated ebook import failed. Check duplicate settings, ebook file, and server logs.",
-            message="Translated ebook import failed. Check duplicate settings, ebook file, and server logs.",
-        )
-        record_audit_event(
-            event_type="import_failure",
-            severity="warning",
-            source="import",
-            message="Translated ebook import failed",
-            job_id=job_id,
-            details={"import_type": "ebook", "result": "failure"},
-        )
-    except Exception:
-        logger.exception("Translated ebook import job %s failed", job_id)
-        tracker.update_job(
-            job_id,
-            status="failed",
-            error="Translated ebook import failed. Check server logs.",
-            message="Translated ebook import failed. Check server logs.",
-        )
-        record_audit_event(
-            event_type="import_failure",
-            severity="error",
-            source="import",
-            message="Translated ebook import failed",
-            job_id=job_id,
-            details={"import_type": "ebook", "result": "failure"},
-        )
-    finally:
-        if not confirmation_conflict:
-            if cleanup_upload_id:
-                _delete_staged_ebook_upload(service, cleanup_upload_id)
-            if cleanup_temp_path:
-                ebook_path.unlink(missing_ok=True)
+    await service.run_import_job(
+        job_id=job_id, tracker=tracker, ebook_path=ebook_path, original_name=original_name,
+        target_book_id=target_book_id, duplicate_strategy=duplicate_strategy, split_mode=split_mode,
+        confirmed_existing_book_id=confirmed_existing_book_id,
+        cleanup_upload_id=cleanup_upload_id, cleanup_temp_path=cleanup_temp_path,
+    )
 
 
 def _ebook_inbox_dir() -> Path:
@@ -856,7 +705,7 @@ def _resolve_inbox_ebook(filename: str) -> tuple[Path, str]:
 
 
 @router.get("/ebook/inbox", response_model=dict)
-async def list_ebook_inbox():
+def list_ebook_inbox():
     """List ebook files copied into the server-side inbox."""
     inbox_dir = _ebook_inbox_dir()
     files = []
@@ -875,7 +724,7 @@ async def list_ebook_inbox():
 
 
 @router.post("/ebook/inbox/preview", response_model=dict)
-async def preview_inbox_translated_ebook(
+def preview_inbox_translated_ebook(
     filename: str = Form(...),
     split_mode: str = Form(default="auto"),
     target_book_id: int | None = Form(default=None),
@@ -909,7 +758,8 @@ async def preview_translated_ebook(
     temp_path, original_name = await _uploaded_ebook_temp_path(file)
     staged = False
     try:
-        preview = service.preview(
+        preview = await asyncio.to_thread(
+            service.preview,
             temp_path,
             split_mode=split_mode,
             target_book_id=target_book_id,
@@ -952,7 +802,8 @@ async def import_translated_ebook(
         raise HTTPException(status_code=400, detail="No file uploaded")
     confirmation_conflict = False
     try:
-        result = service.import_translated_ebook(
+        result = await asyncio.to_thread(
+            service.import_translated_ebook,
             temp_path,
             target_book_id=target_book_id,
             duplicate_strategy=duplicate_strategy,
@@ -1099,7 +950,7 @@ async def start_translated_ebook_import_job(
 
 
 @router.get("/ebook/history", response_model=dict)
-async def ebook_import_history(
+def ebook_import_history(
     limit: int = 20,
     service: EbookImportService = Depends(get_ebook_import_service),
 ):
