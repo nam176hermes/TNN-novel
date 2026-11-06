@@ -87,6 +87,14 @@ from app.storage.artifact_paths import ArtifactClass, ArtifactPathError
 
 logger = logging.getLogger(__name__)
 
+_CHAPTER_ARTIFACT_FIELDS = (
+    ("raw_text_path", ArtifactClass.RAW),
+    ("cleaned_text_path", ArtifactClass.CLEANED),
+    ("translated_text_path", ArtifactClass.TRANSLATED),
+    ("content_html_path", ArtifactClass.HTML),
+    ("audio_path", ArtifactClass.AUDIO),
+)
+
 # Compatibility aliases retained at the original module import path.
 MAX_READER_DICTIONARY_ARCHIVE_FILES = _MAX_READER_DICTIONARY_ARCHIVE_FILES
 MAX_READER_DICTIONARY_BYTES = _MAX_READER_DICTIONARY_BYTES
@@ -2305,11 +2313,22 @@ class PipelineService:
     def _safe_filename_part(value: str) -> str:
         return "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in value)
 
-    @staticmethod
-    def _unlink_path(value: str | None) -> None:
+    def _unlink_artifact(self, value: str | None, artifact_class: ArtifactClass) -> None:
         if not value:
             return
-        Path(value).unlink(missing_ok=True)
+        try:
+            path = self.resolve_artifact_file(value, artifact_class)
+        except ArtifactPathError as exc:
+            logger.warning(
+                "Skipped %s artifact cleanup: %s",
+                artifact_class.value,
+                exc.status.value,
+            )
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove %s artifact after database update", artifact_class.value)
 
     def _cover_url(self, cover_path: str | None) -> str:
         if not cover_path:
@@ -2465,18 +2484,18 @@ class PipelineService:
             return False
 
         chapters = list_chapters(self.db_path, book_id)
-        file_paths = [book.get("cover_path")]
+        artifacts = [(book.get("cover_path"), ArtifactClass.COVER)]
         for chapter in chapters:
-            file_paths.extend(
-                chapter.get(key)
-                for key in ("raw_text_path", "cleaned_text_path", "translated_text_path", "content_html_path", "audio_path")
+            artifacts.extend(
+                (chapter.get(field), artifact_class)
+                for field, artifact_class in _CHAPTER_ARTIFACT_FIELDS
             )
 
         if not db_delete_book(self.db_path, book_id):
             return False
 
-        for file_path in file_paths:
-            self._unlink_path(file_path)
+        for value, artifact_class in artifacts:
+            self._unlink_artifact(value, artifact_class)
         shutil.rmtree(self.data_dir / "book_assets" / str(book_id), ignore_errors=True)
         return True
 
@@ -4146,40 +4165,48 @@ class PipelineService:
         chapter = get_chapter_by_id(self.db_path, chapter_id)
         if not chapter:
             return False
-        self._unlink_path(chapter.get("content_html_path"))
         translated_dir = self.data_dir / "translated"
         translated_dir.mkdir(parents=True, exist_ok=True)
         safe_title = f"chapter_{chapter_id}_{time.time_ns()}.txt"
         translated_path = translated_dir / safe_title
-        translated_path.write_text(clean_translation_layout(text), encoding="utf-8")
         previous_translation_path = chapter.get("translated_text_path")
+        try:
+            translated_path.write_text(clean_translation_layout(text), encoding="utf-8")
+            update_chapter_paths(
+                self.db_path,
+                chapter_id,
+                translated_text_path=translated_path,
+                clear_content_html_path=True,
+                status="translated",
+            )
+        except Exception:
+            translated_path.unlink(missing_ok=True)
+            raise
+        self._unlink_artifact(chapter.get("content_html_path"), ArtifactClass.HTML)
         if previous_translation_path and str(previous_translation_path) != str(translated_path):
-            self._unlink_path(previous_translation_path)
-        update_chapter_paths(
-            self.db_path,
-            chapter_id,
-            translated_text_path=translated_path,
-            clear_content_html_path=True,
-            status="translated",
-        )
+            self._unlink_artifact(previous_translation_path, ArtifactClass.TRANSLATED)
         return True
 
     def delete_chapter_translation(self, book_id: int, chapter_id: int) -> bool:
         chapter = self.get_chapter_for_book(book_id, chapter_id)
         if not chapter:
             return False
-        self._unlink_path(chapter.get("translated_text_path"))
-        self._unlink_path(chapter.get("content_html_path"))
-        self._unlink_path(chapter.get("audio_path"))
-        return delete_chapter_translation_data(self.db_path, chapter_id)
+        if not delete_chapter_translation_data(self.db_path, chapter_id):
+            return False
+        self._unlink_artifact(chapter.get("translated_text_path"), ArtifactClass.TRANSLATED)
+        self._unlink_artifact(chapter.get("content_html_path"), ArtifactClass.HTML)
+        self._unlink_artifact(chapter.get("audio_path"), ArtifactClass.AUDIO)
+        return True
 
     def delete_chapter(self, book_id: int, chapter_id: int) -> bool:
         chapter = self.get_chapter_for_book(book_id, chapter_id)
         if not chapter:
             return False
-        for key in ("raw_text_path", "cleaned_text_path", "translated_text_path", "content_html_path", "audio_path"):
-            self._unlink_path(chapter.get(key))
-        return soft_delete_chapter(self.db_path, chapter_id)
+        if not soft_delete_chapter(self.db_path, chapter_id):
+            return False
+        for field, artifact_class in _CHAPTER_ARTIFACT_FIELDS:
+            self._unlink_artifact(chapter.get(field), artifact_class)
+        return True
 
     def _provider_call_options(
         self,

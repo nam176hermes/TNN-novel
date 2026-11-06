@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 import httpx
 import pytest
@@ -46,6 +47,28 @@ def make_pipeline(db_path: Path, data_dir: Path) -> PipelineService:
     pipeline.data_dir = data_dir
     pipeline.legacy_artifact_root = None
     return pipeline
+
+
+def fail_chapter_updates(db_path: Path) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER fail_chapter_update
+            BEFORE UPDATE ON chapters
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic chapter update failure');
+            END
+            """
+        )
+        conn.commit()
+
+
+def artifact_snapshot(root: Path) -> dict[Path, bytes]:
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 @pytest.fixture
@@ -1152,6 +1175,34 @@ def test_update_chapter_translation_removes_previous_generated_translation(
     assert Path(chapter["translated_text_path"]).read_text(encoding="utf-8") == "new text"
 
 
+def test_update_chapter_translation_preserves_existing_artifacts_when_database_update_fails(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+) -> None:
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter")
+    old_translation = tmp_path / "old-translation.txt"
+    old_html = tmp_path / "old-translation.html"
+    old_translation.write_text("old text", encoding="utf-8")
+    old_html.write_text("<p>old text</p>", encoding="utf-8")
+    update_chapter_paths(
+        temp_pipeline.db_path,
+        chapter_id,
+        translated_text_path=old_translation,
+        content_html_path=old_html,
+        status="translated",
+    )
+    chapter_before = get_chapter_by_id(temp_pipeline.db_path, chapter_id)
+    files_before = artifact_snapshot(tmp_path)
+    fail_chapter_updates(temp_pipeline.db_path)
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic chapter update failure"):
+        temp_pipeline.update_chapter_translation(chapter_id, "new text")
+
+    assert get_chapter_by_id(temp_pipeline.db_path, chapter_id) == chapter_before
+    assert artifact_snapshot(tmp_path) == files_before
+
+
 def test_generate_audio_writes_under_pipeline_data_dir(
     temp_pipeline: PipelineService,
     tmp_path: Path,
@@ -1309,15 +1360,18 @@ def test_delete_chapter_translation_keeps_source_and_clears_generated_artifacts(
     book_id = add_book(temp_pipeline.db_path, "Book")
     raw_path = tmp_path / "source.txt"
     translated_path = tmp_path / "translation.txt"
+    content_html_path = tmp_path / "translation.html"
     audio_path = tmp_path / "audio.mp3"
     raw_path.write_text("source", encoding="utf-8")
     translated_path.write_text("translation", encoding="utf-8")
+    content_html_path.write_text("<p>translation</p>", encoding="utf-8")
     audio_path.write_bytes(b"audio")
     chapter_id = add_chapter(temp_pipeline.db_path, book_id, 1, "Chapter", raw_text_path=raw_path)
     update_chapter_paths(
         temp_pipeline.db_path,
         chapter_id,
         translated_text_path=translated_path,
+        content_html_path=content_html_path,
         audio_path=audio_path,
         status="translated",
     )
@@ -1352,6 +1406,9 @@ def test_delete_chapter_translation_keeps_source_and_clears_generated_artifacts(
     assert chapter["status"] == "cleaned"
     assert temp_pipeline.get_chapter_source(chapter_id) == "source"
     assert temp_pipeline.get_chapter_translation(chapter_id) is None
+    assert not translated_path.exists()
+    assert not content_html_path.exists()
+    assert not audio_path.exists()
     assert get_qa_report(temp_pipeline.db_path, book_id, chapter_id) is None
     assert get_job_attempts(temp_pipeline.db_path, chapter_id=chapter_id) == []
     with get_connection(temp_pipeline.db_path) as conn:
@@ -1360,6 +1417,49 @@ def test_delete_chapter_translation_keeps_source_and_clears_generated_artifacts(
             (chapter_id,),
         ).fetchone()[0]
     assert usage_count == 0
+
+
+@pytest.mark.parametrize("method_name", ["delete_chapter_translation", "delete_chapter"])
+def test_chapter_cleanup_preserves_database_and_files_when_update_fails(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    paths = {
+        "raw_text_path": tmp_path / "source.txt",
+        "cleaned_text_path": tmp_path / "cleaned.txt",
+        "translated_text_path": tmp_path / "translation.txt",
+        "content_html_path": tmp_path / "translation.html",
+        "audio_path": tmp_path / "audio.mp3",
+    }
+    for field, path in paths.items():
+        path.write_bytes(field.encode("utf-8"))
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(
+        temp_pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=paths["raw_text_path"],
+    )
+    update_chapter_paths(
+        temp_pipeline.db_path,
+        chapter_id,
+        cleaned_text_path=paths["cleaned_text_path"],
+        translated_text_path=paths["translated_text_path"],
+        content_html_path=paths["content_html_path"],
+        audio_path=paths["audio_path"],
+        status="translated",
+    )
+    chapter_before = get_chapter_by_id(temp_pipeline.db_path, chapter_id)
+    files_before = artifact_snapshot(tmp_path)
+    fail_chapter_updates(temp_pipeline.db_path)
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic chapter update failure"):
+        getattr(temp_pipeline, method_name)(book_id, chapter_id)
+
+    assert get_chapter_by_id(temp_pipeline.db_path, chapter_id) == chapter_before
+    assert artifact_snapshot(tmp_path) == files_before
 
 
 def test_delete_chapter_soft_deletes_and_hides_chapter(
@@ -1397,6 +1497,49 @@ def test_delete_chapter_soft_deletes_and_hides_chapter(
     assert deleted["raw_text_path"] is None
     assert deleted["translated_text_path"] is None
     assert deleted["audio_path"] is None
+    assert not raw_path.exists()
+    assert not translated_path.exists()
+    assert not audio_path.exists()
+
+
+def test_delete_chapter_does_not_unlink_artifacts_outside_data_dir(
+    temp_pipeline: PipelineService,
+    tmp_path: Path,
+) -> None:
+    paths = {
+        field: tmp_path.parent / f"{tmp_path.name}-{field}"
+        for field in (
+            "raw_text_path",
+            "cleaned_text_path",
+            "translated_text_path",
+            "content_html_path",
+            "audio_path",
+        )
+    }
+    for field, path in paths.items():
+        path.write_bytes(field.encode("utf-8"))
+    book_id = add_book(temp_pipeline.db_path, "Book")
+    chapter_id = add_chapter(
+        temp_pipeline.db_path,
+        book_id,
+        1,
+        "Chapter",
+        raw_text_path=paths["raw_text_path"],
+    )
+    update_chapter_paths(
+        temp_pipeline.db_path,
+        chapter_id,
+        cleaned_text_path=paths["cleaned_text_path"],
+        translated_text_path=paths["translated_text_path"],
+        content_html_path=paths["content_html_path"],
+        audio_path=paths["audio_path"],
+        status="translated",
+    )
+
+    assert temp_pipeline.delete_chapter(book_id, chapter_id) is True
+
+    for field, path in paths.items():
+        assert path.read_bytes() == field.encode("utf-8")
 
 
 def test_library_books_hide_books_that_only_have_deleted_chapters(
