@@ -1,0 +1,7 @@
+# Apply after compose.access.no-login-20261017.yaml; rollback by omitting this file.
+services:
+  api:
+    image: novel-pipeline-api:desktop-ui-no-login-20261017-r2
+    environment:
+      NOVEL_IMAGE_TAG: "novel-pipeline-api:desktop-ui-no-login-20261017-r2"
+      NOVEL_IMAGE_DIGEST: "sha256:09872b80d0b292b6117bd3f30df7ab8d8232ae8d10af83575df3f9af583f9f84"

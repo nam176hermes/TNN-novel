@@ -3950,9 +3950,10 @@
   .raw-backlog-view,
 .workbench-dashboard-empty {
     margin: 0 auto;
-    max-width: 646px;
-    min-height: calc(100dvh - 20px);
+    max-width: 1200px;
+    min-height: calc(100dvh - 40px);
     padding: 18px;
+    width: 100%;
   }
 
   .raw-backlog-view {
@@ -3984,10 +3985,6 @@
     color: rgb(213 224 222 / 72%);
     font-size: 13px;
     margin: 4px 0 0;
-  }
-
-  .raw-backlog-view {
-    max-width: 640px;
   }
 
   .raw-backlog-summary {
@@ -4176,8 +4173,7 @@
   }
 
   .workbench-dashboard-empty {
-    max-width: 767px;
-    padding: 0 28px 30px;
+    padding: 0 0 30px;
   }
 
   .workbench-dashboard-topbar {
@@ -4216,7 +4212,6 @@
     align-items: center;
     background:
       linear-gradient(90deg, rgb(8 20 24 / 94%) 0%, rgb(8 20 24 / 78%) 58%, rgb(8 20 24 / 64%) 100%),
-      url("../assets/reference-ui/sidebar-scenery.png") right bottom / auto 150% no-repeat,
       rgb(9 20 24 / 86%);
     border-color: rgb(50 76 76 / 30%);
     border-radius: 10px;
@@ -4879,7 +4874,7 @@
   max-height: none;
   min-height: calc(100dvh - 20px);
   overflow: visible;
-  width: min(100%, 767px);
+  width: min(100%, 1200px);
 }
 
 .workbench-dashboard-topbar {
@@ -4989,7 +4984,7 @@
 @media (min-width: 821px) {
   .workbench-dashboard-empty .workbench-quick-grid,
 .workbench-dashboard-empty .workbench-overview-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
   }
 }
 

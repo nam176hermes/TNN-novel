@@ -1,0 +1,10 @@
+# Owner-approved public access. Apply after the existing glossary release overlay.
+# Backend and worker retain their matching release; only the API web assets change.
+services:
+  api:
+    image: novel-pipeline-api:glossary-upgrade-no-login-20261015-r1
+    environment:
+      MOBILE_API_DISABLE_AUTH: "1"
+      MOBILE_API_ALLOW_PUBLIC_AUTH_BYPASS: "1"
+      NOVEL_IMAGE_TAG: "novel-pipeline-api:glossary-upgrade-no-login-20261015-r1"
+      NOVEL_IMAGE_DIGEST: "sha256:bafb96bdb7a1d50c0f6a9d43de0311018e21ed3f2da78353d5ae03b5fb360e7c"

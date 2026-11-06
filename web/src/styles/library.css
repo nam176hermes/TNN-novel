@@ -231,9 +231,10 @@
 @media (min-width: 821px) {
   .translated-library-view {
     margin: 0 auto;
-    max-width: 646px;
-    min-height: calc(100dvh - 20px);
+    max-width: 1200px;
+    min-height: calc(100dvh - 40px);
     padding: 18px;
+    width: 100%;
   }
 
   .translated-library-view {
@@ -291,7 +292,7 @@
     border: 1px solid rgb(47 73 73 / 26%);
     border-radius: 10px;
     box-shadow: none;
-    grid-template-columns: minmax(0, 1fr) 128px 224px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
     margin-bottom: 26px;
     padding: 18px;
   }
@@ -342,7 +343,7 @@
 
   .translated-books-grid {
     gap: 23px;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
   }
 
   .translated-book-card {

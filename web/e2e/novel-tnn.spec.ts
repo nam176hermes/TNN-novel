@@ -462,6 +462,34 @@ test('login works and protected shell is blocked without a token', async ({ page
   await expect(page.getByRole('heading', { name: 'Thư viện' })).toBeVisible();
 });
 
+test('desktop layout uses available space and keeps sidebar controls reachable', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 768 });
+  await authenticatedPage(page, { imported: false, translated: true, translateRequests: [] });
+  const navigation = page.getByRole('navigation', { name: 'Quy trình' });
+
+  for (const viewport of [{ width: 821, height: 650 }, { width: 1366, height: 768 }, { width: 1920, height: 1080 }]) {
+    await page.setViewportSize(viewport);
+    for (const [label, selector] of [['Thư viện', '.translated-library-view'], ['Bàn dịch', '.workbench-dashboard-empty'], ['Raw chưa dịch', '.raw-backlog-view']]) {
+      await navigation.getByRole('button', { name: label, exact: true }).click();
+      await expect(page.locator(selector)).toBeVisible();
+      const bounds = await page.locator(selector).boundingBox();
+      const main = await page.locator('.workflow-main').boundingBox();
+      expect(bounds!.width).toBeGreaterThan(Math.min(1000, main!.width - 60));
+      expect(bounds!.x).toBeGreaterThanOrEqual(main!.x);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
+      expect(await page.locator('.workflow-main').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
+      await expectNoHorizontalOverflow(page);
+
+      const logout = page.getByRole('button', { name: 'Đăng xuất', exact: true });
+      await logout.scrollIntoViewIfNeeded();
+      await expect(logout).toBeInViewport();
+      await expect(logout).toBeEnabled();
+      const sidebar = page.locator('.workflow-sidebar');
+      expect(await sidebar.evaluate(e => e.scrollHeight <= e.clientHeight || getComputedStyle(e).overflowY === 'auto')).toBe(true);
+    }
+  }
+});
+
 test('desktop provider table keeps the compact reference sizing', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
   await authenticatedPage(page, state);
@@ -772,16 +800,33 @@ test('mobile feature pages keep actions clear and status backup states usable at
   await expect(filePreview).toHaveCSS('overflow', 'visible');
 });
 
-test('mobile workflow viewport ends above the fixed navigation', async ({ page }) => {
+test('mobile and narrow desktop windows keep content between the header and navigation', async ({ page }) => {
   const state: MockState = { imported: false, translated: true, translateRequests: [] };
-  await page.setViewportSize({ width: 360, height: 740 });
+  await page.setViewportSize({ width: 600, height: 950 });
   await authenticatedPage(page, state);
 
-  const mainBox = await page.locator('.workflow-main').boundingBox();
-  const navBox = await page.getByRole('navigation', { name: 'Điều hướng chính trên di động' }).boundingBox();
-  expect(mainBox).not.toBeNull();
-  expect(navBox).not.toBeNull();
-  expect((mainBox?.y ?? 0) + (mainBox?.height ?? 0)).toBeLessThanOrEqual((navBox?.y ?? 0) + 1);
+  const mobileNavigation = page.getByRole('navigation', { name: 'Điều hướng chính trên di động' });
+  for (const width of [360, 559, 560, 600, 640, 641, 768, 820]) {
+    await page.setViewportSize({ width, height: 950 });
+    await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeHidden();
+    for (const label of ['Bàn dịch', 'Thư viện']) {
+      await mobileNavigation.getByRole('button', { name: label, exact: true }).click();
+      const headerBox = await page.locator('.workflow-sidebar').boundingBox();
+      const mainBox = await page.locator('.workflow-main').boundingBox();
+      const navBox = await mobileNavigation.boundingBox();
+      expect(headerBox!.height).toBeLessThan(100);
+      expect(mainBox!.y).toBeGreaterThanOrEqual(headerBox!.y + headerBox!.height);
+      expect(mainBox!.height).toBeGreaterThan(600);
+      expect(mainBox!.y + mainBox!.height).toBeLessThanOrEqual(navBox!.y + 1);
+      await expect(page.getByRole('heading', { name: label === 'Bàn dịch' ? 'Chưa chọn chương' : 'Thư viện', exact: true })).toBeInViewport();
+      await expectNoHorizontalOverflow(page);
+    }
+  }
+
+  await page.setViewportSize({ width: 821, height: 950 });
+  await expect(mobileNavigation).toBeHidden();
+  await expect(page.getByRole('navigation', { name: 'Quy trình' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Thư viện', exact: true })).toBeInViewport();
 });
 
 test('short desktop login keeps the install prompt outside the login panel', async ({ page }) => {
